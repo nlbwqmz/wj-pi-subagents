@@ -433,8 +433,8 @@ export class TreeController {
 
   /**
    * 应用监督器事件；每个事件都必须携带产生时的代际，不匹配或非法状态边
-   * 会安全地成为无变化。启动失败先发布 failed，监督器随后必须提交终止屏障
-   * 和资源确认，控制器不会在未确认资源时释放预留名额。
+   * 会安全地成为无变化。启动失败先记录 failed，再立即建立 terminating 屏障；
+   * 监督器仍须提交资源确认，控制器不会在未确认资源时释放预留名额。
    */
   applyLifecycleEvent(
     agentId: unknown,
@@ -456,11 +456,16 @@ export class TreeController {
         break;
       case "startup_failed":
         if (record.state === "starting") {
-          applied = this.mutate(record, {
+          // 启动残骸不能停留在只占名额的 failed：先线性化故障事实，
+          // 再在同一顺序域立即建立不可逆的清理屏障。资源确认仍由监督器
+          // 另行提交，未确认前节点继续占用名额。
+          const failedApplied = this.mutate(record, {
             state: "failed",
             pendingMessageCount: 0,
             errorCode: eventFaultCode(event, "spawn_failed"),
           });
+          const terminatingApplied = this.mutate(record, { state: "terminating" });
+          applied = failedApplied || terminatingApplied;
         }
         break;
       case "message_admitted":
@@ -500,8 +505,15 @@ export class TreeController {
         // abort 响应不是 settle 事实，故意不改变生命周期。
         break;
       case "runtime_failed":
-        if (
-          record.state === "starting" ||
+        if (record.state === "starting") {
+          const failedApplied = this.mutate(record, {
+            state: "failed",
+            pendingMessageCount: 0,
+            errorCode: eventFaultCode(event, "spawn_failed"),
+          });
+          const terminatingApplied = this.mutate(record, { state: "terminating" });
+          applied = failedApplied || terminatingApplied;
+        } else if (
           record.state === "idle" ||
           record.state === "working" ||
           record.state === "interrupting"
@@ -674,9 +686,9 @@ export class TreeController {
     record.state = nextState;
     record.pendingMessageCount = nextPending;
     record.error = nextError;
-    // 代际覆盖所有公开事实变化，而不只覆盖状态变化；这样旧消息事件不会
-    // 在 pending 或故障事实更新后误消费新一轮工作。
-    if (stateChanged || pendingChanged || errorChanged) record.lifecycleGeneration += 1;
+    // 生命周期代际只随状态转换推进。pending 事件仍在节点顺序域内串行处理，
+    // 允许同一状态快照上并行获准的多条消息各自完成，不互相误判为迟到。
+    if (stateChanged) record.lifecycleGeneration += 1;
     if (stateChanged && nextState === "idle" && record.lifecycleStartedAt === undefined) {
       record.createdAt = observedAt;
       record.lifecycleStartedAt = monotonicAt;

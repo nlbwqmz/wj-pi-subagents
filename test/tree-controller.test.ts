@@ -257,7 +257,7 @@ test("生命周期只接受七态的合法事实，状态代际会丢弃迟到�
   assert.equal(ignoredSettle.node.state, "failed");
 });
 
-test("启动失败保留失败事实，终止屏障和资源确认完成后才释放预留名额", () => {
+test("启动失败立即建立终止屏障，资源确认完成后才释放预留名额", () => {
   const tree = controller();
   const created = reserveRootChild(tree);
   const id = created.node.agent_id;
@@ -266,11 +266,12 @@ test("启动失败保留失败事实，终止屏障和资源确认完成后才�
     type: "startup_failed",
     error_code: "spawn_timeout",
   }));
-  assert.equal(failed.node.state, "failed");
+  assert.equal(failed.node.state, "terminating");
   assert.equal(failed.node.error?.code, "spawn_timeout");
   assert.equal(expectSuccess(tree.getQuotaSnapshot()).active_tree_agents, 1);
 
   const terminating = expectSuccess(applyEvent(tree, id, { type: "termination_requested" }));
+  assert.equal(terminating.applied, false);
   assert.equal(terminating.node.state, "terminating");
   assert.equal(expectSuccess(tree.getQuotaSnapshot()).active_tree_agents, 1);
 
