@@ -2,10 +2,34 @@ import type { SupportedPlatform } from "./host-gate.ts";
 
 export type ProcessTreeStrategy = "job_object" | "process_group_or_session";
 
-export interface ProcessTreeAdapterCapability {
+/**
+ * 适配器持有的平台树句柄。门禁只把它当作不透明值传递，控制器不能读取 PID。
+ */
+export type ProcessTreeHandle = unknown;
+
+export interface ExitObservation {
+  readonly state: "exited" | "present" | "unknown";
+}
+
+export interface ResourceObservation {
+  readonly state: "released" | "present" | "unknown";
+}
+
+/**
+ * 平台进程树适配器的完整职责契约。
+ *
+ * Windows 使用 Job Object，Unix 类系统使用 process group/session；适配器内部
+ * 负责平台句柄和整树回收，宿主门禁只验证契约是否可加载。
+ */
+export interface ProcessTreeAdapter {
   readonly platform: SupportedPlatform;
   readonly strategy: ProcessTreeStrategy;
-  readonly available: true;
+  attach(processHandle: unknown): Promise<ProcessTreeHandle>;
+  requestGracefulClose(tree: ProcessTreeHandle, signal: AbortSignal): Promise<void>;
+  forceTerminate(tree: ProcessTreeHandle): Promise<void>;
+  waitForExit(tree: ProcessTreeHandle, deadline: number | Date): Promise<ExitObservation>;
+  inspect(tree: ProcessTreeHandle): Promise<ResourceObservation>;
+  release(tree: ProcessTreeHandle): Promise<void>;
 }
 
 const STRATEGIES: Record<SupportedPlatform, ProcessTreeStrategy> = {
@@ -14,17 +38,25 @@ const STRATEGIES: Record<SupportedPlatform, ProcessTreeStrategy> = {
   linux: "process_group_or_session",
 };
 
+const REQUIRED_PROCESS_TREE_ADAPTER_METHODS = [
+  "attach",
+  "requestGracefulClose",
+  "forceTerminate",
+  "waitForExit",
+  "inspect",
+  "release",
+] as const;
+
 /**
- * 返回当前票据的无副作用平台能力令牌；真正的树句柄操作由后续适配器票据注入。
+ * 验证适配器是否提供全部平台树职责，并且声明了与当前平台匹配的策略。
  */
-export function getProcessTreeAdapterCapability(
-  platform: NodeJS.Platform,
-): ProcessTreeAdapterCapability | undefined {
-  if (!Object.prototype.hasOwnProperty.call(STRATEGIES, platform)) return undefined;
-  const supportedPlatform = platform as SupportedPlatform;
-  return {
-    platform: supportedPlatform,
-    strategy: STRATEGIES[supportedPlatform],
-    available: true,
-  };
+export function isProcessTreeAdapter(
+  candidate: unknown,
+  platform: SupportedPlatform,
+): candidate is ProcessTreeAdapter {
+  if (typeof candidate !== "object" || candidate === null) return false;
+  const adapter = candidate as Record<string, unknown>;
+  if (adapter.platform !== platform || adapter.strategy !== STRATEGIES[platform]) return false;
+  if ("available" in adapter && adapter.available !== true) return false;
+  return REQUIRED_PROCESS_TREE_ADAPTER_METHODS.every((method) => typeof adapter[method] === "function");
 }

@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { MIN_NODE_VERSION, MIN_PI_VERSION } from "../src/host-gate.ts";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -19,13 +20,13 @@ test("package manifest 只暴露一个显式 Pi 扩展入口", () => {
 
   assert.equal(manifest.private, undefined);
   assert.deepEqual(manifest.files, ["extensions", "src"]);
-  assert.equal(manifest.engines?.node, ">=22.19.0");
+  assert.equal(manifest.engines?.node, `>=${MIN_NODE_VERSION}`);
   assert.equal(manifest.peerDependencies?.["@earendil-works/pi-coding-agent"], "*");
   assert.ok(manifest.dependencies?.semver, "生产安装必须能够解析 semver");
   assert.deepEqual(manifest.pi, {
     extensions: ["./extensions/pi-subagent.ts"],
   });
-  assert.equal(manifest.piSubagent?.requiresPi, ">=0.83.0");
+  assert.equal(manifest.piSubagent?.requiresPi, `>=${MIN_PI_VERSION}`);
 });
 
 test("package manifest 不注册额外 Pi 资源", () => {

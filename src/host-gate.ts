@@ -1,7 +1,36 @@
-import { getProcessTreeAdapterCapability } from "./process-tree-capability.ts";
+import packageManifest from "../package.json" with { type: "json" };
+import {
+  isProcessTreeAdapter,
+  type ProcessTreeAdapter,
+} from "./process-tree-capability.ts";
 
-export const MIN_NODE_VERSION = "22.19.0";
-export const MIN_PI_VERSION = "0.83.0";
+interface PackageManifestRequirements {
+  engines?: { node?: unknown };
+  piSubagent?: { requiresPi?: unknown };
+}
+
+const manifestRequirements = packageManifest as PackageManifestRequirements;
+
+function requiredVersionRange(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`Invalid ${field} in package manifest`);
+  }
+  return value;
+}
+
+function minimumVersion(range: string, field: string): string {
+  const match = /^>=(\d+\.\d+\.\d+)$/.exec(range);
+  if (match === null) throw new Error(`Invalid ${field} in package manifest`);
+  return match[1]!;
+}
+
+export const NODE_VERSION_RANGE = requiredVersionRange(manifestRequirements.engines?.node, "engines.node");
+export const PI_VERSION_RANGE = requiredVersionRange(
+  manifestRequirements.piSubagent?.requiresPi,
+  "piSubagent.requiresPi",
+);
+export const MIN_NODE_VERSION = minimumVersion(NODE_VERSION_RANGE, "engines.node");
+export const MIN_PI_VERSION = minimumVersion(PI_VERSION_RANGE, "piSubagent.requiresPi");
 export const HOST_CAPABILITY_DIAGNOSTIC_CODE = "host_capability_unavailable";
 export const SUPPORTED_PLATFORMS = ["win32", "darwin", "linux"] as const;
 
@@ -55,7 +84,7 @@ export type HostCapabilityResult =
       nodeVersion: string;
       piVersion: string;
       platform: SupportedPlatform;
-      processTreeAdapter: unknown;
+      processTreeAdapter: ProcessTreeAdapter;
     }
   | {
       ok: false;
@@ -75,13 +104,6 @@ export interface PiSubagentExtensionOptions {
 export type PiSubagentExtensionFactory = (
   extensionApi: ExtensionApiSurface,
 ) => void | Promise<void>;
-
-interface DiagnosticContext {
-  hasUI?: boolean;
-  ui?: {
-    notify?: (message: string, type?: "info" | "warning" | "error") => void;
-  };
-}
 
 interface SemverApi {
   valid(version: string): string | null;
@@ -152,7 +174,14 @@ function findMissingHostApi(extensionApi: ExtensionApiSurface, piModule: unknown
     (name) => typeof extensionApi[name] !== "function",
   );
   const result: string[] = [...missingApi];
-  if (extensionApi.events === undefined || extensionApi.events === null) result.push("events");
+  const events = extensionApi.events;
+  if (typeof events !== "object" || events === null) {
+    result.push("events.emit", "events.on");
+  } else {
+    const eventBus = events as Record<string, unknown>;
+    if (typeof eventBus.emit !== "function") result.push("events.emit");
+    if (typeof eventBus.on !== "function") result.push("events.on");
+  }
   const rpcClient = readModuleExport(piModule, "RpcClient");
   if (typeof rpcClient !== "function") {
     result.push("RpcClient");
@@ -169,60 +198,13 @@ function isSupportedPlatform(platform: NodeJS.Platform): platform is SupportedPl
   return (SUPPORTED_PLATFORMS as readonly string[]).includes(platform);
 }
 
-function isAvailableProcessTreeAdapter(adapter: unknown, platform: SupportedPlatform): boolean {
-  if ((typeof adapter !== "object" || adapter === null) && typeof adapter !== "function") return false;
-  if (typeof adapter === "object" && "available" in adapter && adapter.available === false) return false;
-  if (typeof adapter === "object" && "platform" in adapter && adapter.platform !== platform) return false;
-  return true;
-}
-
-function formatHostCapabilityDiagnostic(diagnostic: HostCapabilityDiagnostic): string {
-  const missingApi = diagnostic.missingApi?.join(",");
-  const detail = missingApi === undefined ? diagnostic.reason : `${diagnostic.reason}:${missingApi}`;
-  return `${diagnostic.code}: Pi 子代理扩展未激活 (${detail})`;
-}
-
-function registerUnavailableDiagnostic(
-  extensionApi: ExtensionApiSurface,
-  diagnostic: HostCapabilityDiagnostic,
-): void {
-  const on = extensionApi.on as
-    | ((event: string, handler: (event: unknown, context: DiagnosticContext) => void) => void)
-    | undefined;
-  if (typeof on !== "function") return;
-
-  // Pi factory 没有 UI 上下文；这个一次性桥只传递诊断，不启动控制生命周期。
-  let notified = false;
-  try {
-    on("session_start", (_event, context) => {
-      if (
-        notified ||
-        typeof context !== "object" ||
-        context === null ||
-        context.hasUI !== true ||
-        typeof context.ui?.notify !== "function"
-      ) {
-        return;
-      }
-      notified = true;
-      try {
-        context.ui.notify(formatHostCapabilityDiagnostic(diagnostic), "warning");
-      } catch {
-        // UI 通知失败不得改变宿主会话或启用扩展。
-      }
-    });
-  } catch {
-    // 诊断桥不可用时保持静默失活。
-  }
-}
-
 export async function checkHostCapabilities(input: HostProbeInput): Promise<HostCapabilityResult> {
   const nodeVersion = input.nodeVersion ?? process.versions.node;
   const platform = input.platform ?? process.platform;
   const loadPiModule = input.loadPiModule ?? (() => import("@earendil-works/pi-coding-agent"));
   const loadRuntimeDependency = input.loadRuntimeDependency ?? (() => import("semver"));
-  const loadProcessTreeAdapter =
-    input.loadProcessTreeAdapter ?? ((currentPlatform) => getProcessTreeAdapterCapability(currentPlatform));
+  // 平台实现由后续适配器模块注入；未提供真实实现时必须失败关闭。
+  const loadProcessTreeAdapter = input.loadProcessTreeAdapter ?? (() => undefined);
 
   let runtimeDependency: unknown;
   try {
@@ -234,11 +216,15 @@ export async function checkHostCapabilities(input: HostProbeInput): Promise<Host
   if (semver === undefined) {
     return unavailable("runtime_dependency_unavailable");
   }
-  if (semver.valid(nodeVersion) === null) {
-    return unavailable("node_version_unparseable");
-  }
-  if (!semver.satisfies(nodeVersion, `>=${MIN_NODE_VERSION}`)) {
-    return unavailable("node_version_unsupported");
+  try {
+    if (semver.valid(nodeVersion) === null) {
+      return unavailable("node_version_unparseable");
+    }
+    if (!semver.satisfies(nodeVersion, NODE_VERSION_RANGE)) {
+      return unavailable("node_version_unsupported");
+    }
+  } catch {
+    return unavailable("runtime_dependency_unavailable");
   }
 
   let piModule: unknown;
@@ -248,11 +234,15 @@ export async function checkHostCapabilities(input: HostProbeInput): Promise<Host
     return unavailable("pi_module_unavailable");
   }
   const piVersion = readPiVersion(piModule);
-  if (semver.valid(piVersion) === null) {
-    return unavailable("pi_version_unparseable");
-  }
-  if (!semver.satisfies(piVersion, `>=${MIN_PI_VERSION}`)) {
-    return unavailable("pi_version_unsupported");
+  try {
+    if (semver.valid(piVersion) === null) {
+      return unavailable("pi_version_unparseable");
+    }
+    if (!semver.satisfies(piVersion, PI_VERSION_RANGE)) {
+      return unavailable("pi_version_unsupported");
+    }
+  } catch {
+    return unavailable("runtime_dependency_unavailable");
   }
 
   const missingApi = findMissingHostApi(input.extensionApi, piModule);
@@ -268,7 +258,7 @@ export async function checkHostCapabilities(input: HostProbeInput): Promise<Host
   } catch {
     return unavailable("process_tree_adapter_unavailable");
   }
-  if (!isAvailableProcessTreeAdapter(processTreeAdapter, platform)) {
+  if (!isProcessTreeAdapter(processTreeAdapter, platform)) {
     return unavailable("process_tree_adapter_unavailable");
   }
 
@@ -290,7 +280,7 @@ export function createPiSubagentExtension(
       extensionApi,
     });
     if (!capabilities.ok) {
-      registerUnavailableDiagnostic(extensionApi, capabilities.diagnostic);
+      // Pi factory 没有 UI 上下文；严格失败关闭不能为诊断注册生命周期钩子。
       return;
     }
     await options.activate?.(extensionApi, capabilities);

@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  HOST_CAPABILITY_DIAGNOSTIC_CODE,
   MIN_NODE_VERSION,
   MIN_PI_VERSION,
+  SUPPORTED_PLATFORMS,
   checkHostCapabilities,
   createPiSubagentExtension,
   type ExtensionApiSurface,
   type HostProbeOverrides,
+  type SupportedPlatform,
 } from "../src/host-gate.ts";
+import type { ProcessTreeAdapter } from "../src/process-tree-capability.ts";
 
 const readyApi = (): ExtensionApiSurface => ({
   on: () => {},
@@ -18,7 +20,7 @@ const readyApi = (): ExtensionApiSurface => ({
   getAllTools: () => [],
   setActiveTools: () => {},
   exec: async () => ({ code: 0, stdout: "", stderr: "" }),
-  events: {},
+  events: { emit: () => {}, on: () => () => {} },
 });
 
 class ReadyRpcClient {
@@ -37,9 +39,23 @@ const readyOverrides = (overrides: HostProbeOverrides = {}): HostProbeOverrides 
   nodeVersion: MIN_NODE_VERSION,
   platform: "linux",
   loadPiModule: async () => ({ VERSION: MIN_PI_VERSION, RpcClient: ReadyRpcClient }),
-  loadProcessTreeAdapter: async (platform) => ({ platform, available: true }),
+  loadProcessTreeAdapter: async (platform) => {
+    if (!(SUPPORTED_PLATFORMS as readonly string[]).includes(platform)) return undefined;
+    return readyProcessTreeAdapter(platform as SupportedPlatform);
+  },
   loadRuntimeDependency: async () => import("semver"),
   ...overrides,
+});
+
+const readyProcessTreeAdapter = (platform: SupportedPlatform): ProcessTreeAdapter => ({
+  platform,
+  strategy: platform === "win32" ? "job_object" : "process_group_or_session",
+  attach: async () => ({}),
+  requestGracefulClose: async () => {},
+  forceTerminate: async () => {},
+  waitForExit: async () => ({ state: "exited" }),
+  inspect: async () => ({ state: "released" }),
+  release: async () => {},
 });
 
 test("支持的宿主通过全部探针并可以空操作激活", async () => {
@@ -52,16 +68,16 @@ test("支持的宿主通过全部探针并可以空操作激活", async () => {
   if (result.ok) assert.equal(result.nodeVersion, MIN_NODE_VERSION);
 });
 
-test("默认平台能力令牌覆盖 Windows、macOS 和 Linux", async () => {
+test("注入完整进程树适配器契约后覆盖 Windows、macOS 和 Linux", async () => {
   const strategies = new Map<string, string>();
   for (const platform of ["win32", "darwin", "linux"] as const) {
-    const overrides = readyOverrides({ platform });
-    delete overrides.loadProcessTreeAdapter;
-    const result = await checkHostCapabilities({ extensionApi: readyApi(), ...overrides });
+    const result = await checkHostCapabilities({
+      extensionApi: readyApi(),
+      ...readyOverrides({ platform }),
+    });
     assert.equal(result.ok, true);
     if (result.ok) {
-      const adapter = result.processTreeAdapter as { strategy: string };
-      strategies.set(platform, adapter.strategy);
+      strategies.set(platform, result.processTreeAdapter.strategy);
     }
   }
 
@@ -70,6 +86,31 @@ test("默认平台能力令牌覆盖 Windows、macOS 和 Linux", async () => {
     ["darwin", "process_group_or_session"],
     ["linux", "process_group_or_session"],
   ]);
+});
+
+test("进程树适配器缺少任一树职责时拒绝激活", async () => {
+  const incompleteAdapter = { ...readyProcessTreeAdapter("linux") } as Record<string, unknown>;
+  delete incompleteAdapter.forceTerminate;
+  const result = await checkHostCapabilities({
+    extensionApi: readyApi(),
+    ...readyOverrides({ loadProcessTreeAdapter: async () => incompleteAdapter }),
+  });
+
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.diagnostic.reason, "process_tree_adapter_unavailable");
+});
+
+test("进程树适配器平台策略不匹配时拒绝激活", async () => {
+  const result = await checkHostCapabilities({
+    extensionApi: readyApi(),
+    ...readyOverrides({
+      platform: "win32",
+      loadProcessTreeAdapter: async () => readyProcessTreeAdapter("linux"),
+    }),
+  });
+
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.diagnostic.reason, "process_tree_adapter_unavailable");
 });
 
 test("Node 低于最低版本时拒绝激活", async () => {
@@ -146,6 +187,21 @@ test("RpcClient 缺失监督方法时拒绝激活", async () => {
   if (!result.ok) {
     assert.equal(result.diagnostic.reason, "host_api_unavailable");
     assert.ok(result.diagnostic.missingApi?.includes("RpcClient.prompt"));
+  }
+});
+
+test("缺失 EventBus 方法时拒绝激活", async () => {
+  const api = readyApi();
+  api.events = { emit: () => {} };
+  const result = await checkHostCapabilities({
+    extensionApi: api,
+    ...readyOverrides(),
+  });
+
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.diagnostic.reason, "host_api_unavailable");
+    assert.deepEqual(result.diagnostic.missingApi, ["events.on"]);
   }
 });
 
@@ -244,7 +300,7 @@ test("通过门禁后只执行一次空操作激活", async () => {
   assert.equal(activationCount, 1);
 });
 
-test("门禁失败不注册公开面，并只提供脱敏 UI-only 诊断", async () => {
+test("门禁失败不注册公开面、生命周期或副作用", async () => {
   const handlers: Array<(event: unknown, context: unknown) => void> = [];
   const publicRegistrations: string[] = [];
   const lifecycleRegistrations: string[] = [];
@@ -282,20 +338,8 @@ test("门禁失败不注册公开面，并只提供脱敏 UI-only 诊断", async
 
   assert.equal(activationCount, 0);
   assert.deepEqual(publicRegistrations, []);
-  assert.deepEqual(lifecycleRegistrations, ["session_start"]);
-
-  const notifications: Array<{ message: string; type: string }> = [];
-  handlers[0]?.(
-    { type: "session_start", reason: "startup" },
-    {
-      hasUI: true,
-      ui: { notify: (message: string, type: string) => notifications.push({ message, type }) },
-    },
-  );
-  assert.equal(notifications.length, 1);
-  assert.equal(notifications[0]?.type, "warning");
-  assert.match(notifications[0]?.message ?? "", new RegExp(HOST_CAPABILITY_DIAGNOSTIC_CODE));
-  assert.doesNotMatch(notifications[0]?.message ?? "", /22\.18\.9/);
+  assert.deepEqual(lifecycleRegistrations, []);
+  assert.deepEqual(handlers, []);
   assert.deepEqual(forbiddenSideEffects, []);
 });
 
@@ -318,15 +362,68 @@ test("无 UI 宿主保持静默且诊断不回退到模型上下文", async () =
   });
 
   await extension(api);
-  const notifications: string[] = [];
-  handlers[0]?.(
-    { type: "session_start", reason: "startup" },
-    {
-      hasUI: false,
-      ui: { notify: (message: string) => notifications.push(message) },
-    },
-  );
-
-  assert.deepEqual(notifications, []);
+  assert.deepEqual(handlers, []);
   assert.deepEqual(forbiddenSideEffects, []);
+});
+
+test("兼容负向组合统一保持完全失活", async () => {
+  const cases: Array<{
+    name: string;
+    probe: HostProbeOverrides;
+    removeApi?: keyof ExtensionApiSurface;
+  }> = [
+    { name: "低 Node", probe: readyOverrides({ nodeVersion: "22.18.9" }) },
+    { name: "不可解析 Node", probe: readyOverrides({ nodeVersion: "node-version" }) },
+    {
+      name: "低 Pi",
+      probe: readyOverrides({ loadPiModule: async () => ({ VERSION: "0.82.9", RpcClient: ReadyRpcClient }) }),
+    },
+    {
+      name: "不可解析 Pi",
+      probe: readyOverrides({ loadPiModule: async () => ({ VERSION: "unknown", RpcClient: ReadyRpcClient }) }),
+    },
+    { name: "缺失 API", probe: readyOverrides(), removeApi: "registerCommand" },
+    { name: "不支持平台", probe: readyOverrides({ platform: "freebsd" }) },
+    { name: "缺失进程树适配器", probe: readyOverrides({ loadProcessTreeAdapter: async () => undefined }) },
+  ];
+
+  for (const scenario of cases) {
+    const lifecycleRegistrations: string[] = [];
+    const publicRegistrations: string[] = [];
+    const forbiddenSideEffects: string[] = [];
+    const api: ExtensionApiSurface = {
+      ...readyApi(),
+      on: ((event: string) => lifecycleRegistrations.push(event)) as NonNullable<ExtensionApiSurface["on"]>,
+      registerTool: (() => publicRegistrations.push("tool")) as NonNullable<
+        ExtensionApiSurface["registerTool"]
+      >,
+      registerCommand: (() => publicRegistrations.push("command")) as NonNullable<
+        ExtensionApiSurface["registerCommand"]
+      >,
+      setActiveTools: (() => forbiddenSideEffects.push("active-tools")) as NonNullable<
+        ExtensionApiSurface["setActiveTools"]
+      >,
+      exec: (() => forbiddenSideEffects.push("exec")) as NonNullable<ExtensionApiSurface["exec"]>,
+      events: {
+        emit: () => forbiddenSideEffects.push("event"),
+        on: () => {
+          forbiddenSideEffects.push("event-handler");
+          return () => {};
+        },
+      },
+    };
+    Object.assign(api, {
+      sendMessage: () => forbiddenSideEffects.push("message"),
+      sendUserMessage: () => forbiddenSideEffects.push("user-message"),
+      appendEntry: () => forbiddenSideEffects.push("session-entry"),
+    });
+    if (scenario.removeApi !== undefined) delete api[scenario.removeApi];
+    const extension = createPiSubagentExtension({ probe: scenario.probe });
+
+    await extension(api);
+
+    assert.deepEqual(lifecycleRegistrations, [], scenario.name);
+    assert.deepEqual(publicRegistrations, [], scenario.name);
+    assert.deepEqual(forbiddenSideEffects, [], scenario.name);
+  }
 });
