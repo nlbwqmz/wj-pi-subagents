@@ -209,7 +209,7 @@ function parseFrontmatter(markdown: string): FrontmatterParseResult {
   } catch {
     return { kind: "invalid" };
   }
-  if (document.errors.length !== 0) return { kind: "invalid" };
+  if (document.errors.length !== 0 || document.warnings.length !== 0) return { kind: "invalid" };
 
   let parsed: unknown;
   try {
@@ -488,10 +488,6 @@ export function discoverTemplateSnapshot(
   });
 }
 
-function sourceLabel(source: TemplateSource): string {
-  return source;
-}
-
 function candidateReasonLabel(reason: TemplateCandidateDiagnosticReason): string {
   switch (reason) {
     case "file_unreadable":
@@ -525,10 +521,10 @@ function candidateReasonLabel(reason: TemplateCandidateDiagnosticReason): string
 export function formatTemplateDiscoveryDiagnostics(snapshot: TemplateDiscoverySnapshot): string {
   const parts = [
     ...snapshot.invalidCandidates.map((diagnostic) => (
-      `${sourceLabel(diagnostic.source)}:${diagnostic.fileName}：${candidateReasonLabel(diagnostic.reason)}`
+      `${diagnostic.source}:${diagnostic.fileName}：${candidateReasonLabel(diagnostic.reason)}`
     )),
     ...snapshot.sourceDiagnostics.map((diagnostic) => (
-      `${sourceLabel(diagnostic.source)} 模板目录：不可枚举`
+      `${diagnostic.source} 模板目录：不可枚举`
     )),
   ];
   return parts.length === 0 ? "" : `发现 ${String(parts.length)} 个代理模板问题：${parts.join("；")}`;

@@ -5,15 +5,11 @@ import test from "node:test";
 import {
   discoverTemplateSnapshot,
   TemplateSnapshotController,
+  type TemplateDirectoryEntry,
   type TemplateDiscoveryFileSystem,
 } from "../src/template-discovery-snapshot.ts";
 
-type MemoryDirectoryEntry = {
-  readonly name: string;
-  readonly kind: "file" | "symbolic_link" | "directory" | "other";
-};
-
-type MemoryDirectoryContent = readonly MemoryDirectoryEntry[] | Error;
+type MemoryDirectoryContent = readonly TemplateDirectoryEntry[] | Error;
 
 class MemoryTemplateFileSystem implements TemplateDiscoveryFileSystem {
   private readonly directories: ReadonlyMap<string, MemoryDirectoryContent>;
@@ -147,7 +143,7 @@ test("接受 Pi 精确模型引用中包含斜杠的模型标识", () => {
   assert.deepEqual(snapshot.invalidCandidates, []);
 });
 
-test("template_id 保留文件名的原始字节语义并忽略 frontmatter name", () => {
+test("template_id 保留原始文件名并忽略 frontmatter name", () => {
   const userDirectory = join(homedir(), ".pi", "agent", "agents");
   const decomposedFileName = "cafe\u0301.md";
   const composedFileName = "caf\u00e9.md";
@@ -198,6 +194,7 @@ test("已知字段与业务工具错误只隔离为安全的无效候选诊断",
     "bad-url-model.md",
     "bad-thinking.md",
     "bad-tools.md",
+    "tagged-tools.md",
     "unknown-tool.md",
   ];
   const fileSystem = new MemoryTemplateFileSystem(
@@ -212,6 +209,7 @@ test("已知字段与业务工具错误只隔离为安全的无效候选诊断",
       [join(userDirectory, "bad-url-model.md"), "---\ntools: read\nmodel: https://models.example.test/gpt\n---\n"],
       [join(userDirectory, "bad-thinking.md"), "---\ntools: read\nthinking: extreme\n---\n"],
       [join(userDirectory, "bad-tools.md"), "---\ntools: ' , '\n---\n"],
+      [join(userDirectory, "tagged-tools.md"), "---\ntools: !secret read\n---\n"],
       [join(userDirectory, "unknown-tool.md"), "---\ntools: read, unregistered\n---\n"],
     ]),
   );
@@ -243,6 +241,7 @@ test("已知字段与业务工具错误只隔离为安全的无效候选诊断",
     ["bad-thinking.md", "thinking_invalid"],
     ["bad-tools.md", "tools_invalid"],
     ["bad-url-model.md", "model_invalid"],
+    ["tagged-tools.md", "frontmatter_invalid"],
     ["unknown-tool.md", "unknown_tool"],
   ]);
 });
