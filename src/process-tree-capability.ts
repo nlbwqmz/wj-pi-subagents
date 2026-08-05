@@ -7,12 +7,22 @@ export type ProcessTreeStrategy = "job_object" | "process_group_or_session";
  */
 export type ProcessTreeHandle = unknown;
 
+export type ExitObservationState = "exited" | "present" | "unknown";
+
+/**
+ * 退出观察只表示平台能够确认的退出事实，不代表整棵树资源已经释放。
+ */
 export interface ExitObservation {
-  readonly state: "exited" | "present" | "unknown";
+  readonly state: ExitObservationState;
 }
 
+export type ResourceObservationState = "released" | "present" | "unknown";
+
+/**
+ * `released` 仅表示适配器确认树内资源已回收；发送信号、EOF 或局部退出都不足以得到该值。
+ */
 export interface ResourceObservation {
-  readonly state: "released" | "present" | "unknown";
+  readonly state: ResourceObservationState;
 }
 
 /**
