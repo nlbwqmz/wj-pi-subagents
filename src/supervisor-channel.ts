@@ -1,8 +1,10 @@
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import {
+  AGENT_LIFECYCLE_EVENT_TYPES,
   AGENT_LIFECYCLE_STATES,
   isCanonicalUuid,
   type AgentFault,
+  type AgentLifecycleEventType,
   type AgentLifecycleState,
   type AgentSnapshot,
 } from "./tree-controller.ts";
@@ -34,8 +36,6 @@ export const SUPERVISOR_CHANNEL_LIMITS = Object.freeze({
   maxJsonEntries: 512,
   maxNodes: 64,
   maxReplyWindow: 32,
-  maxPendingSnapshots: 1,
-  maxRecentRequestIds: 128,
   maxRetiredStreams: 4,
   maxImagesPerReply: 8,
   maxImageBytes: 24 * 1024,
@@ -49,8 +49,6 @@ export interface SupervisorChannelLimits {
   readonly maxJsonEntries: number;
   readonly maxNodes: number;
   readonly maxReplyWindow: number;
-  readonly maxPendingSnapshots: number;
-  readonly maxRecentRequestIds: number;
   readonly maxRetiredStreams: number;
   readonly maxImagesPerReply: number;
   readonly maxImageBytes: number;
@@ -86,6 +84,15 @@ export interface SupervisorReply {
   readonly reply_seq: number;
   readonly text: string;
   readonly images?: readonly SupervisorReplyImage[];
+}
+
+/** 监督器向直接父/子控制器传播的脱敏生命周期事实。 */
+export interface SupervisorEvent {
+  readonly root_id: string;
+  readonly agent_id: string;
+  readonly type: AgentLifecycleEventType;
+  readonly expected_generation?: number;
+  readonly error_code?: AgentFault["code"];
 }
 
 export type SupervisorChannelState =
@@ -147,6 +154,8 @@ export interface SupervisorReceiveAccepted {
   readonly tree_revision: number;
   readonly outbound: readonly SupervisorFrame[];
   readonly replies: readonly SupervisorReply[];
+  /** 仅供本地监督器递交给 TreeController 的脱敏生命周期事实。 */
+  readonly event?: SupervisorEvent;
 }
 
 export interface SupervisorReceiveDuplicate {
@@ -202,7 +211,8 @@ export interface SupervisorChannelOptions {
   readonly credential: string | Uint8Array;
   readonly limits?: Partial<SupervisorChannelLimits>;
   readonly streamIdFactory?: () => string;
-  readonly requestIdFactory?: () => string;
+  /** 同一活动根会话的全部监督通道必须共享这一分配器。 */
+  readonly requestIdRegistry: SupervisorRequestIdRegistry;
   /** 父端在普通回复可安全注入会话后调用；返回 false 时不确认该回复。 */
   readonly onReply?: (reply: SupervisorReply) => boolean;
 }
@@ -214,7 +224,6 @@ interface PendingSnapshotRequest {
 }
 
 interface StoredReply {
-  readonly frame: SupervisorFrame;
   readonly reply: SupervisorReply;
 }
 
@@ -426,28 +435,59 @@ export class SupervisorFrameDecoder {
 
   push(chunk: Uint8Array): readonly SupervisorFrame[] {
     if (!(chunk instanceof Uint8Array)) frameError("invalid_frame");
-    if (chunk.byteLength + this.buffer.byteLength > this.limits.maxFrameBytes + 4) {
-      frameError("frame_too_large");
-    }
-    const combined = new Uint8Array(this.buffer.byteLength + chunk.byteLength);
-    combined.set(this.buffer);
-    combined.set(chunk, this.buffer.byteLength);
-    this.buffer = combined;
     const frames: SupervisorFrame[] = [];
     let offset = 0;
-    while (this.buffer.byteLength - offset >= 4) {
-      const length = new DataView(this.buffer.buffer, this.buffer.byteOffset + offset, 4).getUint32(0, false);
+    while (offset < chunk.byteLength || this.buffer.byteLength !== 0) {
+      if (this.buffer.byteLength !== 0) {
+        if (this.buffer.byteLength < 4) {
+          const headerBytes = Math.min(4 - this.buffer.byteLength, chunk.byteLength - offset);
+          if (headerBytes === 0) break;
+          this.appendBufferedBytes(chunk.subarray(offset, offset + headerBytes));
+          offset += headerBytes;
+          if (this.buffer.byteLength < 4) break;
+        }
+        const length = new DataView(this.buffer.buffer, this.buffer.byteOffset, 4).getUint32(0, false);
+        if (length > this.limits.maxFrameBytes) frameError("frame_too_large");
+        const frameBytes = length + 4;
+        const bodyBytes = Math.min(frameBytes - this.buffer.byteLength, chunk.byteLength - offset);
+        if (bodyBytes > 0) {
+          this.appendBufferedBytes(chunk.subarray(offset, offset + bodyBytes));
+          offset += bodyBytes;
+        }
+        if (this.buffer.byteLength < frameBytes) break;
+        frames.push(decodeSupervisorFrame(this.buffer, this.limits));
+        this.buffer = new Uint8Array(0);
+        continue;
+      }
+
+      if (chunk.byteLength - offset < 4) {
+        this.buffer = cloneBytes(chunk.subarray(offset));
+        break;
+      }
+      const length = new DataView(chunk.buffer, chunk.byteOffset + offset, 4).getUint32(0, false);
       if (length > this.limits.maxFrameBytes) frameError("frame_too_large");
-      if (this.buffer.byteLength - offset < length + 4) break;
-      frames.push(decodeSupervisorFrame(this.buffer.subarray(offset, offset + length + 4), this.limits));
-      offset += length + 4;
+      const frameBytes = length + 4;
+      if (chunk.byteLength - offset < frameBytes) {
+        this.buffer = cloneBytes(chunk.subarray(offset));
+        break;
+      }
+      frames.push(decodeSupervisorFrame(chunk.subarray(offset, offset + frameBytes), this.limits));
+      offset += frameBytes;
     }
-    this.buffer = cloneBytes(this.buffer.subarray(offset));
     return Object.freeze(frames);
   }
 
   finish(): void {
     if (this.buffer.byteLength !== 0) frameError("invalid_frame");
+  }
+
+  /** buffer 只保存一条尚未完整的帧，避免大 read chunk 造成额外聚合上限。 */
+  private appendBufferedBytes(bytes: Uint8Array): void {
+    if (bytes.byteLength === 0) return;
+    const combined = new Uint8Array(this.buffer.byteLength + bytes.byteLength);
+    combined.set(this.buffer);
+    combined.set(bytes, this.buffer.byteLength);
+    this.buffer = combined;
   }
 }
 
@@ -498,6 +538,9 @@ function assertChannelOptions(options: SupervisorChannelOptions, limits: Supervi
   }
   if (options.role === "child" && options.localAgentId === null) {
     throw new SupervisorProtocolError("identity_mismatch");
+  }
+  if (!(options.requestIdRegistry instanceof SupervisorRequestIdRegistry)) {
+    throw new SupervisorProtocolError("invalid_frame");
   }
 }
 
@@ -677,8 +720,20 @@ function randomStreamId(): string {
   return `stream_${randomUUID().replaceAll("-", "")}`;
 }
 
-function randomRequestId(): string {
-  return `req_${randomUUID().replaceAll("-", "")}`;
+/**
+ * 根控制器为其活动根会话创建且只创建一个此分配器，再交给全部直接父子通道。
+ * 随机会话前缀不暴露树关系，单调尾号使整个根内无需保存历史集合也绝不复用。
+ */
+export class SupervisorRequestIdRegistry {
+  private readonly sessionPrefix = `r${randomUUID().replaceAll("-", "")}`;
+  private nextOrdinal = 1;
+
+  allocate(): string {
+    if (this.nextOrdinal > Number.MAX_SAFE_INTEGER) throw new SupervisorProtocolError("request_reused");
+    const requestId = `req_${this.sessionPrefix}_${this.nextOrdinal.toString(36)}`;
+    this.nextOrdinal += 1;
+    return requestId;
+  }
 }
 
 /**
@@ -696,13 +751,9 @@ export class SupervisorChannel {
   private readonly depth: number;
   private readonly credential: Uint8Array;
   private readonly streamIdFactory: () => string;
-  private readonly requestIdFactory: () => string;
+  private readonly requestIdRegistry: SupervisorRequestIdRegistry;
   private readonly onReply: ((reply: SupervisorReply) => boolean) | undefined;
-  private readonly outgoingStreamId: string;
-  private readonly issuedRequestIds = new Set<string>();
-  private readonly issuedRequestOrder: string[] = [];
-  private readonly seenIncomingRequestIds = new Set<string>();
-  private readonly seenIncomingRequestOrder: string[] = [];
+  private outgoingStreamId: string;
   private readonly retiredIncomingStreams = new Set<string>();
   private readonly retiredIncomingOrder: string[] = [];
   private readonly outboundReplies = new Map<number, StoredReply>();
@@ -713,6 +764,7 @@ export class SupervisorChannel {
   private incomingStreamId: string | undefined;
   private incomingLastSeq = 0;
   private pendingSnapshotRequest: PendingSnapshotRequest | undefined;
+  private awaitingInitialSnapshotAckSeq: number | undefined;
   private localSubtreeRevision = 0;
   private acceptedSubtreeRevision = -1;
   private treeRevision = 0;
@@ -734,16 +786,18 @@ export class SupervisorChannel {
     this.depth = options.depth;
     this.credential = normalizeCredential(options.credential);
     this.streamIdFactory = options.streamIdFactory ?? randomStreamId;
-    this.requestIdFactory = options.requestIdFactory ?? randomRequestId;
+    this.requestIdRegistry = options.requestIdRegistry;
     this.onReply = options.onReply;
-    const streamId = this.streamIdFactory();
-    if (!validStreamId(streamId, this.limits)) throw new SupervisorProtocolError("invalid_frame");
-    this.outgoingStreamId = streamId;
+    this.outgoingStreamId = this.allocateStreamId();
   }
 
   /** 发起方 child 的首帧。父端收到后自动产生 hello_ack。 */
   startHandshake(): SupervisorFrame {
-    if (this.role !== "child" || this.state !== "new" || this.terminationBarrier) {
+    if (
+      this.role !== "child" ||
+      (this.state !== "new" && this.state !== "resyncing") ||
+      this.terminationBarrier
+    ) {
       throw new SupervisorProtocolError("closed");
     }
     const frame = this.createFrame("hello", {
@@ -757,11 +811,6 @@ export class SupervisorChannel {
     return frame;
   }
 
-  /** 兼容更直观的调用名。 */
-  hello(): SupervisorFrame {
-    return this.startHandshake();
-  }
-
   /**
    * child 只发布当前完整作用域快照。状态变化可覆盖尚未确认的旧快照，
    * 因为父端仅按 subtree_revision 原子替换缓存。
@@ -769,11 +818,20 @@ export class SupervisorChannel {
   publishSnapshot(
     nodes: readonly AgentSnapshot[] | unknown,
     subtreeRevision?: number,
-    options: { readonly reset?: boolean; readonly requestId?: string } = {},
   ): SupervisorFrame {
-    if (this.role !== "child" || this.terminationBarrier || this.state === "closed" || this.state === "faulted") {
-      throw new SupervisorProtocolError("closed");
-    }
+    return this.createSnapshotFrame(nodes, subtreeRevision);
+  }
+
+  private createSnapshotFrame(
+    nodes: readonly AgentSnapshot[] | unknown,
+    subtreeRevision: number | undefined,
+    resetRequestId?: string,
+  ): SupervisorFrame {
+    if (
+      this.role !== "child" ||
+      this.terminationBarrier ||
+      (this.state !== "awaiting_snapshot" && this.state !== "ready")
+    ) throw new SupervisorProtocolError("closed");
     const nextRevision = subtreeRevision ?? this.localSubtreeRevision + 1;
     if (!Number.isSafeInteger(nextRevision) || nextRevision < this.localSubtreeRevision) {
       throw new SupervisorProtocolError("snapshot_invalid");
@@ -782,24 +840,18 @@ export class SupervisorChannel {
       scope_agent_id: this.localAgentId,
       subtree_revision: nextRevision,
       nodes,
-      ...(options.reset === undefined ? {} : { reset: options.reset }),
+      ...(resetRequestId === undefined ? {} : { reset: true }),
     }, this.localAgentId ?? "", this.parentAgentId, this.depth, this.limits);
     this.localSubtreeRevision = parsed.snapshot.subtree_revision;
     this.localLatestSnapshot = Object.freeze(parsed.snapshot.nodes.map((node) => freezePlain(cloneJson(node) as AgentSnapshot)));
-    return this.createFrame("snapshot", {
+    const frame = this.createFrame("snapshot", {
       scope_agent_id: parsed.snapshot.scope_agent_id,
       subtree_revision: parsed.snapshot.subtree_revision,
       nodes: parsed.snapshot.nodes,
-      ...(options.reset === true ? { reset: true } : {}),
-    }, options.requestId);
-  }
-
-  snapshot(
-    nodes: readonly AgentSnapshot[] | unknown,
-    subtreeRevision?: number,
-    options?: { readonly reset?: boolean; readonly requestId?: string },
-  ): SupervisorFrame {
-    return this.publishSnapshot(nodes, subtreeRevision, options);
+      ...(resetRequestId === undefined ? {} : { reset: true }),
+    }, resetRequestId);
+    if (this.state === "awaiting_snapshot") this.awaitingInitialSnapshotAckSeq = frame.seq;
+    return frame;
   }
 
   /** child 仅能上行普通对话回复，不能夹带工具参数、结果或任意事件。 */
@@ -818,13 +870,41 @@ export class SupervisorChannel {
     }, this.limits);
     if (parsed.reply_seq !== this.nextReplySeq) throw new SupervisorProtocolError("reply_invalid");
     const frame = this.createFrame("reply", parsed as unknown as Record<string, unknown>);
-    this.outboundReplies.set(parsed.reply_seq, { frame, reply: parsed });
+    this.outboundReplies.set(parsed.reply_seq, { reply: parsed });
     this.nextReplySeq += 1;
     return frame;
   }
 
-  reply(reply: Omit<SupervisorReply, "reply_seq"> | SupervisorReply): SupervisorFrame {
-    return this.publishReply(reply);
+  /**
+   * 发布经过归一化的生命周期事实。正文、工具参数/结果和底层异常没有对应
+   * 字段，因而无法通过该 API 进入监督通道。
+   */
+  publishEvent(event: Omit<SupervisorEvent, "root_id" | "agent_id"> & {
+    readonly agent_id?: string;
+  } | SupervisorEvent): SupervisorFrame {
+    if (this.terminationBarrier || this.state === "closed" || this.state === "faulted") {
+      throw new SupervisorProtocolError("closed");
+    }
+    const candidate = event as Record<string, unknown>;
+    const agentId = candidate.agent_id ?? this.localAgentId;
+    if (!isCanonicalUuid(agentId)) throw new SupervisorProtocolError("identity_mismatch");
+    const payload: Record<string, unknown> = {
+      root_id: this.rootId,
+      agent_id: agentId,
+      type: candidate.type,
+      ...(candidate.expected_generation === undefined ? {} : { expected_generation: candidate.expected_generation }),
+      ...(candidate.error_code === undefined ? {} : { error_code: candidate.error_code }),
+    };
+    this.parseEventPayload(payload);
+    return this.createFrame("event", payload);
+  }
+
+  /** 主动请求对端发送当前完整快照；正常断序由 receive 自动调用同一语义。 */
+  requestSnapshot(): SupervisorFrame {
+    if (this.role !== "parent" || this.terminationBarrier || this.state !== "ready") {
+      throw new SupervisorProtocolError("closed");
+    }
+    return this.beginSnapshotRequest();
   }
 
   /** 显式建立终止屏障后，旧流和普通控制帧只会被丢弃。 */
@@ -857,18 +937,17 @@ export class SupervisorChannel {
     }
   }
 
-  accept(input: SupervisorFrame | Uint8Array | unknown): SupervisorReceiveResult {
-    return this.receive(input);
-  }
-
-  /** EOF 是通道事实，不携带底层 socket/pipe 错误。 */
+  /**
+   * EOF 不携带底层 socket/pipe 错误。未被上层裁决为失败时保留一个有限的
+   * 重连窗口；新流必须重新握手并发送完整快照，终止和协议故障则不可恢复。
+   */
   receiveEof(): SupervisorReceiveEof {
-    if (this.state !== "faulted") this.state = "closed";
+    if (this.terminationBarrier) {
+      this.state = "closed";
+    } else if (this.state !== "faulted" && this.state !== "closed") {
+      this.beginReconnect();
+    }
     return Object.freeze({ kind: "eof" });
-  }
-
-  eof(): SupervisorReceiveEof {
-    return this.receiveEof();
   }
 
   /** 仅公开安全快照，不泄露凭据、端点、流 ID、序号或原始异常。 */
@@ -932,21 +1011,20 @@ export class SupervisorChannel {
 
   private acceptSequence(frame: InternalFrame): SupervisorReceiveResult | undefined {
     if (this.incomingStreamId === undefined) {
+      if (this.retiredIncomingStreams.has(frame.stream_id)) {
+        return Object.freeze({ kind: "discarded", reason: "old_stream" });
+      }
       const firstKind = this.role === "parent" ? "hello" : "hello_ack";
-      if (frame.kind !== firstKind || frame.seq !== 1) frameError("sequence_violation");
+      const acceptsNewStream = this.role === "parent"
+        ? this.state === "new" || this.state === "resyncing"
+        : this.state === "hello_sent";
+      if (!acceptsNewStream || frame.kind !== firstKind || frame.seq !== 1) frameError("sequence_violation");
       this.incomingStreamId = frame.stream_id;
       this.incomingLastSeq = 0;
     } else if (frame.stream_id !== this.incomingStreamId) {
-      // 新流仅能在启动/有限重同步期且由新的握手建立；任何已退役流不回 ACK。
-      if (this.retiredIncomingStreams.has(frame.stream_id) || this.state === "ready" || this.state === "resyncing") {
-        return Object.freeze({ kind: "discarded", reason: "old_stream" });
-      }
-      if ((this.role === "parent" ? frame.kind !== "hello" : frame.kind !== "hello_ack") || frame.seq !== 1) {
-        return Object.freeze({ kind: "discarded", reason: "old_stream" });
-      }
-      this.retireIncomingStream(this.incomingStreamId);
-      this.incomingStreamId = frame.stream_id;
-      this.incomingLastSeq = 0;
+      // 只有 EOF 明确开启有限重连窗口后才会清空当前流；活跃连接中的新流
+      // 不能越过终止屏障或当前快照重同步，直接当作旧流丢弃。
+      return Object.freeze({ kind: "discarded", reason: "old_stream" });
     }
 
     if (frame.seq <= this.incomingLastSeq) {
@@ -977,13 +1055,9 @@ export class SupervisorChannel {
           outbound: EMPTY_FRAMES,
         });
       }
-      const requestId = this.allocateRequestId();
-      this.pendingSnapshotRequest = Object.freeze({ requestId });
-      this.state = "resyncing";
-      const request = this.createFrame("snapshot_request", {
-        root_id: this.rootId,
-        reset: true,
-      }, requestId);
+      const request = this.beginSnapshotRequest();
+      const requestId = request.request_id;
+      if (requestId === undefined) frameError("invalid_frame");
       return Object.freeze({
         kind: "gap",
         ack: this.incomingLastSeq,
@@ -996,9 +1070,12 @@ export class SupervisorChannel {
   }
 
   private applyFrame(frame: InternalFrame): SupervisorReceiveResult {
-    if (frame.request_id !== undefined) this.rememberIncomingRequestId(frame.request_id);
+    if (frame.kind !== "snapshot" && frame.kind !== "snapshot_request" && frame.request_id !== undefined) {
+      frameError("invalid_frame");
+    }
     let applied = false;
     let replies: readonly SupervisorReply[] = EMPTY_REPLIES;
+    let event: SupervisorEvent | undefined;
     const outbound: SupervisorFrame[] = [];
     switch (frame.kind) {
       case "hello":
@@ -1023,10 +1100,10 @@ export class SupervisorChannel {
         break;
       }
       case "ack":
-        this.applyAck(frame);
+        outbound.push(...this.applyAck(frame));
         break;
       case "event":
-        this.applyEvent(frame);
+        event = this.applyEvent(frame);
         break;
       case "close":
         this.applyClose(frame);
@@ -1041,11 +1118,14 @@ export class SupervisorChannel {
       tree_revision: this.treeRevision,
       outbound: Object.freeze(outbound),
       replies,
+      ...(event === undefined ? {} : { event }),
     });
   }
 
   private applyHello(frame: InternalFrame): void {
-    if (this.role !== "parent" || this.state !== "new") frameError("sequence_violation");
+    if (this.role !== "parent" || (this.state !== "new" && this.state !== "resyncing")) {
+      frameError("sequence_violation");
+    }
     const payload = frame.payload;
     if (!credentialMatches(payload.credential, this.credential)) frameError("credential_mismatch");
     if (
@@ -1093,7 +1173,7 @@ export class SupervisorChannel {
         frameError("sequence_violation");
       }
       this.pendingSnapshotRequest = undefined;
-    } else if (parsed.reset === true && this.state !== "awaiting_snapshot") {
+    } else if (parsed.reset === true || frame.request_id !== undefined) {
       frameError("sequence_violation");
     }
     if (parsed.snapshot.subtree_revision <= this.acceptedSubtreeRevision) {
@@ -1117,10 +1197,7 @@ export class SupervisorChannel {
     if (this.state === "closed" || this.state === "faulted" || this.terminationBarrier) frameError("closed");
     // 最新完整快照是唯一可重放状态；这里不会保留或重放事件历史。
     if (this.localSubtreeRevision < 0 || this.localLatestSnapshot.length === 0) frameError("snapshot_invalid");
-    return this.publishSnapshot(this.localLatestSnapshot, this.localSubtreeRevision, {
-      reset: true,
-      requestId: frame.request_id,
-    });
+    return this.createSnapshotFrame(this.localLatestSnapshot, this.localSubtreeRevision, frame.request_id);
   }
 
   private applyReplyFrame(frame: InternalFrame): { readonly replies: readonly SupervisorReply[]; readonly ackReplySeq: number } {
@@ -1130,7 +1207,7 @@ export class SupervisorChannel {
       return Object.freeze({ replies: EMPTY_REPLIES, ackReplySeq: this.highestReplyAck });
     }
     if (reply.reply_seq > this.nextExpectedReplySeq) {
-      if (this.bufferedReplies.size >= this.limits.maxReplyWindow || this.bufferedReplies.has(reply.reply_seq)) {
+      if (!this.bufferedReplies.has(reply.reply_seq) && this.bufferedReplies.size >= this.limits.maxReplyWindow) {
         frameError("reply_window_full");
       }
       this.bufferedReplies.set(reply.reply_seq, reply);
@@ -1145,7 +1222,9 @@ export class SupervisorChannel {
       } catch {
         accepted = false;
       }
-      if (!accepted) frameError("reply_invalid");
+      // 传输帧可以确认已接收，但未成功注入的 reply 不推进 reply_seq，
+      // 不回 reply ACK；它会在同一根会话的下一次重连中重新发送。
+      if (!accepted) break;
       delivered.push(current);
       this.highestReplyAck = current.reply_seq;
       this.nextExpectedReplySeq += 1;
@@ -1155,32 +1234,56 @@ export class SupervisorChannel {
     return Object.freeze({ replies: Object.freeze(delivered), ackReplySeq: this.highestReplyAck });
   }
 
-  private applyAck(frame: InternalFrame): void {
+  private applyAck(frame: InternalFrame): readonly SupervisorFrame[] {
     const payload = frame.payload;
     const kind = payload.kind;
     if (kind === "transport") {
       if (!Number.isSafeInteger(payload.seq) || (payload.seq as number) < 0) frameError("invalid_frame");
       if (Object.keys(payload).some((key) => key !== "kind" && key !== "seq")) frameError("invalid_frame");
-      if (this.role === "child" && this.state === "awaiting_snapshot") this.state = "ready";
-      return;
+      const acknowledged = payload.seq as number;
+      if (acknowledged > this.sendSeq) frameError("sequence_violation");
+      if (
+        this.role === "child" &&
+        this.state === "awaiting_snapshot" &&
+        this.awaitingInitialSnapshotAckSeq !== undefined &&
+        acknowledged >= this.awaitingInitialSnapshotAckSeq
+      ) {
+        this.awaitingInitialSnapshotAckSeq = undefined;
+        this.state = "ready";
+        return this.replayUnacknowledgedReplies();
+      }
+      return EMPTY_FRAMES;
     }
     if (kind !== "reply" || !Number.isSafeInteger(payload.reply_seq) || (payload.reply_seq as number) < 0) {
       frameError("invalid_frame");
     }
     if (Object.keys(payload).some((key) => key !== "kind" && key !== "reply_seq")) frameError("invalid_frame");
+    if (this.role !== "child") frameError("sequence_violation");
     const acknowledged = payload.reply_seq as number;
+    if (acknowledged > this.nextReplySeq - 1) frameError("reply_invalid");
     for (const replySeq of this.outboundReplies.keys()) {
       if (replySeq <= acknowledged) this.outboundReplies.delete(replySeq);
     }
+    return EMPTY_FRAMES;
   }
 
-  private applyEvent(frame: InternalFrame): void {
+  private applyEvent(frame: InternalFrame): SupervisorEvent {
     // 生命周期事件仅允许稳定代码，不允许把 RPC 细节、正文或参数混入快照。
-    const payload = frame.payload;
-    if (payload.root_id !== this.rootId || typeof payload.type !== "string" || !SAFE_ID_PATTERN.test(payload.type)) {
-      frameError("invalid_frame");
-    }
-    if (Object.keys(payload).some((key) => key !== "root_id" && key !== "type" && key !== "error_code")) {
+    return this.parseEventPayload(frame.payload);
+  }
+
+  private parseEventPayload(payload: Record<string, unknown>): SupervisorEvent {
+    if (
+      payload.root_id !== this.rootId ||
+      !isCanonicalUuid(payload.agent_id) ||
+      typeof payload.type !== "string" ||
+      !(AGENT_LIFECYCLE_EVENT_TYPES as readonly string[]).includes(payload.type)
+    ) frameError("invalid_frame");
+    if (
+      payload.expected_generation !== undefined &&
+      (!Number.isSafeInteger(payload.expected_generation) || (payload.expected_generation as number) < 0)
+    ) frameError("invalid_frame");
+    if (Object.keys(payload).some((key) => !["root_id", "agent_id", "type", "expected_generation", "error_code"].includes(key))) {
       frameError("invalid_frame");
     }
     if (payload.error_code !== undefined && ![
@@ -1190,6 +1293,17 @@ export class SupervisorChannel {
       "termination_incomplete",
       "internal_error",
     ].includes(payload.error_code as string)) frameError("invalid_frame");
+    return Object.freeze({
+      root_id: this.rootId,
+      agent_id: payload.agent_id as string,
+      type: payload.type as AgentLifecycleEventType,
+      ...(payload.expected_generation === undefined
+        ? {}
+        : { expected_generation: payload.expected_generation as number }),
+      ...(payload.error_code === undefined
+        ? {}
+        : { error_code: payload.error_code as AgentFault["code"] }),
+    });
   }
 
   private applyClose(frame: InternalFrame): void {
@@ -1228,37 +1342,59 @@ export class SupervisorChannel {
     return this.createFrame("ack", { kind: "reply", reply_seq: replySeq });
   }
 
+  private beginSnapshotRequest(): SupervisorFrame {
+    if (this.role !== "parent" || this.pendingSnapshotRequest !== undefined) {
+      throw new SupervisorProtocolError("sequence_violation");
+    }
+    const requestId = this.allocateRequestId();
+    this.pendingSnapshotRequest = Object.freeze({ requestId });
+    this.state = "resyncing";
+    return this.createFrame("snapshot_request", {
+      root_id: this.rootId,
+      reset: true,
+    }, requestId);
+  }
+
   private allocateRequestId(): string {
-    for (let attempt = 0; attempt < 32; attempt += 1) {
-      const id = this.requestIdFactory();
-      if (!validOpaqueId(id, this.limits) || this.issuedRequestIds.has(id)) continue;
-      this.rememberRequestId(this.issuedRequestIds, this.issuedRequestOrder, id);
-      return id;
+    const requestId = this.requestIdRegistry.allocate();
+    if (!validOpaqueId(requestId, this.limits)) throw new SupervisorProtocolError("request_reused");
+    return requestId;
+  }
+
+  private allocateStreamId(): string {
+    const streamId = this.streamIdFactory();
+    if (!validStreamId(streamId, this.limits)) throw new SupervisorProtocolError("invalid_frame");
+    return streamId;
+  }
+
+  private replayUnacknowledgedReplies(): readonly SupervisorFrame[] {
+    const replayed = Array.from(this.outboundReplies.values(), ({ reply }) => {
+      return this.createFrame("reply", reply as unknown as Record<string, unknown>);
+    });
+    return Object.freeze(replayed);
+  }
+
+  private beginReconnect(): void {
+    if (this.incomingStreamId !== undefined && !this.retireIncomingStream(this.incomingStreamId)) {
+      // 旧流集合不淘汰，达到固定窗口后不再接受任何可能被回放的流。
+      this.state = "closed";
+      return;
     }
-    throw new SupervisorProtocolError("request_reused");
+    this.incomingStreamId = undefined;
+    this.incomingLastSeq = 0;
+    this.pendingSnapshotRequest = undefined;
+    this.awaitingInitialSnapshotAckSeq = undefined;
+    this.sendSeq = 0;
+    this.outgoingStreamId = this.allocateStreamId();
+    this.state = "resyncing";
   }
 
-  private rememberIncomingRequestId(requestId: string): void {
-    if (this.seenIncomingRequestIds.has(requestId)) frameError("request_reused");
-    this.rememberRequestId(this.seenIncomingRequestIds, this.seenIncomingRequestOrder, requestId);
-  }
-
-  private rememberRequestId(set: Set<string>, order: string[], requestId: string): void {
-    set.add(requestId);
-    order.push(requestId);
-    while (order.length > this.limits.maxRecentRequestIds) {
-      const oldest = order.shift();
-      if (oldest !== undefined) set.delete(oldest);
-    }
-  }
-
-  private retireIncomingStream(streamId: string): void {
+  private retireIncomingStream(streamId: string): boolean {
+    if (this.retiredIncomingStreams.has(streamId)) return true;
+    if (this.retiredIncomingOrder.length >= this.limits.maxRetiredStreams) return false;
     this.retiredIncomingStreams.add(streamId);
     this.retiredIncomingOrder.push(streamId);
-    while (this.retiredIncomingOrder.length > this.limits.maxRetiredStreams) {
-      const oldest = this.retiredIncomingOrder.shift();
-      if (oldest !== undefined) this.retiredIncomingStreams.delete(oldest);
-    }
+    return true;
   }
 
   private protocolFault(error: unknown): SupervisorReceiveFault {
@@ -1307,9 +1443,8 @@ export class FakeSupervisorChannel extends SupervisorChannel {
   sendSnapshot(
     nodes: readonly AgentSnapshot[] | unknown,
     subtreeRevision?: number,
-    options?: { readonly reset?: boolean; readonly requestId?: string },
   ): SupervisorFrame {
-    const frame = this.publishSnapshot(nodes, subtreeRevision, options);
+    const frame = this.publishSnapshot(nodes, subtreeRevision);
     this.send(frame);
     return frame;
   }
@@ -1370,6 +1505,7 @@ export class FakeSupervisorChannel extends SupervisorChannel {
   }
 
   injectEof(): SupervisorReceiveEof {
+    this.outbox.length = 0;
     return this.receiveEof();
   }
 
@@ -1396,6 +1532,7 @@ export interface FakeSupervisorChannelPairOptions {
   readonly depth?: number;
   readonly credential?: string | Uint8Array;
   readonly limits?: Partial<SupervisorChannelLimits>;
+  readonly requestIdRegistry?: SupervisorRequestIdRegistry;
   readonly onReply?: (reply: SupervisorReply) => boolean;
   readonly autoDeliver?: boolean;
 }
@@ -1404,6 +1541,7 @@ export interface FakeSupervisorChannelPairOptions {
 export function createFakeSupervisorChannelPair(options: FakeSupervisorChannelPairOptions): FakeSupervisorChannelPair {
   const rootId = options.rootId ?? `root_${randomUUID().replaceAll("-", "")}`;
   const credential = options.credential ?? randomBytes(32);
+  const requestIdRegistry = options.requestIdRegistry ?? new SupervisorRequestIdRegistry();
   const parent = new FakeSupervisorChannel({
     role: "parent",
     rootId,
@@ -1412,6 +1550,7 @@ export function createFakeSupervisorChannelPair(options: FakeSupervisorChannelPa
     parentAgentId: options.parentAgentId ?? null,
     depth: options.depth ?? 1,
     credential,
+    requestIdRegistry,
     ...(options.limits === undefined ? {} : { limits: options.limits }),
     ...(options.autoDeliver === undefined ? {} : { autoDeliver: options.autoDeliver }),
     ...(options.onReply === undefined ? {} : { onReply: options.onReply }),
@@ -1424,6 +1563,7 @@ export function createFakeSupervisorChannelPair(options: FakeSupervisorChannelPa
     parentAgentId: options.parentAgentId ?? null,
     depth: options.depth ?? 1,
     credential,
+    requestIdRegistry,
     ...(options.limits === undefined ? {} : { limits: options.limits }),
     ...(options.autoDeliver === undefined ? {} : { autoDeliver: options.autoDeliver }),
   });
@@ -1439,6 +1579,3 @@ export function createFakeSupervisorChannelPair(options: FakeSupervisorChannelPa
     },
   });
 }
-
-/** 便于后续 RpcSupervisor 使用的同义工厂名。 */
-export const createSupervisorChannelPair = createFakeSupervisorChannelPair;

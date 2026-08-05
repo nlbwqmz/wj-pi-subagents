@@ -47,6 +47,7 @@ Status: resolved
 - [冻结根工作基础、环境、信任与配置](issues/18-root-runtime-context-config.md) — 根会话一次冻结规范化 `cwd`、project trust、环境和逐字段配额配置；后代只能从根环境投影并接收控制器追加的固定元数据，配置只读取可信项目与用户的规范路径，错误仅以脱敏 UI-only 诊断呈现。
 - [发布可信代理模板发现快照](issues/19-template-discovery-snapshot.md) — 根模板发现模块以双来源严格扫描、文件名精确身份、项目覆盖和候选/来源诊断建立不可变快照；首次发现与根 `/reload` 通过 UI-only 脱敏通知发布，失败来源不回退旧目录。
 - [建立代理树身份、七态生命周期与配额内核](issues/20-tree-lifecycle-quota-core.md) — `TreeController` 在根实例内原子登记不可复用 UUID v4、直接父关系与双重配额，按能力和深度收窄管理权；七态事件必须携带代际并以安全快照、修订、pending 和单调生命周期计时发布，终止屏障及资源确认后才释放名额。
+- [实现父子监督协议与安全子树汇聚](issues/21-supervisor-channel-protocol.md) — 每条直接父子关系使用隔离的长度边界监督帧、认证握手、完整安全子树快照和有界回复确认；父端原子替换子树并分配根修订。断序请求 reset 快照，EOF 在固定重连窗口内使用新流、首快照确认后重放未确认回复；根级请求号分配器保证同一活动根会话内不复用。
 
 ## Fog
 

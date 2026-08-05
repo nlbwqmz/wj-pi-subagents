@@ -4,6 +4,7 @@ import {
   SUPERVISOR_CHANNEL_LIMITS,
   SupervisorFrameDecoder,
   SupervisorProtocolError,
+  SupervisorRequestIdRegistry,
   decodeSupervisorFrame,
   encodeSupervisorFrame,
   createFakeSupervisorChannelPair,
@@ -12,6 +13,7 @@ import {
 
 const CHILD_ID = "550e8400-e29b-41d4-a716-446655440000";
 const GRANDCHILD_ID = "550e8400-e29b-41d4-a716-446655440001";
+const SIBLING_ID = "550e8400-e29b-41d4-a716-446655440002";
 const ROOT_ID = "root-test";
 const CREDENTIAL = "test-one-time-credential";
 
@@ -34,10 +36,13 @@ function node(
   } as const;
 }
 
-function handshake(pair: ReturnType<typeof createFakeSupervisorChannelPair>): void {
+function handshake(
+  pair: ReturnType<typeof createFakeSupervisorChannelPair>,
+  childAgentId = CHILD_ID,
+): void {
   pair.child.sendHello();
   pair.flush();
-  pair.child.sendSnapshot([node(CHILD_ID, null, 1)], 1);
+  pair.child.sendSnapshot([node(childAgentId, null, 1)], 1);
   pair.flush();
   assert.equal(pair.parent.getPublicState().state, "ready");
   assert.equal(pair.child.getPublicState().state, "ready");
@@ -62,6 +67,19 @@ test("长度边界 UTF-8 JSON 可处理分块与拼接帧，拒绝截断/损坏�
   joined.set(bytes);
   joined.set(bytes, bytes.byteLength);
   assert.equal(new SupervisorFrameDecoder().push(joined).length, 2);
+
+  // 单条帧的上限不能错误限制一次 transport read 中包含的多条合法帧。
+  const largeLimits = { maxFrameBytes: 1024, maxStringBytes: 900 };
+  const largeFrame = {
+    ...frame,
+    payload: { root_id: ROOT_ID, type: "idle", padding: "x".repeat(700) },
+  } as SupervisorFrame;
+  const largeBytes = encodeSupervisorFrame(largeFrame, largeLimits);
+  assert.ok(largeBytes.byteLength * 2 > largeLimits.maxFrameBytes + 4);
+  const largeJoined = new Uint8Array(largeBytes.byteLength * 2);
+  largeJoined.set(largeBytes);
+  largeJoined.set(largeBytes, largeBytes.byteLength);
+  assert.deepEqual(new SupervisorFrameDecoder(largeLimits).push(largeJoined), [largeFrame, largeFrame]);
 
   assert.throws(() => decodeSupervisorFrame(bytes.subarray(0, bytes.byteLength - 1)), (error: unknown) => {
     return error instanceof SupervisorProtocolError && error.code === "invalid_frame";
@@ -100,6 +118,26 @@ test("握手校验根关联、直接父子身份、深度和一次性凭据", ()
   const wrongResult = validPair.parent.receive(wrongCredential);
   assert.deepEqual(wrongResult, { kind: "protocol_fault", error: "credential_mismatch" });
   assert.doesNotMatch(JSON.stringify(validPair.parent.getPublicState()), /credential|root-test|stream/i);
+});
+
+test("child 仅在首个完整快照被父端确认后进入 ready", () => {
+  const pair = createFakeSupervisorChannelPair({ rootId: ROOT_ID, childAgentId: CHILD_ID, credential: CREDENTIAL });
+  pair.child.sendHello();
+  pair.flush();
+  assert.equal(pair.parent.getPublicState().state, "awaiting_snapshot");
+  assert.equal(pair.child.getPublicState().state, "awaiting_snapshot");
+  assert.throws(() => pair.child.publishReply({ text: "过早回复" }), (error: unknown) => {
+    return error instanceof SupervisorProtocolError && error.code === "closed";
+  });
+
+  pair.child.sendSnapshot([node(CHILD_ID, null, 1)], 1);
+  const acceptedSnapshot = pair.child.deliverNext();
+  assert.equal(acceptedSnapshot?.kind, "accepted");
+  assert.equal(pair.parent.getPublicState().state, "ready");
+  assert.equal(pair.child.getPublicState().state, "awaiting_snapshot");
+
+  pair.parent.deliverNext();
+  assert.equal(pair.child.getPublicState().state, "ready");
 });
 
 test("完整握手后快照按 subtree_revision 原子替换并分配 tree_revision", () => {
@@ -233,6 +271,121 @@ test("普通回复按 reply_seq 有序注入并以累计 ACK 去重，窗口有�
   assert.throws(() => limited.child.publishReply({ text: "超限" }), (error: unknown) => {
     return error instanceof SupervisorProtocolError && error.code === "reply_window_full";
   });
+});
+
+test("回复注入未成功时不发送 reply ACK，也不把通道裁决为协议故障", () => {
+  const pair = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+    onReply: () => false,
+  });
+  handshake(pair);
+  const reply = pair.child.publishReply({ text: "等待父会话可用" });
+  const result = pair.parent.receive(reply);
+  assert.equal(result.kind, "accepted");
+  if (result.kind !== "accepted") return;
+  assert.deepEqual(result.replies, []);
+  assert.equal(result.outbound.some((frame) => frame.payload.kind === "reply"), false);
+  assert.equal(pair.parent.getPublicState().state, "ready");
+  assert.equal(pair.child.getPublicState().pending_reply_count, 1);
+});
+
+test("有限重连使用新流，首快照确认后重放未确认回复且丢弃旧流", () => {
+  const replies: string[] = [];
+  const pair = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+    onReply: (reply) => {
+      replies.push(reply.text);
+      return true;
+    },
+  });
+  handshake(pair);
+  const oldReply = pair.child.publishReply({ text: "断线前已到达" });
+  assert.equal(pair.parent.receive(oldReply).kind, "accepted");
+  assert.deepEqual(replies, ["断线前已到达"]);
+  assert.equal(pair.child.getPublicState().pending_reply_count, 1);
+
+  assert.equal(pair.parent.injectEof().kind, "eof");
+  assert.equal(pair.child.injectEof().kind, "eof");
+  assert.equal(pair.parent.getPublicState().state, "resyncing");
+  assert.equal(pair.child.getPublicState().state, "resyncing");
+  assert.deepEqual(pair.parent.receive(oldReply), { kind: "discarded", reason: "old_stream" });
+
+  const newHello = pair.child.sendHello();
+  assert.notEqual(newHello.stream_id, oldReply.stream_id);
+  assert.equal(newHello.seq, 1);
+  pair.flush();
+  assert.equal(pair.parent.getPublicState().state, "awaiting_snapshot");
+  assert.equal(pair.child.getPublicState().state, "awaiting_snapshot");
+
+  pair.child.sendSnapshot([node(CHILD_ID, null, 1)], 1);
+  pair.flush();
+  assert.equal(pair.parent.getPublicState().state, "ready");
+  assert.equal(pair.child.getPublicState().state, "ready");
+  assert.deepEqual(replies, ["断线前已到达"]);
+  assert.equal(pair.child.getPublicState().pending_reply_count, 0);
+});
+
+test("根会话共享请求号分配器，不因旧窗口淘汰而复用 request_id", () => {
+  const requestIdRegistry = new SupervisorRequestIdRegistry();
+  const first = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+    requestIdRegistry,
+  });
+  const second = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: SIBLING_ID,
+    credential: CREDENTIAL,
+    requestIdRegistry,
+  });
+  handshake(first);
+  handshake(second, SIBLING_ID);
+  const requestIds = new Set<string>();
+  for (let index = 0; index < 130; index += 1) {
+    const request = first.parent.requestSnapshot();
+    assert.ok(request.request_id);
+    requestIds.add(request.request_id);
+    first.parent.send(request);
+    first.flush();
+    assert.equal(first.parent.getPublicState().state, "ready");
+  }
+  const siblingRequest = second.parent.requestSnapshot();
+  assert.ok(siblingRequest.request_id);
+  requestIds.add(siblingRequest.request_id);
+  assert.equal(requestIds.size, 131);
+});
+
+test("生命周期 event 只携带安全事实，并可由父监督器递交给树控制器", () => {
+  const pair = createFakeSupervisorChannelPair({ rootId: ROOT_ID, childAgentId: CHILD_ID, credential: CREDENTIAL });
+  handshake(pair);
+  const event = pair.child.publishEvent({
+    type: "agent_settled",
+    expected_generation: 4,
+  });
+  const result = pair.parent.receive(event);
+  assert.equal(result.kind, "accepted");
+  if (result.kind === "accepted") {
+    assert.deepEqual(result.event, {
+      root_id: ROOT_ID,
+      agent_id: CHILD_ID,
+      type: "agent_settled",
+      expected_generation: 4,
+    });
+  }
+  assert.throws(() => pair.child.publishEvent({ type: "unknown_event" as never }), (error: unknown) => {
+    return error instanceof SupervisorProtocolError && error.code === "invalid_frame";
+  });
+  const unsafe = pair.child.publishEvent({ type: "agent_settled" });
+  const injected = {
+    ...unsafe,
+    payload: { ...unsafe.payload, prompt: "secret-canary" },
+  } as SupervisorFrame;
+  assert.deepEqual(pair.parent.receive(injected), { kind: "protocol_fault", error: "invalid_frame" });
 });
 
 test("EOF、损坏载荷、终止屏障和旧流不会伪造健康状态；公开状态无秘密字段", () => {

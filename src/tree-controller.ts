@@ -205,26 +205,39 @@ interface FailureEvent extends EventGeneration {
   readonly error_code?: AgentFaultCode;
 }
 
+/** 监督器可以归一化并提交给树控制器的生命周期事实闭集。 */
+export const AGENT_LIFECYCLE_EVENT_TYPES = Object.freeze([
+  "startup_ready",
+  "startup_failed",
+  "message_admitted",
+  "message_rejected",
+  "message_delivery_failed",
+  "message_cancelled",
+  "prompt_accepted",
+  "steering_accepted",
+  "agent_settled",
+  "interrupt_accepted",
+  "abort_completed",
+  "runtime_failed",
+  "termination_requested",
+  "termination_incomplete",
+  "resources_confirmed",
+] as const);
+
+export type AgentLifecycleEventType = (typeof AGENT_LIFECYCLE_EVENT_TYPES)[number];
+
 /**
  * 监督器把已接纳意图或已确认事实归一化后交给树控制器。
  * 未列出的底层事件不能直接改变公开状态。
  */
-export type AgentLifecycleEvent =
-  | (EventGeneration & { readonly type: "startup_ready" })
-  | (FailureEvent & { readonly type: "startup_failed" })
-  | (EventGeneration & { readonly type: "message_admitted" })
-  | (EventGeneration & { readonly type: "message_rejected" })
-  | (EventGeneration & { readonly type: "message_delivery_failed" })
-  | (EventGeneration & { readonly type: "message_cancelled" })
-  | (EventGeneration & { readonly type: "prompt_accepted" })
-  | (EventGeneration & { readonly type: "steering_accepted" })
-  | (EventGeneration & { readonly type: "agent_settled" })
-  | (EventGeneration & { readonly type: "interrupt_accepted" })
-  | (EventGeneration & { readonly type: "abort_completed" })
-  | (FailureEvent & { readonly type: "runtime_failed" })
-  | (EventGeneration & { readonly type: "termination_requested" })
-  | (EventGeneration & { readonly type: "termination_incomplete" })
-  | (EventGeneration & { readonly type: "resources_confirmed" });
+type FailureLifecycleEventType = "startup_failed" | "runtime_failed";
+
+type LifecycleEventShape<Type extends AgentLifecycleEventType> =
+  Type extends FailureLifecycleEventType ? FailureEvent : EventGeneration;
+
+export type AgentLifecycleEvent = {
+  readonly [Type in AgentLifecycleEventType]: LifecycleEventShape<Type> & { readonly type: Type };
+}[AgentLifecycleEventType];
 
 export interface TreeControllerOptions {
   readonly config: Pick<
