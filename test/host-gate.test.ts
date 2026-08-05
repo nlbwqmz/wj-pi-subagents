@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  HOST_CAPABILITY_DIAGNOSTIC_CODE,
   MIN_NODE_VERSION,
   MIN_PI_VERSION,
   SUPPORTED_PLATFORMS,
@@ -235,6 +236,18 @@ test("受支持平台缺失进程树适配器时拒绝激活", async () => {
   }
 });
 
+test("标准入口未注入真实进程树适配器时默认失败关闭", async () => {
+  const probe = readyOverrides();
+  delete probe.loadProcessTreeAdapter;
+  const result = await checkHostCapabilities({
+    extensionApi: readyApi(),
+    ...probe,
+  });
+
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.diagnostic.reason, "process_tree_adapter_unavailable");
+});
+
 test("运行依赖不可加载时拒绝激活且不泄露底层错误", async () => {
   const result = await checkHostCapabilities({
     extensionApi: readyApi(),
@@ -300,16 +313,17 @@ test("通过门禁后只执行一次空操作激活", async () => {
   assert.equal(activationCount, 1);
 });
 
-test("门禁失败不注册公开面、生命周期或副作用", async () => {
-  const handlers: Array<(event: unknown, context: unknown) => void> = [];
+test("门禁失败只注册一次诊断桥，不注册公开面或运行副作用", async () => {
+  const diagnosticHandlers: Array<(event: unknown, context: unknown) => void> = [];
   const publicRegistrations: string[] = [];
   const lifecycleRegistrations: string[] = [];
   const forbiddenSideEffects: string[] = [];
+  const notifications: Array<{ message: string; type: string }> = [];
   const api: ExtensionApiSurface = {
     ...readyApi(),
     on: ((event: string, handler: (event: unknown, context: unknown) => void) => {
       lifecycleRegistrations.push(event);
-      handlers.push(handler);
+      diagnosticHandlers.push(handler);
     }) as NonNullable<ExtensionApiSurface["on"]>,
     registerTool: (() => publicRegistrations.push("tool")) as NonNullable<
       ExtensionApiSurface["registerTool"]
@@ -338,8 +352,20 @@ test("门禁失败不注册公开面、生命周期或副作用", async () => {
 
   assert.equal(activationCount, 0);
   assert.deepEqual(publicRegistrations, []);
-  assert.deepEqual(lifecycleRegistrations, []);
-  assert.deepEqual(handlers, []);
+  assert.deepEqual(lifecycleRegistrations, ["session_start"]);
+  assert.equal(diagnosticHandlers.length, 1);
+  diagnosticHandlers[0]?.(
+    { type: "session_start", reason: "startup" },
+    { hasUI: true, ui: { notify: (message: string, type: string) => notifications.push({ message, type }) } },
+  );
+  diagnosticHandlers[0]?.(
+    { type: "session_start", reason: "reload" },
+    { hasUI: true, ui: { notify: (message: string, type: string) => notifications.push({ message, type }) } },
+  );
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0]?.type, "warning");
+  assert.match(notifications[0]?.message ?? "", new RegExp(HOST_CAPABILITY_DIAGNOSTIC_CODE));
+  assert.doesNotMatch(notifications[0]?.message ?? "", /22\.18\.9/);
   assert.deepEqual(forbiddenSideEffects, []);
 });
 
@@ -362,8 +388,52 @@ test("无 UI 宿主保持静默且诊断不回退到模型上下文", async () =
   });
 
   await extension(api);
-  assert.deepEqual(handlers, []);
+  assert.deepEqual(handlers.length, 1);
+  handlers[0]?.(
+    { type: "session_start", reason: "startup" },
+    { hasUI: false, ui: { notify: () => forbiddenSideEffects.push("notify") } },
+  );
   assert.deepEqual(forbiddenSideEffects, []);
+});
+
+test("诊断桥面对异常上下文和通知异常保持静默", async () => {
+  const handlers: Array<(event: unknown, context: unknown) => void> = [];
+  const api: ExtensionApiSurface = {
+    ...readyApi(),
+    on: ((_event: string, handler: (event: unknown, context: unknown) => void) => {
+      handlers.push(handler);
+    }) as NonNullable<ExtensionApiSurface["on"]>,
+  };
+  const extension = createPiSubagentExtension({
+    probe: readyOverrides({ nodeVersion: "22.18.9" }),
+  });
+
+  await extension(api);
+  assert.equal(handlers.length, 1);
+  assert.doesNotThrow(() => handlers[0]?.({ type: "session_start" }, undefined));
+
+  let notifyAttempts = 0;
+  assert.doesNotThrow(() =>
+    handlers[0]?.(
+      { type: "session_start" },
+      {
+        hasUI: true,
+        ui: {
+          notify: () => {
+            notifyAttempts += 1;
+            throw new Error("ui unavailable");
+          },
+        },
+      },
+    ),
+  );
+  assert.doesNotThrow(() =>
+    handlers[0]?.(
+      { type: "session_start" },
+      { hasUI: true, ui: { notify: () => notifyAttempts += 1 } },
+    ),
+  );
+  assert.equal(notifyAttempts, 1);
 });
 
 test("兼容负向组合统一保持完全失活", async () => {
@@ -391,9 +461,14 @@ test("兼容负向组合统一保持完全失活", async () => {
     const lifecycleRegistrations: string[] = [];
     const publicRegistrations: string[] = [];
     const forbiddenSideEffects: string[] = [];
+    const handlers: Array<(event: unknown, context: unknown) => void> = [];
+    const notifications: string[] = [];
     const api: ExtensionApiSurface = {
       ...readyApi(),
-      on: ((event: string) => lifecycleRegistrations.push(event)) as NonNullable<ExtensionApiSurface["on"]>,
+      on: ((event: string, handler: (event: unknown, context: unknown) => void) => {
+        lifecycleRegistrations.push(event);
+        handlers.push(handler);
+      }) as NonNullable<ExtensionApiSurface["on"]>,
       registerTool: (() => publicRegistrations.push("tool")) as NonNullable<
         ExtensionApiSurface["registerTool"]
       >,
@@ -422,7 +497,22 @@ test("兼容负向组合统一保持完全失活", async () => {
 
     await extension(api);
 
-    assert.deepEqual(lifecycleRegistrations, [], scenario.name);
+    if (scenario.removeApi === "on") {
+      assert.deepEqual(lifecycleRegistrations, [], scenario.name);
+    } else {
+      assert.deepEqual(lifecycleRegistrations, ["session_start"], scenario.name);
+      assert.equal(handlers.length, 1, scenario.name);
+      handlers[0]?.(
+        { type: "session_start", reason: "startup" },
+        { hasUI: true, ui: { notify: (message: string) => notifications.push(message) } },
+      );
+      handlers[0]?.(
+        { type: "session_start", reason: "reload" },
+        { hasUI: true, ui: { notify: (message: string) => notifications.push(message) } },
+      );
+      assert.equal(notifications.length, 1, scenario.name);
+      assert.match(notifications[0] ?? "", new RegExp(HOST_CAPABILITY_DIAGNOSTIC_CODE), scenario.name);
+    }
     assert.deepEqual(publicRegistrations, [], scenario.name);
     assert.deepEqual(forbiddenSideEffects, [], scenario.name);
   }

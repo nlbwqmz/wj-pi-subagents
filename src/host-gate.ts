@@ -105,6 +105,18 @@ export type PiSubagentExtensionFactory = (
   extensionApi: ExtensionApiSurface,
 ) => void | Promise<void>;
 
+interface DiagnosticContext {
+  hasUI?: unknown;
+  ui?: {
+    notify?: unknown;
+  };
+}
+
+type DiagnosticHandler = (
+  event: unknown,
+  context: DiagnosticContext | null | undefined,
+) => void;
+
 interface SemverApi {
   valid(version: string): string | null;
   satisfies(version: string, range: string): boolean;
@@ -198,6 +210,48 @@ function isSupportedPlatform(platform: NodeJS.Platform): platform is SupportedPl
   return (SUPPORTED_PLATFORMS as readonly string[]).includes(platform);
 }
 
+function formatHostCapabilityDiagnostic(diagnostic: HostCapabilityDiagnostic): string {
+  const missingApi = diagnostic.missingApi?.join(",");
+  const detail = missingApi === undefined ? diagnostic.reason : `${diagnostic.reason}:${missingApi}`;
+  return `${diagnostic.code}: Pi 子代理扩展未激活 (${detail})`;
+}
+
+function registerUnavailableDiagnostic(
+  extensionApi: ExtensionApiSurface,
+  diagnostic: HostCapabilityDiagnostic,
+): void {
+  const on = extensionApi.on as
+    | ((event: string, handler: DiagnosticHandler) => void)
+    | undefined;
+  if (typeof on !== "function") return;
+
+  // 这是唯一允许在门禁失败后保留的生命周期桥，仅负责一次 UI-only 诊断。
+  let notified = false;
+  try {
+    on("session_start", (_event, context) => {
+      try {
+        if (
+          notified ||
+          typeof context !== "object" ||
+          context === null ||
+          context.hasUI !== true ||
+          typeof context.ui !== "object" ||
+          context.ui === null ||
+          typeof context.ui.notify !== "function"
+        ) {
+          return;
+        }
+        notified = true;
+        context.ui.notify(formatHostCapabilityDiagnostic(diagnostic), "warning");
+      } catch {
+        // UI 通知失败不得改变宿主会话或启用扩展。
+      }
+    });
+  } catch {
+    // 诊断桥不可用时保持静默失活。
+  }
+}
+
 export async function checkHostCapabilities(input: HostProbeInput): Promise<HostCapabilityResult> {
   const nodeVersion = input.nodeVersion ?? process.versions.node;
   const platform = input.platform ?? process.platform;
@@ -280,7 +334,7 @@ export function createPiSubagentExtension(
       extensionApi,
     });
     if (!capabilities.ok) {
-      // Pi factory 没有 UI 上下文；严格失败关闭不能为诊断注册生命周期钩子。
+      registerUnavailableDiagnostic(extensionApi, capabilities.diagnostic);
       return;
     }
     await options.activate?.(extensionApi, capabilities);
