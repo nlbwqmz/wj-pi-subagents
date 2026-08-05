@@ -456,16 +456,7 @@ export class TreeController {
         break;
       case "startup_failed":
         if (record.state === "starting") {
-          // 启动残骸不能停留在只占名额的 failed：先线性化故障事实，
-          // 再在同一顺序域立即建立不可逆的清理屏障。资源确认仍由监督器
-          // 另行提交，未确认前节点继续占用名额。
-          const failedApplied = this.mutate(record, {
-            state: "failed",
-            pendingMessageCount: 0,
-            errorCode: eventFaultCode(event, "spawn_failed"),
-          });
-          const terminatingApplied = this.mutate(record, { state: "terminating" });
-          applied = failedApplied || terminatingApplied;
+          applied = this.failStartingNode(record, eventFaultCode(event, "spawn_failed"));
         }
         break;
       case "message_admitted":
@@ -506,13 +497,7 @@ export class TreeController {
         break;
       case "runtime_failed":
         if (record.state === "starting") {
-          const failedApplied = this.mutate(record, {
-            state: "failed",
-            pendingMessageCount: 0,
-            errorCode: eventFaultCode(event, "spawn_failed"),
-          });
-          const terminatingApplied = this.mutate(record, { state: "terminating" });
-          applied = failedApplied || terminatingApplied;
+          applied = this.failStartingNode(record, eventFaultCode(event, "spawn_failed"));
         } else if (
           record.state === "idle" ||
           record.state === "working" ||
@@ -664,6 +649,17 @@ export class TreeController {
       if (record.parentAgentId === parentAgentId && record.state !== "terminated") return false;
     }
     return true;
+  }
+
+  /** 启动残骸先留存失败事实，再在同一顺序域建立不可逆清理屏障。 */
+  private failStartingNode(record: AgentRecord, errorCode: AgentFaultCode): boolean {
+    const failedApplied = this.mutate(record, {
+      state: "failed",
+      pendingMessageCount: 0,
+      errorCode,
+    });
+    const terminatingApplied = this.mutate(record, { state: "terminating" });
+    return failedApplied || terminatingApplied;
   }
 
   private mutate(record: AgentRecord, mutation: PublicMutation): boolean {
