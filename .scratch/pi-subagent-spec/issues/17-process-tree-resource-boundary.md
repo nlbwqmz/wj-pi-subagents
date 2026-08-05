@@ -13,12 +13,13 @@
 
 ## Answer
 
-新增 `src/process-tree-resource-boundary.ts`，以独立纯逻辑函数 `decideProcessTreeTermination` 汇总进程退出观察和整树资源观察。只有 `exit: "exited"` 与 `resources: "released"` 同时确认时才返回 `confirmed_exited`、`terminated` 和 `releaseQuotaSlots: true`；任一观察为 `present` 时保持 `terminating`，任一无法确认时保持 `terminating/unknown`，两种未完成结果都不释放名额。适配器只负责平台句柄和观察，不直接修改生命周期或配额。
+新增 `src/process-tree-resource-boundary.ts`，以独立纯逻辑函数 `classifyProcessTreeResources` 汇总进程退出观察和整树资源观察。只有 `exit: "exited"` 与 `resources: "released"` 同时确认时才返回进程树级 `confirmed_exited`；任一观察为 `present` 时返回 `present`，其余未确认组合返回 `unknown`。该边界不输出代理生命周期或配额裁决；后续控制器仍须合并监督端点、本节点和全部后代的确认事实，才能发布 `terminated` 并释放名额。
 
 新增 `src/fake-process-tree-adapter.ts`。`FakeProcessTreeAdapter` 通过 `WeakMap` 保存场景状态并返回不透明令牌，支持按场景确定性推进优雅关闭、强制回收、部分回收重试、孙进程残留、重复强制回收和句柄释放；释放后观察安全地回到 `unknown`，重复释放幂等。它声明 Windows 的 `job_object` 及 macOS/Linux 的 `process_group_or_session` 策略，可直接注入既有 `ProcessTreeAdapter`/宿主门禁契约，但不实现真实平台回收。
 
-测试位于 `test/process-tree-resource-boundary.test.ts` 和 `test/fake-process-tree-adapter.test.ts`，覆盖直接进程退出不足以确认、三态资源观察、优雅超时、孙进程残留、部分回收、重复回收、句柄释放和三平台契约。真实 Job Object 与 process group/session 适配器仍分别属于 22/23 号票据，RPC 监督器接入属于 24 号票据。
+测试位于 `test/process-tree-resource-boundary.test.ts` 和 `test/fake-process-tree-adapter.test.ts`，覆盖直接进程退出不足以确认、三态资源观察、优雅等待超时后的强制升级、孙进程残留、部分回收、重复回收、句柄释放和三平台契约。纯逻辑输出明确不含 `lifecycle` 或名额释放信号，未确认进程树不能单独推动控制器成熟。真实 Job Object 与 process group/session 适配器仍分别属于 22/23 号票据，完整 RPC 监督器与控制器接入属于 24/20 号票据。
 
 ## Comments
 
-- 2026-08-05：实现完成并通过专项测试与 `npm run typecheck`；完整检查和双轴代码审查在提交前执行。
+- 2026-08-05：初始实现通过专项测试、类型检查和完整检查后提交，随后以实现前提交为固定点执行双轴代码审查。
+- 2026-08-05：双轴审查发现进程树证据不足以单独裁决完整资源确认，已移除边界中的生命周期/配额结果，并补齐优雅期限后强制升级测试。

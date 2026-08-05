@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { FakeProcessTreeAdapter } from "../src/fake-process-tree-adapter.ts";
 import { isProcessTreeAdapter } from "../src/process-tree-capability.ts";
-import { decideProcessTreeTermination } from "../src/process-tree-resource-boundary.ts";
+import { classifyProcessTreeResources } from "../src/process-tree-resource-boundary.ts";
 
-test("FakeProcessTreeAdapter 可确定重现优雅关闭超时", async () => {
+test("FakeProcessTreeAdapter 可确定重现优雅关闭超时后的强制升级", async () => {
   const adapter = new FakeProcessTreeAdapter({
     scenarios: [
       {
@@ -19,6 +19,10 @@ test("FakeProcessTreeAdapter 可确定重现优雅关闭超时", async () => {
 
   assert.deepEqual(await adapter.waitForExit(tree, 100), { state: "present" });
   assert.deepEqual(await adapter.inspect(tree), { state: "present" });
+
+  await adapter.forceTerminate(tree);
+  assert.deepEqual(await adapter.waitForExit(tree, 100), { state: "exited" });
+  assert.deepEqual(await adapter.inspect(tree), { state: "released" });
 });
 
 test("直接进程退出不掩盖孙进程残留", async () => {
@@ -35,14 +39,10 @@ test("直接进程退出不掩盖孙进程残留", async () => {
 
   const exit = await adapter.waitForExit(tree, new Date(100));
   const resources = await adapter.inspect(tree);
-  assert.deepEqual(decideProcessTreeTermination({ exit, resources }), {
-    resourceState: "present",
-    lifecycle: "terminating",
-    releaseQuotaSlots: false,
-  });
+  assert.deepEqual(classifyProcessTreeResources({ exit, resources }), { state: "present" });
 });
 
-test("部分回收保持 terminating，重试确认后才释放名额", async () => {
+test("部分回收保持 present，重试后才得到进程树确认", async () => {
   const adapter = new FakeProcessTreeAdapter({
     scenarios: [
       {
@@ -59,28 +59,20 @@ test("部分回收保持 terminating，重试确认后才释放名额", async ()
   await adapter.requestGracefulClose(tree, new AbortController().signal);
   await adapter.forceTerminate(tree);
   assert.deepEqual(
-    decideProcessTreeTermination({
+    classifyProcessTreeResources({
       exit: await adapter.waitForExit(tree, 100),
       resources: await adapter.inspect(tree),
     }),
-    {
-      resourceState: "present",
-      lifecycle: "terminating",
-      releaseQuotaSlots: false,
-    },
+    { state: "present" },
   );
 
   await adapter.forceTerminate(tree);
   assert.deepEqual(
-    decideProcessTreeTermination({
+    classifyProcessTreeResources({
       exit: await adapter.waitForExit(tree, 100),
       resources: await adapter.inspect(tree),
     }),
-    {
-      resourceState: "confirmed_exited",
-      lifecycle: "terminated",
-      releaseQuotaSlots: true,
-    },
+    { state: "confirmed_exited" },
   );
 });
 
@@ -124,16 +116,12 @@ test("资源观察无法确认时保持 unknown 而不提前终止", async () =>
   const tree = await adapter.attach({ kind: "fake-process" });
 
   await adapter.requestGracefulClose(tree, new AbortController().signal);
-  const decision = decideProcessTreeTermination({
+  const assessment = classifyProcessTreeResources({
     exit: await adapter.waitForExit(tree, 100),
     resources: await adapter.inspect(tree),
   });
 
-  assert.deepEqual(decision, {
-    resourceState: "unknown",
-    lifecycle: "terminating",
-    releaseQuotaSlots: false,
-  });
+  assert.deepEqual(assessment, { state: "unknown" });
 });
 
 test("fake 在三种受支持平台上都满足对应进程树契约", () => {

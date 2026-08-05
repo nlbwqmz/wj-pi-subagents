@@ -3,7 +3,7 @@ import type {
   ResourceObservation,
 } from "./process-tree-capability.ts";
 
-export interface ProcessTreeTerminationEvidence {
+export interface ProcessTreeResourceEvidence {
   readonly exit: ExitObservation;
   readonly resources: ResourceObservation;
 }
@@ -11,43 +11,24 @@ export interface ProcessTreeTerminationEvidence {
 /** 进程树资源边界的三态结果，不等同于代理生命周期状态。 */
 export type ProcessTreeResourceState = "confirmed_exited" | "present" | "unknown";
 
-export type ProcessTreeTerminationDecision =
-  | {
-      readonly resourceState: "confirmed_exited";
-      readonly lifecycle: "terminated";
-      readonly releaseQuotaSlots: true;
-    }
-  | {
-      readonly resourceState: Exclude<ProcessTreeResourceState, "confirmed_exited">;
-      readonly lifecycle: "terminating";
-      readonly releaseQuotaSlots: false;
-    };
+export interface ProcessTreeResourceAssessment {
+  readonly state: ProcessTreeResourceState;
+}
 
 /**
- * 将平台观察转换为控制器可消费的保守决策，适配器本身不修改生命周期或配额。
+ * 汇总平台进程树观察，但不裁决代理生命周期或配额。
+ * 控制器仍须结合监督端点、本节点和全部后代的确认事实。
  */
-export function decideProcessTreeTermination(
-  evidence: ProcessTreeTerminationEvidence,
-): ProcessTreeTerminationDecision {
+export function classifyProcessTreeResources(
+  evidence: ProcessTreeResourceEvidence,
+): ProcessTreeResourceAssessment {
   if (evidence.exit.state === "exited" && evidence.resources.state === "released") {
-    return {
-      resourceState: "confirmed_exited",
-      lifecycle: "terminated",
-      releaseQuotaSlots: true,
-    };
+    return { state: "confirmed_exited" };
   }
 
   if (evidence.exit.state === "present" || evidence.resources.state === "present") {
-    return {
-      resourceState: "present",
-      lifecycle: "terminating",
-      releaseQuotaSlots: false,
-    };
+    return { state: "present" };
   }
 
-  return {
-    resourceState: "unknown",
-    lifecycle: "terminating",
-    releaseQuotaSlots: false,
-  };
+  return { state: "unknown" };
 }

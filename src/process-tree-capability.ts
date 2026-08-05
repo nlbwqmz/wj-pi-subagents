@@ -48,6 +48,10 @@ const STRATEGIES: Record<SupportedPlatform, ProcessTreeStrategy> = {
   linux: "process_group_or_session",
 };
 
+export function processTreeStrategyFor(platform: SupportedPlatform): ProcessTreeStrategy {
+  return STRATEGIES[platform];
+}
+
 const REQUIRED_PROCESS_TREE_ADAPTER_METHODS = [
   "attach",
   "requestGracefulClose",
@@ -66,7 +70,10 @@ export function isProcessTreeAdapter(
 ): candidate is ProcessTreeAdapter {
   if (typeof candidate !== "object" || candidate === null) return false;
   const adapter = candidate as Record<string, unknown>;
-  if (adapter.platform !== platform || adapter.strategy !== STRATEGIES[platform]) return false;
+  if (
+    adapter.platform !== platform ||
+    adapter.strategy !== processTreeStrategyFor(platform)
+  ) return false;
   if ("available" in adapter && adapter.available !== true) return false;
   return REQUIRED_PROCESS_TREE_ADAPTER_METHODS.every((method) => typeof adapter[method] === "function");
 }

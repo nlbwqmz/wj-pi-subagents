@@ -1,9 +1,10 @@
-import type {
-  ExitObservation,
-  ProcessTreeAdapter,
-  ProcessTreeHandle,
-  ProcessTreeStrategy,
-  ResourceObservation,
+import {
+  processTreeStrategyFor,
+  type ExitObservation,
+  type ProcessTreeAdapter,
+  type ProcessTreeHandle,
+  type ProcessTreeStrategy,
+  type ResourceObservation,
 } from "./process-tree-capability.ts";
 import type { SupportedPlatform } from "./host-gate.ts";
 
@@ -33,19 +34,12 @@ interface FakeTreeState {
 
 interface FakeTreeToken {
   readonly owner: symbol;
-  readonly sequence: number;
 }
 
 const DEFAULT_SCENARIO: FakeProcessTreeScenario = {
   initial: { exit: "present", resources: "present" },
   afterGracefulClose: { exit: "present", resources: "present" },
   afterForceTerminate: [{ exit: "exited", resources: "released" }],
-};
-
-const STRATEGIES: Record<SupportedPlatform, ProcessTreeStrategy> = {
-  win32: "job_object",
-  darwin: "process_group_or_session",
-  linux: "process_group_or_session",
 };
 
 function copyStep(step: FakeProcessTreeStep): FakeProcessTreeStep {
@@ -76,7 +70,7 @@ export class FakeProcessTreeAdapter implements ProcessTreeAdapter {
 
   constructor(options: FakeProcessTreeAdapterOptions = {}) {
     this.platform = options.platform ?? "linux";
-    this.strategy = STRATEGIES[this.platform];
+    this.strategy = processTreeStrategyFor(this.platform);
     this.scenarios = options.scenarios === undefined || options.scenarios.length === 0
       ? [copyScenario(DEFAULT_SCENARIO)]
       : options.scenarios.map(copyScenario);
@@ -89,7 +83,6 @@ export class FakeProcessTreeAdapter implements ProcessTreeAdapter {
     const initial = scenario.initial ?? { exit: "present", resources: "present" };
     const token: FakeTreeToken = Object.freeze({
       owner: this.owner,
-      sequence: this.nextSequence,
     });
     this.nextSequence += 1;
     this.states.set(token, {
@@ -121,6 +114,7 @@ export class FakeProcessTreeAdapter implements ProcessTreeAdapter {
 
   async waitForExit(tree: ProcessTreeHandle, _deadline: number | Date): Promise<ExitObservation> {
     const state = this.readState(tree);
+    // fake 不消耗真实时间；present/unknown 表示到达调用方期限时仍未确认退出。
     if (state.released) return { state: "unknown" };
     return { state: state.observation.exit };
   }
