@@ -71,7 +71,7 @@ interface TreeState {
   nextCommandId: number;
   exit: ExitObservation["state"];
   resources: ResourceObservation["state"];
-  released: boolean;
+  handleReleased: boolean;
   helperEnded: boolean;
   readyReceived: boolean;
 }
@@ -128,7 +128,7 @@ function closeServer(server: Server): void {
   }
 }
 
-function listenControlPipe(
+function listenNamedPipe(
   pipeName: string,
   onConnection: (socket: Socket) => void,
 ): Promise<Server> {
@@ -207,7 +207,7 @@ export class WindowsJobObjectAdapter implements ProcessTreeAdapter {
     const controlPipeName = `\\\\.\\pipe\\pi-subagent-job-control-${pipeId}`;
     const eventPipeName = `\\\\.\\pipe\\pi-subagent-job-event-${pipeId}`;
     let connectState: TreeState | undefined;
-    const controlServer = await listenControlPipe(controlPipeName, (socket) => {
+    const controlServer = await listenNamedPipe(controlPipeName, (socket) => {
       if (connectState === undefined || connectState.controlSocket !== undefined) {
         socket.destroy();
         return;
@@ -217,7 +217,7 @@ export class WindowsJobObjectAdapter implements ProcessTreeAdapter {
     });
     let eventServer: Server;
     try {
-      eventServer = await listenControlPipe(eventPipeName, (socket) => {
+      eventServer = await listenNamedPipe(eventPipeName, (socket) => {
         if (connectState === undefined || connectState.eventSocket !== undefined) {
           socket.destroy();
           return;
@@ -278,7 +278,7 @@ export class WindowsJobObjectAdapter implements ProcessTreeAdapter {
       nextCommandId: 1,
       exit: "present",
       resources: "unknown",
-      released: false,
+      handleReleased: false,
       helperEnded: false,
       readyReceived: false,
     };
@@ -315,14 +315,14 @@ export class WindowsJobObjectAdapter implements ProcessTreeAdapter {
 
   async requestGracefulClose(tree: ProcessTreeHandle, signal: AbortSignal): Promise<void> {
     const state = this.readState(tree);
-    if (state.released) return;
+    if (state.handleReleased) return;
     if (signal.aborted) throw safeError("优雅关闭请求已取消");
     if (!state.helper.stdin.writableEnded) state.helper.stdin.end();
   }
 
   async forceTerminate(tree: ProcessTreeHandle): Promise<void> {
     const state = this.readState(tree);
-    if (state.released || state.resources === "released") return;
+    if (state.handleReleased || state.resources === "released") return;
     try {
       await this.sendCommand(state, "force");
     } catch {
@@ -348,7 +348,7 @@ export class WindowsJobObjectAdapter implements ProcessTreeAdapter {
 
   async inspect(tree: ProcessTreeHandle): Promise<ResourceObservation> {
     const state = this.readState(tree);
-    if (state.released) return { state: "unknown" };
+    if (state.handleReleased) return { state: "unknown" };
     if (state.resources === "released") return { state: "released" };
     if (state.helperEnded) return { state: "unknown" };
     try {
@@ -362,7 +362,7 @@ export class WindowsJobObjectAdapter implements ProcessTreeAdapter {
 
   async release(tree: ProcessTreeHandle): Promise<void> {
     const state = this.readState(tree);
-    if (state.released) return;
+    if (state.handleReleased) return;
     if (!state.helperEnded && state.resources !== "released") {
       try {
         await this.sendCommand(state, "release");
@@ -370,7 +370,7 @@ export class WindowsJobObjectAdapter implements ProcessTreeAdapter {
         // 释放后不再有可靠句柄；即使内核随后回收，也不能伪造确认结果。
       }
     }
-    state.released = true;
+    state.handleReleased = true;
     state.resources = "unknown";
     this.closePipeServers(state);
   }

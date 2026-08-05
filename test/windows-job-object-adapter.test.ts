@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import test from "node:test";
 import {
   WindowsJobObjectAdapter,
@@ -64,6 +65,15 @@ test("Windows Job Object 在启动前绑定直接子进程，并在优雅 EOF �
   } finally {
     await forceRelease(adapter, launch);
   }
+});
+
+test("Windows Job Object 启动失败时完成 helper 回滚", nativeTestOptions, async () => {
+  const adapter = new WindowsJobObjectAdapter();
+
+  await assert.rejects(
+    adapter.launch({ command: `C:\\pi-subagent-missing-${randomUUID()}.exe` }),
+    /Windows Job Object helper 未就绪/,
+  );
 });
 
 test("Windows Job Object 保留孙进程存在事实，并能一次强制回收整棵树", nativeTestOptions, async () => {

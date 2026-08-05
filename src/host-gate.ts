@@ -210,6 +210,13 @@ function isSupportedPlatform(platform: NodeJS.Platform): platform is SupportedPl
   return (SUPPORTED_PLATFORMS as readonly string[]).includes(platform);
 }
 
+/** 按宿主平台加载已交付的生产进程树适配器；未交付的平台保持失败关闭。 */
+async function loadDefaultProcessTreeAdapter(platform: NodeJS.Platform): Promise<unknown> {
+  if (platform !== "win32") return undefined;
+  const { WindowsJobObjectAdapter } = await import("./windows-job-object-adapter.ts");
+  return new WindowsJobObjectAdapter();
+}
+
 function formatHostCapabilityDiagnostic(diagnostic: HostCapabilityDiagnostic): string {
   const missingApi = diagnostic.missingApi?.join(",");
   const detail = missingApi === undefined ? diagnostic.reason : `${diagnostic.reason}:${missingApi}`;
@@ -257,8 +264,7 @@ export async function checkHostCapabilities(input: HostProbeInput): Promise<Host
   const platform = input.platform ?? process.platform;
   const loadPiModule = input.loadPiModule ?? (() => import("@earendil-works/pi-coding-agent"));
   const loadRuntimeDependency = input.loadRuntimeDependency ?? (() => import("semver"));
-  // 平台实现由后续适配器模块注入；未提供真实实现时必须失败关闭。
-  const loadProcessTreeAdapter = input.loadProcessTreeAdapter ?? (() => undefined);
+  const loadProcessTreeAdapter = input.loadProcessTreeAdapter ?? loadDefaultProcessTreeAdapter;
 
   let runtimeDependency: unknown;
   try {

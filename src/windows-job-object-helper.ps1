@@ -119,6 +119,9 @@ public static class PiSubagentWindowsJobHelper
     private static extern bool TerminateJobObject(IntPtr hJob, uint uExitCode);
 
     [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool QueryInformationJobObject(
         IntPtr hJob,
         int jobObjectInfoClass,
@@ -324,6 +327,8 @@ public static class PiSubagentWindowsJobHelper
         }
         catch
         {
+            // 绑定或恢复失败时，进程可能尚未由 Job 覆盖；不能只关闭本地句柄。
+            TerminateProcess(processInfo.hProcess, 1);
             CloseHandle(processInfo.hProcess);
             throw;
         }

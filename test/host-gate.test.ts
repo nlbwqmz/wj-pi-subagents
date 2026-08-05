@@ -236,7 +236,7 @@ test("受支持平台缺失进程树适配器时拒绝激活", async () => {
   }
 });
 
-test("标准入口未注入真实进程树适配器时默认失败关闭", async () => {
+test("尚未交付 Unix 适配器时标准入口保持失败关闭", async () => {
   const probe = readyOverrides();
   delete probe.loadProcessTreeAdapter;
   const result = await checkHostCapabilities({
@@ -246,6 +246,21 @@ test("标准入口未注入真实进程树适配器时默认失败关闭", async
 
   assert.equal(result.ok, false);
   if (!result.ok) assert.equal(result.diagnostic.reason, "process_tree_adapter_unavailable");
+});
+
+test("Windows 标准入口加载 Job Object 适配器", async () => {
+  const probe = readyOverrides({ platform: "win32" });
+  delete probe.loadProcessTreeAdapter;
+  const result = await checkHostCapabilities({
+    extensionApi: readyApi(),
+    ...probe,
+  });
+
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.processTreeAdapter.platform, "win32");
+    assert.equal(result.processTreeAdapter.strategy, "job_object");
+  }
 });
 
 test("运行依赖不可加载时拒绝激活且不泄露底层错误", async () => {
