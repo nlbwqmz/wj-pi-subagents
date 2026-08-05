@@ -190,10 +190,15 @@ export interface LifecycleEventOutcome {
   readonly tree_revision: number;
 }
 
-export interface ReservedAgentOutcome extends LifecycleEventOutcome {}
+/** 创建旅程的稳定返回名称；字段与生命周期事件结果保持相同安全外壳。 */
+export type ReservedAgentOutcome = LifecycleEventOutcome;
 
 interface EventGeneration {
-  readonly expected_generation?: number;
+  /**
+   * 事件产生时读取的节点代际；所有监督事件都必须携带，避免无身份的迟到事件
+   * 在新的消息或状态变化后再次消费当前节点事实。
+   */
+  readonly expected_generation: number;
 }
 
 interface FailureEvent extends EventGeneration {
@@ -292,8 +297,9 @@ function isLifecycleEvent(value: unknown): value is AgentLifecycleEvent {
   ];
   if (!supported.includes(type)) return false;
   if (
-    "expected_generation" in candidate &&
-    (!Number.isSafeInteger(candidate.expected_generation) || (candidate.expected_generation as number) < 0)
+    !("expected_generation" in candidate) ||
+    !Number.isSafeInteger(candidate.expected_generation) ||
+    (candidate.expected_generation as number) < 0
   ) {
     return false;
   }
@@ -332,8 +338,8 @@ function isQuotaConsumingState(state: AgentLifecycleState): boolean {
   return state !== "terminated";
 }
 
-function eventGeneration(event: AgentLifecycleEvent): number | undefined {
-  return "expected_generation" in event ? event.expected_generation : undefined;
+function eventGeneration(event: AgentLifecycleEvent): number {
+  return event.expected_generation;
 }
 
 function eventFaultCode(event: FailureEvent, fallback: AgentFaultCode): AgentFaultCode {
@@ -425,7 +431,11 @@ export class TreeController {
     return controlSuccess(this.outcome(record, true));
   }
 
-  /** 应用监督器事件；不匹配的代际或非法状态边会安全地成为无变化。 */
+  /**
+   * 应用监督器事件；每个事件都必须携带产生时的代际，不匹配或非法状态边
+   * 会安全地成为无变化。启动失败先发布 failed，监督器随后必须提交终止屏障
+   * 和资源确认，控制器不会在未确认资源时释放预留名额。
+   */
   applyLifecycleEvent(
     agentId: unknown,
     event: AgentLifecycleEvent | unknown,
@@ -435,7 +445,7 @@ export class TreeController {
     if (!isLifecycleEvent(event)) return controlFailure("invalid_argument");
     const record = resolved.data;
     const expectedGeneration = eventGeneration(event);
-    if (expectedGeneration !== undefined && expectedGeneration !== record.lifecycleGeneration) {
+    if (expectedGeneration !== record.lifecycleGeneration) {
       return controlSuccess(this.outcome(record, false));
     }
 
@@ -657,23 +667,32 @@ export class TreeController {
 
     const observedAt = safeObservedAt(this.now);
     const monotonicAt = this.safeMonotonicNow();
+    const elapsedAtMutation = this.lifecycleElapsed(record, monotonicAt);
     const nextError = mutation.errorCode === undefined
       ? (mutation.clearError === true ? undefined : record.error)
       : this.createFault(mutation.errorCode, observedAt);
     record.state = nextState;
     record.pendingMessageCount = nextPending;
     record.error = nextError;
-    if (stateChanged) record.lifecycleGeneration += 1;
+    // 代际覆盖所有公开事实变化，而不只覆盖状态变化；这样旧消息事件不会
+    // 在 pending 或故障事实更新后误消费新一轮工作。
+    if (stateChanged || pendingChanged || errorChanged) record.lifecycleGeneration += 1;
     if (stateChanged && nextState === "idle" && record.lifecycleStartedAt === undefined) {
       record.createdAt = observedAt;
       record.lifecycleStartedAt = monotonicAt;
     }
+    if (stateChanged && nextState === "terminating" && record.frozenLifecycleElapsedMs !== undefined) {
+      // failed 的展示时长固定；开始清理后从该固定值继续累计，但不把停留在
+      // failed 的时间误算为清理时长。
+      record.lifecycleStartedAt = monotonicAt - record.frozenLifecycleElapsedMs;
+      record.frozenLifecycleElapsedMs = undefined;
+    }
     if (
       stateChanged &&
       (nextState === "failed" || nextState === "terminated") &&
-      record.lifecycleStartedAt !== undefined
+      elapsedAtMutation !== undefined
     ) {
-      record.frozenLifecycleElapsedMs = Math.max(0, Math.round(monotonicAt - record.lifecycleStartedAt));
+      record.frozenLifecycleElapsedMs = elapsedAtMutation;
     }
     record.revision += 1;
     record.observedAt = observedAt;
@@ -740,5 +759,5 @@ export class TreeController {
   }
 }
 
-// 保留更直观的别名，供后续垂直旅程使用。
+// 兼容后续纵向旅程采用的命名，不复制控制器实现或状态。
 export { TreeController as AgentTreeController };
