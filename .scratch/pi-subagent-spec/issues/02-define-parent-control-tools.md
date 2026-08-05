@@ -15,7 +15,7 @@ Blocked by: none
 ### 共通约定
 
 - 公开工具为 `spawn_agent`、`send_message`、`wait_agent`、`interrupt_agent`、`terminate_agent`、`get_agent_status` 和 `get_agent_tree`，不提供多模式通用工具。
-- 定向工具只接受不透明字符串 `agent_id`。标识在当前根会话内唯一、节点生命周期内稳定、终止后不复用；名称只用于展示，不能寻址或推断树结构。
+- 定向工具只接受 UUID `agent_id`。控制器以随机 UUID v4 分配新标识，文本值使用 RFC 9562 canonical 小写格式且不带 `agent_` 前缀；标识在当前根会话内唯一、节点生命周期内稳定、终止后不复用。名称只用于展示，不能寻址或推断树结构。非 canonical UUID 文本返回 `invalid_argument`，格式正确但未注册返回 `agent_not_found`。
 - 成功结果统一为 `{ "ok": true, "data": ... }`；预期失败以工具错误交给 Pi，使 `isError: true`，错误结构为 `{ "ok": false, "error": { "code", "message", "retryable", "details?" } }`。调用方只依赖稳定错误码，不依赖消息文本或 `details` 的具体结构。
 - 公开生命周期状态固定为 `starting`、`idle`、`working`、`interrupting`、`failed`、`terminating`、`terminated`。待处理消息使用计数，不单独建 `queued` 状态；意外进程退出归入 `failed`，终止流程中的预期退出归入 `terminated`。
 - 所有时间使用 UTC RFC 3339、固定毫秒精度和 `Z` 后缀；状态新旧顺序由单调 `revision` 判断，不能用时间字符串排序。
@@ -28,7 +28,7 @@ Blocked by: none
 { "template_id": "researcher", "name": "资料代理" }
 ```
 
-创建操作不携带首条任务消息，也不允许调用方覆盖工作目录、环境、模型、工具、扩展、技能、系统提示、最大深度等权限字段。创建成功前必须启动 RPC 子进程、完成握手并进入可通信的 `idle`；首条及后续任务统一由 `send_message` 发送。
+创建操作不携带首条任务消息，也不允许调用方覆盖工作目录、环境、模型、工具、扩展、技能、系统提示、最大深度等权限字段。创建成功前必须启动 RPC 子进程、完成一次无副作用的 RPC 请求与响应并进入可通信的 `idle`；该就绪确认不证明最终模型、工具或资源快照。首条及后续任务统一由 `send_message` 发送。
 
 成功最小结果为：
 
@@ -36,7 +36,7 @@ Blocked by: none
 {
   "ok": true,
   "data": {
-    "agent_id": "agent_...",
+    "agent_id": "550e8400-e29b-41d4-a716-446655440000",
     "name": "资料代理",
     "template_id": "researcher",
     "depth": 1,
@@ -45,7 +45,7 @@ Blocked by: none
 }
 ```
 
-创建前原子预留父节点名额和登记关系；预留或启动失败必须释放残留资源和名额。达到深度上限返回 `max_depth_reached`；直接子代理名额已满返回 `max_children_reached`；启动阶段失败或协议/握手失败返回 `spawn_failed`；在启动期限内未进入 `idle` 返回 `spawn_timeout`。
+创建前原子预留父节点名额和登记关系；预留或启动失败必须释放残留资源和名额。达到深度上限返回 `max_depth_reached`；直接子代理名额已满返回 `max_children_reached`；启动阶段失败或 RPC 通信/协议确认失败返回 `spawn_failed`；在启动期限内未进入 `idle` 返回 `spawn_timeout`。
 
 ### `send_message`
 
@@ -76,7 +76,7 @@ Blocked by: none
 {
   "ok": true,
   "data": {
-    "agent_id": "agent_...",
+    "agent_id": "550e8400-e29b-41d4-a716-446655440000",
     "outcome": "settled",
     "state": "idle",
     "revision": 12,
@@ -97,7 +97,7 @@ Blocked by: none
 {
   "ok": true,
   "data": {
-    "agent_id": "agent_...",
+    "agent_id": "550e8400-e29b-41d4-a716-446655440000",
     "accepted": true,
     "changed": true,
     "state": "interrupting"
@@ -119,7 +119,7 @@ Blocked by: none
 {
   "ok": true,
   "data": {
-    "agent_id": "agent_...",
+    "agent_id": "550e8400-e29b-41d4-a716-446655440000",
     "state": "terminated",
     "changed": true,
     "forced": true,
@@ -138,7 +138,7 @@ Blocked by: none
 
 ### `get_agent_tree`
 
-无目标参数，控制器根据调用者身份自动裁剪只读视图：根会话查看整棵树，非根父会话查看自身及后代子树。`data.scope` 为 `{ "kind": "root" }` 或 `{ "kind": "subtree", "agent_id": "..." }`，调用方不能传入任意查询目标。
+无目标参数，控制器根据调用者身份自动裁剪只读视图：根会话查看整棵树，非根父会话查看自身及后代子树。`data.scope` 为 `{ "kind": "root" }` 或 `{ "kind": "subtree", "agent_id": "550e8400-e29b-41d4-a716-446655440000" }`，调用方不能传入任意查询目标。
 
 每次返回一个单一 `tree_revision` 下捕获的完整快照，不暴露增量、游标或事件确认协议。节点用扁平 `nodes` 列表表示，按父节点优先和稳定创建顺序排序：
 
@@ -151,7 +151,7 @@ Blocked by: none
     "observed_at": "2026-08-04T04:36:12.004Z",
     "nodes": [
       {
-        "agent_id": "agent_...",
+        "agent_id": "550e8400-e29b-41d4-a716-446655440000",
         "name": "资料代理",
         "template_id": "researcher",
         "parent_agent_id": null,
@@ -179,9 +179,11 @@ Blocked by: none
 | `not_direct_child` | 节点存在但不是调用者的直接子代理 | 不可重试 |
 | `template_not_found` | 模板经来源和权限过滤后不可用 | 不可重试 |
 | `template_invalid` | 模板存在但格式或字段无效 | 不可重试 |
+| `template_capability_unavailable` | 模板有效，但当前父会话的有效授权不能满足其必需能力 | 不可重试；需更换模板或父会话配置 |
 | `max_depth_reached` | 当前节点达到根会话深度上限 | 不可重试 |
 | `max_children_reached` | 当前父节点直接子代理名额已满 | 完成一个子代理终止清理后可重试 |
-| `spawn_failed` | 进程启动、提前退出、RPC 握手或协议失败 | 按具体原因决定 |
+| `max_tree_agents_reached` | 当前根会话的全树代理名额已满 | 完成任一节点终止清理并释放全树名额后可重试 |
+| `spawn_failed` | 进程启动、提前退出、RPC 通信就绪确认或协议失败 | 按具体原因决定 |
 | `spawn_timeout` | 启动期限内未进入可通信 `idle` | 可重试 |
 | `agent_unavailable` | 直接子代理存在但其状态不再接受该操作 | 不可重试 |
 | `message_delivery_failed` | 消息未获接受确认 | 仅能证明未被接受且目标仍可用时可重试 |
@@ -193,11 +195,11 @@ Blocked by: none
 ### 配置、配额与工具可见性
 
 - 用户级扩展配置固定为 `~/.pi/agent/subagent.json`，项目级配置为 `<cwd>/.pi/subagent.json`。项目级覆盖用户级；根启动参数可覆盖文件配置。
-- 配置不设版本字段。文件缺失、不可读或 JSON 无法解析时静默跳过该层；已知字段值无效时回退到下一优先级或内置默认值；未知字段静默忽略。
-- `maxWaitTimeoutMs` 不是支持的配置字段，出现时按未知字段忽略；等待合法范围由代码固定。可配置的是默认等待值，内置回退为 `60000` 毫秒。
-- 单一 `maxChildrenPerAgent` 有效值统一约束根会话和所有可创建子代理的节点，由根在启动时确定并传给整棵树；后代不能提高，不支持按深度、模板或单节点覆盖。默认值和代码硬上限由配额票据确定。
+- 配置不设版本字段。文件缺失或某个字段未提供是正常空配置，未提供字段继续按低优先级层解析；已获信任的用户级或项目级配置文件不可读、JSON 无法解析或已知配额字段值无效时，该字段直接采用对应内置默认值，不回退到更低优先级层，并通过根会话 UI-only warning 告知用户。未知字段（包括不支持的 `maxWaitTimeoutMs`）通过同一 UI-only warning 提示后忽略。显式根启动参数非法时直接拒绝根会话启动；这些配置诊断不进入会话消息或模型上下文。
+- `wait_agent.timeout_ms` 的单次合法范围由代码固定为 `10000..600000` 毫秒，默认值为 `60000`；等待默认值仍可按既有单次参数、根启动参数、项目配置、用户配置和内置默认值优先级解析，超时只结束本次等待，不改变节点。
+- `maxDepth`、`maxChildrenPerAgent` 与 `maxAgentsPerTree` 三个根配额值在根启动时一次确定并传给整棵树，后代不能提高；其默认值、合法范围、硬上限、原子预留和耗尽行为由 06 号票据冻结。每个父会话的直接子代理独立计数；全树名额统计根之外尚未 `terminated` 的节点。
 - 创建前原子预留直接子代理名额；除 `terminated` 外的公开状态都占用名额。只有节点及其子树完成资源回收后释放名额，终止记录仍可见但不计数。
-- 仅节点自身满足 `depth == maxDepth` 时隐藏整套七个管理工具；所有 `depth < maxDepth` 的节点仍完整暴露。服务端始终重复校验深度，绕过工具发现的创建请求仍返回 `max_depth_reached`。
+- 七个管理工具作为不可拆分的“子代理管理能力”整体暴露或整体移除。节点只有在直接父会话仍具备该能力、模板 `subagents` 未设为 `disabled` 且自身 `depth < maxDepth` 时才完整获得这七个工具；任一条件不满足时整组隐藏。`maxDepth` 仍是不可突破的硬上限，服务端始终重复校验深度，绕过工具发现的创建请求仍返回 `max_depth_reached`。
 
 ### 并发与后续边界
 
@@ -210,7 +212,7 @@ Blocked by: none
 - 2026-08-04：用户确认公开控制面采用职责单一的工具，覆盖创建直接子代理、发送父子消息、等待、中断当前处理、终止并级联清理、读取指定状态以及读取代理树视图；不提供多模式通用工具。
 - 2026-08-04：用户澄清进度交互：父会话通过 `send_message` 发送 steering 请求，子代理需要通过直接父子上行通道把回复交回父控制器，再由父控制器注入父会话，而不是让子代理越级调用父代理管理工具。
 - 2026-08-04：用户确认最终工具名为 `spawn_agent`、`send_message`、`wait_agent`、`interrupt_agent`、`terminate_agent`、`get_agent_status` 与 `get_agent_tree`。
-- 2026-08-04：用户确认所有定向控制工具统一使用不透明字符串 `agent_id`；它在代理树内唯一、节点生命周期内稳定、根会话期间不复用，显示名称不参与寻址，调用者不得从其编码推断树结构。
+- 2026-08-04：用户确认所有定向控制工具统一使用 `agent_id`；它在代理树内唯一、节点生命周期内稳定、根会话期间不复用，显示名称不参与寻址，调用者不得从其值推断树结构。
 - 2026-08-04：用户确认所有控制工具统一返回 JSON：成功为 `{ ok: true, data }`，预期失败通过 `SubagentToolError` 使 Pi 标记 `isError`，其消息为 `{ ok: false, error: { code, message, retryable, details? } }`；调用方只依赖稳定的 `snake_case` 错误码，内部异常统一转换为 `internal_error`。
 - 2026-08-04：用户确认 `spawn_agent` 只负责创建并完成握手，不携带首条任务消息；首条及后续父子消息统一通过 `send_message` 发送。
 - 2026-08-04：用户将 `spawn_agent` 创建请求收紧为 `template_id` 与 `name` 均必填；不允许省略模板以使用默认值，也不允许创建匿名节点。`name` 仍只是可重复的展示标签，不参与寻址。
@@ -268,3 +270,8 @@ Blocked by: none
 - 2026-08-04：用户最终确认 `terminate_agent` 成功摘要保留 `agent_id`、`state: "terminated"`、`changed`、`forced` 与 `terminated_count`；计数仅表示同一共享终止流程中实际转为 `terminated` 的目标及后代数，纯幂等调用为 `0`，不返回后代 ID 列表。
 - 2026-08-04：用户确认 `interrupt_agent` 成功结果只包含 `agent_id`、`accepted`、`changed` 与准确 `state`；新中断为 `changed: true, state: "interrupting"`，幂等或无活动节点为 `changed: false`，故障节点另附 `data.error`，不返回重复的 `reason` 字段。
 - 2026-08-04：用户确认公开生命周期状态集合固定为 `starting`、`idle`、`working`、`interrupting`、`failed`、`terminating`、`terminated`；`queued` 与 `exited` 不作为公开状态，待处理消息用计数表示，意外进程退出折算为 `failed`，终止流程中的预期退出折算为 `terminated`。
+- 2026-08-04：用户在“确定子代理能力与上下文继承规则”中修订管理工具可见性：模板可用 `subagents: disabled` 主动关闭子代理管理能力；此时即使节点尚未达到 `maxDepth`，七个管理工具也整组隐藏，后代不能重新开启。原有 `maxDepth` 规则保留为独立硬上限。
+- 2026-08-04：用户在“确定子代理能力与上下文继承规则”中扩展公开错误码闭集，新增不可重试的 `template_capability_unavailable`：模板存在且格式有效，但当前父会话有效授权缺少模板必需工具或其他能力时，在预留名额和启动进程前整体拒绝创建；安全诊断放入 `details`。
+- 2026-08-05：用户在“确定深度、并发与资源配额”中扩展公开错误码闭集，新增可重试的 `max_tree_agents_reached`：全树中除根会话外尚未 `terminated` 的节点已达到根配额，完成节点终止与资源回收释放名额后可以重试。
+- 2026-08-05：06 号票据最终修订并冻结配置故障语义：已选中的项目或用户配置层不可读、JSON 无法解析或已知配额字段非法时直接采用该字段内置默认值，不回退低优先级层；未知字段通过根 UI-only warning 提示后忽略；非法显式根参数拒绝启动。此前关于坏配置层静默跳过或向下回退的历史记录不再代表最终规范。
+- 2026-08-05：用户补充确认 `agent_id` 字段的值使用 UUID。为保持生成不可预测、与树结构及创建顺序无关，控制器采用随机 UUID v4 生成值，并统一使用 RFC 9562 canonical 小写文本格式；输入校验不额外限制 UUID 版本，非 UUID 文本才返回 `invalid_argument`。`message_id`、`request_id`、`stream_id` 和传输序号仍保持独立命名空间。

@@ -17,6 +17,17 @@ const RESET = "\x1b[0m";
 const QUESTION =
   "七态生命周期能否在启动失败、中断后继续、迟到事件、等待竞态和级联终止下保持单向且可解释？";
 
+const DEMO_IDS = Object.freeze({
+  interrupt: "550e8400-e29b-41d4-a716-446655440000",
+  startup: "550e8400-e29b-41d4-a716-446655440001",
+  delivery: "550e8400-e29b-41d4-a716-446655440002",
+  cascadeRoot: "550e8400-e29b-41d4-a716-446655440003",
+  cascadeChild: "550e8400-e29b-41d4-a716-446655440004",
+  orphanParent: "550e8400-e29b-41d4-a716-446655440005",
+  orphanChild: "550e8400-e29b-41d4-a716-446655440006",
+  orphanGrandchild: "550e8400-e29b-41d4-a716-446655440007",
+});
+
 function action(type, agentId, extra = {}) {
   return { type, agent_id: agentId, ...extra };
 }
@@ -176,190 +187,202 @@ function runDemo() {
   let interruptModel = createModel();
   interruptModel = applyDemoStep(interruptModel, "1. 登记节点 a", {
     type: "register",
-    agent_id: "a",
+    agent_id: DEMO_IDS.interrupt,
     parent_agent_id: null,
   });
   interruptModel = applyDemoStep(
     interruptModel,
     "2. 握手完成：starting -> idle",
-    action("handshake_completed", "a"),
+    action("handshake_completed", DEMO_IDS.interrupt),
   );
   interruptModel = applyDemoStep(
     interruptModel,
     "3. 首条消息进入控制器队列",
-    action("admit_message", "a", { message_id: "m1" }),
+    action("admit_message", DEMO_IDS.interrupt, { message_id: "m1" }),
   );
   interruptModel = applyDemoStep(
     interruptModel,
     "4. RPC 接受首条消息：idle -> working",
-    action("accept_message", "a", { message_id: "m1" }),
+    action("accept_message", DEMO_IDS.interrupt, { message_id: "m1" }),
   );
   interruptModel = applyDemoStep(
     interruptModel,
     "5. 登记等待器 w1",
-    action("wait_start", "a", { wait_id: "w1" }),
+    action("wait_start", DEMO_IDS.interrupt, { wait_id: "w1" }),
   );
   interruptModel = applyDemoStep(
     interruptModel,
     "6. 接纳中断：working -> interrupting",
-    action("interrupt_requested", "a"),
+    action("interrupt_requested", DEMO_IDS.interrupt),
   );
   interruptModel = applyDemoStep(
     interruptModel,
     "7. agent_end 不结束 interrupting",
-    action("agent_end", "a"),
+    action("agent_end", DEMO_IDS.interrupt),
   );
   interruptModel = applyDemoStep(
     interruptModel,
     "8. 中断期间追加消息 m2，留在控制器队列",
-    action("admit_message", "a", { message_id: "m2" }),
+    action("admit_message", DEMO_IDS.interrupt, { message_id: "m2" }),
   );
   interruptModel = applyDemoStep(
     interruptModel,
     "9. agent_settled：interrupting -> idle，并完成 w1",
-    action("agent_settled", "a"),
+    action("agent_settled", DEMO_IDS.interrupt),
   );
   interruptModel = applyDemoStep(
     interruptModel,
     "10. m2 获得接受：idle -> working",
-    action("accept_message", "a", { message_id: "m2" }),
+    action("accept_message", DEMO_IDS.interrupt, { message_id: "m2" }),
     (model) => getWaitResult(model, "w1"),
   );
   const waitRaceObservation = getWaitResult(interruptModel, "w1");
   interruptModel = applyDemoStep(
     interruptModel,
     "11. 终止屏障：working -> terminating",
-    action("terminate_subtree", "a"),
+    action("terminate_subtree", DEMO_IDS.interrupt),
   );
   interruptModel = applyDemoStep(
     interruptModel,
     "12. 迟到 agent_settled 被终止优先级忽略",
-    action("agent_settled", "a"),
+    action("agent_settled", DEMO_IDS.interrupt),
   );
   const lateSettleObservation = structuredClone(interruptModel.last_result);
   interruptModel = applyDemoStep(
     interruptModel,
     "13. 回收未完成：保持 terminating 并附故障",
-    action("termination_incomplete", "a"),
+    action("termination_incomplete", DEMO_IDS.interrupt),
   );
   const incompleteObservation = inspectModel(interruptModel).nodes.find(
-    (node) => node.agent_id === "a",
+    (node) => node.agent_id === DEMO_IDS.interrupt,
   );
   interruptModel = applyDemoStep(
     interruptModel,
     "14. 资源确认回收：terminating -> terminated",
-    action("resource_reclaimed", "a"),
+    action("resource_reclaimed", DEMO_IDS.interrupt),
   );
 
   let startupModel = createModel();
   startupModel = applyAction(startupModel, {
     type: "register",
-    agent_id: "s",
+    agent_id: DEMO_IDS.startup,
     parent_agent_id: null,
   });
   startupModel = applyAction(
     startupModel,
-    action("wait_start", "s", { wait_id: "ws" }),
+    action("wait_start", DEMO_IDS.startup, { wait_id: "ws" }),
   );
   startupModel = applyDemoStep(
     startupModel,
     "15. 启动超时：starting -> failed -> terminating",
-    action("startup_failed", "s", { code: "spawn_timeout" }),
+    action("startup_failed", DEMO_IDS.startup, { code: "spawn_timeout" }),
     (model) => getWaitResult(model, "ws"),
   );
   const startupWaitObservation = getWaitResult(startupModel, "ws");
   startupModel = applyDemoStep(
     startupModel,
     "16. 启动残留回收：terminating -> terminated",
-    action("resource_reclaimed", "s"),
+    action("resource_reclaimed", DEMO_IDS.startup),
   );
 
   let deliveryModel = createModel();
   for (const nextAction of [
-    { type: "register", agent_id: "u", parent_agent_id: null },
-    action("handshake_completed", "u"),
-    action("admit_message", "u", { message_id: "mu" }),
+    { type: "register", agent_id: DEMO_IDS.delivery, parent_agent_id: null },
+    action("handshake_completed", DEMO_IDS.delivery),
+    action("admit_message", DEMO_IDS.delivery, { message_id: "mu" }),
   ]) {
     deliveryModel = applyAction(deliveryModel, nextAction);
   }
   deliveryModel = applyDemoStep(
     deliveryModel,
     "17. 交付接受状态未知：工具失败但节点仍 idle",
-    action("delivery_unknown", "u", { message_id: "mu" }),
+    action("delivery_unknown", DEMO_IDS.delivery, { message_id: "mu" }),
   );
   const deliveryUnknownObservation = inspectModel(deliveryModel).nodes[0];
   deliveryModel = applyDemoStep(
     deliveryModel,
     "18. 后续 settle 消解未决交付，不把节点置为 failed",
-    action("agent_settled", "u"),
+    action("agent_settled", DEMO_IDS.delivery),
   );
   const deliveryResolvedObservation = inspectModel(deliveryModel).nodes[0];
 
   let cascadeModel = createModel();
   for (const nextAction of [
-    { type: "register", agent_id: "r", parent_agent_id: null },
-    action("handshake_completed", "r"),
-    { type: "register", agent_id: "d", parent_agent_id: "r" },
-    action("handshake_completed", "d"),
+    { type: "register", agent_id: DEMO_IDS.cascadeRoot, parent_agent_id: null },
+    action("handshake_completed", DEMO_IDS.cascadeRoot),
+    {
+      type: "register",
+      agent_id: DEMO_IDS.cascadeChild,
+      parent_agent_id: DEMO_IDS.cascadeRoot,
+    },
+    action("handshake_completed", DEMO_IDS.cascadeChild),
   ]) {
     cascadeModel = applyAction(cascadeModel, nextAction);
   }
   cascadeModel = applyDemoStep(
     cascadeModel,
     "19. 级联终止在一个 tree_revision 中覆盖 r 与 d",
-    action("terminate_subtree", "r"),
+    action("terminate_subtree", DEMO_IDS.cascadeRoot),
   );
   const cascadeBarrierObservation = inspectModel(cascadeModel);
   cascadeModel = applyDemoStep(
     cascadeModel,
     "20. 后代未终止前拒绝确认父节点回收",
-    action("resource_reclaimed", "r"),
+    action("resource_reclaimed", DEMO_IDS.cascadeRoot),
   );
   const earlyParentReclaimObservation = structuredClone(cascadeModel.last_result);
   cascadeModel = applyDemoStep(
     cascadeModel,
     "21. 先确认后代 d 回收",
-    action("resource_reclaimed", "d"),
+    action("resource_reclaimed", DEMO_IDS.cascadeChild),
   );
   cascadeModel = applyDemoStep(
     cascadeModel,
     "22. 再确认父节点 r 回收",
-    action("resource_reclaimed", "r"),
+    action("resource_reclaimed", DEMO_IDS.cascadeRoot),
   );
 
   let orphanModel = createModel();
   for (const nextAction of [
-    { type: "register", agent_id: "p", parent_agent_id: null },
-    action("handshake_completed", "p"),
-    { type: "register", agent_id: "c", parent_agent_id: "p" },
-    action("handshake_completed", "c"),
-    { type: "register", agent_id: "g", parent_agent_id: "c" },
-    action("handshake_completed", "g"),
+    { type: "register", agent_id: DEMO_IDS.orphanParent, parent_agent_id: null },
+    action("handshake_completed", DEMO_IDS.orphanParent),
+    {
+      type: "register",
+      agent_id: DEMO_IDS.orphanChild,
+      parent_agent_id: DEMO_IDS.orphanParent,
+    },
+    action("handshake_completed", DEMO_IDS.orphanChild),
+    {
+      type: "register",
+      agent_id: DEMO_IDS.orphanGrandchild,
+      parent_agent_id: DEMO_IDS.orphanChild,
+    },
+    action("handshake_completed", DEMO_IDS.orphanGrandchild),
   ]) {
     orphanModel = applyAction(orphanModel, nextAction);
   }
   orphanModel = applyDemoStep(
     orphanModel,
     "23. 中间节点 c 崩溃：c 保持 failed，后代 g 自动 terminating",
-    action("runtime_failed", "c", { code: "process_exited" }),
+    action("runtime_failed", DEMO_IDS.orphanChild, { code: "process_exited" }),
   );
   const orphanObservation = inspectModel(orphanModel).nodes.filter((node) =>
-    ["c", "g"].includes(node.agent_id),
+    [DEMO_IDS.orphanChild, DEMO_IDS.orphanGrandchild].includes(node.agent_id),
   );
   orphanModel = applyDemoStep(
     orphanModel,
     "24. 先确认后代 g 回收",
-    action("resource_reclaimed", "g"),
+    action("resource_reclaimed", DEMO_IDS.orphanGrandchild),
   );
   orphanModel = applyDemoStep(
     orphanModel,
     "25. 直接父显式终止故障节点 c",
-    action("terminate_subtree", "c"),
+    action("terminate_subtree", DEMO_IDS.orphanChild),
   );
   orphanModel = applyDemoStep(
     orphanModel,
     "26. c 在后代终止后完成回收",
-    action("resource_reclaimed", "c"),
+    action("resource_reclaimed", DEMO_IDS.orphanChild),
   );
 
   console.log(`\n${BOLD}演示完成${RESET}`);

@@ -18,7 +18,7 @@ Blocked by: 01, 02
 
 | 状态 | 精确定义 | 是否接受新父子消息 | 是否占直接子代理名额 |
 | --- | --- | --- | --- |
-| `starting` | 已登记节点并预留名额，正在启动进程和完成 RPC 握手 | 否 | 是 |
+| `starting` | 已登记节点并预留名额，正在启动进程和确认 RPC 可通信 | 否 | 是 |
 | `idle` | RPC 可通信，当前没有活动处理 | 是 | 是 |
 | `working` | 当前 prompt 已被 Pi 接受并处于一次活动处理内 | 是，作为 steering | 是 |
 | `interrupting` | 协作式中断意图已接纳，但尚未收到最终 `agent_settled` | 是，排在中断之后 | 是 |
@@ -34,9 +34,9 @@ Blocked by: 01, 02
 
 | 当前状态 | 触发条件 | 下一状态 | 关键约束 |
 | --- | --- | --- | --- |
-| 无节点 | 原子预留名额、分配不可复用 `agent_id` 并登记关系 | `starting` | 登记先于进程启动，树视图可观察启动窗口 |
-| `starting` | RPC 握手完成且确认可通信 | `idle` | `spawn_agent` 只有到达这里才成功返回 |
-| `starting` | 启动、提前退出、握手、协议或启动期限失败 | `failed -> terminating` | 先留下故障转换记录，再自动清理；资源确认后进入 `terminated` |
+| 无节点 | 原子预留名额、分配不可复用的 UUID v4 `agent_id` 并登记关系 | `starting` | 登记先于进程启动，树视图可观察启动窗口 |
+| `starting` | 无副作用的 RPC 请求与响应完成，确认协议可通信 | `idle` | `spawn_agent` 只有到达这里才成功返回；不校验最终能力快照 |
+| `starting` | 启动、提前退出、RPC 通信、协议或启动期限失败 | `failed -> terminating` | 先留下故障转换记录，再自动清理；资源确认后进入 `terminated` |
 | `idle` | prompt 获得 RPC 接受确认 | `working` | 接受前不得提前改变状态 |
 | `working` | 新 steering 获得 RPC 接受确认 | `working` | 只更新消息计数，不新建 `queued` 状态 |
 | `working` | `agent_settled` | `idle` | `agent_end`、turn/message/tool 结束均不能代替 settle |
@@ -116,7 +116,7 @@ Blocked by: 01, 02
 
 ### 启动失败、运行故障与所有者结束
 
-创建时先分配不可复用的 `agent_id`、登记 `starting` 并原子预留名额。启动或握手失败采用以下路径：
+创建时先分配不可复用的 UUID v4 `agent_id`、登记 `starting` 并原子预留名额。启动或握手失败采用以下路径：
 
 ```text
 starting -> failed -> terminating -> terminated
@@ -128,7 +128,7 @@ starting -> failed -> terminating -> terminated
 
 终止被接纳时，控制器在一个原子树修订中固定目标及全部已登记后代，对所有未终止节点建立屏障并转为 `terminating`。并发子节点登记在线性化顺序上若先完成则纳入本次子树，若落后于屏障则拒绝，不能形成逃逸节点。实际确认采用后代优先顺序；只要任何后代尚未 `terminated`，父节点就不能确认 `terminated`。
 
-根会话退出、`new`、`resume`、`fork`、`reload` 或扩展 runtime 关闭时，自动对所有直接子代理启动同一套级联终止，无需用户逐个调用工具。中间节点意外崩溃时，该节点先保留为 `failed`，监督器只对其后代自动建立防孤儿终止屏障；故障父节点继续占用其直接父会话名额，直到直接父会话显式终止。根会话清理结束后释放所有终止记录，不跨会话恢复。
+根会话退出、`new`、`resume`、`fork` 或扩展 runtime 真正关闭时，自动对所有直接子代理启动同一套级联终止，无需用户逐个调用工具。成功的 Pi `/reload` 通过控制器交接保留既有节点，只刷新模板发现和 Pi 动态资源；若新扩展实例兼容门禁失败，则按 09 号票据清理整棵树。中间节点意外崩溃时，该节点先保留为 `failed`，监督器只对其后代自动建立防孤儿终止屏障；故障父节点继续占用其直接父会话名额，直到直接父会话显式终止。根会话清理结束后释放所有终止记录，不跨会话恢复。
 
 ### 修订号、时间与当前故障
 
@@ -158,10 +158,12 @@ node .scratch/pi-subagent-spec/prototypes/lifecycle-state-machine-throwaway/tui.
 
 ## Comments
 
+- 2026-08-05：最终规格收敛时按后续 04、05、09、10 号票据修正 reload 边界：成功 reload 保留既有代理树并仅影响动态资源及未来创建；reload 新实例兼容门禁失败才清理整棵树。本条取代答案中早期把任意 reload 等同于根关闭的表述。
+
 - 2026-08-04：用户确认公开生命周期状态固定为 `starting`、`idle`、`working`、`interrupting`、`failed`、`terminating`、`terminated`；不公开 `queued` 或 `exited`，分别用待处理消息计数和 `failed`/`terminated` 结果表达。
 - 2026-08-04：用户确认公开状态由“控制器已经接纳的意图”与“Pi 或资源监督器已经确认的事实”共同驱动：登记节点进入 `starting`；RPC 握手完成且确认可通信后进入 `idle`；`prompt` 获得 RPC 接受后进入 `working`；中断请求被控制器接纳后立即进入 `interrupting`；只有 `agent_settled` 能把活动节点推进回 `idle`，`agent_end` 不能；终止屏障被控制器接纳后立即进入 `terminating`；资源回收得到确认后进入 `terminated`；意外退出以及 RPC/协议故障进入 `failed`。
 - 2026-08-04：用户确认 Pi `get_state` 只用于启动同步或检测到事件缺口后的异常重同步，不能在正常路径覆盖事件驱动的公开生命周期；每次公开状态或其他可见状态元数据发生变化时，节点 `revision` 都必须单调递增。
-- 2026-08-04：用户确认创建时先分配不可复用的 `agent_id`，登记 `starting` 并原子预留直接子代理名额；启动、握手或启动期限失败时先记录 `failed` 故障，再自动转入 `terminating` 执行清理，资源回收确认后转为 `terminated` 并释放名额；`spawn_agent` 只在清理确认后返回 `spawn_failed` 或 `spawn_timeout`，终止记录保留至根会话结束，诊断可携带 `details.agent_id` 但该节点不可继续操作。
+- 2026-08-04：用户确认创建时先分配不可复用的 UUID v4 `agent_id`，登记 `starting` 并原子预留直接子代理名额；启动、握手或启动期限失败时先记录 `failed` 故障，再自动转入 `terminating` 执行清理，资源回收确认后转为 `terminated` 并释放名额；`spawn_agent` 只在清理确认后返回 `spawn_failed` 或 `spawn_timeout`，终止记录保留至根会话结束，诊断可携带 `details.agent_id` 但该节点不可继续操作。
 - 2026-08-04：用户确认终止清理在优雅关闭和强制回收后仍无法确认部分资源退出时，已确认回收的节点可先进入 `terminated`，目标以及仍有未确认资源的相关节点保持 `terminating` 并附带 `termination_incomplete` 故障；终止工具返回顶层错误，终止屏障持续生效，未终止节点继续占名额；后续幂等终止重试确认全部资源后才进入 `terminated`。`failed` 保留给终止意图建立前的意外运行故障。
 - 2026-08-04：用户确认运行期节点意外退出或发生无法继续通信的 RPC/协议故障时，在必要的短暂重同步后进入稳定的 `failed`；控制器不自动重启、不复用原 `agent_id`，已公开为 `failed` 后也不能由 `get_state` 恢复为 `idle` 或 `working`。故障节点拒绝新消息，但仍可查询、等待和显式终止；在 `terminate_agent` 确认资源回收前继续占直接子代理名额，随后经 `terminating` 进入 `terminated` 并释放名额。
 - 2026-08-04：用户确认级联终止被接纳时，控制器在一个原子树状态变更中固定目标及其全部已登记后代，并为所有尚未终止的节点同时建立终止屏障、转为 `terminating`；与之并发的子节点登记若先完成则纳入本次终止，若在线性化顺序上落后则拒绝，不能形成逃逸进程。资源清理按后代优先、父节点最后确认；已终止记录不变，全部后代确认回收后目标才能进入 `terminated`。
