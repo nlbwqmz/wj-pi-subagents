@@ -210,11 +210,17 @@ function isSupportedPlatform(platform: NodeJS.Platform): platform is SupportedPl
   return (SUPPORTED_PLATFORMS as readonly string[]).includes(platform);
 }
 
-/** 按宿主平台加载已交付的生产进程树适配器；未交付的平台保持失败关闭。 */
+/** 按宿主平台加载已交付的生产进程树适配器；未验证平台保持失败关闭。 */
 async function loadDefaultProcessTreeAdapter(platform: NodeJS.Platform): Promise<unknown> {
-  if (platform !== "win32") return undefined;
-  const { WindowsJobObjectAdapter } = await import("./windows-job-object-adapter.ts");
-  return new WindowsJobObjectAdapter();
+  if (platform === "win32") {
+    const { WindowsJobObjectAdapter } = await import("./windows-job-object-adapter.ts");
+    return new WindowsJobObjectAdapter();
+  }
+  if (platform === "darwin" || platform === "linux") {
+    const { UnixProcessTreeAdapter } = await import("./unix-process-tree-adapter.ts");
+    return new UnixProcessTreeAdapter({ platform });
+  }
+  return undefined;
 }
 
 function formatHostCapabilityDiagnostic(diagnostic: HostCapabilityDiagnostic): string {

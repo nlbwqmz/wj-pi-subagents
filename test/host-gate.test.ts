@@ -236,16 +236,25 @@ test("受支持平台缺失进程树适配器时拒绝激活", async () => {
   }
 });
 
-test("尚未交付 Unix 适配器时标准入口保持失败关闭", async () => {
-  const probe = readyOverrides();
+test("Unix 标准入口按宿主能力加载 process group/session 适配器", async () => {
+  const platform = process.platform === "darwin" || process.platform === "linux"
+    ? process.platform
+    : "linux";
+  const probe = readyOverrides({ platform });
   delete probe.loadProcessTreeAdapter;
   const result = await checkHostCapabilities({
     extensionApi: readyApi(),
     ...probe,
   });
 
-  assert.equal(result.ok, false);
-  if (!result.ok) assert.equal(result.diagnostic.reason, "process_tree_adapter_unavailable");
+  const available = process.platform === "darwin" || process.platform === "linux";
+  assert.equal(result.ok, available);
+  if (result.ok) {
+    assert.equal(result.processTreeAdapter.platform, platform);
+    assert.equal(result.processTreeAdapter.strategy, "process_group_or_session");
+  } else {
+    assert.equal(result.diagnostic.reason, "process_tree_adapter_unavailable");
+  }
 });
 
 test("Windows 标准入口加载 Job Object 适配器", async () => {
