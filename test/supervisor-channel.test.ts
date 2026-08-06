@@ -178,6 +178,49 @@ test("完整握手后快照按 subtree_revision 原子替换并分配 tree_revis
   assert.equal(pair.parent.getTreeSnapshot().nodes.length, 2);
 });
 
+test("递归快照只往返固定安全活动类别和计数", () => {
+  const pair = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+  });
+  handshake(pair);
+  pair.child.sendSnapshot([Object.freeze({
+    ...node(CHILD_ID, null, 1, "working"),
+    activity: Object.freeze({ category: "editing" as const, active_count: 2 }),
+  })], 2);
+  pair.flush();
+  assert.deepEqual(pair.parent.getTreeSnapshot().nodes[0]?.activity, {
+    category: "editing",
+    active_count: 2,
+  });
+
+  assertProtocolError(() => pair.child.publishSnapshot([Object.freeze({
+    ...node(CHILD_ID, null, 1, "working"),
+    activity: {
+      category: "editing",
+      active_count: 1,
+      path: "D:\\private\\secret-canary.txt",
+    },
+  })], 3), "snapshot_invalid");
+  assertProtocolError(() => pair.child.publishSnapshot([Object.freeze({
+    ...node(CHILD_ID, null, 1, "working"),
+    state: "failed" as const,
+    error: Object.freeze({
+      code: "internal_error" as const,
+      message: "D:\\private\\secret-canary.txt",
+      retryable: false,
+      observed_at: "2026-08-05T12:00:01.000Z",
+    }),
+  })], 3), "snapshot_invalid");
+  assertProtocolError(() => pair.child.publishSnapshot([Object.freeze({
+    ...node(CHILD_ID, null, 1),
+    state: "starting" as const,
+    activity: Object.freeze({ category: "running" as const, active_count: 1 }),
+  })], 3), "snapshot_invalid");
+  assert.doesNotMatch(JSON.stringify(pair.parent.getTreeSnapshot()), /secret-canary|private/i);
+});
+
 test("重复帧只回 ACK，断序仅请求一次 reset 快照且不应用缺口帧", () => {
   const pair = createFakeSupervisorChannelPair({ rootId: ROOT_ID, childAgentId: CHILD_ID, credential: CREDENTIAL });
   handshake(pair);

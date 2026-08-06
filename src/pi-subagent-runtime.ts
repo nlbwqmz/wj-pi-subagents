@@ -67,11 +67,20 @@ import {
   type ControlResult,
   type TreeActor,
 } from "./tree-controller.ts";
+import {
+  bindAgentTreeUi,
+  type AgentTreeUiBinding,
+  type AgentTreeUiContext,
+} from "./agent-tree-ui.ts";
 
 export const PI_SUBAGENT_REPLY_MESSAGE_TYPE = "pi-subagent-reply" as const;
 
 interface RuntimeExtensionApi extends AgentToolRegistrationApi {
   on(event: string, handler: (event: unknown, context: unknown) => unknown): void;
+  registerCommand(name: string, options: {
+    readonly description: string;
+    readonly handler: (args: string, context: unknown) => unknown;
+  }): void;
   getActiveTools(): string[];
   getAllTools(): unknown[];
   setActiveTools?(tools: readonly string[]): void;
@@ -86,10 +95,8 @@ interface RuntimeModel {
   readonly thinkingLevelMap?: Readonly<Record<string, unknown>>;
 }
 
-interface RuntimeContextView {
+interface RuntimeContextView extends AgentTreeUiContext {
   readonly cwd?: unknown;
-  readonly hasUI?: unknown;
-  readonly ui?: { readonly notify?: unknown };
   readonly model?: unknown;
   readonly thinkingLevel?: unknown;
   readonly modelRegistry?: unknown;
@@ -549,8 +556,28 @@ export function createPiSubagentRuntimeActivator(
     const api = asRuntimeApi(extensionApi);
     let active: ActiveRuntime | undefined;
     let lifecycle: Promise<void> = Promise.resolve();
+    let runtimeUi: { readonly runtime: ActiveRuntime; readonly binding: AgentTreeUiBinding } | undefined;
+
+    const disposeRuntimeUi = (current?: ActiveRuntime): void => {
+      const registered = runtimeUi;
+      if (registered === undefined || (current !== undefined && registered.runtime !== current)) return;
+      runtimeUi = undefined;
+      registered.binding.dispose();
+    };
+
+    const bindRuntimeUi = (current: ActiveRuntime, context: RuntimeContextView): void => {
+      disposeRuntimeUi();
+      runtimeUi = Object.freeze({
+        runtime: current,
+        binding: bindAgentTreeUi({
+          read: () => current.controller.getAgentTree(),
+          onChange: (listener) => current.tree.onChange(listener),
+        }, context),
+      });
+    };
 
     const relinquishAuthority = (current: ActiveRuntime): boolean => {
+      disposeRuntimeUi(current);
       if (current.isChild) return false;
       const authority = runtimeAuthorities.get(current.rootId);
       if (authority?.tree === current.tree) {
@@ -561,6 +588,7 @@ export function createPiSubagentRuntimeActivator(
     };
 
     const releaseAuthority = (current: ActiveRuntime): void => {
+      disposeRuntimeUi(current);
       if (current.isChild) return;
       relinquishAuthority(current);
       current.tree.clearTerminatedRecords();
@@ -571,6 +599,21 @@ export function createPiSubagentRuntimeActivator(
       return active?.handoffPending === true
         ? undefined as unknown as AgentController
         : active?.controller as AgentController;
+    });
+
+    api.registerCommand("agent", {
+      description: "查看当前会话作用域内的只读代理树",
+      handler: async (_args, rawContext) => {
+        const current = active;
+        if (current === undefined || current.handoffPending === true) return;
+        const context = readContext(rawContext);
+        current.bindings.context = context;
+        const registered = runtimeUi;
+        if (registered === undefined || registered.runtime !== current) {
+          bindRuntimeUi(current, context);
+        }
+        await runtimeUi?.binding.openPanel(context);
+      },
     });
 
     api.on("message_end", (event) => {
@@ -653,6 +696,7 @@ export function createPiSubagentRuntimeActivator(
       releaseUpstream = true,
       parentBarrierEstablished = false,
     ): Promise<boolean> => {
+      disposeRuntimeUi(current);
       let complete: boolean;
       try {
         complete = parentBarrierEstablished
@@ -721,6 +765,7 @@ export function createPiSubagentRuntimeActivator(
         active.bindings.context = context;
         publishReloadSnapshot(active, context);
         applyManagementToolVisibility(api, active.managementEnabled);
+        bindRuntimeUi(active, context);
         return;
       }
       if (sessionEvent.reason === "reload") {
@@ -746,6 +791,7 @@ export function createPiSubagentRuntimeActivator(
           reloadCoordinator.commitIncoming(incoming);
           active = current;
           applyManagementToolVisibility(api, current.managementEnabled);
+          bindRuntimeUi(current, context);
           try {
             options.onController?.(current.controller);
           } catch {
@@ -947,6 +993,7 @@ export function createPiSubagentRuntimeActivator(
         }));
       }
       applyManagementToolVisibility(api, state.managementEnabled);
+      bindRuntimeUi(state, context);
       try {
         options.onController?.(controller);
       } catch {
@@ -962,6 +1009,7 @@ export function createPiSubagentRuntimeActivator(
       }
       const reason = isRecord(event) ? event.reason : undefined;
       if (reason === "reload" && reloadCoordinator.beginHandoff(current)) {
+        disposeRuntimeUi(current);
         applyManagementToolVisibility(api, false);
         return;
       }

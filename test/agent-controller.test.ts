@@ -152,6 +152,54 @@ test("直接父子旅程闭合 spawn、prompt、steering、wait 和协作式 int
   }
 });
 
+test("已确认工具活动只以固定类别和计数进入控制器安全树快照", async () => {
+  const id = "45454545-4545-4545-8545-454545454545";
+  const tree = makeTree(id);
+  let node: FakeManagedRpcNode | undefined;
+  const controller = new AgentController({
+    tree,
+    allowUnvalidatedTemplates: true,
+    createSupervisor: ({ actor, reservation }) => {
+      node = new FakeManagedRpcNode();
+      return new RpcSupervisor({
+        controller: tree,
+        actor,
+        reservation,
+        managedNode: node,
+        channel: new ReadyChannel(),
+        startupTimeoutMs: 100,
+        gracefulShutdownMs: 10,
+      });
+    },
+  });
+  const spawned = await controller.spawnAgent({ template_id: "researcher", name: "活动代理" });
+  assert.equal(spawned.ok, true);
+  assert.ok(node);
+
+  node.emitEvent({
+    type: "tool_execution_start",
+    toolCallId: "secret-call-id",
+    toolName: "apply_patch",
+    args: { path: "D:\\private\\secret-canary.txt", patch: "TOP_SECRET" },
+  });
+  const active = controller.getAgentTree();
+  assert.equal(active.ok, true);
+  if (!active.ok) return;
+  assert.deepEqual(active.data.nodes[0]?.activity, { category: "editing", active_count: 1 });
+  assert.doesNotMatch(JSON.stringify(active.data), /secret-call-id|secret-canary|TOP_SECRET|apply_patch/i);
+
+  node.emitEvent({
+    type: "tool_execution_end",
+    toolCallId: "secret-call-id",
+    toolName: "apply_patch",
+    result: { output: "TOP_SECRET_RESULT" },
+    isError: false,
+  });
+  const settled = controller.getAgentTree();
+  assert.equal(settled.ok, true);
+  if (settled.ok) assert.equal(settled.data.nodes[0]?.activity, undefined);
+});
+
 test("等待参数越界和非直接子代理调用在启动 RPC 前稳定失败", async () => {
   const tree = new TreeController({
     config: { maxDepth: 2, maxChildrenPerAgent: 4, maxAgentsPerTree: 16, waitTimeoutMs: 60_000 },
@@ -362,6 +410,98 @@ test("运行期监督故障自动清理后代但保留 failed 父节点，显式
   const explicit = await root.terminateAgent(parentId);
   assert.equal(explicit.ok, true);
   assert.equal(parentSupervisor!.terminationCalls, 1);
+});
+
+test("同批防孤儿清理失败只发布一个树修订并聚合全部后代", async () => {
+  const parentId = "a3111111-1111-4111-8111-111111111111";
+  const childIds = [
+    "a3222222-2222-4222-8222-222222222221",
+    "a3222222-2222-4222-8222-222222222222",
+  ];
+  const ids = [parentId, ...childIds];
+  let nextId = 0;
+  const tree = new TreeController({
+    config: { maxDepth: 2, maxChildrenPerAgent: 4, maxAgentsPerTree: 16, waitTimeoutMs: 60_000 },
+    idFactory: () => ids[nextId++]!,
+  });
+  const reserveReady = (
+    actor: typeof ROOT_TREE_ACTOR | { kind: "agent"; agent_id: string },
+    input: { templateId: string; name: string },
+  ): string => {
+    const reserved = tree.reserveStartingChild(actor, input);
+    assert.equal(reserved.ok, true);
+    if (!reserved.ok) throw new Error("预留失败");
+    const ready = tree.applyLifecycleEvent(reserved.data.node.agent_id, {
+      type: "startup_ready",
+      expected_generation: reserved.data.lifecycle_generation,
+    });
+    assert.equal(ready.ok, true);
+    return reserved.data.node.agent_id;
+  };
+  let parentSupervisor: ControlledSupervisor;
+  const root = new AgentController({
+    tree,
+    allowUnvalidatedTemplates: true,
+    createSupervisor: () => {
+      parentSupervisor = new ControlledSupervisor(
+        async () => ({ ok: true, agent_id: parentId, state: "idle" }),
+        async () => ({ ok: true, agent_id: parentId, state: "terminated", cleanup: "confirmed" }),
+        async () => false,
+      );
+      reserveReady(ROOT_TREE_ACTOR, { templateId: "parent", name: "父" });
+      return parentSupervisor;
+    },
+  });
+  let childIndex = 0;
+  const child = new AgentController({
+    tree,
+    actor: { kind: "agent", agent_id: parentId },
+    allowUnvalidatedTemplates: true,
+    createSupervisor: () => {
+      const childId = childIds[childIndex++]!;
+      const supervisor = new ControlledSupervisor(
+        async () => ({ ok: true, agent_id: childId, state: "idle" }),
+        async () => ({ ok: true, agent_id: childId, state: "terminated", cleanup: "confirmed" }),
+      );
+      reserveReady({ kind: "agent", agent_id: parentId }, { templateId: "child", name: `子${childIndex}` });
+      return supervisor;
+    },
+  });
+  assert.equal((await root.spawnAgent({ template_id: "parent", name: "父" })).ok, true);
+  assert.equal((await child.spawnAgent({ template_id: "child", name: "子一" })).ok, true);
+  assert.equal((await child.spawnAgent({ template_id: "child", name: "子二" })).ok, true);
+
+  const generation = tree.getLifecycleGeneration(parentId);
+  assert.equal(generation.ok, true);
+  if (!generation.ok) return;
+  assert.equal(tree.applyLifecycleEvent(parentId, {
+    type: "runtime_failed",
+    expected_generation: generation.data,
+    error_code: "internal_error",
+  }).ok, true);
+  const before = tree.getTreeSnapshot();
+  assert.equal(before.ok, true);
+  if (!before.ok) return;
+  const visibleRevisions: number[] = [];
+  const unsubscribe = tree.onChange(() => {
+    const snapshot = tree.getTreeSnapshot();
+    if (snapshot.ok) visibleRevisions.push(snapshot.data.tree_revision);
+  });
+  parentSupervisor!.emitEvent({ kind: "fault", code: "rpc_process_exit" });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  unsubscribe();
+
+  assert.deepEqual(visibleRevisions, [before.data.tree_revision + 1]);
+  assert.deepEqual(childIds.map((agentId) => {
+    const status = tree.getStatus(agentId);
+    return status.ok ? [status.data.state, status.data.error?.code] : ["missing", undefined];
+  }), [
+    ["terminating", "termination_incomplete"],
+    ["terminating", "termination_incomplete"],
+  ]);
+  child.dispose();
+  root.dispose();
 });
 
 test("启动失败只在清理不完整时保留监督器供 terminate_agent 重试", async () => {

@@ -1,18 +1,33 @@
 import { randomUUID } from "node:crypto";
 import type { RuntimeConfig } from "./root-runtime-context.ts";
+import {
+  AGENT_FAULT_CODES,
+  AGENT_FAULT_METADATA,
+  isCanonicalAgentUuid,
+  parseAgentActivitySummary,
+  parseAgentSnapshot,
+  type AgentActivityCategory,
+  type AgentActivitySummary,
+  type AgentFault,
+  type AgentFaultCode,
+  type AgentLifecycleState,
+  type AgentSnapshot,
+  type AgentTerminationResult,
+} from "./agent-snapshot-codec.ts";
 
-/** 子代理对外可观察的生命周期仅限这七种状态。 */
-export const AGENT_LIFECYCLE_STATES = Object.freeze([
-  "starting",
-  "idle",
-  "working",
-  "interrupting",
-  "failed",
-  "terminating",
-  "terminated",
-] as const);
-
-export type AgentLifecycleState = (typeof AGENT_LIFECYCLE_STATES)[number];
+export {
+  AGENT_ACTIVITY_CATEGORIES,
+  AGENT_FAULT_CODES,
+  AGENT_LIFECYCLE_STATES,
+  AGENT_TERMINATION_RESULTS,
+  type AgentActivityCategory,
+  type AgentActivitySummary,
+  type AgentFault,
+  type AgentFaultCode,
+  type AgentLifecycleState,
+  type AgentSnapshot,
+  type AgentTerminationResult,
+} from "./agent-snapshot-codec.ts";
 
 /** 公开控制面允许返回的稳定错误码闭集。 */
 export const PUBLIC_ERROR_CODES = Object.freeze([
@@ -34,24 +49,6 @@ export const PUBLIC_ERROR_CODES = Object.freeze([
 ] as const);
 
 export type PublicErrorCode = (typeof PUBLIC_ERROR_CODES)[number];
-
-/** 节点状态中可以保留的安全故障码，不保存底层异常文字。 */
-export const AGENT_FAULT_CODES = Object.freeze([
-  "spawn_failed",
-  "spawn_timeout",
-  "message_delivery_failed",
-  "termination_incomplete",
-  "internal_error",
-] as const);
-
-export type AgentFaultCode = (typeof AGENT_FAULT_CODES)[number];
-
-export interface AgentFault {
-  readonly code: AgentFaultCode;
-  readonly message: string;
-  readonly retryable: boolean;
-  readonly observed_at: string;
-}
 
 export interface PublicControlError {
   readonly code: PublicErrorCode;
@@ -87,12 +84,12 @@ const ERROR_METADATA: Readonly<Record<PublicErrorCode, Readonly<{
   max_depth_reached: Object.freeze({ message: "已达到最大代理深度", retryable: false }),
   max_children_reached: Object.freeze({ message: "直接子代理名额已满", retryable: true }),
   max_tree_agents_reached: Object.freeze({ message: "代理树名额已满", retryable: true }),
-  spawn_failed: Object.freeze({ message: "代理启动失败", retryable: false }),
-  spawn_timeout: Object.freeze({ message: "代理启动超时", retryable: true }),
+  spawn_failed: AGENT_FAULT_METADATA.spawn_failed,
+  spawn_timeout: AGENT_FAULT_METADATA.spawn_timeout,
   agent_unavailable: Object.freeze({ message: "代理当前不可用", retryable: false }),
-  message_delivery_failed: Object.freeze({ message: "消息未获确认接收", retryable: false }),
-  termination_incomplete: Object.freeze({ message: "代理资源尚未完全回收", retryable: true }),
-  internal_error: Object.freeze({ message: "控制器内部错误", retryable: false }),
+  message_delivery_failed: AGENT_FAULT_METADATA.message_delivery_failed,
+  termination_incomplete: AGENT_FAULT_METADATA.termination_incomplete,
+  internal_error: AGENT_FAULT_METADATA.internal_error,
 });
 
 /** 所有公开失败均从此处创建，避免把路径、异常或句柄带出控制器。 */
@@ -113,14 +110,12 @@ function controlSuccess<T>(data: T): ControlSuccess<T> {
   return Object.freeze({ ok: true, data });
 }
 
-const CANONICAL_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const CANONICAL_UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const RFC3339_MILLIS_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const MAX_ID_GENERATION_ATTEMPTS = 32;
 
 /** 判断输入是否为 RFC 9562 传输用的小写 canonical UUID 文本。 */
 export function isCanonicalUuid(value: unknown): value is string {
-  return typeof value === "string" && CANONICAL_UUID_PATTERN.test(value);
+  return isCanonicalAgentUuid(value);
 }
 
 /** 新分配身份必须额外满足 UUID v4 版本位。 */
@@ -148,23 +143,6 @@ export interface ReserveStartingChildInput {
   readonly templateId: string;
   readonly name: string;
   readonly subagents?: TemplateSubagentCapability;
-}
-
-export interface AgentSnapshot {
-  readonly agent_id: string;
-  readonly parent_agent_id: string | null;
-  readonly template_id: string;
-  readonly name: string;
-  readonly depth: number;
-  readonly state: AgentLifecycleState;
-  readonly pending_message_count: number;
-  readonly revision: number;
-  readonly observed_at: string;
-  /** 成功创建的线性化点；starting 节点没有该时间。 */
-  readonly created_at?: string;
-  /** 由单调时钟派生，活动节点持续累加，终态节点固定。 */
-  readonly lifecycle_elapsed_ms?: number;
-  readonly error?: AgentFault;
 }
 
 export interface AgentTreeSnapshot {
@@ -321,7 +299,12 @@ interface AgentRecord {
   createdAt: string | undefined;
   lifecycleStartedAt: number | undefined;
   frozenLifecycleElapsedMs: number | undefined;
+  activity: AgentActivitySummary | undefined;
+  activityCounts: Map<AgentActivityCategory, number>;
   error: AgentFault | undefined;
+  terminationResult: AgentTerminationResult | undefined;
+  terminationHadFailure: boolean;
+  terminationHadIncompleteCleanup: boolean;
   readonly scopeActorOnly: boolean;
 }
 
@@ -344,6 +327,12 @@ interface PublicMutation {
   readonly pendingMessageCount?: number;
   readonly errorCode?: AgentFaultCode;
   readonly clearError?: boolean;
+  /** undefined 表示保持，null 表示清除。 */
+  readonly activity?: AgentActivitySummary | null;
+}
+
+function isAgentActivitySummary(value: unknown, allowZero: boolean): value is AgentActivitySummary {
+  return parseAgentActivitySummary(value, allowZero) !== undefined;
 }
 
 function isAgentFaultCode(value: unknown): value is AgentFaultCode {
@@ -397,57 +386,8 @@ function validReserveInput(value: unknown): value is ReserveStartingChildInput {
   return candidate.subagents === undefined || candidate.subagents === "inherit" || candidate.subagents === "disabled";
 }
 
-function isAgentLifecycleState(value: unknown): value is AgentLifecycleState {
-  return typeof value === "string"
-    && (AGENT_LIFECYCLE_STATES as readonly string[]).includes(value);
-}
-
-function isSafeAgentFault(value: unknown): value is AgentFault {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const candidate = value as Record<string, unknown>;
-  return isAgentFaultCode(candidate.code)
-    && typeof candidate.message === "string"
-    && typeof candidate.retryable === "boolean"
-    && typeof candidate.observed_at === "string"
-    && RFC3339_MILLIS_PATTERN.test(candidate.observed_at)
-    && Object.keys(candidate).every((key) => ["code", "message", "retryable", "observed_at"].includes(key));
-}
-
 function isPublicAgentSnapshot(value: unknown): value is AgentSnapshot {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const candidate = value as Record<string, unknown>;
-  if (
-    !isCanonicalUuid(candidate.agent_id)
-    || (candidate.parent_agent_id !== null && !isCanonicalUuid(candidate.parent_agent_id))
-    || typeof candidate.template_id !== "string"
-    || typeof candidate.name !== "string"
-    || !Number.isSafeInteger(candidate.depth)
-    || (candidate.depth as number) < 1
-    || !isAgentLifecycleState(candidate.state)
-    || !Number.isSafeInteger(candidate.pending_message_count)
-    || (candidate.pending_message_count as number) < 0
-    || !Number.isSafeInteger(candidate.revision)
-    || (candidate.revision as number) < 1
-    || typeof candidate.observed_at !== "string"
-    || !RFC3339_MILLIS_PATTERN.test(candidate.observed_at)
-  ) return false;
-  if (
-    candidate.created_at !== undefined
-    && (typeof candidate.created_at !== "string" || !RFC3339_MILLIS_PATTERN.test(candidate.created_at))
-  ) return false;
-  if (
-    candidate.lifecycle_elapsed_ms !== undefined
-    && (!Number.isSafeInteger(candidate.lifecycle_elapsed_ms) || (candidate.lifecycle_elapsed_ms as number) < 0)
-  ) return false;
-  if (candidate.error !== undefined && !isSafeAgentFault(candidate.error)) return false;
-  if (candidate.state === "failed" && candidate.error === undefined) return false;
-  if (candidate.state === "terminated" && (candidate.pending_message_count !== 0 || candidate.error !== undefined)) return false;
-  const allowed = new Set([
-    "agent_id", "parent_agent_id", "template_id", "name", "depth", "state",
-    "pending_message_count", "revision", "observed_at", "created_at",
-    "lifecycle_elapsed_ms", "error",
-  ]);
-  return Object.keys(candidate).every((key) => allowed.has(key));
+  return parseAgentSnapshot(value) !== undefined;
 }
 
 function isSubtreeSnapshotInput(value: unknown): value is SubtreeSnapshotInput {
@@ -477,6 +417,21 @@ function cloneAgentFault(fault: AgentFault | undefined): AgentFault | undefined 
   return fault === undefined ? undefined : Object.freeze({ ...fault });
 }
 
+function snapshotHadTerminationFailure(node: AgentSnapshot): boolean {
+  return node.state === "failed" || node.termination_result === "failed";
+}
+
+function snapshotHadIncompleteCleanup(node: AgentSnapshot): boolean {
+  return node.error?.code === "termination_incomplete" || node.termination_result === "incomplete";
+}
+
+function terminationResultFromHistory(
+  hadFailure: boolean,
+  hadIncompleteCleanup: boolean,
+): AgentTerminationResult {
+  return hadIncompleteCleanup ? "incomplete" : hadFailure ? "failed" : "completed";
+}
+
 function sameSnapshot(
   record: AgentRecord,
   node: AgentSnapshot,
@@ -486,7 +441,12 @@ function sameSnapshot(
   const nextFault = node.error;
   const lifecycleMatches = record.frozenLifecycleElapsedMs === node.lifecycle_elapsed_ms
     || (
-      (record.state === "idle" || record.state === "working" || record.state === "interrupting")
+      (
+        record.state === "idle"
+        || record.state === "working"
+        || record.state === "interrupting"
+        || record.state === "terminating"
+      )
       && node.lifecycle_elapsed_ms !== undefined
     );
   return (
@@ -500,7 +460,9 @@ function sameSnapshot(
     && record.observedAt === node.observed_at
     && record.createdAt === node.created_at
     && lifecycleMatches
+    && JSON.stringify(record.activity) === JSON.stringify(node.activity)
     && JSON.stringify(currentFault) === JSON.stringify(nextFault)
+    && record.terminationResult === node.termination_result
   );
 }
 
@@ -592,7 +554,12 @@ export class TreeController {
         createdAt: observedAt,
         lifecycleStartedAt: monotonicAt,
         frozenLifecycleElapsedMs: undefined,
+        activity: undefined,
+        activityCounts: new Map(),
         error: undefined,
+        terminationResult: undefined,
+        terminationHadFailure: false,
+        terminationHadIncompleteCleanup: false,
         scopeActorOnly: true,
       });
       this.issuedAgentIds.add(initialActor.agentId);
@@ -650,6 +617,72 @@ export class TreeController {
     return controlSuccess(this.barrierOutcome(barrier, false));
   }
 
+  /**
+   * 将同一屏障内全部可确认成员按后代优先顺序提交为一个公开树修订。
+   * 故障父的防孤儿回收可保留目标 `failed`，只确认其后代。
+   */
+  confirmTerminationBarrierResources(
+    agentId: unknown,
+    preserveFailedTarget = false,
+  ): ControlResult<LifecycleEventOutcome> {
+    const target = this.findAgent(agentId);
+    if (!target.ok) return target;
+    const barrier = this.terminationBarriers.get(target.data.agentId);
+    if (barrier === undefined) return controlFailure("agent_unavailable");
+    if (preserveFailedTarget && target.data.state !== "failed") return controlFailure("agent_unavailable");
+    const members: AgentRecord[] = [];
+    for (const memberId of barrier.memberIds) {
+      const member = this.agents.get(memberId);
+      if (member === undefined) return controlFailure("internal_error");
+      if (preserveFailedTarget && memberId === target.data.agentId) continue;
+      if (member.state !== "terminating" && member.state !== "terminated") {
+        return controlFailure("agent_unavailable");
+      }
+      members.push(member);
+    }
+    const targetWasTerminated = target.data.state === "terminated";
+    this.mutateMany(members, (member) => member.state === "terminated"
+      ? {}
+      : {
+          state: "terminated",
+          pendingMessageCount: 0,
+          clearError: true,
+        });
+    return controlSuccess(this.outcome(
+      target.data,
+      !targetWasTerminated && target.data.state === "terminated",
+    ));
+  }
+
+  /** 同一故障清理批次只发布一个修订，供 UI 聚合一次安全通知。 */
+  markTerminationBarrierIncomplete(
+    agentId: unknown,
+    preserveTarget = false,
+  ): ControlResult<LifecycleEventOutcome> {
+    const target = this.findAgent(agentId);
+    if (!target.ok) return target;
+    const barrier = this.terminationBarriers.get(target.data.agentId);
+    if (barrier === undefined) return controlFailure("agent_unavailable");
+    const members: AgentRecord[] = [];
+    for (const memberId of barrier.memberIds) {
+      if (preserveTarget && memberId === target.data.agentId) continue;
+      const member = this.agents.get(memberId);
+      if (member === undefined) return controlFailure("internal_error");
+      if (member.state !== "terminating" && member.state !== "terminated") {
+        return controlFailure("agent_unavailable");
+      }
+      members.push(member);
+    }
+    const targetHadIncomplete = target.data.error?.code === "termination_incomplete";
+    this.mutateMany(members, (member) => member.state === "terminating"
+      ? { errorCode: "termination_incomplete" }
+      : {});
+    return controlSuccess(this.outcome(
+      target.data,
+      !targetHadIncomplete && target.data.error?.code === "termination_incomplete",
+    ));
+  }
+
   /** 创建调用在同步临界区内同时预留两类名额并登记 starting。 */
   reserveStartingChild(
     actor: TreeActor | unknown,
@@ -693,7 +726,12 @@ export class TreeController {
       createdAt: undefined,
       lifecycleStartedAt: undefined,
       frozenLifecycleElapsedMs: undefined,
+      activity: undefined,
+      activityCounts: new Map(),
       error: undefined,
+      terminationResult: undefined,
+      terminationHadFailure: false,
+      terminationHadIncompleteCleanup: false,
       scopeActorOnly: false,
     };
 
@@ -755,7 +793,12 @@ export class TreeController {
       createdAt: undefined,
       lifecycleStartedAt: undefined,
       frozenLifecycleElapsedMs: undefined,
+      activity: undefined,
+      activityCounts: new Map(),
       error: undefined,
+      terminationResult: undefined,
+      terminationHadFailure: false,
+      terminationHadIncompleteCleanup: false,
       scopeActorOnly: false,
     };
     this.agents.set(record.agentId, record);
@@ -865,6 +908,37 @@ export class TreeController {
         }
         break;
     }
+    return controlSuccess(this.outcome(record, applied));
+  }
+
+  /** 将监督器确认的工具边界折叠成单个安全活动事实。 */
+  updateActivity(
+    agentId: unknown,
+    activity: AgentActivitySummary | unknown,
+  ): ControlResult<LifecycleEventOutcome> {
+    const resolved = this.findAgent(agentId);
+    if (!resolved.ok) return resolved;
+    if (!isAgentActivitySummary(activity, true)) return controlFailure("invalid_argument");
+    const record = resolved.data;
+    if (
+      record.state === "starting"
+      || record.state === "failed"
+      || record.state === "terminating"
+      || record.state === "terminated"
+    ) return controlSuccess(this.outcome(record, false));
+    const nextCounts = new Map(record.activityCounts);
+    if (activity.active_count === 0) nextCounts.delete(activity.category);
+    else nextCounts.set(activity.category, activity.active_count);
+    const fallback = [...nextCounts].at(-1);
+    const next = activity.active_count > 0
+      ? Object.freeze({ category: activity.category, active_count: activity.active_count })
+      : record.activity?.category !== activity.category
+        ? record.activity ?? null
+        : fallback === undefined
+          ? null
+          : Object.freeze({ category: fallback[0], active_count: fallback[1] });
+    record.activityCounts = nextCounts;
+    const applied = this.mutate(record, { activity: next });
     return controlSuccess(this.outcome(record, applied));
   }
 
@@ -1057,9 +1131,21 @@ export class TreeController {
           observedAt: node.observed_at,
           lifecycleGeneration: 0,
           createdAt: node.created_at,
-          lifecycleStartedAt: undefined,
-          frozenLifecycleElapsedMs: node.lifecycle_elapsed_ms,
+          lifecycleStartedAt: node.lifecycle_elapsed_ms === undefined
+            ? undefined
+            : monotonicAt - node.lifecycle_elapsed_ms,
+          frozenLifecycleElapsedMs: node.lifecycle_elapsed_ms !== undefined
+            && (node.state === "failed" || node.state === "terminated")
+              ? node.lifecycle_elapsed_ms
+              : undefined,
+          activity: node.activity,
+          activityCounts: node.activity === undefined
+            ? new Map()
+            : new Map([[node.activity.category, node.activity.active_count]]),
           error: node.error,
+          terminationResult: node.termination_result,
+          terminationHadFailure: snapshotHadTerminationFailure(node),
+          terminationHadIncompleteCleanup: snapshotHadIncompleteCleanup(node),
           scopeActorOnly: false,
         };
         additions.push(added);
@@ -1127,9 +1213,12 @@ export class TreeController {
       }
     }
     return controlSuccess(Object.freeze(nodes.map((node) => {
+      const activity = node.activity === undefined ? {} : {
+        activity: Object.freeze({ ...node.activity }),
+      };
       const copy: AgentSnapshot = node.error === undefined
-        ? Object.freeze({ ...node })
-        : Object.freeze({ ...node, error: cloneAgentFault(node.error)! });
+        ? Object.freeze({ ...node, ...activity })
+        : Object.freeze({ ...node, ...activity, error: cloneAgentFault(node.error)! });
       return copy;
     })));
   }
@@ -1138,27 +1227,37 @@ export class TreeController {
     record: AgentRecord,
     node: AgentSnapshot,
     observedAt: string,
-    _monotonicAt: number,
+    monotonicAt: number,
   ): void {
     const stateChanged = record.state !== node.state;
-    const elapsedAtMutation = this.lifecycleElapsed(record, _monotonicAt);
     record.state = node.state;
     record.pendingMessageCount = node.pending_message_count;
     record.revision = node.revision;
     record.observedAt = node.observed_at || observedAt;
     record.createdAt = node.created_at;
-    record.frozenLifecycleElapsedMs = node.lifecycle_elapsed_ms;
+    record.activity = node.activity === undefined ? undefined : Object.freeze({ ...node.activity });
+    record.activityCounts = node.activity === undefined
+      ? new Map()
+      : new Map([[node.activity.category, node.activity.active_count]]);
     record.error = cloneAgentFault(node.error);
+    record.terminationHadFailure ||= snapshotHadTerminationFailure(node);
+    record.terminationHadIncompleteCleanup ||= snapshotHadIncompleteCleanup(node);
+    record.terminationResult = node.state === "terminated"
+      ? terminationResultFromHistory(
+          record.terminationHadFailure,
+          record.terminationHadIncompleteCleanup,
+        )
+      : undefined;
     if (stateChanged) record.lifecycleGeneration += 1;
-    if (node.state === "idle" && record.lifecycleStartedAt === undefined) {
-      record.lifecycleStartedAt = _monotonicAt;
-    }
-    if (stateChanged && node.state === "terminating" && record.frozenLifecycleElapsedMs !== undefined) {
-      record.lifecycleStartedAt = _monotonicAt - record.frozenLifecycleElapsedMs;
+    const elapsed = node.lifecycle_elapsed_ms;
+    if (elapsed === undefined) {
+      record.lifecycleStartedAt = undefined;
       record.frozenLifecycleElapsedMs = undefined;
-    }
-    if (stateChanged && (node.state === "failed" || node.state === "terminated") && elapsedAtMutation !== undefined) {
-      record.frozenLifecycleElapsedMs = elapsedAtMutation;
+    } else {
+      record.lifecycleStartedAt = monotonicAt - elapsed;
+      record.frozenLifecycleElapsedMs = node.state === "failed" || node.state === "terminated"
+        ? elapsed
+        : undefined;
     }
   }
 
@@ -1419,7 +1518,13 @@ export class TreeController {
     const stateChanged = nextState !== record.state;
     const pendingChanged = nextPending !== record.pendingMessageCount;
     const errorChanged = nextErrorCode !== record.error?.code;
-    if (!stateChanged && !pendingChanged && !errorChanged) return false;
+    const nextActivity = mutation.activity === undefined
+      ? record.activity
+      : mutation.activity === null
+        ? undefined
+        : mutation.activity;
+    const activityChanged = JSON.stringify(nextActivity) !== JSON.stringify(record.activity);
+    if (!stateChanged && !pendingChanged && !errorChanged && !activityChanged) return false;
 
     const elapsedAtMutation = this.lifecycleElapsed(record, monotonicAt);
     const nextError = mutation.errorCode === undefined
@@ -1427,7 +1532,16 @@ export class TreeController {
       : this.createFault(mutation.errorCode, observedAt);
     record.state = nextState;
     record.pendingMessageCount = nextPending;
+    record.activity = nextActivity;
     record.error = nextError;
+    if (nextState === "failed") record.terminationHadFailure = true;
+    if (nextErrorCode === "termination_incomplete") record.terminationHadIncompleteCleanup = true;
+    if (stateChanged && nextState === "terminated") {
+      record.terminationResult = terminationResultFromHistory(
+        record.terminationHadFailure,
+        record.terminationHadIncompleteCleanup,
+      );
+    }
     // 生命周期代际只随状态转换推进。pending 事件仍在节点顺序域内串行处理，
     // 允许同一状态快照上并行获准的多条消息各自完成，不互相误判为迟到。
     if (stateChanged) record.lifecycleGeneration += 1;
@@ -1447,6 +1561,10 @@ export class TreeController {
       && elapsedAtMutation !== undefined
     ) {
       record.frozenLifecycleElapsedMs = elapsedAtMutation;
+    }
+    if (stateChanged && (nextState === "failed" || nextState === "terminating" || nextState === "terminated")) {
+      record.activity = undefined;
+      record.activityCounts.clear();
     }
     record.revision += 1;
     record.observedAt = observedAt;
@@ -1526,8 +1644,14 @@ export class TreeController {
           created_at: record.createdAt,
           lifecycle_elapsed_ms: this.lifecycleElapsed(record, monotonicAt) ?? 0,
         };
-    if (record.error === undefined) return Object.freeze(base);
-    return Object.freeze({ ...base, error: record.error });
+    const withTerminationResult = record.terminationResult === undefined
+      ? base
+      : { ...base, termination_result: record.terminationResult };
+    const withActivity = record.activity === undefined
+      ? withTerminationResult
+      : { ...withTerminationResult, activity: Object.freeze({ ...record.activity }) };
+    if (record.error === undefined) return Object.freeze(withActivity);
+    return Object.freeze({ ...withActivity, error: record.error });
   }
 
   private outcome(record: AgentRecord, applied: boolean): LifecycleEventOutcome {

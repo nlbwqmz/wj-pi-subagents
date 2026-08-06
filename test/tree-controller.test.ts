@@ -41,6 +41,7 @@ function applyEvent(
 const FIRST_ID = "550e8400-e29b-41d4-a716-446655440000";
 const SECOND_ID = "550e8400-e29b-41d4-a716-446655440001";
 const THIRD_ID = "550e8400-e29b-41d4-a716-446655440002";
+const FOURTH_ID = "550e8400-e29b-41d4-a716-446655440003";
 
 function expectSuccess<T>(result: ControlResult<T>): T {
   if (!result.ok) assert.fail(result.error.code);
@@ -363,6 +364,87 @@ test("pending、revision、observed_at 与 tree_revision 只在公开事实变�
   assert.deepEqual(treeSnapshot.nodes.map((node) => node.agent_id), [id]);
 });
 
+test("安全活动只以固定类别和非负计数原子进入树快照", () => {
+  const tree = controller();
+  const created = reserveRootChild(tree);
+  const id = created.node.agent_id;
+  expectSuccess(applyEvent(tree, id, { type: "startup_ready" }));
+  const before = expectSuccess(tree.getTreeSnapshot());
+
+  const started = expectSuccess(tree.updateActivity(id, {
+    category: "editing",
+    active_count: 2,
+  }));
+  assert.deepEqual(started.node.activity, { category: "editing", active_count: 2 });
+  assert.equal(started.node.revision, before.nodes[0]!.revision + 1);
+  assert.equal(started.tree_revision, before.tree_revision + 1);
+
+  expectFailure(tree.updateActivity(id, {
+    category: "editing",
+    active_count: 3,
+    path: "C:\\secret-canary\\private.txt",
+  }), "invalid_argument");
+  assert.doesNotMatch(JSON.stringify(expectSuccess(tree.getTreeSnapshot())), /secret-canary|private\.txt/i);
+
+  const finished = expectSuccess(tree.updateActivity(id, {
+    category: "editing",
+    active_count: 0,
+  }));
+  assert.equal(finished.node.activity, undefined);
+});
+
+test("starting 节点不接纳活动，递归快照也不能注入不可能的生命周期组合", () => {
+  const tree = controller();
+  const created = reserveRootChild(tree);
+
+  const ignored = expectSuccess(tree.updateActivity(created.node.agent_id, {
+    category: "running",
+    active_count: 1,
+  }));
+  assert.equal(ignored.applied, false);
+  assert.equal(ignored.node.activity, undefined);
+
+  expectFailure(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
+    scope_agent_id: created.node.agent_id,
+    subtree_revision: 1,
+    nodes: Object.freeze([Object.freeze({
+      ...created.node,
+      activity: Object.freeze({ category: "running" as const, active_count: 1 }),
+    })]),
+  }), "invalid_argument");
+
+  expectFailure(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
+    scope_agent_id: created.node.agent_id,
+    subtree_revision: 1,
+    nodes: Object.freeze([Object.freeze({
+      ...created.node,
+      state: "failed" as const,
+      error: Object.freeze({
+        code: "internal_error" as const,
+        message: "D:\\private\\secret-canary.txt",
+        retryable: false,
+        observed_at: "2026-01-02T03:04:06.000Z",
+      }),
+    })]),
+  }), "invalid_argument");
+  assert.doesNotMatch(JSON.stringify(expectSuccess(tree.getTreeSnapshot())), /private|secret-canary/i);
+});
+
+test("并行活动类别结束时保留仍在运行的安全摘要", () => {
+  const tree = controller();
+  const created = reserveRootChild(tree);
+  const id = created.node.agent_id;
+  expectSuccess(applyEvent(tree, id, { type: "startup_ready" }));
+
+  expectSuccess(tree.updateActivity(id, { category: "editing", active_count: 1 }));
+  expectSuccess(tree.updateActivity(id, { category: "reading", active_count: 1 }));
+  const oneFinished = expectSuccess(tree.updateActivity(id, { category: "reading", active_count: 0 }));
+  assert.deepEqual(oneFinished.node.activity, { category: "editing", active_count: 1 });
+
+  const allFinished = expectSuccess(tree.updateActivity(id, { category: "editing", active_count: 0 }));
+  assert.equal(allFinished.node.activity, undefined);
+});
+
 test("终止屏障不可逆，父节点必须等已登记后代确认回收后才能进入 terminated", () => {
   const tree = controller();
   const parent = reserveRootChild(tree);
@@ -477,6 +559,44 @@ test("子树终止屏障在一个树修订中固定成员并按后代优先返�
   assert.equal(repeated.changed, false);
   assert.equal(repeated.tree_revision, barrier.tree_revision);
   assert.deepEqual(repeated.agent_ids, barrier.agent_ids);
+});
+
+test("终止记录固定保留完成、失败终止与清理不完整结果", () => {
+  const tree = controller([FIRST_ID, SECOND_ID, THIRD_ID]);
+  const completed = reserveRootChild(tree, "正常完成");
+  const failed = reserveRootChild(tree, "故障后终止");
+  const incomplete = reserveRootChild(tree, "清理重试后终止");
+  for (const outcome of [completed, failed, incomplete]) {
+    expectSuccess(applyEvent(tree, outcome.node.agent_id, { type: "startup_ready" }));
+  }
+
+  expectSuccess(applyEvent(tree, completed.node.agent_id, { type: "termination_requested" }));
+  expectSuccess(applyEvent(tree, completed.node.agent_id, { type: "resources_confirmed" }));
+
+  expectSuccess(applyEvent(tree, failed.node.agent_id, {
+    type: "runtime_failed",
+    error_code: "internal_error",
+  }));
+  expectSuccess(applyEvent(tree, failed.node.agent_id, { type: "termination_requested" }));
+  expectSuccess(applyEvent(tree, failed.node.agent_id, { type: "resources_confirmed" }));
+
+  expectSuccess(applyEvent(tree, incomplete.node.agent_id, { type: "termination_requested" }));
+  expectSuccess(applyEvent(tree, incomplete.node.agent_id, { type: "termination_incomplete" }));
+  expectSuccess(applyEvent(tree, incomplete.node.agent_id, { type: "resources_confirmed" }));
+
+  assert.deepEqual(
+    expectSuccess(tree.getTreeSnapshot()).nodes.map((node) => ({
+      name: node.name,
+      state: node.state,
+      termination_result: node.termination_result,
+      error: node.error,
+    })),
+    [
+      { name: "正常完成", state: "terminated", termination_result: "completed", error: undefined },
+      { name: "故障后终止", state: "terminated", termination_result: "failed", error: undefined },
+      { name: "清理重试后终止", state: "terminated", termination_result: "incomplete", error: undefined },
+    ],
+  );
 });
 
 test("运行故障先保留父节点 failed，并为全部后代建立防孤儿屏障", () => {
@@ -648,6 +768,365 @@ test("根端只合入已预留完整子树并丢弃旧修订，查询保持稳�
   assert.equal(stale.applied, false);
   assert.equal(stale.tree_revision, accepted.tree_revision);
   assert.equal(stale.subtree_revision, 1);
+});
+
+test("递归子树的活动时长从快照基线继续累计并在终态精确冻结", () => {
+  let monotonic = 10_000;
+  const tree = controller([FIRST_ID, SECOND_ID], {
+    config: {
+      maxDepth: 3,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 16,
+      waitTimeoutMs: 60_000,
+    },
+    monotonicNow: () => monotonic,
+  });
+  const parent = reserveRootChild(tree, "父代理");
+  expectSuccess(applyEvent(tree, parent.node.agent_id, { type: "startup_ready" }));
+  const child = expectSuccess(tree.reserveStartingChild(
+    { kind: "agent", agent_id: parent.node.agent_id },
+    { templateId: "child", name: "递归子代理" },
+  ));
+  rememberOutcome(tree, child);
+  expectSuccess(applyEvent(tree, child.node.agent_id, { type: "startup_ready" }));
+  const parentSnapshot = expectSuccess(tree.getStatus(parent.node.agent_id));
+  const childSnapshot = expectSuccess(tree.getStatus(child.node.agent_id));
+
+  const working = Object.freeze({
+    ...childSnapshot,
+    state: "working" as const,
+    lifecycle_elapsed_ms: 5_000,
+    revision: childSnapshot.revision + 1,
+    observed_at: "2026-01-02T03:04:06.000Z",
+  });
+  expectSuccess(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
+    scope_agent_id: parent.node.agent_id,
+    subtree_revision: 1,
+    nodes: Object.freeze([parentSnapshot, working]),
+  }));
+  assert.equal(expectSuccess(tree.getStatus(child.node.agent_id)).lifecycle_elapsed_ms, 5_000);
+  monotonic = 12_000;
+  assert.equal(expectSuccess(tree.getStatus(child.node.agent_id)).lifecycle_elapsed_ms, 7_000);
+
+  const failed = Object.freeze({
+    ...working,
+    state: "failed" as const,
+    lifecycle_elapsed_ms: 7_000,
+    revision: working.revision + 1,
+    observed_at: "2026-01-02T03:04:07.000Z",
+    error: Object.freeze({
+      code: "internal_error" as const,
+      message: "控制器内部错误",
+      retryable: false,
+      observed_at: "2026-01-02T03:04:07.000Z",
+    }),
+  });
+  expectSuccess(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
+    scope_agent_id: parent.node.agent_id,
+    subtree_revision: 2,
+    nodes: Object.freeze([parentSnapshot, failed]),
+  }));
+  monotonic = 20_000;
+  assert.equal(expectSuccess(tree.getStatus(child.node.agent_id)).lifecycle_elapsed_ms, 7_000);
+});
+
+test("递归已登记节点在批量终止后保留故障与清理不完整分类", () => {
+  const tree = controller([FIRST_ID, SECOND_ID, THIRD_ID], {
+    config: {
+      maxDepth: 3,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 16,
+      waitTimeoutMs: 60_000,
+    },
+  });
+  const parent = reserveRootChild(tree, "递归父代理");
+  expectSuccess(applyEvent(tree, parent.node.agent_id, { type: "startup_ready" }));
+  const failed = expectSuccess(tree.reserveStartingChild(
+    { kind: "agent", agent_id: parent.node.agent_id },
+    { templateId: "failed", name: "递归故障节点" },
+  ));
+  rememberOutcome(tree, failed);
+  expectSuccess(applyEvent(tree, failed.node.agent_id, { type: "startup_ready" }));
+  const incomplete = expectSuccess(tree.reserveStartingChild(
+    { kind: "agent", agent_id: parent.node.agent_id },
+    { templateId: "incomplete", name: "递归清理节点" },
+  ));
+  rememberOutcome(tree, incomplete);
+  expectSuccess(applyEvent(tree, incomplete.node.agent_id, { type: "startup_ready" }));
+
+  const parentSnapshot = expectSuccess(tree.getStatus(parent.node.agent_id));
+  const failedSnapshot = expectSuccess(tree.getStatus(failed.node.agent_id));
+  const incompleteSnapshot = expectSuccess(tree.getStatus(incomplete.node.agent_id));
+  expectSuccess(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
+    scope_agent_id: parent.node.agent_id,
+    subtree_revision: 1,
+    nodes: Object.freeze([
+      parentSnapshot,
+      Object.freeze({
+        ...failedSnapshot,
+        state: "failed" as const,
+        revision: failedSnapshot.revision + 1,
+        observed_at: "2026-01-02T03:04:06.000Z",
+        error: Object.freeze({
+          code: "internal_error" as const,
+          message: "控制器内部错误",
+          retryable: false,
+          observed_at: "2026-01-02T03:04:06.000Z",
+        }),
+      }),
+      Object.freeze({
+        ...incompleteSnapshot,
+        state: "terminating" as const,
+        revision: incompleteSnapshot.revision + 1,
+        observed_at: "2026-01-02T03:04:06.000Z",
+        error: Object.freeze({
+          code: "termination_incomplete" as const,
+          message: "代理资源尚未完全回收",
+          retryable: true,
+          observed_at: "2026-01-02T03:04:06.000Z",
+        }),
+      }),
+    ]),
+  }));
+  assert.equal(expectSuccess(tree.getStatus(failed.node.agent_id)).termination_result, undefined);
+  assert.equal(expectSuccess(tree.getStatus(incomplete.node.agent_id)).termination_result, undefined);
+
+  expectSuccess(tree.beginTerminationBarrier(ROOT_TREE_ACTOR, parent.node.agent_id));
+  expectSuccess(tree.confirmTerminationBarrierResources(parent.node.agent_id));
+  assert.deepEqual(
+    expectSuccess(tree.getTreeSnapshot()).nodes.map((node) => [node.name, node.termination_result]),
+    [
+      ["递归父代理", "completed"],
+      ["递归故障节点", "failed"],
+      ["递归清理节点", "incomplete"],
+    ],
+  );
+});
+
+test("非权威中继首次接收的故障后代在终止后保留历史分类", () => {
+  const tree = controller([], {
+    config: {
+      maxDepth: 4,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 16,
+      waitTimeoutMs: 60_000,
+    },
+    initialActor: {
+      agentId: FIRST_ID,
+      parentAgentId: null,
+      depth: 1,
+      templateId: "relay",
+      name: "中继父代理",
+      managementEnabled: true,
+    },
+  });
+  const relayActor = Object.freeze({ kind: "agent" as const, agent_id: FIRST_ID });
+  const child = expectSuccess(tree.adoptSpawnGrant(relayActor, {
+    node: Object.freeze({
+      agent_id: SECOND_ID,
+      parent_agent_id: FIRST_ID,
+      template_id: "child",
+      name: "直接子代理",
+      depth: 2,
+      state: "starting" as const,
+      pending_message_count: 0,
+      revision: 1,
+      observed_at: "2026-01-02T03:04:05.000Z",
+    }),
+    lifecycle_generation: 0,
+    management_enabled: true,
+  }));
+  expectSuccess(tree.applyLifecycleEvent(SECOND_ID, {
+    type: "startup_ready",
+    expected_generation: child.lifecycle_generation,
+  }));
+  const childSnapshot = expectSuccess(tree.getStatus(SECOND_ID));
+  const failedDescendant = Object.freeze({
+    agent_id: THIRD_ID,
+    parent_agent_id: SECOND_ID,
+    template_id: "failed",
+    name: "新故障后代",
+    depth: 3,
+    state: "failed" as const,
+    pending_message_count: 0,
+    revision: 2,
+    observed_at: "2026-01-02T03:04:07.000Z",
+    created_at: "2026-01-02T03:04:02.000Z",
+    lifecycle_elapsed_ms: 5_000,
+    error: Object.freeze({
+      code: "internal_error" as const,
+      message: "控制器内部错误",
+      retryable: false,
+      observed_at: "2026-01-02T03:04:07.000Z",
+    }),
+  });
+  const incompleteDescendant = Object.freeze({
+    agent_id: FOURTH_ID,
+    parent_agent_id: SECOND_ID,
+    template_id: "incomplete",
+    name: "新清理后代",
+    depth: 3,
+    state: "terminating" as const,
+    pending_message_count: 0,
+    revision: 2,
+    observed_at: "2026-01-02T03:04:07.000Z",
+    created_at: "2026-01-02T03:04:02.000Z",
+    lifecycle_elapsed_ms: 5_000,
+    error: Object.freeze({
+      code: "termination_incomplete" as const,
+      message: "代理资源尚未完全回收",
+      retryable: true,
+      observed_at: "2026-01-02T03:04:07.000Z",
+    }),
+  });
+  expectSuccess(tree.applySubtreeSnapshot(relayActor, {
+    scope_agent_id: SECOND_ID,
+    subtree_revision: 1,
+    nodes: Object.freeze([childSnapshot, failedDescendant, incompleteDescendant]),
+  }));
+
+  const childActor = Object.freeze({ kind: "agent" as const, agent_id: SECOND_ID });
+  expectSuccess(tree.beginTerminationBarrier(childActor, THIRD_ID));
+  expectSuccess(tree.confirmTerminationBarrierResources(THIRD_ID));
+  expectSuccess(tree.beginTerminationBarrier(childActor, FOURTH_ID));
+  expectSuccess(tree.confirmTerminationBarrierResources(FOURTH_ID));
+  assert.deepEqual(
+    [THIRD_ID, FOURTH_ID].map((agentId) => {
+      const node = expectSuccess(tree.getStatus(agentId));
+      return [node.name, node.termination_result];
+    }),
+    [
+      ["新故障后代", "failed"],
+      ["新清理后代", "incomplete"],
+    ],
+  );
+});
+
+test("递归子树其他节点变化时允许 terminating 节点在同一节点修订继续计时", () => {
+  let monotonic = 10_000;
+  const tree = controller([FIRST_ID, SECOND_ID, THIRD_ID], {
+    config: {
+      maxDepth: 3,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 16,
+      waitTimeoutMs: 60_000,
+    },
+    monotonicNow: () => monotonic,
+  });
+  const parent = reserveRootChild(tree, "父代理");
+  expectSuccess(applyEvent(tree, parent.node.agent_id, { type: "startup_ready" }));
+  const first = expectSuccess(tree.reserveStartingChild(
+    { kind: "agent", agent_id: parent.node.agent_id },
+    { templateId: "first", name: "清理中的后代" },
+  ));
+  rememberOutcome(tree, first);
+  expectSuccess(applyEvent(tree, first.node.agent_id, { type: "startup_ready" }));
+  const second = expectSuccess(tree.reserveStartingChild(
+    { kind: "agent", agent_id: parent.node.agent_id },
+    { templateId: "second", name: "变化的后代" },
+  ));
+  rememberOutcome(tree, second);
+  expectSuccess(applyEvent(tree, second.node.agent_id, { type: "startup_ready" }));
+
+  const parentSnapshot = expectSuccess(tree.getStatus(parent.node.agent_id));
+  const firstSnapshot = expectSuccess(tree.getStatus(first.node.agent_id));
+  const secondSnapshot = expectSuccess(tree.getStatus(second.node.agent_id));
+  const terminating = Object.freeze({
+    ...firstSnapshot,
+    state: "terminating" as const,
+    lifecycle_elapsed_ms: 5_000,
+    revision: firstSnapshot.revision + 1,
+    observed_at: "2026-01-02T03:04:06.000Z",
+  });
+  expectSuccess(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
+    scope_agent_id: parent.node.agent_id,
+    subtree_revision: 1,
+    nodes: Object.freeze([parentSnapshot, terminating, secondSnapshot]),
+  }));
+
+  monotonic = 12_000;
+  const workingSecond = Object.freeze({
+    ...secondSnapshot,
+    state: "working" as const,
+    lifecycle_elapsed_ms: 7_000,
+    revision: secondSnapshot.revision + 1,
+    observed_at: "2026-01-02T03:04:07.000Z",
+  });
+  const accepted = expectSuccess(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
+    scope_agent_id: parent.node.agent_id,
+    subtree_revision: 2,
+    nodes: Object.freeze([
+      parentSnapshot,
+      Object.freeze({ ...terminating, lifecycle_elapsed_ms: 7_000 }),
+      workingSecond,
+    ]),
+  }));
+  assert.equal(accepted.applied, true);
+  assert.equal(expectSuccess(tree.getStatus(first.node.agent_id)).lifecycle_elapsed_ms, 7_000);
+});
+
+test("非权威中继首次接收的新活动后代从快照时长继续累计", () => {
+  let monotonic = 10_000;
+  const tree = controller([], {
+    config: {
+      maxDepth: 4,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 16,
+      waitTimeoutMs: 60_000,
+    },
+    monotonicNow: () => monotonic,
+    initialActor: {
+      agentId: FIRST_ID,
+      parentAgentId: null,
+      depth: 1,
+      templateId: "relay",
+      name: "中继父代理",
+      managementEnabled: true,
+    },
+  });
+  const actor = Object.freeze({ kind: "agent" as const, agent_id: FIRST_ID });
+  const adopted = expectSuccess(tree.adoptSpawnGrant(actor, {
+    node: Object.freeze({
+      agent_id: SECOND_ID,
+      parent_agent_id: FIRST_ID,
+      template_id: "child",
+      name: "直接子代理",
+      depth: 2,
+      state: "starting" as const,
+      pending_message_count: 0,
+      revision: 1,
+      observed_at: "2026-01-02T03:04:06.000Z",
+    }),
+    lifecycle_generation: 0,
+    management_enabled: true,
+  }));
+  expectSuccess(tree.applyLifecycleEvent(SECOND_ID, {
+    type: "startup_ready",
+    expected_generation: adopted.lifecycle_generation,
+  }));
+  const child = expectSuccess(tree.getStatus(SECOND_ID));
+  const newDescendant = Object.freeze({
+    agent_id: THIRD_ID,
+    parent_agent_id: SECOND_ID,
+    template_id: "worker",
+    name: "新活动后代",
+    depth: 3,
+    state: "working" as const,
+    pending_message_count: 0,
+    revision: 2,
+    observed_at: "2026-01-02T03:04:07.000Z",
+    created_at: "2026-01-02T03:04:02.000Z",
+    lifecycle_elapsed_ms: 5_000,
+  });
+
+  expectSuccess(tree.applySubtreeSnapshot(actor, {
+    scope_agent_id: SECOND_ID,
+    subtree_revision: 1,
+    nodes: Object.freeze([child, newDescendant]),
+  }));
+  assert.equal(expectSuccess(tree.getStatus(THIRD_ID)).lifecycle_elapsed_ms, 5_000);
+  monotonic = 12_000;
+  assert.equal(expectSuccess(tree.getStatus(THIRD_ID)).lifecycle_elapsed_ms, 7_000);
 });
 
 test("根快照拒绝未经过 reserve_child 预登记的未知身份", () => {

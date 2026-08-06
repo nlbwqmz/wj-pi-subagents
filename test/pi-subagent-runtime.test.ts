@@ -208,9 +208,15 @@ interface RegisteredTool {
   readonly execute: (...args: unknown[]) => Promise<unknown>;
 }
 
+interface RegisteredCommand {
+  readonly description: string;
+  readonly handler: (args: string, context: unknown) => unknown;
+}
+
 class FakeExtensionApi {
   readonly handlers = new Map<string, Array<(event: unknown, context: unknown) => unknown>>();
   readonly tools = new Map<string, RegisteredTool>();
+  readonly commands = new Map<string, RegisteredCommand>();
   readonly sentMessages: Array<{ message: unknown; options: unknown }> = [];
   readonly activeToolHistory: string[][] = [];
   activeTools = ["read", "grep"];
@@ -231,7 +237,9 @@ class FakeExtensionApi {
     this.tools.set(candidate.name, candidate);
   }
 
-  registerCommand(): void {}
+  registerCommand(name: string, command: RegisteredCommand): void {
+    this.commands.set(name, command);
+  }
   getActiveTools(): string[] { return [...this.activeTools, ...this.tools.keys()]; }
   getAllTools(): Array<{ name: string }> {
     return [
@@ -307,6 +315,56 @@ function extensionContext(cwd: string): Record<string, unknown> {
     },
     isProjectTrusted: () => false,
     isIdle: () => true,
+  };
+}
+
+class FakeRuntimeUi {
+  readonly widgetCalls: Array<{ readonly key: string; readonly content: unknown; readonly options: unknown }> = [];
+  readonly notifications: Array<{ readonly message: string; readonly type: string | undefined }> = [];
+  overlay: {
+    render(width: number): string[];
+    handleInput?(data: string): void;
+    invalidate(): void;
+    dispose?(): void;
+  } | undefined;
+  overlayOptions: unknown;
+  renderRequests = 0;
+
+  setWidget(key: string, content: unknown, options?: unknown): void {
+    this.widgetCalls.push({ key, content, options });
+  }
+
+  notify(message: string, type?: string): void {
+    this.notifications.push({ message, type });
+  }
+
+  custom<T>(
+    factory: (
+      tui: { requestRender(): void },
+      theme: unknown,
+      keybindings: unknown,
+      done: (result: T) => void,
+    ) => {
+      render(width: number): string[];
+      handleInput?(data: string): void;
+      invalidate(): void;
+      dispose?(): void;
+    },
+    options?: unknown,
+  ): Promise<T> {
+    this.overlayOptions = options;
+    return new Promise<T>((resolve) => {
+      this.overlay = factory({ requestRender: () => { this.renderRequests += 1; } }, {}, {}, resolve);
+    });
+  }
+}
+
+function tuiExtensionContext(cwd: string, ui: FakeRuntimeUi): Record<string, unknown> {
+  return {
+    ...extensionContext(cwd),
+    hasUI: true,
+    mode: "tui",
+    ui,
   };
 }
 
@@ -493,6 +551,69 @@ test("生产运行时闭合直接父子的创建、消息、回复、等待、�
 
   await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
   assert.equal(node.operations().includes("release"), true, node.operations().join(","));
+});
+
+test("运行时以单数 agent 命令交付只读 TUI，并在会话关闭时清理 UI", async () => {
+  const cwd = "C:\\workspace\\agent-tree-ui";
+  const api = new FakeExtensionApi();
+  const ui = new FakeRuntimeUi();
+  const context = tuiExtensionContext(cwd, ui);
+  const node = new RuntimeLinkedNode();
+  const activate = createPiSubagentRuntimeActivator({
+    rootIdFactory: () => "root-agent-tree-ui",
+    agentIdFactory: () => AGENT_ID,
+    rootArguments: {
+      maxDepth: 2,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 8,
+      waitTimeoutMs: 10_000,
+    },
+    templateFileSystem: templateFileSystem(cwd),
+    nodeFactory: () => node,
+  });
+  await activate(api as never, {
+    ok: true,
+    nodeVersion: process.versions.node,
+    piVersion: "0.83.0",
+    platform: "win32",
+    processTreeAdapter: {} as never,
+  });
+  assert.deepEqual([...api.commands.keys()], ["agent"]);
+  await api.emit("session_start", { type: "session_start", reason: "startup" }, context);
+  const firstWidget = ui.widgetCalls.at(-1);
+  assert.equal(firstWidget?.key, "pi-subagent-agents");
+  assert.equal(typeof firstWidget?.content, "function");
+  const tui = { requestRender: () => {} };
+  const widget = (firstWidget?.content as (
+    widgetTui: { requestRender(): void },
+  ) => { render(width: number): string[] })(tui);
+  assert.deepEqual(widget.render(80), ["Agents"]);
+
+  await execute(api, "spawn_agent", { template_id: "researcher", name: "TUI 子代理" }, context);
+  assert.deepEqual(widget.render(80), [
+    "Agents",
+    "  researcher · TUI 子代理 · idle · 0s",
+  ]);
+  const command = api.commands.get("agent");
+  assert.ok(command);
+  const opened = command.handler("", context) as Promise<void>;
+  assert.deepEqual(ui.overlayOptions, { overlay: true });
+  assert.match(ui.overlay?.render(80).join("\n") ?? "", /Agent tree · revision/);
+  ui.overlay?.handleInput?.("\x1b");
+  await opened;
+
+  node.emitTransportFault("eof");
+  assert.deepEqual(ui.notifications, [{
+    message: "代理故障：researcher ×1；internal_error ×1",
+    type: "warning",
+  }]);
+  assert.deepEqual(api.sentMessages, []);
+  await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
+  assert.deepEqual(ui.widgetCalls.at(-1), {
+    key: "pi-subagent-agents",
+    content: undefined,
+    options: { placement: "aboveEditor" },
+  });
 });
 
 test("根会话 new、resume、fork 与 quit 都按同一有界关闭语义清理整树", async () => {
@@ -767,7 +888,10 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
     platform: "win32" as const,
     processTreeAdapter: {} as never,
   };
-  const context = extensionContext(cwd);
+  const oldUi = new FakeRuntimeUi();
+  const newUi = new FakeRuntimeUi();
+  const oldContext = tuiExtensionContext(cwd, oldUi);
+  const newContext = tuiExtensionContext(cwd, newUi);
   let oldController: AgentController | undefined;
   let newController: AgentController | undefined;
   const oldActivate = oldRuntimeModule.createPiSubagentRuntimeActivator({
@@ -784,15 +908,16 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
     onController: (controller: AgentController) => { oldController = controller; },
   });
   await oldActivate(oldApi as never, capabilities);
-  await oldApi.emit("session_start", { type: "session_start", reason: "startup" }, context);
+  await oldApi.emit("session_start", { type: "session_start", reason: "startup" }, oldContext);
   const first = await execute(oldApi, "spawn_agent", {
     template_id: "researcher",
     name: "交接前节点",
-  }, context) as { details?: Record<string, unknown> };
+  }, oldContext) as { details?: Record<string, unknown> };
   const firstId = String(first.details?.agent_id);
   assert.equal(firstId, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
 
-  await oldApi.emit("session_shutdown", { type: "session_shutdown", reason: "reload" }, context);
+  await oldApi.emit("session_shutdown", { type: "session_shutdown", reason: "reload" }, oldContext);
+  assert.equal(oldUi.widgetCalls.at(-1)?.content, undefined);
   assert.deepEqual(
     firstNode.operations().filter((operation) => [
       "graceful_close",
@@ -812,7 +937,8 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
     onController: (controller: AgentController) => { newController = controller; },
   });
   await newActivate(newApi as never, capabilities);
-  await newApi.emit("session_start", { type: "session_start", reason: "reload" }, context);
+  await newApi.emit("session_start", { type: "session_start", reason: "reload" }, newContext);
+  assert.equal(typeof newUi.widgetCalls.at(-1)?.content, "function");
   assert.equal(replacementRootIdCalls, 0);
   assert.strictEqual(newController, oldController);
   assert.deepEqual(
@@ -824,7 +950,7 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
     [],
   );
 
-  const retained = await execute(newApi, "get_agent_tree", {}, context) as {
+  const retained = await execute(newApi, "get_agent_tree", {}, newContext) as {
     details?: { nodes?: Array<{ agent_id: string }> };
   };
   assert.deepEqual(retained.details?.nodes?.map((node) => node.agent_id), [firstId]);
@@ -832,7 +958,7 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
   const reloadedTemplate = await execute(newApi, "spawn_agent", {
     template_id: "reviewer",
     name: "reload 新模板节点",
-  }, context) as { details?: Record<string, unknown> };
+  }, newContext) as { details?: Record<string, unknown> };
   assert.equal(reloadedTemplate.details?.agent_id, "cccccccc-cccc-4ccc-8ccc-cccccccccccc");
 
   await firstNode.publishReply({ text: "交接后的回复" });
@@ -841,7 +967,7 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
   assert.equal(oldApi.sentMessages.length, 0);
   assert.equal(newApi.sentMessages.length, 1);
 
-  await newApi.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
+  await newApi.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, newContext);
   assert.equal(firstNode.operations().includes("release"), true);
   assert.equal(secondNode.operations().includes("release"), true);
 });

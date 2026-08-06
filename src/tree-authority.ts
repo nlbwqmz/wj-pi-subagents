@@ -212,24 +212,7 @@ export class RootTreeAuthority implements TreeAuthorityPort {
     if (!preserveFailedTarget && target.data.state !== "terminating" && target.data.state !== "terminated") {
       return controlFailure("agent_unavailable");
     }
-    let targetOutcome: LifecycleEventOutcome | undefined;
-    for (const memberId of barrier.data.agent_ids) {
-      if (preserveFailedTarget && memberId === agentId) continue;
-      const status = this.tree.getStatus(memberId);
-      if (!status.ok) return controlFailure("internal_error");
-      if (status.data.state === "terminated") continue;
-      if (status.data.state !== "terminating") return controlFailure("agent_unavailable");
-      const generation = this.tree.getLifecycleGeneration(memberId);
-      if (!generation.ok) return controlFailure("internal_error");
-      const confirmed = this.tree.applyLifecycleEvent(memberId, {
-        type: "resources_confirmed",
-        expected_generation: generation.data,
-      });
-      if (!confirmed.ok) return controlFailure("internal_error");
-      if (memberId === agentId) targetOutcome = confirmed.data;
-    }
-    if (targetOutcome !== undefined) return success(targetOutcome);
-    return this.currentLifecycleOutcome(agentId);
+    return this.tree.confirmTerminationBarrierResources(agentId, preserveFailedTarget);
   }
 
   private currentLifecycleOutcome(agentId: string): ControlResult<LifecycleEventOutcome> {

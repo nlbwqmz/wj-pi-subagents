@@ -714,6 +714,12 @@ export class AgentController {
         // 父会话注入失败只影响上行观察者，不破坏节点等待和生命周期。
       }
     }
+    if (agentId !== undefined && event.kind === "activity") {
+      this.tree.updateActivity(agentId, {
+        category: event.activity.category,
+        active_count: event.activity.active_count,
+      });
+    }
     if (agentId !== undefined) this.resolveWaiters(agentId);
     if (
       agentId !== undefined
@@ -755,9 +761,7 @@ export class AgentController {
     const entry = this.agents.get(agentId);
     const cleanup = entry?.supervisor.reapOrphanedDescendants;
     if (entry === undefined || cleanup === undefined) {
-      for (const descendantId of barrier.agent_ids) {
-        if (descendantId !== agentId) this.markTerminationIncomplete(descendantId);
-      }
+      this.tree.markTerminationBarrierIncomplete(agentId, true);
       return;
     }
     let confirmed = false;
@@ -767,23 +771,17 @@ export class AgentController {
       confirmed = false;
     }
     if (!confirmed) {
-      for (const descendantId of barrier.agent_ids) {
-        if (descendantId !== agentId) this.markTerminationIncomplete(descendantId);
-      }
+      this.tree.markTerminationBarrierIncomplete(agentId, true);
       return;
     }
     if (this.authority !== undefined) {
       const rootConfirmation = await this.authority.confirmResources(this.actor, agentId);
       if (!rootConfirmation.ok) {
-        for (const descendantId of barrier.agent_ids) {
-          if (descendantId !== agentId) this.markTerminationIncomplete(descendantId);
-        }
+        this.tree.markTerminationBarrierIncomplete(agentId, true);
         return;
       }
     }
-    for (const descendantId of barrier.agent_ids) {
-      if (descendantId !== agentId) this.confirmTreeResources(descendantId);
-    }
+    this.tree.confirmTerminationBarrierResources(agentId, true);
   }
 
   private releaseTerminatedSupervisor(agentId: string): void {

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { parseAgentSnapshot as parseSafeAgentSnapshot } from "./agent-snapshot-codec.ts";
 import {
   controlFailure,
   isCanonicalUuid,
@@ -555,23 +556,7 @@ function parseLifecycleOutcome(value: SupervisorJsonValue): LifecycleEventOutcom
 }
 
 function parseAgentSnapshot(value: unknown): AgentSnapshot | undefined {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-  const record = value as Record<string, unknown>;
-  if (
-    !isCanonicalUuid(record.agent_id)
-    || (record.parent_agent_id !== null && !isCanonicalUuid(record.parent_agent_id))
-    || typeof record.template_id !== "string"
-    || typeof record.name !== "string"
-    || !positiveSafeInteger(record.depth)
-    || !["starting", "idle", "working", "interrupting", "failed", "terminating", "terminated"].includes(String(record.state))
-    || !nonNegativeSafeInteger(record.pending_message_count)
-    || !positiveSafeInteger(record.revision)
-    || typeof record.observed_at !== "string"
-  ) return undefined;
-  // SupervisorChannel 已严格校验 AgentSnapshot；这里再次复制并冻结，防止响应
-  // 适配层把额外字段或可变引用交给 AgentController。
-  const copy = JSON.parse(JSON.stringify(record)) as AgentSnapshot;
-  return Object.freeze(copy);
+  return parseSafeAgentSnapshot(value);
 }
 
 function agentIdBody(value: SupervisorJsonValue): string | undefined {

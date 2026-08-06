@@ -157,3 +157,59 @@ test("控制准入、终止屏障与资源确认都重复校验直接父关系",
   const foreignActor = Object.freeze({ kind: "agent" as const, agent_id: grant.node.agent_id });
   expectFailure(await authority.confirmResources(foreignActor, grant.node.agent_id), "not_direct_child");
 });
+
+test("根权威以单一树修订原子确认级联屏障的全部成员", async () => {
+  const ids = [
+    "10000000-0000-4000-8000-000000000011",
+    "10000000-0000-4000-8000-000000000012",
+    "10000000-0000-4000-8000-000000000013",
+  ];
+  const tree = new TreeController({
+    config: { maxDepth: 3, maxChildrenPerAgent: 3, maxAgentsPerTree: 6, waitTimeoutMs: 10_000 },
+    idFactory: () => ids.shift() ?? SECOND_ID,
+  });
+  const authority = new RootTreeAuthority({ tree, templateSnapshot: snapshot(template()) });
+  const templateRevision = (expectSuccess(await authority.resolveTemplate(ROOT_TREE_ACTOR, "worker"))).template_revision;
+  const reserveReady = async (
+    actor: typeof ROOT_TREE_ACTOR | { readonly kind: "agent"; readonly agent_id: string },
+    name: string,
+  ): Promise<SpawnGrant> => {
+    const grant = expectSuccess(await authority.reserveChild(actor, {
+      template_id: "worker",
+      template_revision: templateRevision,
+      name,
+    }));
+    expectSuccess(tree.applyLifecycleEvent(grant.node.agent_id, {
+      type: "startup_ready",
+      expected_generation: grant.lifecycle_generation,
+    }));
+    return grant;
+  };
+  const parent = await reserveReady(ROOT_TREE_ACTOR, "父代理");
+  const child = await reserveReady({ kind: "agent", agent_id: parent.node.agent_id }, "子代理");
+  const grandchild = await reserveReady({ kind: "agent", agent_id: child.node.agent_id }, "孙代理");
+  expectSuccess(await authority.beginTermination(ROOT_TREE_ACTOR, parent.node.agent_id));
+
+  const before = expectSuccess(tree.getTreeSnapshot()).tree_revision;
+  const visibleRevisions: number[] = [];
+  const unsubscribe = tree.onChange(() => {
+    visibleRevisions.push(expectSuccess(tree.getTreeSnapshot()).tree_revision);
+  });
+  const confirmed = expectSuccess(await authority.confirmResources(ROOT_TREE_ACTOR, parent.node.agent_id));
+  unsubscribe();
+
+  assert.equal(confirmed.node.state, "terminated");
+  assert.deepEqual(visibleRevisions, [before + 1]);
+  assert.deepEqual(
+    expectSuccess(tree.getTreeSnapshot()).nodes.map((node) => [
+      node.agent_id,
+      node.state,
+      node.termination_result,
+    ]),
+    [
+      [parent.node.agent_id, "terminated", "completed"],
+      [child.node.agent_id, "terminated", "completed"],
+      [grandchild.node.agent_id, "terminated", "completed"],
+    ],
+  );
+});

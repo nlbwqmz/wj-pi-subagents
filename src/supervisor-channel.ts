@@ -1,12 +1,13 @@
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { parseAgentSnapshot as parseSafeAgentSnapshot } from "./agent-snapshot-codec.ts";
 import {
   AGENT_LIFECYCLE_EVENT_TYPES,
   AGENT_LIFECYCLE_STATES,
   PUBLIC_ERROR_CODES,
+  controlFailure,
   isCanonicalUuid,
   type AgentFault,
   type AgentLifecycleEventType,
-  type AgentLifecycleState,
   type AgentSnapshot,
   type PublicControlError,
   type PublicErrorCode,
@@ -813,89 +814,12 @@ function parseSnapshotNode(
   input: unknown,
   limits: SupervisorChannelLimits,
 ): AgentSnapshot {
-  if (typeof input !== "object" || input === null || Array.isArray(input)) frameError("snapshot_invalid");
-  const node = input as Record<string, unknown>;
-  if (!isCanonicalUuid(node.agent_id)) frameError("snapshot_invalid");
-  if (node.parent_agent_id !== null && !isCanonicalUuid(node.parent_agent_id)) frameError("snapshot_invalid");
-  if (!validBoundedString(node.template_id, limits) || !validBoundedString(node.name, limits)) {
-    frameError("snapshot_invalid");
-  }
-  if (!Number.isSafeInteger(node.depth) || (node.depth as number) < 1 || (node.depth as number) > limits.maxDepth) {
-    frameError("snapshot_invalid");
-  }
-  if (typeof node.state !== "string" || !(AGENT_LIFECYCLE_STATES as readonly string[]).includes(node.state)) {
-    frameError("snapshot_invalid");
-  }
-  if (!Number.isSafeInteger(node.pending_message_count) || (node.pending_message_count as number) < 0) {
-    frameError("snapshot_invalid");
-  }
-  if (!Number.isSafeInteger(node.revision) || (node.revision as number) < 1) frameError("snapshot_invalid");
-  if (typeof node.observed_at !== "string" || !RFC3339_MILLIS_PATTERN.test(node.observed_at)) {
-    frameError("snapshot_invalid");
-  }
-  if (node.created_at !== undefined && (typeof node.created_at !== "string" || !RFC3339_MILLIS_PATTERN.test(node.created_at))) {
-    frameError("snapshot_invalid");
-  }
-  if (node.lifecycle_elapsed_ms !== undefined && (
-    !Number.isSafeInteger(node.lifecycle_elapsed_ms) || (node.lifecycle_elapsed_ms as number) < 0
-  )) frameError("snapshot_invalid");
-  const error = parseSafeFault(node.error, limits);
-  const allowed = new Set([
-    "agent_id",
-    "parent_agent_id",
-    "template_id",
-    "name",
-    "depth",
-    "state",
-    "pending_message_count",
-    "revision",
-    "observed_at",
-    "created_at",
-    "lifecycle_elapsed_ms",
-    "error",
-  ]);
-  for (const key of Object.keys(node)) {
-    // 快照只接收公开树字段，阻断正文、路径、端点、凭据和原始异常进入缓存。
-    if (!allowed.has(key)) frameError("snapshot_invalid");
-  }
-  return Object.freeze({
-    agent_id: node.agent_id,
-    parent_agent_id: node.parent_agent_id,
-    template_id: node.template_id,
-    name: node.name,
-    depth: node.depth as number,
-    state: node.state as AgentLifecycleState,
-    pending_message_count: node.pending_message_count as number,
-    revision: node.revision as number,
-    observed_at: node.observed_at as string,
-    ...(node.created_at === undefined ? {} : { created_at: node.created_at as string }),
-    ...(node.lifecycle_elapsed_ms === undefined ? {} : { lifecycle_elapsed_ms: node.lifecycle_elapsed_ms as number }),
-    ...(error === undefined ? {} : { error }),
+  const parsed = parseSafeAgentSnapshot(input, {
+    maxDepth: limits.maxDepth,
+    maxStringBytes: limits.maxStringBytes,
   });
-}
-
-function parseSafeFault(input: unknown, limits: SupervisorChannelLimits): AgentFault | undefined {
-  if (input === undefined) return undefined;
-  if (typeof input !== "object" || input === null || Array.isArray(input)) frameError("snapshot_invalid");
-  const error = input as Record<string, unknown>;
-  if (
-    typeof error.code !== "string" ||
-    !["spawn_failed", "spawn_timeout", "message_delivery_failed", "termination_incomplete", "internal_error"].includes(error.code) ||
-    typeof error.message !== "string" ||
-    !validBoundedString(error.message, limits) ||
-    typeof error.retryable !== "boolean" ||
-    typeof error.observed_at !== "string" ||
-    !RFC3339_MILLIS_PATTERN.test(error.observed_at)
-  ) frameError("snapshot_invalid");
-  if (Object.keys(error).some((key) => !["code", "message", "retryable", "observed_at"].includes(key))) {
-    frameError("snapshot_invalid");
-  }
-  return Object.freeze({
-    code: error.code as AgentFault["code"],
-    message: error.message,
-    retryable: error.retryable,
-    observed_at: error.observed_at,
-  });
+  if (parsed === undefined) frameError("snapshot_invalid");
+  return parsed;
 }
 
 function parseSnapshot(

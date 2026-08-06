@@ -143,9 +143,57 @@ test("远程端口经请求相关器调用根权威并保留完整模板语义",
   assert.equal(grant.node.agent_id, B_ID);
   assert.equal(grant.node.parent_agent_id, A_ID);
   assert.equal(expectSuccess(tree.getStatus(B_ID)).state, "starting");
+  expectSuccess(tree.applyLifecycleEvent(B_ID, {
+    type: "startup_ready",
+    expected_generation: grant.lifecycle_generation,
+  }));
+  expectSuccess(tree.updateActivity(B_ID, { category: "researching", active_count: 1 }));
+  const admission = expectSuccess(await remote.admitControl(actor, B_ID, "get_agent_status"));
+  assert.equal(admission.node.agent_id, B_ID);
+  assert.deepEqual(admission.node.activity, { category: "researching", active_count: 1 });
   assert.equal(links.parent.protocolFaults, 0);
   assert.equal(links.child.protocolFaults, 0);
 
+  client.close();
+  server.close();
+});
+
+test("远程端口拒绝夹带未声明节点字段的权威响应", async () => {
+  const links = linkPair();
+  const server = new SupervisorControlServer(links.parent, async (request) => Object.freeze({
+    operation_id: request.operation_id,
+    ok: true as const,
+    data: Object.freeze({
+      action: "get_agent_status",
+      node: Object.freeze({
+        agent_id: B_ID,
+        parent_agent_id: A_ID,
+        template_id: "worker",
+        name: "B",
+        depth: 2,
+        state: "working",
+        pending_message_count: 0,
+        revision: 1,
+        observed_at: "2026-08-06T08:00:00.000Z",
+        created_at: "2026-08-06T07:59:59.000Z",
+        lifecycle_elapsed_ms: 1_000,
+        activity: Object.freeze({ category: "reading", active_count: 1 }),
+        metadata: "不属于安全快照闭集",
+      }),
+      tree_revision: 1,
+    }),
+  }));
+  const client = new SupervisorControlClient(links.child, 1_000);
+  const remote = new RemoteTreeAuthorityPort(A_ID, client);
+  const actor = Object.freeze({ kind: "agent" as const, agent_id: A_ID });
+
+  const result = await remote.admitControl(actor, B_ID, "get_agent_status");
+
+  assert.equal(result.ok, false);
+  if (result.ok) throw new Error("预期拒绝越界权威响应");
+  assert.equal(result.error.code, "internal_error");
+  assert.equal(links.parent.protocolFaults, 0);
+  assert.equal(links.child.protocolFaults, 0);
   client.close();
   server.close();
 });
