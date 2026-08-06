@@ -12,13 +12,13 @@ Blocked by: 03, 04, 08, 11
 
 本票据冻结子代理 RPC 监督器的模块边界、启动/关闭阶段和可测试接口。原型位于 [RPC 监督器原型](../prototypes/rpc-supervisor-throwaway/README.md)，只使用 fake RPC、fake 进程树和 fake 父子通道验证阶段与竞态，不启动真实 Pi 进程。
 
-总体采用“封装 Pi `RpcClient`，外加专用监督器”，不复制 Pi RPC 协议，也不修改 Pi 核心。监督器把 Pi 的任务语义和扩展需要的所有权、顺序、回收语义接在一起：
+总体采用“由受管 RPC 节点承载 Pi 公共 `RpcClient`，外加专用监督器”，不复制 Pi RPC 协议，也不修改 Pi 核心。受管节点把平台树归属、桥接进程和公共客户端绑定在同一启动事务，监督器把 Pi 的任务语义和扩展需要的所有权、顺序、回收语义接在一起：
 
 ```text
 AgentController
   ├─ RpcSupervisor           单个子代理的 RPC/进程生命周期与命令顺序
-  │   ├─ RpcClient            Pi prompt、abort、get_state、事件解析
-  │   ├─ ProcessTreeAdapter  Job Object / process group/session
+  │   ├─ ManagedRpcNode       受管桥接进程、Pi RpcClient、高层事件与资源句柄
+  │   │   └─ ProcessTreeAdapter  Job Object / process group/session
   │   └─ SupervisorChannel    直接父子握手、快照、回复和关闭通知
   └─ TreeController           所有权、生命周期、配额、tree_revision 和 UI 快照
 ```
@@ -34,15 +34,15 @@ AgentController
 
 #### `RpcSupervisor`
 
-- 独占一个子代理的 Pi `RpcClient`、stdin/stdout 和进程句柄；
-- 负责启动顺序、无副作用 RPC 就绪确认、任务 prompt/abort、RPC 事件单读者和回复组装；
+- 只通过一个 `ManagedRpcNode` 控制子代理，不接受可独立组合的 RPC 客户端和进程句柄；
+- 负责启动顺序、无副作用 RPC 就绪确认、任务 prompt/abort、受管事件归一化和回复组装；
 - 为状态变更命令提供单一串行执行通道，并给每条内部命令分配请求号和阶段；
 - 负责优雅关闭、清理期限、强制阶段调用和最终资源确认，但不自行裁决公开生命周期；
 - 监督通道或进程故障时只向 `AgentController` 报告规范化事件，不自动重启或恢复节点。
 
 #### `ProcessTreeAdapter`
 
-- 把一个已经启动并纳入监督的节点及其后代绑定到平台进程树原语；
+- 在目标进程运行前启动受管桥接进程，并把桥接进程及其后代纳入平台进程树原语；
 - Windows 首选专用 Job Object，Unix 类系统首选 process group/session；
 - 提供优雅关闭、整树强制回收、退出等待、资源观察和句柄释放；
 - 不让控制器读取 PID 或递归枚举进程，不把“已发出信号”当作“资源已回收”。
@@ -75,7 +75,7 @@ AgentController
 - 已被 Pi 接受的消息不追溯撤回；
 - 迟到 RPC 响应、Pi 事件和监督帧必须通过当前状态代际校验，不能回写旧状态。
 
-同一目标的并发终止请求合并到一个清理流程；重复调用等待或返回该流程的同一结果。监督器是对应 RPC stdin/stdout 的唯一读写者，避免多个工具调用直接竞争 JSONL 流。
+同一目标的并发终止请求合并到一个清理流程；重复调用等待或返回该流程的同一结果。受管 RPC 节点是桥接协议和 Pi RPC stdin/stdout 的唯一拥有者，监督器是高层命令的唯一调用者，避免多个工具调用直接竞争 JSONL 流。
 
 ### 3. 启动阶段
 
@@ -83,16 +83,16 @@ AgentController
 
 1. `TreeController` 原子预留直接子代理和全树名额，分配不可复用的 UUID v4 `agent_id`，登记 `starting`。
 2. 创建本地父子监督端点和一次性凭据，准备固定 `cwd`、根环境快照、模板解析结果及内部元数据。
-3. 先创建 Job Object 或 process group/session 归属，再启动 Pi 子进程，避免后代脱离监督范围。
+3. 由 `ProcessTreeAdapter` 先启动受管桥接进程并建立 Job Object 或 process group/session 归属；桥接进程内部再创建公共 Pi `RpcClient`，其 RPC 子进程继承同一树。
 4. 子控制器连接监督端点，完成协议版本、根会话、直接父标识、`agent_id` 和初始完整子树快照校验。
-5. 启动 Pi `RpcClient`，完成无副作用 RPC 请求/响应，确认任务通道可通信。
-6. 控制器同时确认监督通道和 Pi 任务通道就绪，记录 `created_at`，把节点从 `starting` 置为 `idle`；此刻才返回 `spawn_agent` 成功。
+5. 通过受管 RPC 节点发出无副作用状态请求，确认桥接协议和 Pi 任务通道均可通信。
+6. 控制器同时确认监督通道和受管 RPC 节点就绪，记录 `created_at`，把节点从 `starting` 置为 `idle`；此刻才返回 `spawn_agent` 成功。
 
 进程启动、Job Object/process group 绑定、扩展加载、监督握手、首个快照、RPC 就绪或启动期限任一步失败，都先记录启动诊断，再走 08 号票据的终止清理。清理确认后返回 `spawn_failed`/`spawn_timeout`；若残余资源无法确认则返回 `termination_incomplete`，保留失败节点和名额。失败 `agent_id` 不复用。
 
 ### 4. 任务事件归一化
 
-`RpcSupervisor` 是 Pi RPC stdout 的唯一读取者，把原始事件映射为控制器可裁决的规范事件：
+受管 RPC 桥接进程独占 Pi RPC stdout，并通过高层协议把公共客户端事件交给 `RpcSupervisor`；监督器再把它们映射为控制器可裁决的规范事件：
 
 - `prompt` 获得接受确认后发布 `message_accepted`；空闲节点由控制器推进到 `working`，活动节点只增加 pending/steering 计数；
 - `agent_settled` 发布 `settled`，它是 `working`/`interrupting` 回到 `idle` 的唯一正常边界；
@@ -119,7 +119,7 @@ AgentController
 
 ```ts
 interface ProcessTreeAdapter {
-  attach(processHandle): Promise<ProcessTreeHandle>;
+  launch(processSpec): Promise<{ tree: ProcessTreeHandle; transport: ManagedProcessTransport }>;
   requestGracefulClose(tree, signal): Promise<void>;
   forceTerminate(tree): Promise<void>;
   waitForExit(tree, deadline): Promise<ExitObservation>;
@@ -175,3 +175,4 @@ interface ProcessTreeAdapter {
 - 2026-08-05：用户确认监督器独占 Pi RPC 事件流，`agent_settled` 是唯一正常 settle 边界，工具事件只生成安全摘要，assistant 回复按 `reply_seq` 组装、上行和去重，迟到事件不能越过状态代际。
 - 2026-08-05：用户确认监督通道只在启动或尚未判定故障的有限重同步窗口内允许新 `stream_id`；运行期故障后不自动恢复，终止屏障拒绝新流。
 - 2026-08-05：用户确认原型和测试至少提供 fake RPC、fake 进程树和 fake 监督通道，覆盖串行命令、中断 settle、整树回收、防孤儿、部分失败、断序重同步、启动回滚和根关闭期限。
+- 2026-08-06：实现阶段核对 Pi `0.83.0` 后发现公共 `RpcClient.start()` 固定自行创建子进程，不能与事后 `attach()` 的平台适配器安全组合。保持“不修改 Pi 核心、不复制 Pi JSONL”的原决策，细化为 `ManagedRpcNode`：平台适配器先启动受管桥接进程，桥接进程内部独占公共 `RpcClient`，两者通过同一 Job Object/process group 绑定；详情见 [ADR-0001](../../../docs/adr/0001-managed-rpc-bridge.md)。

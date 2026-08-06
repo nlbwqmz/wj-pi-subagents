@@ -1,17 +1,20 @@
-# 明确 Pi 分层子代理扩展规格
+# 交付 Pi 分层子代理扩展的 Windows 开发里程碑
 
 Label: wayfinder:map
-Status: resolved
+Status: active
 
 ## Destination
 
-形成一份可直接交给实现代理的、独立可发布 Pi Subagent 扩展规格，完整定义临时分层代理树的公开工具契约、运行语义、安全边界、交互体验、发布方式与验收标准。
+在现有冻结规格和 01–23 号基础模块之上，交付可在 Windows 开发环境中运行的 Pi Subagent 独立扩展：完成受管 RPC 节点、代理树控制、TUI 可观测性、本地 package 形态和 Windows 开发验收。代码保留 macOS/Linux 适配方向，但本里程碑不执行其原生测试或支持承诺。
 
 规范入口：[spec.md](spec.md)
 
 ## Notes
 
-- 本地图只消除实现前的决策不确定性，不执行扩展实现、发布或安装。
+- 本地图当前明确承载实现工作；实现完成的工单在 `Answer` 或评论中记录代码、测试和证据，规格仍是行为唯一入口。
+- 后续按纵向能力分组，不再为单个公开工具、单个 UI 视图或单个平台适配器各拆一张工单；每张工单必须形成可运行、可验证的闭环。
+- 受管 RPC 节点是唯一合法的生产装配单位：平台适配器先建立进程树归属，桥接进程内部独占 Pi 公共 `RpcClient`，监督器不能拼接不同进程的客户端和树句柄。
+- 当前开发宿主为 Windows。跨平台任务可以先交付代码、类型检查、纯逻辑测试和 fake 测试；原生 macOS/Linux runner、原生进程树证据和跨平台支持结论另立 wayfinder 计划。
 - 每次处理决策票时使用 `grilling` 与 `domain-modeling`；状态机、协议或交互形态问题同时使用 `prototype`；内部模块边界使用 `codebase-design`；读取当前仓库之外的事实时使用 `research`。
 - Pi 上游源码以 `D:\code\open-source\pi` 当前检出的提交 `a96fb984d8c8b065fc5d193309fc812a882adee0` 为事实基线。
 - 子代理是父会话期间常驻的临时实体，与 `pi --mode rpc --no-session` 进程一一对应；父会话结束后不恢复。
@@ -39,27 +42,28 @@ Status: resolved
 - [确定父子控制与代理树状态上报协议](issues/11-prototype-parent-child-tree-protocol.md) — 任务正文和普通回复继续走 Pi RPC，生命周期与子树状态走独立的本地直接父子监督通道；帧使用 `stream_id`、单向 `seq`、请求号和本地 `subtree_revision`，重复安全丢弃、断序用带 `reset` 的最新完整快照重同步，根侧原子合并并分配 `tree_revision`；只保留最新快照和有界 ACK/回复水位，不使用 `entry_appended` 作为权威控制载体。
 - [确定代理树可观测性与流式交互](issues/07-prototype-tree-observability.md) — 常驻 `Agents` widget 只显示当前会话直接子代理；`/agent` 打开只读 TUI 遮罩面板查看根整树或普通父会话自身子树，默认展开直接子代理、折叠后代并支持滚动、左右展开/折叠和 `Esc` 关闭；行显示 `template_id`、名称、生命周期、安全活动摘要、创建成功后的冻结/累计时长、非零 pending 与稳定故障码，终止记录归入折叠的 `finished`；所有 UI 与通知不进入模型上下文。
 - [确定中断、失败与级联清理语义](issues/08-define-failure-cancellation-and-cleanup.md) — 中断只保留节点并等待 `agent_settled`，终止先建立不可逆屏障、后代优先清理；根退出使用独立内部清理期限，Windows 优先 Job Object、Unix 优先进程组/session，部分失败保留 `terminating`/`termination_incomplete`，中间父代理故障自动防孤儿清理且不自动重启，不新增公开错误码。
-- [确定 RPC 监督器与跨平台进程回收架构](issues/12-prototype-rpc-supervisor.md) — 采用封装 Pi `RpcClient` 的专用 `RpcSupervisor`，单节点状态变更串行、终止优先；启动先预留并挂接 OS 进程树监督，再完成父子通道和 RPC 双握手，关闭按 abort/EOF/内部期限/整树强制回收/资源确认推进；`ProcessTreeAdapter` 和 fake 替身隔离 Windows Job Object、Unix process group/session 与测试竞态，运行期通道故障不自动恢复。
+- [确定 RPC 监督器与跨平台进程回收架构](issues/12-prototype-rpc-supervisor.md) — 采用承载公共 `RpcClient` 的 `ManagedRpcNode` 与专用 `RpcSupervisor`；平台适配器先启动受管桥接进程并绑定 OS 进程树，单节点状态变更串行、终止优先，父子通道和 RPC 双握手后才就绪，运行期通道故障不自动恢复。
 - [预构资源确认边界与可注入进程树替身](issues/17-process-tree-resource-boundary.md) — 固定不透明 `ProcessTreeAdapter` 句柄与进程树三态观察；仅退出和整树资源释放同时确认才得到进程树级 `confirmed_exited`，生命周期与配额仍由后续控制器结合监督端点、本节点和全部后代裁决，fake 以场景序列稳定复现优雅超时、孙进程残留、部分回收、重复回收和句柄释放。
-- [确定发布、安装与 Pi 兼容性边界](issues/09-define-packaging-and-compatibility.md) — 以只声明唯一扩展入口的标准 Pi package 发布，npm 为规范渠道并支持等版本 git tag 与完整 commit；首版要求 Node `>=22.19.0`、Pi `>=0.83.0`，覆盖 Windows/macOS/Linux，并在版本、平台或必需宿主 API 不满足时原子失活、仅作 UI-only 诊断而不阻断宿主 Pi，会话 reload 失败时清理既有代理树。
-- [确定首版验收标准与规格交付结构](issues/10-define-acceptance-and-spec-delivery.md) — 当前交付以 `spec.md` 为唯一开发实现入口；Windows/macOS/Linux 各执行最低与当前两个锁定宿主组合的五层自动化验收和六组合核心旅程，负向/安全/清理矩阵为开发门槛，明确不做性能测试或正式发布证明。
+- [确定发布、安装与 Pi 兼容性边界](issues/09-define-packaging-and-compatibility.md) — 以只声明唯一扩展入口的标准 Pi package 发布，npm 为规范渠道并支持等版本 git tag 与完整 commit；代码目标覆盖 Windows/macOS/Linux，当前里程碑只验证 Windows，版本、平台或必需宿主 API 不满足时原子失活、仅作 UI-only 诊断而不阻断宿主 Pi，会话 reload 失败时清理既有代理树。
+- [确定首版验收标准与规格交付结构](issues/10-define-acceptance-and-spec-delivery.md) — `spec.md` 仍是唯一行为入口；当前里程碑收敛为 Windows 最低/当前两个宿主组合，跨平台代码可先写但 macOS/Linux 原生验收与支持证据延期到独立计划，性能和正式发布证明仍不在本轮。
 - [统一代理标识值域](issues/02-define-parent-control-tools.md) — `agent_id` 字段值使用 UUID，控制器新分配值采用随机 UUID v4，并使用 RFC 9562 canonical 小写格式且不带 `agent_` 前缀；格式错误返回 `invalid_argument`，格式正确但未注册返回 `agent_not_found`，其他消息/请求/流标识保持独立命名空间。
 - [冻结根工作基础、环境、信任与配置](issues/18-root-runtime-context-config.md) — 根会话一次冻结规范化 `cwd`、project trust、环境和逐字段配额配置；后代只能从根环境投影并接收控制器追加的固定元数据，配置只读取可信项目与用户的规范路径，错误仅以脱敏 UI-only 诊断呈现。
 - [发布可信代理模板发现快照](issues/19-template-discovery-snapshot.md) — 根模板发现模块以双来源严格扫描、文件名精确身份、项目覆盖和候选/来源诊断建立不可变快照；首次发现与根 `/reload` 通过 UI-only 脱敏通知发布，失败来源不回退旧目录。
 - [建立代理树身份、七态生命周期与配额内核](issues/20-tree-lifecycle-quota-core.md) — `TreeController` 在根实例内原子登记不可复用 UUID v4、直接父关系与双重配额，按能力和深度收窄管理权；七态事件必须携带代际并以安全快照、修订、pending 和单调生命周期计时发布，终止屏障及资源确认后才释放名额。
 - [实现父子监督协议与安全子树汇聚](issues/21-supervisor-channel-protocol.md) — 每条直接父子关系使用隔离的长度边界监督帧、认证握手、完整安全子树快照和有界回复确认；父端原子替换子树并分配根修订。断序请求 reset 快照，EOF 在固定重连窗口内使用新流、首快照确认后重放未确认回复；根级请求号分配器保证同一活动根会话内不复用。
 - [实现 Windows Job Object 进程树适配器](issues/22-windows-job-object-adapter.md) — Windows 启动路径使用 `CREATE_SUSPENDED`，先完成节点专用 Job Object 分配并正确写入 `KILL_ON_JOB_CLOSE` 的 native 结构布局，再恢复目标线程；强制回收只调用 Job Object，资源确认使用进程 ID 列表的 `present`/`released`/`unknown` 三态。原生测试以 `detached`/`unref` 孙进程证明后代仍在 Job 内并可整树回收；句柄释放或观察失败时保留 `unknown`，不伪造终止确认。宿主门禁已在 Windows 标准入口加载该适配器，Unix 平台在对应适配器交付前继续失败关闭。
-- [实现 macOS/Linux process group 进程树适配器](issues/23-unix-process-tree-adapter.md) — Unix 启动路径使用 POSIX `detached` 创建节点专用 process group/session，优雅阶段关闭 stdin，强制阶段只向负 PGID 发送整组信号；退出事件与 `kill(-pgid, 0)` 共同提供 `present`/`released`/`unknown` 观察，句柄释放后不伪造确认。宿主门禁已在实际 macOS/Linux 加载该适配器，原生测试执行与跨平台验收由后续测试任务承担。
+- [实现 macOS/Linux process group 进程树适配器](issues/23-unix-process-tree-adapter.md) — Unix 代码和宿主接入已保留，但本里程碑只在 Windows 做平台原生验证；macOS/Linux 原生 runner、资源回收证据和支持结论延期到独立计划。
 
 ## Fog
 
-- 无。性能测试明确不属于首版开发验收；正式发布运营另立任务。
+- 无。性能测试明确不属于本里程碑开发验收；macOS/Linux 原生验证已经明确成另一项未来工作，不作为本地图的隐性前沿。
 
 ## Out of scope
 
-- 实现、发布或安装扩展；本地图的终点是可实施规格。
 - 子代理跨根会话结束、Pi 会话恢复或设备重启后的持久化与恢复。
 - 兄弟代理、非直接祖先与后代之间的直接通信，以及广播或对等代理网络。
 - 远程主机、分布式调度或多用户共享代理树。
 - 自动排队并在当前处理结束后执行的独立后续任务。
 - 修改 Pi 核心以内置 Subagent；目标产物必须是独立扩展。
+- macOS/Linux 原生 runner、真实进程树回收验收、跨平台支持声明和相关发布证据；这些内容在后续独立 wayfinder 计划中处理。
+- npm registry、正式 tarball、release tag/commit 对应证明和正式发布运营。

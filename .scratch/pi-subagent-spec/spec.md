@@ -4,9 +4,11 @@ Status: development-ready
 Upstream baseline: `a96fb984d8c8b065fc5d193309fc812a882adee0`
 Minimum host: Pi `0.83.0`, Node `22.19.0`
 
+当前实现里程碑：开发和原生验收只在 Windows 执行，使用最低宿主组合与验收时锁定的当前宿主组合各一个 job。macOS/Linux 适配代码可以在本里程碑交付并接受类型、纯逻辑和 fake 测试，但其原生 runner、进程树回收证据和支持结论明确延期到独立计划；未完成该计划前，不把 Unix 路径标记为已验证支持。
+
 ## 0. 文档约定
 
-本文是 Pi Subagent 首版实现的唯一规范性入口。`map.md` 只提供导航；`issues/`、`research/` 和 `prototypes/` 保存决策依据、上游证据和抛弃式验证，不要求实现代理拼接这些文件才能理解行为。
+本文是 Pi Subagent 首版实现的唯一规范性入口。`map.md` 提供当前实现路线和工单导航；`issues/`、`research/` 和 `prototypes/` 保存决策依据、上游证据和抛弃式验证，不要求实现代理拼接这些文件才能理解行为。
 
 本文中的“必须”“不得”“应”“可以”具有规范含义：
 
@@ -91,14 +93,15 @@ Node 版本低到宿主 Pi 本身无法启动时，由 Node/Pi 既有启动路�
 
 ### 2.4 支持平台
 
-**REQ-006**：首版支持 Windows、macOS 和 Linux：
+**REQ-006**：代码必须保留 Windows、macOS 和 Linux 的平台适配契约；当前 Windows 开发里程碑只验证 Windows：
 
 - Windows 必须使用基于 Job Object 的进程树适配器；
 - macOS/Linux 必须使用 process group 或 session；
 - CPU 架构不另设限制，但必须能运行兼容 Node/Pi 和对应适配器；
-- 浏览器、移动系统、远程宿主和未验证 Unix 变体不属于首版支持范围。
+- 本里程碑允许先交付 macOS/Linux 代码，并在 Windows 上执行类型、纯逻辑和 fake 测试，但不执行其原生 runner，也不据此宣称已验证支持；
+- 浏览器、移动系统、远程宿主和未验证 Unix 变体不属于目标范围。
 
-没有可靠整树适配器的平台必须被兼容门禁拒绝，不得退化为只终止直接子进程，也不得伪造 `terminated`。
+没有可靠整树适配器的平台必须被兼容门禁拒绝，不得退化为只终止直接子进程，也不得伪造 `terminated`。Unix 原生验证延期不改变代码契约，但在对应验证计划完成前不构成当前里程碑的支持证据。
 
 ## 3. 根基础、配置与诊断
 
@@ -578,17 +581,18 @@ Unix 使用本地 Unix socket，Windows 使用命名管道。上层必须用带�
 
 ### 8.1 模块责任
 
-**REQ-038**：实现必须采用“封装 Pi `RpcClient`，由扩展补充监督器”的结构，不复制 Pi RPC。至少保留下列深模块边界：
+**REQ-038**：实现必须采用“由受管 RPC 节点承载 Pi 公共 `RpcClient`，由扩展补充监督器”的结构，不修改 Pi 核心，也不复制 Pi RPC 协议。受管 RPC 节点必须把平台进程树句柄、桥接进程、Pi `RpcClient` 命令面和退出观察绑定在同一启动事务中；桥接进程不生成 `agent_id`，不是独立子代理。监督器不得分别接收可独立组合的 RPC 客户端和树句柄。至少保留下列深模块边界：
 
 | 模块 | 责任 | 禁止承担 |
 | --- | --- | --- |
 | `AgentController` | 单节点身份、直接父授权、生命周期、工具裁决和状态代际 | 直接递归 PID、渲染模型正文 |
-| `RpcSupervisor` | 独占 Pi RPC、命令串行、事件归一化、启动/关闭和资源观察 | 裁决整树所有权、自动重启 |
-| `ProcessTreeAdapter` | 平台树句柄、优雅请求、强制整树回收、退出观察、释放 | 修改生命周期或配额 |
+| `ManagedRpcNode` | 在平台树内启动受管桥接进程，桥接进程独占公共 `RpcClient`，提供高层命令、事件、故障和资源操作 | 复制 Pi JSONL、裁决整树所有权 |
+| `RpcSupervisor` | 通过单一 `ManagedRpcNode` 接口执行命令串行、事件归一化、启动/关闭和节点级资源协调 | 拼接独立进程与客户端、裁决整树所有权、自动重启 |
+| `ProcessTreeAdapter` | 为 `ManagedRpcNode` 在目标进程运行前建立平台树归属，并提供不透明句柄的优雅请求、强制整树回收、退出观察和释放 | 修改生命周期或配额、暴露 PID |
 | `SupervisorChannel` | 直接父子帧、握手、ACK、快照、回复和关闭 | 注入模型或越级通信 |
 | `TreeController` | 所有权、配额、树合并、`tree_revision` 和安全 UI 快照 | 直接访问 RPC、PID、socket 或管道 |
 
-模型工具不得直接调用平台适配器；树视图不得发送 RPC；子控制器不得直接访问祖先控制器。
+模型工具不得直接调用平台适配器；树视图不得发送 RPC；子控制器不得直接访问祖先控制器；`RpcSupervisor` 之外不得直接调用 `ManagedRpcNode` 的状态变更接口。
 
 ### 8.2 启动事务
 
@@ -596,16 +600,16 @@ Unix 使用本地 Unix socket，Windows 使用命名管道。上层必须用带�
 
 1. 原子预留直接和全树名额，分配身份，登记 `starting`；
 2. 创建本地监督端点和一次性凭据，准备固定 cwd、根环境快照、模板结果及内部元数据；
-3. 先创建 Job Object 或 process group/session 归属，再启动子进程；
-4. 完成监督协议身份、版本和初始快照校验；
-5. 启动 Pi `RpcClient` 并完成无副作用请求/响应；
+3. 由 `ProcessTreeAdapter` 在目标进程运行前启动受管桥接进程并建立 Job Object 或 process group/session 归属；
+4. 桥接进程内部创建公共 Pi `RpcClient`，其 RPC 子进程继承同一平台树；受管节点只通过高层桥接协议转发命令、事件和故障，不复制 Pi JSONL；
+5. 完成监督协议身份、版本和初始快照校验，并通过受管节点发出无副作用状态请求；
 6. 双通道就绪后记录创建成功的单调时间，进入 `idle` 并返回。
 
 任一步失败必须先记录安全故障，再执行终止清理。失败身份不复用。
 
 ### 8.3 单节点命令顺序
 
-**REQ-040**：每个 `RpcSupervisor` 必须是其 RPC stdin/stdout 的唯一读写者，并提供一个状态变更顺序域，协调 prompt、steering、abort、优雅关闭和强制清理。只读查询、事件观察和多个等待者可以并行；不同节点可以并行。
+**REQ-040**：每个 `ManagedRpcNode` 必须是其桥接协议和 Pi RPC 传输的唯一拥有者；每个 `RpcSupervisor` 通过该节点提供一个状态变更顺序域，协调 prompt、steering、abort、优雅关闭和强制清理。只读查询、事件观察和多个等待者可以并行；不同节点可以并行。
 
 终止屏障优先级最高：取消尚未写入的普通命令，抢占未完成中断清理，拒绝新 prompt/创建/普通控制，并用状态代际丢弃迟到响应。并发终止合并到同一流程。
 
@@ -623,11 +627,17 @@ Unix 使用本地 Unix socket，Windows 使用命名管道。上层必须用带�
 6. 期限到达后调用平台适配器强制回收整树；
 7. 重新观察进程、IPC、本节点和全部后代；只有全部确认退出才发布 `terminated`。
 
-`ProcessTreeAdapter` 必须提供等价职责：
+`ProcessTreeAdapter` 必须提供启动和回收职责；生产路径不得用 `attach` 把一个已经由其他模块启动的进程事后拼入树。等价接口如下：
 
 ```ts
+interface ManagedProcessTransport {
+  stdin: Writable;
+  stdout: Readable;
+  stderr: Readable;
+}
+
 interface ProcessTreeAdapter {
-  attach(processHandle): Promise<ProcessTreeHandle>;
+  launch(processSpec): Promise<{ tree: ProcessTreeHandle; transport: ManagedProcessTransport }>;
   requestGracefulClose(tree, signal): Promise<void>;
   forceTerminate(tree): Promise<void>;
   waitForExit(tree, deadline): Promise<ExitObservation>;
@@ -704,9 +714,9 @@ UI 只消费控制器确认事实，不按逐 token 刷新：消息受理增加 
 
 ### 10.1 判定范围
 
-**REQ-048**：开发交付必须在 Windows、macOS、Linux 原生 runner 上通过。缺少任一 runner 或任一平台必测场景失败，都表示开发验收未完成；mock 不能替代原生进程树回收。CPU 架构不单列矩阵，以 runner 可运行兼容 Node/Pi 的架构为准。
+**REQ-048**：当前开发交付只要求 Windows 原生 runner 通过；macOS/Linux 原生 runner、真实进程树回收证据和跨平台支持结论延期到独立计划。Windows runner 缺失或任一 Windows 必测场景失败，都表示本里程碑未完成；mock 不能替代 Windows Job Object 的原生回收。CPU 架构不单列矩阵，以 runner 可运行兼容 Node/Pi 的架构为准。
 
-每个平台执行两个锁定宿主组合：
+Windows 执行两个锁定宿主组合：
 
 1. 最低组合：Node `22.19.0` + Pi `0.83.0`；
 2. 当前组合：验收执行时最新稳定 Pi + 该 Pi 支持的当前 Node Active LTS。
@@ -723,11 +733,13 @@ UI 只消费控制器确认事实，不按逐 token 刷新：消息受理增加 
 4. **TUI 交互测试**：验证直接子代理 widget、`/agent` 遮罩、滚动/展开/关闭、稳定尺寸和 UI-only 通知。
 5. **本地 package 测试**：验证本地包目录或本地构建包的 manifest、生产依赖、临时加载和隔离的本地持久安装形态。
 
+五层自动化当前都在 Windows runner 执行。平台无关逻辑和 Unix 适配代码可以通过 fake、类型检查和条件分支契约测试覆盖；需要 macOS/Linux 内核原语的测试不属于本里程碑通过项，必须留给独立原生验证计划。
+
 现有 throwaway 原型只能作为设计证据，关键断言必须迁入正式测试。人工探索可以补充，但不能替代自动化验收。
 
 ### 10.3 核心端到端旅程
 
-**REQ-050**：以下旅程必须在三平台乘两个宿主组合的六个 job 中全部执行：
+**REQ-050**：以下旅程必须在 Windows 乘两个宿主组合的两个 job 中全部执行；macOS/Linux 只保留代码、类型、纯逻辑和 fake 测试，不在本里程碑执行原生旅程：
 
 1. 加载扩展并发现合法模板，根创建 A；只有双握手后才以 `idle` 成功。
 2. 向空闲 A 发送任务，接收直接回复并等待 settled；再次发送可观察同一节点上下文延续。
@@ -751,7 +763,7 @@ UI 只消费控制器确认事实，不按逐 token 刷新：消息受理增加 
 - 未信任项目资源不加载、模板不能扩权、叶节点不能绕过深度、根不能越级控制；
 - cwd 外路径仍按 Pi 正常工具能力处理，证明扩展没有误实现 cwd 沙箱；
 - 以秘密 canary 注入 prompt、路径、环境、工具参数/结果、连接凭据和堆栈，证明 widget、`/agent`、状态/树、错误、UI 通知、监督帧和 UI-only 诊断不泄露，也不进入模型上下文；
-- 三个平台真实验证显式终止、根关闭和 reload 激活失败后没有存活的被监督后代；其余平台无关用例不重复完整六组合。
+- Windows 真实验证显式终止、根关闭和 reload 激活失败后没有存活的被监督后代；macOS/Linux 对应原生场景记为延期，不得以 skip 或 mock 标记为已通过。
 
 配额边界、协议状态有界、资源确认、名额释放和无孤儿是功能/安全正确性，不是性能指标。
 
@@ -774,7 +786,7 @@ UI 只消费控制器确认事实，不按逐 token 刷新：消息受理增加 
 
 ### 10.7 开发验收证据
 
-**REQ-054**：开发验收记录至少包含源码 commit、精确 OS/Node/Pi 版本、执行的 `AC-xxx`、通过/失败结果、资源清理结论和脱敏日志/UI 快照。所有映射到要求的 AC 必须通过；不得用 skip、quarantine 或自动重试掩盖失败。失败修复后必须重跑受影响场景。证据不包含 registry、正式发行 hash 或 release tag 证明。
+**REQ-054**：开发验收记录至少包含源码 commit、精确 Windows/Node/Pi 版本、执行的 `AC-xxx`、通过/失败结果、资源清理结论和脱敏日志/UI 快照；本里程碑映射到 Windows 的 AC 必须通过。延期的 macOS/Linux 原生场景必须单独列为未执行，不得用 skip、quarantine、mock 或自动重试伪装成通过。失败修复后必须重跑受影响场景。证据不包含 registry、正式发行 hash 或 release tag 证明。
 
 ## 11. 验收场景目录
 
@@ -801,16 +813,16 @@ UI 只消费控制器确认事实，不按逐 token 刷新：消息受理增加 
 | `AC-019` | 监督握手和快照 | 身份/版本/凭据、初始快照、subtree replacement、原子根修订 |
 | `AC-020` | seq、ACK、重同步和有界状态 | duplicate/gap/reset/new stream/reply dedupe/窗口边界 |
 | `AC-021` | 监督器启动和命令顺序 | 先挂接 OS 树、双通道就绪、单写者、终止优先、迟到丢弃 |
-| `AC-022` | 原生平台进程树回收 | Windows Job Object、macOS/Linux process group/session、资源确认 |
+| `AC-022` | Windows 原生进程树回收 | Windows Job Object、资源确认和孙进程整树回收；Unix 原生部分延期 |
 | `AC-023` | 父故障、根关闭与 reload 失败 | 防孤儿、内部期限、无自动重启、失败 reload 清树 |
 | `AC-024` | 常驻 widget | 只显示直接子代理、稳定行字段、计时、pending 和故障码 |
 | `AC-025` | `/agent` 遮罩 | 作用域、折叠/滚动/展开/Esc、finished、修订保持交互状态 |
 | `AC-026` | UI-only 与秘密 canary | 诊断/通知不进上下文，所有公开面不泄露正文和秘密 |
 | `AC-027` | 本地 package 形态 | 唯一入口、生产依赖、本地临时/持久 scope、无隐式写入、清理临时资源 |
-| `AC-028` | 六组合核心旅程 | 三平台乘最低/当前组合完整执行 REQ-050 |
+| `AC-028` | Windows 双组合核心旅程 | Windows 乘最低/当前组合完整执行 REQ-050 |
 | `AC-029` | 兼容负向组合 | 低版本、不可解析版本、API 缺失、不支持平台统一失活 |
 | `AC-030` | 无性能门槛 | 测试计划和 CI 不含性能/压力/SLO/coverage 百分比阻断项 |
-| `AC-031` | 追踪与开发证据 | 每个 REQ 有 AC；环境、commit、结果和清理证据完整，无 skip 隐藏 |
+| `AC-031` | 追踪与 Windows 开发证据 | Windows 环境、commit、结果和清理证据完整；延期 Unix 场景单独列出，不以 skip 隐藏 |
 
 ## 12. 需求追踪
 
@@ -844,4 +856,4 @@ UI 只消费控制器确认事实，不按逐 token 刷新：消息受理增加 
 | `REQ-053` | 06、10 | `AC-030` |
 | `REQ-054` | 10 | `AC-031` |
 
-本文没有性能测试或发布执行要求，registry 凭据等发布运营信息属于外部输入，所有运行期产品决策均已冻结。实现代理应按 REQ 和 AC 直接拆分生产代码与测试；对不改变公开行为的类名、文件布局、内部期限数值、帧/字符串安全上限和日志后端，可以在实现中选择并用测试固定。
+本文没有性能测试或发布执行要求，registry 凭据等发布运营信息属于外部输入。当前运行期产品决策已冻结，平台验收范围则明确分为 Windows 开发里程碑和后续独立的 macOS/Linux 原生验证计划。实现代理应按 REQ 和 AC 直接拆分生产代码与测试；对不改变公开行为的类名、文件布局、内部期限数值、帧/字符串安全上限和日志后端，可以在实现中选择并用测试固定。
