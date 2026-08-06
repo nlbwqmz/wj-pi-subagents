@@ -6,7 +6,7 @@ Type: task
 
 Blocked by: 17 - 预构资源确认边界与可注入进程树替身；19 - 发布可信代理模板发现快照；20 - 建立代理树身份、七态生命周期与配额内核；21 - 实现父子监督协议与安全子树汇聚；22 - 实现 Windows Job Object 进程树适配器
 
-Status: ready-for-human
+Status: resolved
 
 - [x] 把现有监督器的外部接口收敛为 `ManagedRpcNode`：`ProcessTreeAdapter.launch()` 先启动包内受管桥接进程，桥接进程内部独占 Pi 公共 `RpcClient`；桥接与 Pi RPC 子进程继承同一 Job Object/process group，监督器不再分别接收客户端和树句柄。
 - [x] 为桥接协议提供固定长度边界、一次性认证、有限命令/事件集合和故障观察；只转发高层命令与安全事件，不复制 Pi JSONL，不允许第二个模块直接读写同一 RPC 流。（REQ-038、REQ-039、AC-021）
