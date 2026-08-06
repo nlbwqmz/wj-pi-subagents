@@ -12,8 +12,9 @@ Status: ready-for-agent
 - [ ] 交付 `get_agent_status` 与 `get_agent_tree`：按直接父/自身子树裁剪安全快照，保证父先、稳定创建顺序、全局深度、原子 `tree_revision` 和终止记录语义，不因查询触发 RPC、等待或状态变化。（REQ-001..003、REQ-030..031；AC-001、AC-017）
 - [ ] 交付 `terminate_agent` 的单次树线性化屏障和后代优先清理：取消未写命令、活动 abort、优雅关闭、内部期限、平台强制整树回收、资源确认和幂等合并；部分确认时释放已完成节点名额，未确认节点保留 `terminating`/`termination_incomplete`。（REQ-029、REQ-041..042；AC-016、AC-022）
 - [ ] 闭合运行故障、RPC/监督通道 EOF、非法事件、中间父故障、根退出/new/resume/fork/runtime 关闭和 reload 激活失败；不自动重启、不恢复、不复用身份，并确保无孤儿和未确认资源不提前释放。（REQ-003、REQ-017、REQ-043；AC-001、AC-023）
-- [ ] 在 Windows 验证递归树、并行兄弟、后代优先终止、部分回收、父故障和根关闭的真实 Job Object 结果；macOS/Linux 仅保留跨平台逻辑和 fake 覆盖，原生验证交给后续独立计划。
 
 ## Comments
 
 <!-- 追加实现与审查记录。 -->
+
+- 2026-08-06：按用户确认的批次范围，删除依赖真实 Windows、Pi 进程树和 Job Object 环境的测试任务；相关真实环境验证由人工完成，不作为本工单的代理任务项。
