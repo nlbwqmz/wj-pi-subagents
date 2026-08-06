@@ -303,16 +303,6 @@ export class WindowsJobObjectAdapter implements ProcessTreeAdapter {
     });
   }
 
-  /**
-   * 兼容既有 ProcessTreeAdapter 契约，但只接受启动前说明；拒绝已运行进程以保留绑定保证。
-   */
-  async attach(processHandle: unknown): Promise<ProcessTreeHandle> {
-    if (!isLaunchOptions(processHandle)) {
-      throw safeError("Windows Job Object 只能绑定启动前的进程说明");
-    }
-    return (await this.launch(processHandle)).tree;
-  }
-
   async requestGracefulClose(tree: ProcessTreeHandle, signal: AbortSignal): Promise<void> {
     const state = this.readState(tree);
     if (state.handleReleased) return;

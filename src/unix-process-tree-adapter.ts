@@ -279,14 +279,6 @@ export class UnixProcessTreeAdapter implements ProcessTreeAdapter {
     });
   }
 
-  /** 只接受启动前说明；绑定已运行进程无法证明其属于专用 process group/session。 */
-  async attach(processHandle: unknown): Promise<ProcessTreeHandle> {
-    if (!isLaunchOptions(processHandle)) {
-      throw safeError("Unix process group 只能绑定启动前的进程说明");
-    }
-    return (await this.launch(processHandle)).tree;
-  }
-
   async requestGracefulClose(tree: ProcessTreeHandle, signal: AbortSignal): Promise<void> {
     const state = this.readState(tree);
     if (state.handleReleased || state.gracefulCloseRequested) return;

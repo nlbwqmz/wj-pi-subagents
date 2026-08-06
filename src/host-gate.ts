@@ -1,6 +1,6 @@
 import packageManifest from "../package.json" with { type: "json" };
 import {
-  isProcessTreeAdapter,
+  isManagedProcessTreeAdapter,
   type ProcessTreeAdapter,
 } from "./process-tree-capability.ts";
 
@@ -43,6 +43,7 @@ export interface ExtensionApiSurface {
   getActiveTools?: unknown;
   getAllTools?: unknown;
   setActiveTools?: unknown;
+  sendMessage?: unknown;
   exec?: unknown;
   events?: unknown;
 }
@@ -166,6 +167,7 @@ const REQUIRED_EXTENSION_API_METHODS = [
   "getActiveTools",
   "getAllTools",
   "setActiveTools",
+  "sendMessage",
   "exec",
 ] as const;
 
@@ -324,7 +326,9 @@ export async function checkHostCapabilities(input: HostProbeInput): Promise<Host
   } catch {
     return unavailable("process_tree_adapter_unavailable");
   }
-  if (!isProcessTreeAdapter(processTreeAdapter, platform)) {
+  // 生产启动必须证明树句柄和桥接传输来自同一次 launch() 事务；仅有旧
+  // 只有同事务 launch() 的适配器才能通过宿主门禁。
+  if (!isManagedProcessTreeAdapter(processTreeAdapter, platform)) {
     return unavailable("process_tree_adapter_unavailable");
   }
 

@@ -183,6 +183,15 @@ export interface ManagementCapabilitySnapshot {
   readonly enabled: boolean;
 }
 
+export interface TreeSnapshotScope {
+  readonly kind: "root" | "subtree";
+  readonly agent_id?: string;
+}
+
+export interface ScopedAgentTreeSnapshot extends AgentTreeSnapshot {
+  readonly scope: TreeSnapshotScope;
+}
+
 export interface LifecycleEventOutcome {
   readonly applied: boolean;
   readonly node: AgentSnapshot;
@@ -374,6 +383,7 @@ export class TreeController {
   private readonly rootManagementEnabled: boolean;
   private readonly agents = new Map<string, AgentRecord>();
   private readonly issuedAgentIds = new Set<string>();
+  private readonly changeListeners = new Set<() => void>();
   private treeRevision = 0;
   private treeObservedAt = new Date(0).toISOString();
 
@@ -388,6 +398,12 @@ export class TreeController {
     this.now = options.now ?? (() => new Date());
     this.monotonicNow = options.monotonicNow ?? (() => performance.now());
     this.rootManagementEnabled = options.rootManagementEnabled !== false;
+  }
+
+  /** 只读观察树事实变化；观察者异常不会影响控制器顺序域。 */
+  onChange(listener: () => void): () => void {
+    this.changeListeners.add(listener);
+    return () => this.changeListeners.delete(listener);
   }
 
   /** 创建调用在同步临界区内同时预留两类名额并登记 starting。 */
@@ -441,6 +457,7 @@ export class TreeController {
     this.issuedAgentIds.add(agentId);
     this.treeRevision += 1;
     this.treeObservedAt = record.observedAt;
+    this.notifyChange();
     return controlSuccess(this.outcome(record, true));
   }
 
@@ -590,6 +607,38 @@ export class TreeController {
     }));
   }
 
+  /** 按调用者作用域裁剪安全树快照，不触发 RPC 或生命周期变化。 */
+  getTreeSnapshotFor(actor: TreeActor | unknown): ControlResult<ScopedAgentTreeSnapshot> {
+    const resolved = this.resolveActor(actor);
+    if (!resolved.ok) return resolved;
+    const scope = resolved.data.record;
+    const monotonicAt = this.safeMonotonicNow();
+    const records = scope === undefined
+      ? Array.from(this.agents.values())
+      : Array.from(this.agents.values()).filter((record) =>
+        record.agentId === scope.agentId || this.isDescendantOf(record, scope.agentId),
+      );
+    const nodes = records.map((record) => {
+      const snapshot = this.snapshot(record, monotonicAt);
+      if (scope !== undefined && record.agentId === scope.agentId) {
+        return Object.freeze({ ...snapshot, parent_agent_id: null });
+      }
+      if (scope !== undefined && record.parentAgentId !== null && !records.some((candidate) => candidate.agentId === record.parentAgentId)) {
+        return Object.freeze({ ...snapshot, parent_agent_id: null });
+      }
+      return snapshot;
+    });
+    const scoped = Object.freeze({
+      scope: Object.freeze(scope === undefined
+        ? { kind: "root" as const }
+        : { kind: "subtree" as const, agent_id: scope.agentId }),
+      tree_revision: this.treeRevision,
+      observed_at: this.treeObservedAt,
+      nodes: Object.freeze(nodes),
+    });
+    return controlSuccess(scoped);
+  }
+
   /** 返回配额事实；终止记录仍可查询但不会计入这些数字。 */
   getQuotaSnapshot(): ControlResult<QuotaSnapshot> {
     return controlSuccess(Object.freeze({
@@ -722,7 +771,29 @@ export class TreeController {
     record.observedAt = observedAt;
     this.treeRevision += 1;
     this.treeObservedAt = observedAt;
+    this.notifyChange();
     return true;
+  }
+
+  private isDescendantOf(record: AgentRecord, ancestorAgentId: string): boolean {
+    let parentId = record.parentAgentId;
+    const visited = new Set<string>();
+    while (parentId !== null && !visited.has(parentId)) {
+      if (parentId === ancestorAgentId) return true;
+      visited.add(parentId);
+      parentId = this.agents.get(parentId)?.parentAgentId ?? null;
+    }
+    return false;
+  }
+
+  private notifyChange(): void {
+    for (const listener of this.changeListeners) {
+      try {
+        listener();
+      } catch {
+        // 只读观察者异常不能改变身份、配额或生命周期事实。
+      }
+    }
   }
 
   private createFault(code: AgentFaultCode, observedAt: string): AgentFault {

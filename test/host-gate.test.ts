@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { PassThrough } from "node:stream";
 import {
   HOST_CAPABILITY_DIAGNOSTIC_CODE,
   MIN_NODE_VERSION,
@@ -20,6 +21,7 @@ const readyApi = (): ExtensionApiSurface => ({
   getActiveTools: () => [],
   getAllTools: () => [],
   setActiveTools: () => {},
+  sendMessage: () => {},
   exec: async () => ({ code: 0, stdout: "", stderr: "" }),
   events: { emit: () => {}, on: () => () => {} },
 });
@@ -51,7 +53,11 @@ const readyOverrides = (overrides: HostProbeOverrides = {}): HostProbeOverrides 
 const readyProcessTreeAdapter = (platform: SupportedPlatform): ProcessTreeAdapter => ({
   platform,
   strategy: platform === "win32" ? "job_object" : "process_group_or_session",
-  attach: async () => ({}),
+  launch: async () => ({ tree: {}, transport: {
+    stdin: new PassThrough(),
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+  } }),
   requestGracefulClose: async () => {},
   forceTerminate: async () => {},
   waitForExit: async () => ({ state: "exited" }),

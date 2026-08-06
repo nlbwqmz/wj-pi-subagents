@@ -8,11 +8,19 @@ import {
   type RpcSupervisorChannelCloseState,
   type RpcSupervisorEvent,
 } from "../src/rpc-supervisor.ts";
+import type {
+  ManagedRpcNodeLike,
+  ManagedRpcNodeStartContext,
+} from "../src/managed-rpc-node.ts";
 import {
   FakeProcessTreeAdapter,
   type FakeProcessTreeAdapterOptions,
 } from "../src/fake-process-tree-adapter.ts";
-import type { ProcessTreeHandle } from "../src/process-tree-capability.ts";
+import type {
+  ExitObservation,
+  ProcessTreeHandle,
+  ResourceObservation,
+} from "../src/process-tree-capability.ts";
 import {
   ROOT_TREE_ACTOR,
   TreeController,
@@ -110,6 +118,137 @@ class RecordingController {
   }
 }
 
+/**
+ * 测试仍复用 RPC 与进程树替身的可控行为，但监督器只能看到同一受管节点。
+ * 启动中等待绑定的语义与生产 ManagedRpcNode 一致，用于覆盖迟到 launch 回收。
+ */
+class TestManagedRpcNode implements ManagedRpcNodeLike {
+  readonly process_binding = "managed" as const;
+
+  private readonly rpc: FakeRpcClient;
+  private readonly adapter: FakeProcessTreeAdapter;
+  private tree: ProcessTreeHandle | undefined;
+  private phase: "new" | "starting" | "ready" | "failed" | "released" = "new";
+  private startPromise: Promise<void> | undefined;
+  private bindingSettled = false;
+  private resolveBindingSettled!: () => void;
+  private readonly bindingSettlement = new Promise<void>((resolve) => {
+    this.resolveBindingSettled = resolve;
+  });
+  private gracefulCloseRequested = false;
+  private forceTerminationRequested = false;
+  private releaseRequested = false;
+
+  constructor(rpc: FakeRpcClient, adapter: FakeProcessTreeAdapter) {
+    this.rpc = rpc;
+    this.adapter = adapter;
+  }
+
+  start(_signal?: AbortSignal, _context?: ManagedRpcNodeStartContext): Promise<void> {
+    this.startPromise ??= this.runStart();
+    return this.startPromise;
+  }
+
+  prompt(message: string, images?: readonly { readonly type: "image"; readonly data: string; readonly mimeType: string }[]): Promise<void> {
+    return this.rpc.prompt(message, images);
+  }
+
+  steer(message: string, images?: readonly { readonly type: "image"; readonly data: string; readonly mimeType: string }[]): Promise<void> {
+    return this.rpc.steer(message, images);
+  }
+
+  abort(): Promise<void> {
+    return this.rpc.abort();
+  }
+
+  getState(): Promise<unknown> {
+    return this.rpc.getState();
+  }
+
+  onEvent(listener: (event: unknown) => void): () => void {
+    return this.rpc.onEvent(listener);
+  }
+
+  onTransportFault(listener: (fault: "eof" | "protocol_fault" | "process_exit") => void): () => void {
+    return this.rpc.onTransportFault(listener);
+  }
+
+  async sendSupervisorFrame(): Promise<void> {}
+
+  onSupervisorFrame(): () => void {
+    return () => {};
+  }
+
+  async publishSupervisorReply(): Promise<void> {}
+
+  async requestGracefulClose(signal: AbortSignal): Promise<void> {
+    this.gracefulCloseRequested = true;
+    await this.waitForBindingSettlement();
+    if (this.tree !== undefined) await this.adapter.requestGracefulClose(this.tree, signal);
+  }
+
+  async forceTerminate(): Promise<void> {
+    this.forceTerminationRequested = true;
+    await this.waitForBindingSettlement();
+    if (this.tree !== undefined) await this.adapter.forceTerminate(this.tree);
+  }
+
+  async waitForExit(deadline: number | Date): Promise<ExitObservation> {
+    if (this.tree !== undefined) return this.adapter.waitForExit(this.tree, deadline);
+    return this.phase === "starting" ? { state: "unknown" } : { state: "exited" };
+  }
+
+  async inspect(): Promise<ResourceObservation> {
+    if (this.tree !== undefined) return this.adapter.inspect(this.tree);
+    return this.phase === "starting" ? { state: "unknown" } : { state: "released" };
+  }
+
+  async release(): Promise<void> {
+    this.releaseRequested = true;
+    await this.waitForBindingSettlement();
+    if (this.tree !== undefined) await this.adapter.release(this.tree);
+    this.phase = "released";
+  }
+
+  private async runStart(): Promise<void> {
+    if (this.phase !== "new") throw new Error("测试受管节点已启动");
+    this.phase = "starting";
+    try {
+      const launch = await this.adapter.launch({ command: "test-rpc-bridge" });
+      this.tree = launch.tree;
+      this.recordBindingSettlement();
+      if (this.cleanupRequested()) {
+        this.phase = "failed";
+        return;
+      }
+      await this.rpc.start();
+      if (this.cleanupRequested()) {
+        this.phase = "failed";
+        return;
+      }
+      this.phase = "ready";
+    } catch (error) {
+      this.recordBindingSettlement();
+      if (!this.releaseRequested) this.phase = "failed";
+      throw error;
+    }
+  }
+
+  private cleanupRequested(): boolean {
+    return this.gracefulCloseRequested || this.forceTerminationRequested || this.releaseRequested;
+  }
+
+  private recordBindingSettlement(): void {
+    if (this.bindingSettled) return;
+    this.bindingSettled = true;
+    this.resolveBindingSettled();
+  }
+
+  private async waitForBindingSettlement(): Promise<void> {
+    if (this.phase === "starting" && !this.bindingSettled) await this.bindingSettlement;
+  }
+}
+
 class RecordingProcessTreeAdapter extends FakeProcessTreeAdapter {
   private readonly trace: string[];
 
@@ -121,9 +260,12 @@ class RecordingProcessTreeAdapter extends FakeProcessTreeAdapter {
     this.trace = trace;
   }
 
-  override async attach(processHandle: unknown): Promise<ProcessTreeHandle> {
-    this.trace.push("process:attach");
-    return super.attach(processHandle);
+  override async launch(spec: { readonly command: string }): Promise<{
+    readonly tree: ProcessTreeHandle;
+    readonly transport: import("../src/process-tree-capability.ts").ManagedProcessTransport;
+  }> {
+    this.trace.push("process:launch");
+    return super.launch(spec);
   }
 
   override async requestGracefulClose(
@@ -140,15 +282,15 @@ class RecordingProcessTreeAdapter extends FakeProcessTreeAdapter {
   }
 }
 
-class DelayedAttachProcessTreeAdapter extends RecordingProcessTreeAdapter {
-  readonly attachStarted: Promise<void>;
+class DelayedLaunchProcessTreeAdapter extends RecordingProcessTreeAdapter {
+  readonly launchStarted: Promise<void>;
   private signalStarted!: () => void;
   private releasePromise: Promise<void>;
   private releaseAttach!: () => void;
 
   constructor(trace: string[]) {
     super(trace);
-    this.attachStarted = new Promise<void>((resolve) => {
+    this.launchStarted = new Promise<void>((resolve) => {
       this.signalStarted = resolve;
     });
     this.releasePromise = new Promise<void>((resolve) => {
@@ -156,13 +298,16 @@ class DelayedAttachProcessTreeAdapter extends RecordingProcessTreeAdapter {
     });
   }
 
-  override async attach(processHandle: unknown): Promise<ProcessTreeHandle> {
+  override async launch(spec: { readonly command: string }): Promise<{
+    readonly tree: ProcessTreeHandle;
+    readonly transport: import("../src/process-tree-capability.ts").ManagedProcessTransport;
+  }> {
     this.signalStarted();
     await this.releasePromise;
-    return super.attach(processHandle);
+    return super.launch(spec);
   }
 
-  completeAttach(): void {
+  completeLaunch(): void {
     this.releaseAttach();
   }
 }
@@ -275,14 +420,13 @@ test("启动按预留、监督绑定、进程树、双通道握手和无副作�
   const rpcClient = new FakeRpcClient({
     onOperation: (operation) => trace.push(`rpc:${operation}`),
   });
+  const managedNode = new TestManagedRpcNode(rpcClient, processTreeAdapter);
   const channel = new RecordingSupervisorChannel(trace);
   const supervisor = new RpcSupervisor({
     controller,
     actor: ROOT_TREE_ACTOR,
     reservation: { templateId: "researcher", name: "研究" },
-    rpcClient,
-    processTreeAdapter,
-    processHandle: Object.freeze({ command: "pi" }),
+    managedNode,
     channel,
     startupTimeoutMs: 100,
     gracefulShutdownMs: 10,
@@ -298,9 +442,9 @@ test("启动按预留、监督绑定、进程树、双通道握手和无副作�
   assert.deepEqual(trace.slice(0, 8), [
     "controller:reserve",
     "channel:bind",
-    "process:attach",
-    "channel:wait_ready",
+    "process:launch",
     "rpc:start",
+    "channel:wait_ready",
     "rpc:get_state",
     "controller:startup_ready",
   ]);
@@ -315,14 +459,13 @@ test("启动超时先记录安全故障再强制回滚，确认回收后释放�
   const controller = new RecordingController(tree, trace);
   const processTreeAdapter = new RecordingProcessTreeAdapter(trace);
   const rpcClient = new FakeRpcClient();
+  const managedNode = new TestManagedRpcNode(rpcClient, processTreeAdapter);
   const channel = new RecordingSupervisorChannel(trace, new Promise<void>(() => {}));
   const first = new RpcSupervisor({
     controller,
     actor: ROOT_TREE_ACTOR,
     reservation: { templateId: "researcher", name: "超时" },
-    rpcClient,
-    processTreeAdapter,
-    processHandle: Object.freeze({ command: "pi" }),
+    managedNode,
     channel,
     startupTimeoutMs: 5,
     gracefulShutdownMs: 5,
@@ -349,24 +492,24 @@ test("启动超时先记录安全故障再强制回滚，确认回收后释放�
   if (second.ok) assert.equal(second.data.node.agent_id, SECOND_AGENT_ID);
 });
 
-test("attach 超时但树句柄迟到时先保留名额，随后后台确认并完成回收", async () => {
+test("launch 超时但树句柄迟到时先保留名额，随后后台确认并完成回收", async () => {
   const trace: string[] = [];
   const tree = createController();
-  const processTreeAdapter = new DelayedAttachProcessTreeAdapter(trace);
+  const processTreeAdapter = new DelayedLaunchProcessTreeAdapter(trace);
+  const rpcClient = new FakeRpcClient();
+  const managedNode = new TestManagedRpcNode(rpcClient, processTreeAdapter);
   const supervisor = new RpcSupervisor({
     controller: new RecordingController(tree, trace),
     actor: ROOT_TREE_ACTOR,
     reservation: { templateId: "researcher", name: "迟到句柄" },
-    rpcClient: new FakeRpcClient(),
-    processTreeAdapter,
-    processHandle: Object.freeze({ command: "pi" }),
+    managedNode,
     channel: new RecordingSupervisorChannel(trace),
     startupTimeoutMs: 5,
     gracefulShutdownMs: 5,
   });
 
   const startup = supervisor.start();
-  await processTreeAdapter.attachStarted;
+  await processTreeAdapter.launchStarted;
   const failed = await startup;
 
   assert.deepEqual(failed, {
@@ -379,7 +522,7 @@ test("attach 超时但树句柄迟到时先保留名额，随后后台确认并�
   assert.equal(status.ok, true);
   if (status.ok) assert.equal(status.data.state, "terminating");
 
-  processTreeAdapter.completeAttach();
+  processTreeAdapter.completeLaunch();
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -396,13 +539,12 @@ test("RPC 在启动探测前提前 EOF 时走 spawn_failed 回滚而不发布 st
     onOperation: (operation) => trace.push(`rpc:${operation}`),
     transportEventOnStart: "eof",
   });
+  const managedNode = new TestManagedRpcNode(rpcClient, new RecordingProcessTreeAdapter(trace));
   const supervisor = new RpcSupervisor({
     controller: new RecordingController(tree, trace),
     actor: ROOT_TREE_ACTOR,
     reservation: { templateId: "researcher", name: "提前退出" },
-    rpcClient,
-    processTreeAdapter: new RecordingProcessTreeAdapter(trace),
-    processHandle: Object.freeze({ command: "pi" }),
+    managedNode,
     channel: new RecordingSupervisorChannel(trace),
     startupTimeoutMs: 100,
     gracefulShutdownMs: 5,
@@ -424,13 +566,12 @@ test("RPC 在启动探测前提前 EOF 时走 spawn_failed 回滚而不发布 st
 test("同一节点的 prompt 与 steering 只按一个 RPC 写入顺序域执行", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
+  const managedNode = new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter());
   const supervisor = new RpcSupervisor({
     controller: tree,
     actor: ROOT_TREE_ACTOR,
     reservation: { templateId: "researcher", name: "串行" },
-    rpcClient,
-    processTreeAdapter: new FakeProcessTreeAdapter(),
-    processHandle: Object.freeze({ command: "pi" }),
+    managedNode,
     channel: new RecordingSupervisorChannel([]),
     startupTimeoutMs: 100,
     gracefulShutdownMs: 5,
@@ -462,13 +603,12 @@ test("同一节点的 prompt 与 steering 只按一个 RPC 写入顺序域执行
 test("prompt 接受响应与 agent_settled 同批到达时按线序提交并最终保持 idle", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
+  const managedNode = new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter());
   const supervisor = new RpcSupervisor({
     controller: tree,
     actor: ROOT_TREE_ACTOR,
     reservation: { templateId: "researcher", name: "settle 竞态" },
-    rpcClient,
-    processTreeAdapter: new FakeProcessTreeAdapter(),
-    processHandle: Object.freeze({ command: "pi" }),
+    managedNode,
     channel: new RecordingSupervisorChannel([]),
     startupTimeoutMs: 100,
     gracefulShutdownMs: 5,
@@ -494,13 +634,13 @@ test("不同节点拥有独立命令顺序域并可同时写入各自 RPC", asyn
   const tree = createController();
   const firstRpc = new FakeRpcClient();
   const secondRpc = new FakeRpcClient();
+  const firstNode = new TestManagedRpcNode(firstRpc, new FakeProcessTreeAdapter());
+  const secondNode = new TestManagedRpcNode(secondRpc, new FakeProcessTreeAdapter());
   const first = new RpcSupervisor({
     controller: tree,
     actor: ROOT_TREE_ACTOR,
     reservation: { templateId: "researcher", name: "并行一" },
-    rpcClient: firstRpc,
-    processTreeAdapter: new FakeProcessTreeAdapter(),
-    processHandle: Object.freeze({ command: "pi" }),
+    managedNode: firstNode,
     channel: new RecordingSupervisorChannel([]),
     startupTimeoutMs: 100,
     gracefulShutdownMs: 5,
@@ -509,9 +649,7 @@ test("不同节点拥有独立命令顺序域并可同时写入各自 RPC", asyn
     controller: tree,
     actor: ROOT_TREE_ACTOR,
     reservation: { templateId: "researcher", name: "并行二" },
-    rpcClient: secondRpc,
-    processTreeAdapter: new FakeProcessTreeAdapter(),
-    processHandle: Object.freeze({ command: "pi" }),
+    managedNode: secondNode,
     channel: new RecordingSupervisorChannel([]),
     startupTimeoutMs: 100,
     gracefulShutdownMs: 5,
@@ -536,13 +674,12 @@ test("不同节点拥有独立命令顺序域并可同时写入各自 RPC", asyn
 test("abort 与消息共用顺序域，响应和 agent_end 不 settle，只有 agent_settled 回到 idle", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
+  const managedNode = new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter());
   const supervisor = new RpcSupervisor({
     controller: tree,
     actor: ROOT_TREE_ACTOR,
     reservation: { templateId: "researcher", name: "中断" },
-    rpcClient,
-    processTreeAdapter: new FakeProcessTreeAdapter(),
-    processHandle: Object.freeze({ command: "pi" }),
+    managedNode,
     channel: new RecordingSupervisorChannel([]),
     startupTimeoutMs: 100,
     gracefulShutdownMs: 5,
@@ -582,13 +719,12 @@ test("abort 与消息共用顺序域，响应和 agent_end 不 settle，只有 a
 test("abort 写入后不等待响应，interrupting 中的后续消息继续按顺序交付", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
+  const managedNode = new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter());
   const supervisor = new RpcSupervisor({
     controller: tree,
     actor: ROOT_TREE_ACTOR,
     reservation: { templateId: "researcher", name: "中断后消息" },
-    rpcClient,
-    processTreeAdapter: new FakeProcessTreeAdapter(),
-    processHandle: Object.freeze({ command: "pi" }),
+    managedNode,
     channel: new RecordingSupervisorChannel([]),
     startupTimeoutMs: 100,
     gracefulShutdownMs: 5,
@@ -621,14 +757,13 @@ test("abort 写入后不等待响应，interrupting 中的后续消息继续按�
 test("Pi 事件只归一化为生命周期、安全工具活动和普通 assistant 回复", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
+  const managedNode = new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter());
   const channel = new RecordingSupervisorChannel([]);
   const supervisor = new RpcSupervisor({
     controller: tree,
     actor: ROOT_TREE_ACTOR,
     reservation: { templateId: "researcher", name: "事件" },
-    rpcClient,
-    processTreeAdapter: new FakeProcessTreeAdapter(),
-    processHandle: Object.freeze({ command: "pi" }),
+    managedNode,
     channel,
     startupTimeoutMs: 100,
     gracefulShutdownMs: 5,
@@ -708,16 +843,15 @@ test("Pi 事件只归一化为生命周期、安全工具活动和普通 assista
 });
 
 test("非法 Pi 事件和运行期 EOF 归一化为稳定故障且不泄露原始载荷", async () => {
-  for (const scenario of ["invalid_event", "eof"] as const) {
+  for (const scenario of ["invalid_event", "unknown_content", "eof"] as const) {
     const tree = createController();
     const rpcClient = new FakeRpcClient();
+    const managedNode = new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter());
     const supervisor = new RpcSupervisor({
       controller: tree,
       actor: ROOT_TREE_ACTOR,
       reservation: { templateId: "researcher", name: scenario },
-      rpcClient,
-      processTreeAdapter: new FakeProcessTreeAdapter(),
-      processHandle: Object.freeze({ command: "pi" }),
+      managedNode,
       channel: new RecordingSupervisorChannel([]),
       startupTimeoutMs: 100,
       gracefulShutdownMs: 5,
@@ -728,6 +862,14 @@ test("非法 Pi 事件和运行期 EOF 归一化为稳定故障且不泄露原�
 
     if (scenario === "invalid_event") {
       rpcClient.emitEvent({ type: "unknown_pi_event", error: "TOP_SECRET_STACK" });
+    } else if (scenario === "unknown_content") {
+      rpcClient.emitEvent({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "future_secret_block", secret: "TOP_SECRET_STACK" }],
+        },
+      });
     } else {
       rpcClient.emitTransportFault("eof");
     }
@@ -745,7 +887,7 @@ test("非法 Pi 事件和运行期 EOF 归一化为稳定故障且不泄露原�
     const fault = events.find((event) => event.kind === "fault");
     assert.deepEqual(fault, {
       kind: "fault",
-      code: scenario === "invalid_event" ? "invalid_rpc_event" : "rpc_eof",
+      code: scenario === "eof" ? "rpc_eof" : "invalid_rpc_event",
     });
     assert.equal(JSON.stringify(events).includes("TOP_SECRET_STACK"), false);
   }
@@ -754,13 +896,12 @@ test("非法 Pi 事件和运行期 EOF 归一化为稳定故障且不泄露原�
 test("prompt 接受响应未决时遇到 EOF 返回 message_delivery_failed 且不重发", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
+  const managedNode = new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter());
   const supervisor = new RpcSupervisor({
     controller: tree,
     actor: ROOT_TREE_ACTOR,
     reservation: { templateId: "researcher", name: "未决交付" },
-    rpcClient,
-    processTreeAdapter: new FakeProcessTreeAdapter(),
-    processHandle: Object.freeze({ command: "pi" }),
+    managedNode,
     channel: new RecordingSupervisorChannel([]),
     startupTimeoutMs: 100,
     gracefulShutdownMs: 5,
@@ -791,13 +932,12 @@ test("终止屏障取消未写命令、抢占活动 RPC、合并并发终止并�
   const rpcClient = new FakeRpcClient({
     onOperation: (operation) => trace.push(`rpc:${operation}`),
   });
+  const managedNode = new TestManagedRpcNode(rpcClient, new RecordingProcessTreeAdapter(trace));
   const supervisor = new RpcSupervisor({
     controller: new RecordingController(tree, trace),
     actor: ROOT_TREE_ACTOR,
     reservation: { templateId: "researcher", name: "终止" },
-    rpcClient,
-    processTreeAdapter: new RecordingProcessTreeAdapter(trace),
-    processHandle: Object.freeze({ command: "pi" }),
+    managedNode,
     channel: new RecordingSupervisorChannel(trace),
     startupTimeoutMs: 100,
     gracefulShutdownMs: 5,
@@ -845,13 +985,12 @@ test("终止屏障取消未写命令、抢占活动 RPC、合并并发终止并�
 
 test("直接后代尚未终止时不把本节点资源确认误报为终止成功", async () => {
   const tree = createController();
+  const managedNode = new TestManagedRpcNode(new FakeRpcClient(), new FakeProcessTreeAdapter());
   const supervisor = new RpcSupervisor({
     controller: tree,
     actor: ROOT_TREE_ACTOR,
     reservation: { templateId: "researcher", name: "父节点" },
-    rpcClient: new FakeRpcClient(),
-    processTreeAdapter: new FakeProcessTreeAdapter(),
-    processHandle: Object.freeze({ command: "pi" }),
+    managedNode,
     channel: new RecordingSupervisorChannel([]),
     startupTimeoutMs: 100,
     gracefulShutdownMs: 5,
@@ -902,14 +1041,13 @@ test("直接后代尚未终止时不把本节点资源确认误报为终止成�
 test("关闭请求不返回时仍在内部期限后强制回收并结束等待", async () => {
   const trace: string[] = [];
   const processTreeAdapter = new HangingGracefulProcessTreeAdapter(trace);
+  const managedNode = new TestManagedRpcNode(new FakeRpcClient(), processTreeAdapter);
   const channel = new HangingCloseSupervisorChannel(trace);
   const supervisor = new RpcSupervisor({
     controller: createController(),
     actor: ROOT_TREE_ACTOR,
     reservation: { templateId: "researcher", name: "关闭期限" },
-    rpcClient: new FakeRpcClient(),
-    processTreeAdapter,
-    processHandle: Object.freeze({ command: "pi" }),
+    managedNode,
     channel,
     startupTimeoutMs: 100,
     gracefulShutdownMs: 5,
@@ -936,20 +1074,22 @@ test("关闭请求不返回时仍在内部期限后强制回收并结束等待",
 test("强制回收后资源仍存在时保持 terminating 并报告 termination_incomplete", async () => {
   const trace: string[] = [];
   const tree = createController();
-  const channel = new RecordingSupervisorChannel(trace);
-  const supervisor = new RpcSupervisor({
-    controller: new RecordingController(tree, trace),
-    actor: ROOT_TREE_ACTOR,
-    reservation: { templateId: "researcher", name: "残留" },
-    rpcClient: new FakeRpcClient(),
-    processTreeAdapter: new RecordingProcessTreeAdapter(trace, {
+  const managedNode = new TestManagedRpcNode(
+    new FakeRpcClient(),
+    new RecordingProcessTreeAdapter(trace, {
       scenarios: [{
         initial: { exit: "present", resources: "present" },
         afterGracefulClose: { exit: "present", resources: "present" },
         afterForceTerminate: [{ exit: "present", resources: "present" }],
       }],
     }),
-    processHandle: Object.freeze({ command: "pi" }),
+  );
+  const channel = new RecordingSupervisorChannel(trace);
+  const supervisor = new RpcSupervisor({
+    controller: new RecordingController(tree, trace),
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "残留" },
+    managedNode,
     channel,
     startupTimeoutMs: 100,
     gracefulShutdownMs: 5,
@@ -979,13 +1119,15 @@ test("强制回收后资源仍存在时保持 terminating 并报告 termination_
 test("资源观察已确认但句柄释放失败时仍保持 terminating 且不泄露异常", async () => {
   const trace: string[] = [];
   const tree = createController();
+  const managedNode = new TestManagedRpcNode(
+    new FakeRpcClient(),
+    new ReleaseFailingProcessTreeAdapter(trace),
+  );
   const supervisor = new RpcSupervisor({
     controller: new RecordingController(tree, trace),
     actor: ROOT_TREE_ACTOR,
     reservation: { templateId: "researcher", name: "释放失败" },
-    rpcClient: new FakeRpcClient(),
-    processTreeAdapter: new ReleaseFailingProcessTreeAdapter(trace),
-    processHandle: Object.freeze({ command: "pi" }),
+    managedNode,
     channel: new RecordingSupervisorChannel(trace),
     startupTimeoutMs: 100,
     gracefulShutdownMs: 5,

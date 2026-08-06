@@ -127,7 +127,7 @@ test("释放未确认的活动句柄时保持 unknown 且重复释放幂等", na
   });
 });
 
-test("Unix 适配器拒绝已运行进程和取消的优雅关闭", nativeTestOptions, async () => {
+test("Unix 适配器拒绝无效启动并处理取消的优雅关闭", nativeTestOptions, async () => {
   const adapter = new UnixProcessTreeAdapter();
   await assert.rejects(
     adapter.launch({ command: `pi-subagent-missing-${Date.now()}` }),
@@ -138,8 +138,6 @@ test("Unix 适配器拒绝已运行进程和取消的优雅关闭", nativeTestOp
       return true;
     },
   );
-  await assert.rejects(adapter.attach({ pid: 1 }), /只能绑定启动前的进程说明/);
-
   const launch = await adapter.launch(nodeLaunch("setInterval(() => {}, 1_000);"));
   try {
     const controller = new AbortController();

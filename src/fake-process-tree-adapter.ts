@@ -1,8 +1,12 @@
+import { PassThrough } from "node:stream";
 import {
   processTreeStrategyFor,
   type ExitObservation,
+  type ManagedProcessTransport,
+  type ProcessLaunchSpec,
   type ProcessTreeAdapter,
   type ProcessTreeHandle,
+  type ProcessTreeLaunch,
   type ProcessTreeStrategy,
   type ResourceObservation,
 } from "./process-tree-capability.ts";
@@ -76,7 +80,7 @@ export class FakeProcessTreeAdapter implements ProcessTreeAdapter {
       : options.scenarios.map(copyScenario);
   }
 
-  async attach(_processHandle: unknown): Promise<ProcessTreeHandle> {
+  private createTree(): ProcessTreeHandle {
     const scenario =
       this.scenarios[Math.min(this.nextSequence, this.scenarios.length - 1)] ??
       DEFAULT_SCENARIO;
@@ -93,6 +97,17 @@ export class FakeProcessTreeAdapter implements ProcessTreeAdapter {
       released: false,
     });
     return token;
+  }
+
+  /** 测试受管节点使用的同事务启动入口。 */
+  async launch(_spec: ProcessLaunchSpec): Promise<ProcessTreeLaunch> {
+    const tree = this.createTree();
+    const transport: ManagedProcessTransport = Object.freeze({
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+    });
+    return Object.freeze({ tree, transport });
   }
 
   async requestGracefulClose(tree: ProcessTreeHandle, _signal: AbortSignal): Promise<void> {

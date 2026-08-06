@@ -89,6 +89,9 @@ test("长度边界 UTF-8 JSON 可处理分块与拼接帧，拒绝截断/损坏�
   assert.throws(() => decodeSupervisorFrame(corrupt), (error: unknown) => {
     return error instanceof SupervisorProtocolError && error.code === "invalid_utf8";
   });
+  assert.throws(() => encodeSupervisorFrame({ ...frame, unexpected: "不得透传" }), (error: unknown) => {
+    return error instanceof SupervisorProtocolError && error.code === "invalid_frame";
+  });
 });
 
 test("握手校验根关联、直接父子身份、深度和一次性凭据", () => {

@@ -25,6 +25,17 @@ export const SUPERVISOR_FRAME_KINDS = Object.freeze([
 
 export type SupervisorFrameKind = (typeof SUPERVISOR_FRAME_KINDS)[number];
 
+const SUPERVISOR_FRAME_KEYS = new Set([
+  "protocol",
+  "kind",
+  "stream_id",
+  "sender_agent_id",
+  "target_agent_id",
+  "seq",
+  "request_id",
+  "payload",
+]);
+
 /**
  * 这些边界是实现常量而不是用户配额。它们限制单条本地控制流的内存，
  * 不能改变树的公开配额、等待或模型行为。
@@ -345,6 +356,7 @@ function assertJsonBounds(
 function parseFrameObject(value: unknown, limits: SupervisorChannelLimits): InternalFrame {
   if (typeof value !== "object" || value === null || Array.isArray(value)) frameError("invalid_frame");
   const candidate = value as Record<string, unknown>;
+  if (Object.keys(candidate).some((key) => !SUPERVISOR_FRAME_KEYS.has(key))) frameError("invalid_frame");
   if (candidate.protocol !== SUPERVISOR_PROTOCOL_VERSION) {
     if (typeof candidate.protocol === "string") frameError("protocol_mismatch");
     frameError("invalid_frame");
@@ -948,6 +960,11 @@ export class SupervisorChannel {
       this.beginReconnect();
     }
     return Object.freeze({ kind: "eof" });
+  }
+
+  /** 传输解码器在收到截断/损坏字节时使用；不携带底层错误正文。 */
+  markProtocolFault(): void {
+    if (this.state !== "closed") this.state = "faulted";
   }
 
   /** 仅公开安全快照，不泄露凭据、端点、流 ID、序号或原始异常。 */

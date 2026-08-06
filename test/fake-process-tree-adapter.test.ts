@@ -4,6 +4,10 @@ import { FakeProcessTreeAdapter } from "../src/fake-process-tree-adapter.ts";
 import { isProcessTreeAdapter } from "../src/process-tree-capability.ts";
 import { classifyProcessTreeResources } from "../src/process-tree-resource-boundary.ts";
 
+async function launchTree(adapter: FakeProcessTreeAdapter): Promise<unknown> {
+  return (await adapter.launch({ command: "fake-managed-bridge" })).tree;
+}
+
 test("FakeProcessTreeAdapter 可确定重现优雅关闭超时后的强制升级", async () => {
   const adapter = new FakeProcessTreeAdapter({
     scenarios: [
@@ -13,7 +17,7 @@ test("FakeProcessTreeAdapter 可确定重现优雅关闭超时后的强制升级
       },
     ],
   });
-  const tree = await adapter.attach({ kind: "fake-process" });
+  const tree = await launchTree(adapter);
 
   await adapter.requestGracefulClose(tree, new AbortController().signal);
 
@@ -33,7 +37,7 @@ test("直接进程退出不掩盖孙进程残留", async () => {
       },
     ],
   });
-  const tree = await adapter.attach({ kind: "fake-process" });
+  const tree = await launchTree(adapter);
 
   await adapter.requestGracefulClose(tree, new AbortController().signal);
 
@@ -54,7 +58,7 @@ test("部分回收保持 present，重试后才得到进程树确认", async () 
       },
     ],
   });
-  const tree = await adapter.attach({ kind: "fake-process" });
+  const tree = await launchTree(adapter);
 
   await adapter.requestGracefulClose(tree, new AbortController().signal);
   await adapter.forceTerminate(tree);
@@ -85,7 +89,7 @@ test("重复强制回收和句柄释放保持幂等且可观察", async () => {
       },
     ],
   });
-  const tree = await adapter.attach({ kind: "fake-process" });
+  const tree = await launchTree(adapter);
 
   await adapter.forceTerminate(tree);
   const firstObservation = {
@@ -113,7 +117,7 @@ test("资源观察无法确认时保持 unknown 而不提前终止", async () =>
       },
     ],
   });
-  const tree = await adapter.attach({ kind: "fake-process" });
+  const tree = await launchTree(adapter);
 
   await adapter.requestGracefulClose(tree, new AbortController().signal);
   const assessment = classifyProcessTreeResources({

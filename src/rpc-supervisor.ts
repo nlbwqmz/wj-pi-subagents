@@ -1,12 +1,12 @@
-import { classifyProcessTreeResources } from "./process-tree-resource-boundary.ts";
 import type {
-  ProcessTreeAdapter,
-  ProcessTreeHandle,
-} from "./process-tree-capability.ts";
-import type { SupervisorReply } from "./supervisor-channel.ts";
+  ManagedRpcNodeLike,
+  ManagedRpcNodeStartContext,
+} from "./managed-rpc-node.ts";
+import type { SupervisorEvent, SupervisorReply } from "./supervisor-channel.ts";
 import type {
   AgentLifecycleEvent,
   AgentLifecycleState,
+  AgentSnapshot,
   ControlResult,
   LifecycleEventOutcome,
   PublicErrorCode,
@@ -299,6 +299,24 @@ export interface RpcSupervisorChannel {
   waitForClose(deadline: number | Date): Promise<RpcSupervisorChannelCloseState>;
   release(): Promise<void>;
   onFault(listener: (fault: RpcSupervisorChannelFault) => void): () => void;
+  /** 父端收到子端安全生命周期事实时调用；旧替身可省略。 */
+  onEvent?(listener: (event: SupervisorEvent) => void): () => void;
+  /** 子端向直接父端发布安全生命周期事实；旧替身可省略。 */
+  publishEvent?(event: Omit<SupervisorEvent, "root_id" | "agent_id"> & {
+    readonly agent_id?: string;
+  }): Promise<void>;
+}
+
+export interface RpcSupervisorChannelFactoryContext {
+  readonly agent_id: string;
+  readonly parent_agent_id: string | null;
+  readonly depth: number;
+  readonly initial_snapshot: readonly AgentSnapshot[];
+}
+
+export interface RpcSupervisorChannelBinding {
+  readonly channel: RpcSupervisorChannel;
+  readonly nodeStartContext?: ManagedRpcNodeStartContext;
 }
 
 export interface RpcSupervisorController {
@@ -316,11 +334,13 @@ export interface RpcSupervisorOptions {
   readonly controller: RpcSupervisorController;
   readonly actor: TreeActor;
   readonly reservation: ReserveStartingChildInput;
-  readonly rpcClient: RpcSupervisorClient;
-  readonly processTreeAdapter: ProcessTreeAdapter;
-  /** 平台适配器接收的启动前说明；监督器不读取 PID 或底层句柄。 */
-  readonly processHandle: unknown;
-  readonly channel: RpcSupervisorChannel;
+  /** RPC 命令面和进程树必须由同一受管节点在同一启动事务中提供。 */
+  readonly managedNode: ManagedRpcNodeLike;
+  readonly channel?: RpcSupervisorChannel;
+  /** 生产装配在身份预留后创建通道，并把同一身份上下文交给桥接进程。 */
+  readonly channelFactory?: (
+    context: RpcSupervisorChannelFactoryContext,
+  ) => RpcSupervisorChannelBinding;
   readonly startupTimeoutMs: number;
   readonly gracefulShutdownMs: number;
   readonly now?: () => number;
@@ -390,11 +410,6 @@ class StartupTimeoutError extends Error {
 
 function validDuration(value: number): boolean {
   return Number.isSafeInteger(value) && value > 0;
-}
-
-function safeTreeFromError(error: unknown): ProcessTreeHandle | undefined {
-  if (typeof error !== "object" || error === null || !("tree" in error)) return undefined;
-  return (error as { readonly tree?: ProcessTreeHandle }).tree;
 }
 
 function abortError(): Error {
@@ -473,17 +488,18 @@ type QueuedCommand = QueuedMessageCommand | QueuedInterruptCommand;
 export class RpcSupervisor {
   private readonly options: RpcSupervisorOptions;
   private readonly now: () => number;
+  private channel: RpcSupervisorChannel | undefined;
+  private managedNodeStartContext: ManagedRpcNodeStartContext | undefined;
   private phase: "new" | "starting" | "ready" | "failed" | "terminating" | "terminated" = "new";
   private agentId: string | undefined;
   private lifecycleGeneration = 0;
   private lifecycleState: AgentLifecycleState | undefined;
-  private tree: ProcessTreeHandle | undefined;
-  private processAttachPending = false;
   private startupFault: RpcSupervisorTransportFault | RpcSupervisorChannelFault | undefined;
   private startPromise: Promise<RpcSupervisorStartupResult> | undefined;
   private unsubscribeRpcEvent: (() => void) | undefined;
   private unsubscribeRpcFault: (() => void) | undefined;
   private unsubscribeChannelFault: (() => void) | undefined;
+  private unsubscribeChannelEvent: (() => void) | undefined;
   private readonly commandQueue: QueuedCommand[] = [];
   private activeCommand: QueuedCommand | undefined;
   private acceptancePending = false;
@@ -493,18 +509,26 @@ export class RpcSupervisor {
   private readonly activeToolCounts = new Map<RpcSupervisorActivityCategory, number>();
   private terminationPromise: Promise<RpcSupervisorTerminationResult> | undefined;
   private cleanupInFlight: Promise<"confirmed" | "incomplete"> | undefined;
-  private lateAttachCleanupScheduled = false;
+  private lateStartupCleanupScheduled = false;
   private processResourcesConfirmed = false;
   private channelResourcesConfirmed = false;
-  private processHandleReleased = false;
+  private nodeHandleReleased = false;
   private channelHandleReleased = false;
+  private forcedTerminationUsed = false;
 
   constructor(options: RpcSupervisorOptions) {
     if (!validDuration(options.startupTimeoutMs) || !validDuration(options.gracefulShutdownMs)) {
       throw new TypeError("RPC 监督器期限无效");
     }
+    if (options.managedNode.process_binding !== "managed") {
+      throw new TypeError("受管 RPC 节点绑定标记无效");
+    }
+    if ((options.channel === undefined) === (options.channelFactory === undefined)) {
+      throw new TypeError("RPC 监督器必须使用一个监督通道或身份后通道工厂");
+    }
     this.options = options;
     this.now = options.now ?? Date.now;
+    this.channel = options.channel;
   }
 
   start(): Promise<RpcSupervisorStartupResult> {
@@ -571,13 +595,13 @@ export class RpcSupervisor {
     this.applyLifecycle({ type: "termination_requested" });
     this.phase = "terminating";
     this.settlePending = false;
-    this.options.channel.establishTerminationBarrier();
+    this.channel?.establishTerminationBarrier();
     this.cancelQueuedCommands();
     this.resolveActiveMessageAsUnavailable();
 
     if (abortActiveRpc) {
       try {
-        void this.options.rpcClient.abort().catch(() => {
+        void this.commandClient().abort().catch(() => {
           // 终止屏障已经线性化；abort 失败不撤销关闭意图。
         });
       } catch {
@@ -586,6 +610,11 @@ export class RpcSupervisor {
     }
 
     return this.beginTerminationAttempt();
+  }
+
+  /** 清理结果摘要使用；不会暴露平台句柄或底层阶段。 */
+  wasForcedTerminationUsed(): boolean {
+    return this.forcedTerminationUsed;
   }
 
   private beginTerminationAttempt(): Promise<RpcSupervisorTerminationResult> {
@@ -620,10 +649,25 @@ export class RpcSupervisor {
     this.agentId = reserved.data.node.agent_id;
     this.lifecycleGeneration = reserved.data.lifecycle_generation;
     this.lifecycleState = reserved.data.node.state;
-    this.subscribeToDependencies();
 
     const abortController = new AbortController();
     try {
+      if (this.channel === undefined) {
+        const factory = this.options.channelFactory;
+        if (factory === undefined) throw new Error("缺少监督通道工厂");
+        const binding = factory(Object.freeze({
+          agent_id: reserved.data.node.agent_id,
+          parent_agent_id: reserved.data.node.parent_agent_id,
+          depth: reserved.data.node.depth,
+          initial_snapshot: Object.freeze([reserved.data.node]),
+        }));
+        if (binding === null || typeof binding !== "object" || binding.channel === undefined) {
+          throw new Error("监督通道工厂返回值无效");
+        }
+        this.channel = binding.channel;
+        this.managedNodeStartContext = binding.nodeStartContext;
+      }
+      this.subscribeToDependencies();
       await this.withStartupTimeout(this.performStartup(abortController.signal), abortController);
       const ready = this.applyLifecycle({ type: "startup_ready" });
       if (!ready.applied || ready.node.state !== "idle") {
@@ -637,38 +681,34 @@ export class RpcSupervisor {
       });
     } catch (error: unknown) {
       const failureCode = error instanceof StartupTimeoutError ? "spawn_timeout" : "spawn_failed";
-      return this.rollbackStartup(failureCode, safeTreeFromError(error));
+      return this.rollbackStartup(failureCode);
     }
   }
 
   private async performStartup(signal: AbortSignal): Promise<void> {
-    await this.options.channel.bind(signal);
+    const channel = this.channelOrThrow();
+    await channel.bind(signal);
     if (signal.aborted) throw abortError();
 
-    this.processAttachPending = true;
     try {
-      this.tree = await this.options.processTreeAdapter.attach(this.options.processHandle);
+      await this.options.managedNode.start(signal, this.managedNodeStartContext);
     } catch (error: unknown) {
-      this.tree = safeTreeFromError(error);
-      if (signal.aborted && this.tree !== undefined) this.scheduleLateAttachCleanup();
+      if (signal.aborted) this.scheduleLateStartupCleanup();
       throw error;
-    } finally {
-      this.processAttachPending = false;
     }
     if (signal.aborted) {
-      this.scheduleLateAttachCleanup();
+      this.scheduleLateStartupCleanup();
       throw abortError();
     }
 
-    await this.options.channel.waitForReady(signal);
+    await channel.waitForReady(signal);
     if (signal.aborted) throw abortError();
-    if (!this.options.channel.isReady()) throw new Error("监督通道未就绪");
+    if (!channel.isReady()) throw new Error("监督通道未就绪");
 
-    await this.options.rpcClient.start();
     this.throwIfStartupFaulted();
-    await this.options.rpcClient.getState();
+    await this.options.managedNode.getState();
     this.throwIfStartupFaulted();
-    if (!this.options.channel.isReady()) throw new Error("双通道未同时就绪");
+    if (!channel.isReady()) throw new Error("双通道未同时就绪");
   }
 
   private withStartupTimeout(
@@ -694,15 +734,23 @@ export class RpcSupervisor {
   }
 
   private subscribeToDependencies(): void {
-    this.unsubscribeRpcEvent = this.options.rpcClient.onEvent((event) => {
+    const client = this.commandClient();
+    this.unsubscribeRpcEvent = client.onEvent((event) => {
       this.receiveRpcEvent(event);
     });
-    this.unsubscribeRpcFault = this.options.rpcClient.onTransportFault((fault) => {
+    this.unsubscribeRpcFault = client.onTransportFault((fault) => {
       this.receiveTransportFault(fault, "rpc");
     });
-    this.unsubscribeChannelFault = this.options.channel.onFault((fault) => {
+    const channel = this.channelOrThrow();
+    this.unsubscribeChannelFault = channel.onFault((fault) => {
       this.receiveTransportFault(fault, "supervisor");
     });
+    const onChannelEvent = channel.onEvent;
+    if (typeof onChannelEvent === "function") {
+      this.unsubscribeChannelEvent = onChannelEvent.call(channel, (event) => {
+        this.receiveSupervisorEvent(event);
+      });
+    }
   }
 
   private receiveRpcEvent(event: unknown): void {
@@ -753,6 +801,35 @@ export class RpcSupervisor {
           ? "rpc_process_exit"
           : "rpc_protocol_fault";
     this.failRuntime(code);
+  }
+
+  /** 父端只接受监督协议已脱敏的生命周期事实，并按当前代际提交。 */
+  private receiveSupervisorEvent(event: SupervisorEvent): void {
+    if (this.phase !== "ready" && this.phase !== "starting") return;
+    const expectedGeneration = event.expected_generation;
+    if (typeof expectedGeneration !== "number" || !Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) {
+      this.receiveTransportFault("protocol_fault", "supervisor");
+      return;
+    }
+    try {
+      const lifecycleEvent = Object.freeze({
+        type: event.type,
+        expected_generation: expectedGeneration,
+        ...(event.error_code === undefined ? {} : { error_code: event.error_code }),
+      }) as AgentLifecycleEvent;
+      const outcome = this.options.controller.applyLifecycleEvent(event.agent_id, lifecycleEvent);
+      if (!outcome.ok) {
+        this.receiveTransportFault("protocol_fault", "supervisor");
+        return;
+      }
+      if (event.agent_id === this.agentId) {
+        this.lifecycleGeneration = outcome.data.lifecycle_generation;
+        this.lifecycleState = outcome.data.node.state;
+      }
+      this.emitEvent(Object.freeze({ kind: "lifecycle", event: lifecycleEvent }));
+    } catch {
+      this.receiveTransportFault("protocol_fault", "supervisor");
+    }
   }
 
   private throwIfStartupFaulted(): void {
@@ -834,11 +911,15 @@ export class RpcSupervisor {
           data: item.data,
           mimeType: item.mimeType,
         }));
+      } else if (item.type !== "thinking" && item.type !== "toolCall") {
+        // Pi 的合法 assistant 内容仅允许显式忽略 thinking/toolCall；未知类型不能静默丢失。
+        this.failRuntime("invalid_rpc_event");
+        return;
       }
     }
     if (text.length === 0 && images.length === 0) return;
     const reply = freezeReply(text.join(""), images);
-    void this.options.channel.publishReply(reply).then(
+    void this.channelOrThrow().publishReply(reply).then(
       () => this.emitEvent(Object.freeze({ kind: "reply", reply })),
       () => this.failRuntime("supervisor_protocol_fault"),
     );
@@ -899,9 +980,9 @@ export class RpcSupervisor {
     this.acceptancePending = true;
     try {
       if (command.kind === "prompt") {
-        await this.options.rpcClient.prompt(command.message, command.images);
+        await this.commandClient().prompt(command.message, command.images);
       } else {
-        await this.options.rpcClient.steer(command.message, command.images);
+        await this.commandClient().steer(command.message, command.images);
       }
       if (this.phase !== "ready" || commandGeneration !== this.lifecycleGeneration) {
         command.resolve(Object.freeze({ ok: false, code: "message_delivery_failed" }));
@@ -936,7 +1017,7 @@ export class RpcSupervisor {
     const responseGeneration = this.lifecycleGeneration;
     let response: Promise<void>;
     try {
-      response = this.options.rpcClient.abort();
+      response = this.commandClient().abort();
     } catch {
       command.resolve(Object.freeze({ ok: false, code: "agent_unavailable" }));
       this.failRuntime("rpc_protocol_fault");
@@ -997,9 +1078,7 @@ export class RpcSupervisor {
 
   private async rollbackStartup(
     code: "spawn_failed" | "spawn_timeout",
-    errorTree: ProcessTreeHandle | undefined,
   ): Promise<RpcSupervisorStartupResult> {
-    if (this.tree === undefined && errorTree !== undefined) this.tree = errorTree;
     if (this.agentId !== undefined) {
       this.applyLifecycle({ type: "startup_failed", error_code: code });
     }
@@ -1058,44 +1137,43 @@ export class RpcSupervisor {
   private async performCleanupResources(
     barrierEstablished: boolean,
   ): Promise<"confirmed" | "incomplete"> {
-    if (!barrierEstablished) this.options.channel.establishTerminationBarrier();
-    const tree = this.tree;
-    if (tree === undefined && !this.processAttachPending) {
-      this.processResourcesConfirmed = true;
-      this.processHandleReleased = true;
-    }
+    if (!barrierEstablished) this.channel?.establishTerminationBarrier();
+    const node = this.options.managedNode;
 
     const closeAbort = new AbortController();
-    const gracefulRequests: Promise<unknown>[] = [
-      this.startOperation(() => this.options.channel.requestClose(closeAbort.signal)),
-    ];
-    if (tree !== undefined && !this.processHandleReleased) {
-      gracefulRequests.push(this.startOperation(
-        () => this.options.processTreeAdapter.requestGracefulClose(tree, closeAbort.signal),
-      ));
+    const gracefulRequests: Promise<unknown>[] = [];
+    if (this.channel !== undefined) {
+      gracefulRequests.push(this.startOperation(() => this.channel!.requestClose(closeAbort.signal)));
+    } else {
+      this.channelResourcesConfirmed = true;
+      this.channelHandleReleased = true;
     }
+    gracefulRequests.push(this.startOperation(
+      () => node.requestGracefulClose(closeAbort.signal),
+    ));
 
     const gracefulDeadline = this.now() + this.options.gracefulShutdownMs;
     await this.waitForDeadline(Promise.allSettled(gracefulRequests), gracefulDeadline);
     closeAbort.abort();
-    if (!this.processResourcesConfirmed && tree !== undefined && !this.processHandleReleased) {
-      this.processResourcesConfirmed = await this.observeProcessTree(tree, gracefulDeadline);
+    if (!this.processResourcesConfirmed) {
+      this.processResourcesConfirmed = await this.observeManagedNode(gracefulDeadline);
     }
     if (!this.channelResourcesConfirmed && !this.channelHandleReleased) {
       this.channelResourcesConfirmed = await this.observeChannelClose(gracefulDeadline);
     }
 
     if (!this.processResourcesConfirmed || !this.channelResourcesConfirmed) {
-      if (tree !== undefined && !this.processResourcesConfirmed && !this.processHandleReleased) {
+      if (!this.processResourcesConfirmed) {
         const forceDeadline = this.now() + this.options.gracefulShutdownMs;
+        this.forcedTerminationUsed = true;
         await this.waitForDeadline(
-          this.startOperation(() => this.options.processTreeAdapter.forceTerminate(tree)),
+          this.startOperation(() => node.forceTerminate()),
           forceDeadline,
         );
       }
       const confirmationDeadline = this.now() + this.options.gracefulShutdownMs;
-      if (tree !== undefined && !this.processResourcesConfirmed && !this.processHandleReleased) {
-        this.processResourcesConfirmed = await this.observeProcessTree(tree, confirmationDeadline);
+      if (!this.processResourcesConfirmed) {
+        this.processResourcesConfirmed = await this.observeManagedNode(confirmationDeadline);
       }
       if (!this.channelResourcesConfirmed && !this.channelHandleReleased) {
         this.channelResourcesConfirmed = await this.observeChannelClose(confirmationDeadline);
@@ -1108,23 +1186,23 @@ export class RpcSupervisor {
     }
 
     const releaseOperations: Promise<unknown>[] = [];
-    if (tree !== undefined && !this.processHandleReleased) {
+    if (!this.nodeHandleReleased) {
       releaseOperations.push(this.startOperation(
-        () => this.options.processTreeAdapter.release(tree),
+        () => node.release(),
       ).then(() => {
-        this.processHandleReleased = true;
+        this.nodeHandleReleased = true;
       }));
     }
     if (!this.channelHandleReleased) {
       releaseOperations.push(this.startOperation(
-        () => this.options.channel.release(),
+        () => this.channelOrThrow().release(),
       ).then(() => {
         this.channelHandleReleased = true;
       }));
     }
     const releaseDeadline = this.now() + this.options.gracefulShutdownMs;
     await this.waitForDeadline(Promise.allSettled(releaseOperations), releaseDeadline);
-    if (!this.processHandleReleased || !this.channelHandleReleased) {
+    if (!this.nodeHandleReleased || !this.channelHandleReleased) {
       if (this.agentId !== undefined) this.applyLifecycle({ type: "termination_incomplete" });
       return "incomplete";
     }
@@ -1140,32 +1218,40 @@ export class RpcSupervisor {
     return "confirmed";
   }
 
-  private async observeProcessTree(
-    tree: ProcessTreeHandle,
-    deadline: number | Date,
-  ): Promise<boolean> {
-    const deadlineMs = deadline instanceof Date ? deadline.getTime() : deadline;
-    const exit = await this.waitForDeadline(
-      this.startOperation(() => this.options.processTreeAdapter.waitForExit(tree, deadline)),
-      deadlineMs,
-    );
-    if (!exit.settled) return false;
-    const resources = await this.waitForDeadline(
-      this.startOperation(() => this.options.processTreeAdapter.inspect(tree)),
-      deadlineMs,
-    );
-    return resources.settled &&
-      classifyProcessTreeResources({ exit: exit.value, resources: resources.value }).state ===
-        "confirmed_exited";
-  }
-
   private async observeChannelClose(deadline: number | Date): Promise<boolean> {
     const deadlineMs = deadline instanceof Date ? deadline.getTime() : deadline;
     const close = await this.waitForDeadline(
-      this.startOperation(() => this.options.channel.waitForClose(deadline)),
+      this.startOperation(() => this.channelOrThrow().waitForClose(deadline)),
       deadlineMs,
     );
     return close.settled && close.value === "released";
+  }
+
+  private async observeManagedNode(deadline: number | Date): Promise<boolean> {
+    const node = this.options.managedNode;
+    const deadlineMs = deadline instanceof Date ? deadline.getTime() : deadline;
+    const exit = await this.waitForDeadline(
+      this.startOperation(() => node.waitForExit(deadline)),
+      deadlineMs,
+    );
+    const resources = await this.waitForDeadline(
+      this.startOperation(() => node.inspect()),
+      deadlineMs,
+    );
+    return exit.settled
+      && resources.settled
+      && exit.value.state === "exited"
+      && resources.value.state === "released";
+  }
+
+  private commandClient(): ManagedRpcNodeLike {
+    return this.options.managedNode;
+  }
+
+  private channelOrThrow(): RpcSupervisorChannel {
+    const channel = this.channel;
+    if (channel === undefined) throw new Error("监督通道尚未创建");
+    return channel;
   }
 
   private startOperation<T>(operation: () => Promise<T>): Promise<T> {
@@ -1197,12 +1283,12 @@ export class RpcSupervisor {
     });
   }
 
-  private scheduleLateAttachCleanup(): void {
-    if (this.lateAttachCleanupScheduled || this.tree === undefined) return;
-    this.lateAttachCleanupScheduled = true;
+  private scheduleLateStartupCleanup(): void {
+    if (this.lateStartupCleanupScheduled) return;
+    this.lateStartupCleanupScheduled = true;
     queueMicrotask(() => {
-      this.lateAttachCleanupScheduled = false;
-      if (this.phase !== "terminating" || this.tree === undefined) return;
+      this.lateStartupCleanupScheduled = false;
+      if (this.phase !== "terminating") return;
       void this.cleanupResources(true).catch(() => {
         // 已公开 termination_incomplete；后台重试失败不能伪造确认或泄露异常。
       });
@@ -1239,8 +1325,10 @@ export class RpcSupervisor {
     this.unsubscribeRpcEvent?.();
     this.unsubscribeRpcFault?.();
     this.unsubscribeChannelFault?.();
+    this.unsubscribeChannelEvent?.();
     this.unsubscribeRpcEvent = undefined;
     this.unsubscribeRpcFault = undefined;
     this.unsubscribeChannelFault = undefined;
+    this.unsubscribeChannelEvent = undefined;
   }
 }
