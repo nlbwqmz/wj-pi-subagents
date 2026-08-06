@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { AGENT_TOOL_NAMES } from "./agent-tools.ts";
 import type {
   AgentSupervisorFactory,
@@ -32,6 +33,8 @@ export interface AgentSupervisorFactoryOptions {
   readonly templateSnapshot: TemplateDiscoverySnapshot;
   readonly rootId?: string;
   readonly bridgeScriptPath?: string;
+  /** 子 Pi 必须显式加载本扩展；未填写时使用包内标准入口。 */
+  readonly childExtensionPath?: string;
   readonly startupTimeoutMs?: number;
   readonly gracefulShutdownMs?: number;
   readonly nodeFactory?: (template: TemplateDefinition) => ManagedRpcNodeLike;
@@ -41,6 +44,13 @@ export interface AgentSupervisorFactoryOptions {
   readonly managementToolNames?: readonly string[];
   /** 只有宿主消息已同步进入父会话上下文时才返回 true，随后协议才会 ACK。 */
   readonly deliverReply?: (agentId: string, reply: ManagedRpcReply) => boolean;
+  /** 为每条直接子监督通道绑定根裁决或逐跳转发服务。 */
+  readonly bindControlServer?: (
+    agentId: string,
+    channel: ManagedRpcSupervisorChannel,
+  ) => (() => void) | void;
+  /** 本控制器的上游与全部直接子通道共享同一请求 ID 顺序域。 */
+  readonly requestIdRegistry?: SupervisorRequestIdRegistry;
 }
 
 /** 生产节点装配所需的稳定桥接超时；不受 wait_agent 参数影响。 */
@@ -55,14 +65,15 @@ export function createAgentSupervisorFactory(
   options: AgentSupervisorFactoryOptions,
 ): AgentSupervisorFactory {
   if (options.templateSnapshot === undefined) throw new TypeError("生产工厂需要模板快照");
+  let templateSnapshot = options.templateSnapshot;
   const rootId = options.rootId ?? randomUUID();
   const localAgentId = options.actor.kind === "agent" ? options.actor.agent_id : null;
   const startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_RPC_STARTUP_TIMEOUT_MS;
   const gracefulShutdownMs = options.gracefulShutdownMs ?? DEFAULT_RPC_GRACEFUL_SHUTDOWN_MS;
-  const requestIdRegistry = new SupervisorRequestIdRegistry();
+  const requestIdRegistry = options.requestIdRegistry ?? new SupervisorRequestIdRegistry();
 
-  return (input: AgentSupervisorFactoryInput): RpcSupervisor => {
-    const template = input.template ?? resolveTemplate(options.templateSnapshot, input.reservation.templateId);
+  const factory = ((input: AgentSupervisorFactoryInput): RpcSupervisor => {
+    const template = input.template ?? resolveTemplate(templateSnapshot, input.reservation.templateId);
     if (template === undefined) throw new Error("模板快照未提供有效模板");
     const node = options.nodeFactory?.(template) ?? createManagedRpcNode({
       processTreeAdapter: options.processTreeAdapter,
@@ -71,6 +82,7 @@ export function createAgentSupervisorFactory(
       rpcOptions: buildManagedRpcOptions(template, {
         currentModel: options.currentModel,
         currentThinking: options.currentThinking,
+        extensionPath: options.childExtensionPath ?? defaultChildExtensionPath(),
         managementTools: childManagementEnabled(options, input, template)
           ? (options.managementToolNames ?? AGENT_TOOL_NAMES)
           : [],
@@ -82,6 +94,7 @@ export function createAgentSupervisorFactory(
       controller: options.tree,
       actor: input.actor,
       reservation: input.reservation,
+      ...(input.grant === undefined ? {} : { grant: input.grant }),
       managedNode: node,
       channelFactory: (context): RpcSupervisorChannelBinding => {
         const credential = randomBytes(32).toString("base64url");
@@ -108,6 +121,13 @@ export function createAgentSupervisorFactory(
             }
           },
         });
+        let cleanup: (() => void) | void;
+        try {
+          cleanup = options.bindControlServer?.(context.agent_id, channel);
+        } catch {
+          void channel.release();
+          throw new Error("监督控制服务绑定失败");
+        }
         const supervisor: ManagedRpcSupervisorInit = {
           root_id: rootId,
           local_agent_id: context.agent_id,
@@ -119,12 +139,20 @@ export function createAgentSupervisorFactory(
           initial_subtree_revision: 1,
         };
         const runtime = options.rootRuntime.createChildRuntimeContext({
-          parentAgentId: context.parent_agent_id ?? rootId,
+          parentAgentId: context.parent_agent_id,
           agentId: context.agent_id,
           depth: context.depth,
+          managementEnabled: childManagementCapability(options.tree, context.agent_id),
+          ...(context.initial_snapshot[0]?.template_id === undefined
+            ? {}
+            : { templateId: context.initial_snapshot[0].template_id }),
+          ...(context.initial_snapshot[0]?.name === undefined
+            ? {}
+            : { name: context.initial_snapshot[0].name }),
         });
         return Object.freeze({
           channel,
+          ...(cleanup === undefined ? {} : { cleanup }),
           nodeStartContext: Object.freeze({
             supervisor,
             environment: runtime.environment,
@@ -134,7 +162,16 @@ export function createAgentSupervisorFactory(
       startupTimeoutMs,
       gracefulShutdownMs,
     });
+  }) as AgentSupervisorFactory;
+  factory.updateTemplateSnapshot = (snapshot: TemplateDiscoverySnapshot): void => {
+    templateSnapshot = snapshot;
   };
+  return factory;
+}
+
+function childManagementCapability(tree: TreeController, agentId: string): boolean {
+  const capability = tree.getManagementBootstrapCapability(agentId);
+  return capability.ok && capability.data.enabled;
 }
 
 function resolveTemplate(
@@ -151,9 +188,13 @@ export function buildManagedRpcOptions(
     readonly currentModel?: AgentSupervisorFactoryOptions["currentModel"];
     readonly currentThinking?: AgentSupervisorFactoryOptions["currentThinking"];
     readonly managementTools?: readonly string[];
+    readonly extensionPath?: string;
   } = {},
 ): Readonly<Record<string, unknown>> {
   const args: string[] = ["--no-session"];
+  if (options.extensionPath !== undefined) {
+    args.push("--no-extensions", "-e", options.extensionPath);
+  }
   if (template.contextFiles === "disabled") args.push("--no-context-files");
   const thinking = template.thinking ?? resolveCurrent(options.currentThinking);
   if (thinking !== undefined) args.push("--thinking", thinking);
@@ -170,6 +211,14 @@ export function buildManagedRpcOptions(
     ...(model === undefined ? {} : { model }),
     args: Object.freeze(args),
   });
+}
+
+function defaultChildExtensionPath(): string {
+  try {
+    return fileURLToPath(new URL("../extensions/pi-subagent.ts", import.meta.url));
+  } catch {
+    throw new Error("子代理扩展入口不可用");
+  }
 }
 
 function childManagementEnabled(

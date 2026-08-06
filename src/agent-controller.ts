@@ -7,10 +7,16 @@ import {
   type ControlResult,
   type ReserveStartingChildInput,
   type ScopedAgentTreeSnapshot,
+  type TerminationBarrierOutcome,
   type TreeActor,
   type TreeController,
 } from "./tree-controller.ts";
 import type { TemplateDefinition, TemplateDiscoverySnapshot } from "./template-discovery-snapshot.ts";
+import type {
+  AuthorityControlAction,
+  SpawnGrant,
+  TreeAuthorityPort,
+} from "./tree-authority.ts";
 import {
   type RpcSupervisorCommandResult,
   type RpcSupervisorEvent,
@@ -44,6 +50,7 @@ export interface AgentSupervisorFactoryInput {
   readonly actor: TreeActor;
   readonly reservation: ReserveStartingChildInput;
   readonly template?: TemplateDefinition;
+  readonly grant?: SpawnGrant;
 }
 
 /** 控制器只依赖单节点监督器的公开命令面，不接触其进程树或传输实现。 */
@@ -59,13 +66,18 @@ export interface AgentSupervisor {
   ): Promise<RpcSupervisorCommandResult>;
   interrupt(): Promise<RpcSupervisorInterruptResult>;
   terminate(): Promise<RpcSupervisorTerminationResult>;
+  /** 故障节点的平台进程树边界回收；节点记录本身继续保持 failed。 */
+  reapOrphanedDescendants?(): Promise<{ readonly confirmed: boolean; readonly forced: boolean }>;
   onEvent(listener: (event: RpcSupervisorEvent) => void): () => void;
   wasForcedTerminationUsed(): boolean;
 }
 
-export type AgentSupervisorFactory = (
+export type AgentSupervisorFactory = ((
   input: AgentSupervisorFactoryInput,
-) => AgentSupervisor;
+) => AgentSupervisor) & {
+  /** 根 reload 后替换未来创建使用的模板目录；旧监督器不受影响。 */
+  updateTemplateSnapshot?: (snapshot: TemplateDiscoverySnapshot) => void;
+};
 
 export interface AgentControllerOptions {
   readonly tree: TreeController;
@@ -84,6 +96,8 @@ export interface AgentControllerOptions {
     agentId: string,
     reply: Extract<RpcSupervisorEvent, { kind: "reply" }>['reply'],
   ) => void;
+  /** 生产运行时必须提供根权威端口；省略仅保留旧单节点测试 seam。 */
+  readonly authority?: TreeAuthorityPort;
 }
 
 interface ManagedAgentEntry {
@@ -155,12 +169,18 @@ export class AgentController {
   private readonly validateTemplate: AgentControllerOptions["validateTemplate"];
   private readonly waitTimeoutMs: number;
   private readonly onReply: AgentControllerOptions["onReply"];
+  private readonly authority: TreeAuthorityPort | undefined;
   private readonly agents = new Map<string, ManagedAgentEntry>();
   /** start 抛出前无法取得公开身份的节点仍需保留内部回收能力。 */
   private readonly unassignedSupervisors = new Map<AgentSupervisor, () => void>();
   private readonly waiters = new Map<string, Set<PendingWaiter>>();
   private readonly messageIds = new Set<string>();
   private unsubscribeTreeChange: (() => void) | undefined;
+  private readonly confirmedWithoutOwnership = new Set<string>();
+  private readonly terminationFlows = new Map<string, Promise<ControlResult<TerminateAgentData>>>();
+  private readonly orphanCleanupFlows = new Map<string, Promise<void>>();
+  private shutdownFlow: Promise<boolean> | undefined;
+  private disposed = false;
 
   constructor(options: AgentControllerOptions) {
     this.tree = options.tree;
@@ -172,27 +192,38 @@ export class AgentController {
     this.validateTemplate = options.validateTemplate;
     this.waitTimeoutMs = options.waitTimeoutMs ?? WAIT_AGENT_DEFAULT_TIMEOUT_MS;
     this.onReply = options.onReply;
+    this.authority = options.authority;
     if (!validWaitTimeout(this.waitTimeoutMs)) throw new TypeError("默认等待期限无效");
     this.unsubscribeTreeChange = this.tree.onChange(() => this.resolveAllReadyWaiters());
   }
 
   async spawnAgent(input: SpawnAgentInput | unknown): Promise<ControlResult<SpawnAgentData>> {
     if (!isSpawnInput(input)) return controlFailure("invalid_argument");
-    const preflight = this.preflightTemplate(input.template_id);
-    if (!preflight.ok) return preflight;
-    if (this.activeTools !== undefined && preflight.data !== undefined) {
+    let template: TemplateDefinition | undefined;
+    let templateRevision: number | undefined;
+    if (this.authority !== undefined) {
+      const resolved = await this.authority.resolveTemplate(this.actor, input.template_id);
+      if (!resolved.ok) return resolved;
+      template = resolved.data.template;
+      templateRevision = resolved.data.template_revision;
+    } else {
+      const preflight = this.preflightTemplate(input.template_id);
+      if (!preflight.ok) return preflight;
+      template = preflight.data;
+    }
+    if (this.activeTools !== undefined && template !== undefined) {
       let available: Set<string>;
       try {
         available = new Set(this.activeTools());
       } catch {
         return controlFailure("template_capability_unavailable");
       }
-      const missing = preflight.data.tools.filter((tool) => !available.has(tool));
+      const missing = template.tools.filter((tool) => !available.has(tool));
       if (missing.length > 0) return controlFailure("template_capability_unavailable");
     }
-    if (preflight.data !== undefined && this.validateTemplate !== undefined) {
+    if (template !== undefined && this.validateTemplate !== undefined) {
       try {
-        const validated = this.validateTemplate(preflight.data, this.actor);
+        const validated = this.validateTemplate(template, this.actor);
         if (!validated.ok) return validated;
       } catch {
         return controlFailure("internal_error");
@@ -202,16 +233,38 @@ export class AgentController {
     const reservation: ReserveStartingChildInput = Object.freeze({
       templateId: input.template_id,
       name: input.name,
-      ...(preflight.data === undefined ? {} : { subagents: preflight.data.subagents }),
+      ...(template === undefined ? {} : { subagents: template.subagents }),
     });
+    let grant: SpawnGrant | undefined;
+    if (this.authority !== undefined) {
+      if (templateRevision === undefined) return controlFailure("internal_error");
+      const reserved = await this.authority.reserveChild(this.actor, {
+        template_id: input.template_id,
+        template_revision: templateRevision,
+        name: input.name,
+      });
+      if (!reserved.ok) return reserved;
+      grant = reserved.data;
+      const adopted = this.tree.adoptSpawnGrant(this.actor, {
+        node: grant.node,
+        lifecycle_generation: grant.lifecycle_generation,
+        management_enabled: grant.management_enabled,
+      });
+      if (!adopted.ok) {
+        await this.rollbackUnusedGrant(grant);
+        return controlFailure("internal_error");
+      }
+    }
     let supervisor: AgentSupervisor;
     try {
       supervisor = this.createSupervisor({
         actor: this.actor,
         reservation,
-        ...(preflight.data === undefined ? {} : { template: preflight.data }),
+        ...(template === undefined ? {} : { template }),
+        ...(grant === undefined ? {} : { grant }),
       });
     } catch {
+      if (grant !== undefined) await this.rollbackUnusedGrant(grant);
       return controlFailure("internal_error");
     }
     let assignedAgentId: string | undefined;
@@ -232,6 +285,8 @@ export class AgentController {
     assignedAgentId = started.agent_id;
     if (!started.ok && started.agent_id !== undefined) {
       if (started.cleanup === "confirmed") {
+        this.confirmSupervisorCleanup(started.agent_id);
+        this.confirmedWithoutOwnership.add(started.agent_id);
         unsubscribe();
       } else {
         // 只有资源未确认时才保留活动监督器，供后续 terminate_agent 重试。
@@ -247,6 +302,8 @@ export class AgentController {
     if (!status.ok || status.data.state !== "idle") {
       const cleanup = await this.tryTerminateSupervisor(supervisor);
       if (cleanup === "confirmed") {
+        this.confirmedWithoutOwnership.add(started.agent_id);
+        this.confirmSupervisorCleanup(started.agent_id);
         unsubscribe();
       } else {
         this.retainSupervisor(started.agent_id, supervisor, input, unsubscribe, earlyEvents);
@@ -259,7 +316,7 @@ export class AgentController {
 
   async sendMessage(input: SendMessageInput | unknown): Promise<ControlResult<AgentMessageData>> {
     if (!isSendMessageInput(input)) return controlFailure("invalid_argument");
-    const target = this.directChild(input.agent_id);
+    const target = await this.admittedDirectChild(input.agent_id, "send_message");
     if (!target.ok) return target;
     const entry = this.agents.get(input.agent_id);
     if (entry === undefined) return controlFailure("agent_unavailable");
@@ -283,7 +340,7 @@ export class AgentController {
 
   async waitAgent(input: WaitAgentInput | unknown): Promise<WaitAgentResult> {
     if (!isWaitInput(input)) return controlFailure("invalid_argument");
-    const target = this.directChild(input.agent_id);
+    const target = await this.admittedDirectChild(input.agent_id, "wait_agent");
     if (!target.ok) return target;
     const timeout = input.timeout_ms ?? this.waitTimeoutMs;
     const immediate = this.waitOutcome(input.agent_id, target.data);
@@ -316,7 +373,7 @@ export class AgentController {
   }
 
   async interruptAgent(agentId: unknown): Promise<ControlResult<InterruptAgentData>> {
-    const target = this.directChild(agentId);
+    const target = await this.admittedDirectChild(agentId, "interrupt_agent");
     if (!target.ok) return target;
     const entry = this.agents.get(target.data.agent_id);
     if (entry === undefined) return controlFailure("agent_unavailable");
@@ -339,6 +396,9 @@ export class AgentController {
   async terminateAgent(agentId: unknown): Promise<ControlResult<TerminateAgentData>> {
     const target = this.directChild(agentId);
     if (!target.ok) return target;
+    if (this.confirmedWithoutOwnership.has(target.data.agent_id)) {
+      return controlFailure("agent_unavailable");
+    }
     if (target.data.state === "terminated") {
       return Object.freeze({ ok: true, data: {
         agent_id: target.data.agent_id,
@@ -348,24 +408,127 @@ export class AgentController {
         terminated_count: 0,
       } });
     }
-    const entry = this.agents.get(target.data.agent_id);
-    if (entry === undefined) return controlFailure("agent_unavailable");
+    const existing = this.terminationFlows.get(target.data.agent_id);
+    if (existing !== undefined) return existing;
+    const flow = this.runDirectTermination(target.data.agent_id, true);
+    this.terminationFlows.set(target.data.agent_id, flow);
+    try {
+      return await flow;
+    } finally {
+      if (this.terminationFlows.get(target.data.agent_id) === flow) {
+        this.terminationFlows.delete(target.data.agent_id);
+      }
+    }
+  }
+
+  /**
+   * 直接父只关闭自己拥有的一个受管节点。该 child 收到 close 后先递归清理其
+   * 直接子树；根屏障和逐跳资源确认保证祖先不会越过未确认后代。
+   */
+  private async runDirectTermination(
+    agentId: string,
+    useAuthority: boolean,
+  ): Promise<ControlResult<TerminateAgentData>> {
+    let barrier: TerminationBarrierOutcome;
+    if (!useAuthority || this.authority === undefined) {
+      const local = this.tree.beginTerminationBarrier(this.actor, agentId);
+      if (!local.ok) return local;
+      barrier = local.data;
+    } else {
+      const authorized = await this.authority.beginTermination(this.actor, agentId);
+      if (!authorized.ok) return authorized;
+      barrier = authorized.data;
+      // 投影也建立同一不可逆屏障，停止本地迟到命令与快照发布。
+      this.tree.beginTerminationBarrier(this.actor, agentId);
+    }
+    const terminatedBefore = barrier.agent_ids.filter((memberId) => {
+      const member = this.tree.getStatus(memberId);
+      return member.ok && member.data.state === "terminated";
+    }).length;
+
+    const entry = this.agents.get(agentId);
+    if (entry === undefined) {
+      this.markTerminationIncomplete(agentId);
+      return controlFailure("termination_incomplete");
+    }
     let result: RpcSupervisorTerminationResult;
     try {
       result = await entry.supervisor.terminate();
     } catch {
+      this.markTerminationIncomplete(agentId);
       return controlFailure("termination_incomplete");
     }
-    if (!result.ok) return controlFailure(result.code);
-    entry.unsubscribe();
-    this.agents.delete(target.data.agent_id);
-    return Object.freeze({ ok: true, data: {
-      agent_id: target.data.agent_id,
+    if (!result.ok) {
+      this.markTerminationIncomplete(agentId);
+      return controlFailure("termination_incomplete");
+    }
+
+    if (useAuthority && this.authority !== undefined) {
+      const confirmed = await this.authority.confirmResources(this.actor, agentId);
+      if (!confirmed.ok || confirmed.data.node.state !== "terminated") {
+        this.markTerminationIncomplete(agentId);
+        return controlFailure("termination_incomplete");
+      }
+    }
+    this.confirmTreeResources(agentId);
+    const status = this.tree.getStatus(agentId);
+    if (!status.ok || status.data.state !== "terminated") {
+      this.markTerminationIncomplete(agentId);
+      return controlFailure("termination_incomplete");
+    }
+    this.releaseOwnedSupervisor(agentId, entry);
+    const terminatedAfter = barrier.agent_ids.filter((memberId) => {
+      const member = this.tree.getStatus(memberId);
+      return member.ok && member.data.state === "terminated";
+    }).length;
+    const terminatedCount = Math.max(0, terminatedAfter - terminatedBefore);
+    return Object.freeze({ ok: true, data: Object.freeze({
+      agent_id: agentId,
       state: "terminated" as const,
-      changed: true,
-      forced: entry.supervisor.wasForcedTerminationUsed(),
-      terminated_count: 1,
-    } });
+      changed: terminatedCount > 0,
+      forced: safeForced(entry.supervisor),
+      terminated_count: terminatedCount,
+    }) });
+  }
+
+  private confirmTreeResources(agentId: string): boolean {
+    const status = this.tree.getStatus(agentId);
+    if (!status.ok || status.data.state === "terminated") return false;
+    const generation = this.tree.getLifecycleGeneration(agentId);
+    if (!generation.ok) return false;
+    const result = this.tree.applyLifecycleEvent(agentId, {
+      type: "resources_confirmed",
+      expected_generation: generation.data,
+    });
+    return result.ok && result.data.applied && result.data.node.state === "terminated";
+  }
+
+  private markTerminationIncomplete(agentId: string): void {
+    const generation = this.tree.getLifecycleGeneration(agentId);
+    if (!generation.ok) return;
+    this.tree.applyLifecycleEvent(agentId, {
+      type: "termination_incomplete",
+      expected_generation: generation.data,
+    });
+  }
+
+  private confirmSupervisorCleanup(agentId: string): void {
+    const barrier = this.tree.beginTerminationBarrier(this.actor, agentId);
+    if (!barrier.ok) return;
+    const generation = this.tree.getLifecycleGeneration(agentId);
+    if (generation.ok) {
+      this.tree.applyLifecycleEvent(agentId, {
+        type: "resources_confirmed",
+        expected_generation: generation.data,
+      });
+    }
+  }
+
+  private releaseOwnedSupervisor(agentId: string, expected: ManagedAgentEntry): void {
+    const current = this.agents.get(agentId);
+    if (current !== expected) return;
+    current.unsubscribe();
+    this.agents.delete(agentId);
   }
 
   getAgentStatus(agentId: unknown): ControlResult<AgentSnapshot> {
@@ -380,23 +543,43 @@ export class AgentController {
   /** 根 reload 原子替换未来创建使用的目录，不回溯改变既有节点。 */
   updateTemplateSnapshot(snapshot: TemplateDiscoverySnapshot): void {
     this.templateSnapshot = snapshot;
+    this.createSupervisor.updateTemplateSnapshot?.(snapshot);
   }
 
-  /** 会话关闭时终止当前控制器拥有的全部节点；不同节点可并行清理。 */
-  async shutdown(): Promise<void> {
-    const assigned = [...this.agents.entries()];
+  /**
+   * 会话关闭时终止当前控制器拥有的全部节点；不同节点可并行清理。
+   *
+   * 返回值表示控制器是否已经确认并释放全部资源。未确认时保留监督器
+   * 所有权，调用者可以安全地在后续生命周期事件中再次重试。
+   */
+  async shutdown(): Promise<boolean> {
+    return this.beginShutdown(false);
+  }
+
+  /** 父监督 close 已在根建立整棵屏障，后代清理不能再依赖已关闭的上游控制流。 */
+  async shutdownFromParentBarrier(): Promise<boolean> {
+    return this.beginShutdown(true);
+  }
+
+  private async beginShutdown(parentBarrierEstablished: boolean): Promise<boolean> {
+    if (this.disposed) return true;
+    const existing = this.shutdownFlow;
+    if (existing !== undefined) return existing;
+    const flow = this.performShutdown(parentBarrierEstablished);
+    this.shutdownFlow = flow;
+    try {
+      return await flow;
+    } finally {
+      if (this.shutdownFlow === flow) this.shutdownFlow = undefined;
+    }
+  }
+
+  private async performShutdown(parentBarrierEstablished: boolean): Promise<boolean> {
+    const assignedIds = [...this.agents.keys()];
     const unassigned = [...this.unassignedSupervisors.entries()];
-    await Promise.allSettled(assigned.map(async ([agentId, entry]) => {
-      try {
-        const result = await entry.supervisor.terminate();
-        if (!result.ok) return;
-        if (this.agents.get(agentId) !== entry) return;
-        entry.unsubscribe();
-        this.agents.delete(agentId);
-      } catch {
-        // 未确认资源必须保留监督器，供下一次关闭或显式终止重试。
-      }
-    }));
+    await Promise.allSettled(assignedIds.map((agentId) => parentBarrierEstablished
+      ? this.terminateAfterParentBarrier(agentId)
+      : this.terminateAgent(agentId)));
     await Promise.allSettled(unassigned.map(async ([supervisor, unsubscribe]) => {
       try {
         const result = await supervisor.terminate();
@@ -408,10 +591,28 @@ export class AgentController {
         // 身份未知不等于资源已回收；继续保留内部控制面。
       }
     }));
-    if (this.agents.size === 0 && this.unassignedSupervisors.size === 0) this.dispose();
+    const complete = this.agents.size === 0 && this.unassignedSupervisors.size === 0;
+    if (complete) this.dispose();
+    return complete;
+  }
+
+  private async terminateAfterParentBarrier(agentId: string): Promise<void> {
+    const status = this.directChild(agentId);
+    if (!status.ok || status.data.state === "terminated") return;
+    const key = `parent:${agentId}`;
+    const existing = this.terminationFlows.get(key);
+    const flow = existing ?? this.runDirectTermination(agentId, false);
+    if (existing === undefined) this.terminationFlows.set(key, flow);
+    try {
+      await flow;
+    } finally {
+      if (this.terminationFlows.get(key) === flow) this.terminationFlows.delete(key);
+    }
   }
 
   dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
     this.unsubscribeTreeChange?.();
     this.unsubscribeTreeChange = undefined;
     for (const [agentId, set] of this.waiters) {
@@ -424,6 +625,27 @@ export class AgentController {
     this.agents.clear();
     for (const unsubscribe of this.unassignedSupervisors.values()) unsubscribe();
     this.unassignedSupervisors.clear();
+    this.terminationFlows.clear();
+    this.orphanCleanupFlows.clear();
+  }
+
+  /** grant 已签发但监督器尚未拥有任何资源时，仍按不可逆终止事实关闭身份。 */
+  private async rollbackUnusedGrant(grant: SpawnGrant): Promise<void> {
+    const agentId = grant.node.agent_id;
+    try {
+      await this.authority?.beginTermination(this.actor, agentId);
+      await this.authority?.confirmResources(this.actor, agentId);
+    } catch {
+      // 根权威故障时不能伪造已确认；本地投影继续保留 terminating 事实。
+    }
+    const barrier = this.tree.beginTerminationBarrier(this.actor, agentId);
+    if (!barrier.ok) return;
+    const generation = this.tree.getLifecycleGeneration(agentId);
+    if (!generation.ok) return;
+    this.tree.applyLifecycleEvent(agentId, {
+      type: "resources_confirmed",
+      expected_generation: generation.data,
+    });
   }
 
   private preflightTemplate(templateId: string): ControlResult<TemplateDefinition | undefined> {
@@ -440,6 +662,18 @@ export class AgentController {
 
   private directChild(agentId: unknown): ControlResult<AgentSnapshot> {
     return this.tree.assertDirectChild(this.actor, agentId);
+  }
+
+  private async admittedDirectChild(
+    agentId: unknown,
+    action: AuthorityControlAction,
+  ): Promise<ControlResult<AgentSnapshot>> {
+    const local = this.directChild(agentId);
+    if (!local.ok || this.authority === undefined) return local;
+    const admitted = await this.authority.admitControl(this.actor, local.data.agent_id, action);
+    if (!admitted.ok) return admitted;
+    if (admitted.data.node.agent_id !== local.data.agent_id) return controlFailure("internal_error");
+    return local;
   }
 
   private retainSupervisor(
@@ -483,12 +717,73 @@ export class AgentController {
     if (agentId !== undefined) this.resolveWaiters(agentId);
     if (
       agentId !== undefined
+      && (
+        (event.kind === "fault")
+        || (event.kind === "lifecycle" && event.event.type === "runtime_failed")
+      )
+    ) {
+      this.startOrphanTermination(agentId);
+    }
+    if (
+      agentId !== undefined
       && event.kind === "lifecycle"
       && event.event.type === "resources_confirmed"
     ) {
       this.releaseTerminatedSupervisor(agentId);
     }
     this.resolveAllReadyWaiters();
+  }
+
+  /** 运行故障只自动回收后代；故障父节点保持 failed，等待直接父显式终止。 */
+  private startOrphanTermination(agentId: string): void {
+    const barrier = this.tree.getTerminationBarrier(agentId);
+    if (!barrier.ok || barrier.data.agent_id !== agentId || barrier.data.agent_ids.length <= 1) return;
+    if (this.orphanCleanupFlows.has(agentId)) return;
+    const flow = this.runOrphanTermination(agentId, barrier.data);
+    this.orphanCleanupFlows.set(agentId, flow);
+    void flow.finally(() => {
+      if (this.orphanCleanupFlows.get(agentId) === flow) this.orphanCleanupFlows.delete(agentId);
+    }).catch(() => {
+      // 后代继续保留 termination_incomplete，显式终止仍可重试平台边界。
+    });
+  }
+
+  private async runOrphanTermination(
+    agentId: string,
+    barrier: TerminationBarrierOutcome,
+  ): Promise<void> {
+    const entry = this.agents.get(agentId);
+    const cleanup = entry?.supervisor.reapOrphanedDescendants;
+    if (entry === undefined || cleanup === undefined) {
+      for (const descendantId of barrier.agent_ids) {
+        if (descendantId !== agentId) this.markTerminationIncomplete(descendantId);
+      }
+      return;
+    }
+    let confirmed = false;
+    try {
+      confirmed = (await cleanup.call(entry.supervisor)).confirmed;
+    } catch {
+      confirmed = false;
+    }
+    if (!confirmed) {
+      for (const descendantId of barrier.agent_ids) {
+        if (descendantId !== agentId) this.markTerminationIncomplete(descendantId);
+      }
+      return;
+    }
+    if (this.authority !== undefined) {
+      const rootConfirmation = await this.authority.confirmResources(this.actor, agentId);
+      if (!rootConfirmation.ok) {
+        for (const descendantId of barrier.agent_ids) {
+          if (descendantId !== agentId) this.markTerminationIncomplete(descendantId);
+        }
+        return;
+      }
+    }
+    for (const descendantId of barrier.agent_ids) {
+      if (descendantId !== agentId) this.confirmTreeResources(descendantId);
+    }
   }
 
   private releaseTerminatedSupervisor(agentId: string): void {
@@ -638,4 +933,12 @@ function interruptData(status: AgentSnapshot, changed: boolean): InterruptAgentD
     state: status.state,
     ...(status.error === undefined ? {} : { error: status.error }),
   });
+}
+
+function safeForced(supervisor: AgentSupervisor): boolean {
+  try {
+    return supervisor.wasForcedTerminationUsed() === true;
+  } catch {
+    return false;
+  }
 }

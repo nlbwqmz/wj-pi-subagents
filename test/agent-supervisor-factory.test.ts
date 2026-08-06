@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createAgentSupervisorFactory, buildManagedRpcOptions } from "../src/agent-supervisor-factory.ts";
-import { BridgeSupervisorEndpoint } from "../src/bridge-supervisor-endpoint.ts";
+import { BridgeSupervisorEndpoint } from "./helpers/bridge-supervisor-endpoint.ts";
 import {
   FakeManagedRpcNode,
   type ManagedRpcNodeStartContext,
@@ -36,7 +36,7 @@ class LinkedFactoryNode extends FakeManagedRpcNode {
     this.endpoint?.receive(frame);
   }
 
-  override async publishSupervisorReply(reply: ManagedRpcReply): Promise<void> {
+  async publishReply(reply: ManagedRpcReply): Promise<void> {
     this.endpoint?.publishReply(reply);
   }
 
@@ -196,7 +196,7 @@ test("身份预留后才建立监督上下文并追加最终子代理环境", as
   assert.equal(context.supervisor.root_id, "root-factory");
   assert.equal(context.environment?.ROOT_VALUE, "stable");
   assert.equal(context.environment?.PI_SUBAGENT_ROOT_ID, "root-factory");
-  assert.equal(context.environment?.PI_SUBAGENT_PARENT_AGENT_ID, "root-factory");
+  assert.equal(context.environment?.PI_SUBAGENT_PARENT_AGENT_ID, "");
   assert.equal(context.environment?.PI_SUBAGENT_AGENT_ID, AGENT_ID);
   assert.equal(context.environment?.PI_SUBAGENT_DEPTH, "1");
   assert.equal(context.environment?.PI_SUBAGENT_MAX_DEPTH, "2");
@@ -213,10 +213,7 @@ test("没有安全回复投递器时父端不发送 ACK", async () => {
   });
   assert.equal((await supervisor.start()).ok, true);
 
-  node.emitEvent({
-    type: "message_end",
-    message: { role: "assistant", content: [{ type: "text", text: "未投递回复" }] },
-  });
+  await node.publishReply({ text: "未投递回复" });
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -237,10 +234,7 @@ test("安全回复投递成功后才通过监督通道确认", async () => {
   });
   assert.equal((await supervisor.start()).ok, true);
 
-  node.emitEvent({
-    type: "message_end",
-    message: { role: "assistant", content: [{ type: "text", text: "已投递回复" }] },
-  });
+  await node.publishReply({ text: "已投递回复" });
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
 

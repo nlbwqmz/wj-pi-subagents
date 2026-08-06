@@ -424,3 +424,311 @@ test("定向标识按 canonical 格式与注册表分流，直接父检查不授
     child.node.agent_id,
   );
 });
+
+test("子树终止屏障在一个树修订中固定成员并按后代优先返回", () => {
+  const ids = [FIRST_ID, SECOND_ID, THIRD_ID];
+  let index = 0;
+  const tree = controller(ids, {
+    config: {
+      maxDepth: 3,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 16,
+      waitTimeoutMs: 60_000,
+    },
+  });
+  const parent = reserveRootChild(tree, "父代理");
+  expectSuccess(applyEvent(tree, parent.node.agent_id, { type: "startup_ready" }));
+  const child = expectSuccess(tree.reserveStartingChild(
+    { kind: "agent", agent_id: parent.node.agent_id },
+    { templateId: "child", name: "子代理" },
+  ));
+  rememberOutcome(tree, child);
+  expectSuccess(applyEvent(tree, child.node.agent_id, { type: "startup_ready" }));
+  const grandchild = expectSuccess(tree.reserveStartingChild(
+    { kind: "agent", agent_id: child.node.agent_id },
+    { templateId: "grandchild", name: "孙代理" },
+  ));
+  rememberOutcome(tree, grandchild);
+  expectSuccess(applyEvent(tree, grandchild.node.agent_id, { type: "startup_ready" }));
+  assert.equal(index, 0);
+
+  const before = expectSuccess(tree.getTreeSnapshot()).tree_revision;
+  const barrier = expectSuccess(tree.beginTerminationBarrier(ROOT_TREE_ACTOR, parent.node.agent_id));
+  assert.deepEqual(barrier.agent_ids, [grandchild.node.agent_id, child.node.agent_id, parent.node.agent_id]);
+  assert.equal(barrier.tree_revision, before + 1);
+  assert.equal(barrier.changed, true);
+  assert.deepEqual(
+    expectSuccess(tree.getTreeSnapshot()).nodes.map((node) => [node.agent_id, node.state]),
+    [
+      [parent.node.agent_id, "terminating"],
+      [child.node.agent_id, "terminating"],
+      [grandchild.node.agent_id, "terminating"],
+    ],
+  );
+  expectFailure(
+    tree.reserveStartingChild({ kind: "agent", agent_id: parent.node.agent_id }, {
+      templateId: "late",
+      name: "迟到创建",
+    }),
+    "agent_unavailable",
+  );
+
+  const repeated = expectSuccess(tree.beginTerminationBarrier(ROOT_TREE_ACTOR, parent.node.agent_id));
+  assert.equal(repeated.changed, false);
+  assert.equal(repeated.tree_revision, barrier.tree_revision);
+  assert.deepEqual(repeated.agent_ids, barrier.agent_ids);
+});
+
+test("运行故障先保留父节点 failed，并为全部后代建立防孤儿屏障", () => {
+  const tree = controller([FIRST_ID, SECOND_ID, THIRD_ID], {
+    config: {
+      maxDepth: 3,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 16,
+      waitTimeoutMs: 60_000,
+    },
+  });
+  const parent = reserveRootChild(tree, "故障父");
+  expectSuccess(applyEvent(tree, parent.node.agent_id, { type: "startup_ready" }));
+  const child = expectSuccess(tree.reserveStartingChild(
+    { kind: "agent", agent_id: parent.node.agent_id },
+    { templateId: "child", name: "孤儿子" },
+  ));
+  rememberOutcome(tree, child);
+  expectSuccess(applyEvent(tree, child.node.agent_id, { type: "startup_ready" }));
+  const grandchild = expectSuccess(tree.reserveStartingChild(
+    { kind: "agent", agent_id: child.node.agent_id },
+    { templateId: "grandchild", name: "孤儿孙" },
+  ));
+  rememberOutcome(tree, grandchild);
+  expectSuccess(applyEvent(tree, grandchild.node.agent_id, { type: "startup_ready" }));
+
+  const failed = expectSuccess(applyEvent(tree, parent.node.agent_id, {
+    type: "runtime_failed",
+    error_code: "internal_error",
+  }));
+  assert.equal(failed.node.state, "failed");
+  assert.equal(expectSuccess(tree.getStatus(child.node.agent_id)).state, "terminating");
+  assert.equal(expectSuccess(tree.getStatus(grandchild.node.agent_id)).state, "terminating");
+  expectFailure(
+    tree.reserveStartingChild({ kind: "agent", agent_id: child.node.agent_id }, {
+      templateId: "late",
+      name: "孤儿迟到",
+    }),
+    "agent_unavailable",
+  );
+});
+
+test("父端拒绝把既有兄弟节点伪装为直接子树快照中的后代", () => {
+  const tree = controller([FIRST_ID, SECOND_ID, THIRD_ID], {
+    config: {
+      maxDepth: 3,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 16,
+      waitTimeoutMs: 60_000,
+    },
+  });
+  const parent = reserveRootChild(tree, "父代理");
+  expectSuccess(applyEvent(tree, parent.node.agent_id, { type: "startup_ready" }));
+  const sibling = reserveRootChild(tree, "兄弟代理");
+  expectSuccess(applyEvent(tree, sibling.node.agent_id, { type: "startup_ready" }));
+  const child = expectSuccess(tree.reserveStartingChild(
+    { kind: "agent", agent_id: parent.node.agent_id },
+    { templateId: "child", name: "真实子代理" },
+  ));
+  rememberOutcome(tree, child);
+  expectSuccess(applyEvent(tree, child.node.agent_id, { type: "startup_ready" }));
+
+  const before = expectSuccess(tree.getTreeSnapshot());
+  const parentSnapshot = expectSuccess(tree.getStatus(parent.node.agent_id));
+  const childSnapshot = expectSuccess(tree.getStatus(child.node.agent_id));
+  const siblingSnapshot = expectSuccess(tree.getStatus(sibling.node.agent_id));
+  const forgedSibling = Object.freeze({
+    ...siblingSnapshot,
+    parent_agent_id: parent.node.agent_id,
+    depth: parentSnapshot.depth + 1,
+  });
+
+  expectFailure(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
+    scope_agent_id: parent.node.agent_id,
+    subtree_revision: 1,
+    nodes: Object.freeze([parentSnapshot, forgedSibling, childSnapshot]),
+  }), "invalid_argument");
+  const after = expectSuccess(tree.getTreeSnapshot());
+  assert.equal(after.tree_revision, before.tree_revision);
+  assert.deepEqual(
+    after.nodes.map((node) => [node.agent_id, node.parent_agent_id, node.depth, node.state, node.revision]),
+    before.nodes.map((node) => [node.agent_id, node.parent_agent_id, node.depth, node.state, node.revision]),
+  );
+});
+
+test("child 首快照只能校验作用域根身份，不能越过直接父把 starting 提前改成 idle", () => {
+  const tree = controller([FIRST_ID]);
+  const parent = reserveRootChild(tree, "正在握手的直接子代理");
+  const beforeTree = expectSuccess(tree.getTreeSnapshot());
+  const before = expectSuccess(tree.getStatus(parent.node.agent_id));
+  assert.equal(before.state, "starting");
+
+  const accepted = expectSuccess(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
+    scope_agent_id: parent.node.agent_id,
+    subtree_revision: 1,
+    nodes: Object.freeze([Object.freeze({
+      ...before,
+      state: "idle" as const,
+      pending_message_count: 7,
+      revision: before.revision + 100,
+      observed_at: "2099-01-01T00:00:00.000Z",
+    })]),
+  }));
+
+  assert.equal(accepted.applied, false);
+  assert.equal(accepted.subtree_revision, 1);
+  assert.equal(accepted.tree_revision, beforeTree.tree_revision);
+  const after = expectSuccess(tree.getStatus(parent.node.agent_id));
+  assert.deepEqual(after, before);
+
+  const ready = expectSuccess(applyEvent(tree, parent.node.agent_id, { type: "startup_ready" }));
+  assert.equal(ready.node.state, "idle");
+});
+
+test("根端只合入已预留完整子树并丢弃旧修订，查询保持稳定父先顺序", () => {
+  const tree = controller([FIRST_ID, SECOND_ID, THIRD_ID], {
+    config: {
+      maxDepth: 3,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 16,
+      waitTimeoutMs: 60_000,
+    },
+  });
+  const parent = reserveRootChild(tree, "父代理");
+  expectSuccess(applyEvent(tree, parent.node.agent_id, { type: "startup_ready" }));
+  const reservedChild = expectSuccess(tree.reserveStartingChild(
+    { kind: "agent", agent_id: parent.node.agent_id },
+    { templateId: "child", name: "递归子代理" },
+  ));
+  rememberOutcome(tree, reservedChild);
+  expectSuccess(applyEvent(tree, reservedChild.node.agent_id, { type: "startup_ready" }));
+  const before = expectSuccess(tree.getTreeSnapshot());
+  const parentSnapshot = expectSuccess(tree.getStatus(parent.node.agent_id));
+  const currentChild = expectSuccess(tree.getStatus(reservedChild.node.agent_id));
+  const child = Object.freeze({
+    ...currentChild,
+    state: "working" as const,
+    revision: currentChild.revision + 1,
+    observed_at: "2026-01-02T03:04:06.000Z",
+  });
+  const accepted = expectSuccess(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
+    scope_agent_id: FIRST_ID,
+    subtree_revision: 1,
+    nodes: Object.freeze([parentSnapshot, child]),
+  }));
+  assert.equal(accepted.applied, true);
+  assert.equal(accepted.tree_revision, before.tree_revision + 1);
+  assert.deepEqual(expectSuccess(tree.getTreeSnapshot()).nodes.map((node) => node.agent_id), [FIRST_ID, SECOND_ID]);
+  assert.deepEqual(expectSuccess(tree.getTreeSnapshotFor(ROOT_TREE_ACTOR)).nodes.map((node) => [
+    node.agent_id,
+    node.parent_agent_id,
+    node.depth,
+  ]), [
+    [FIRST_ID, null, 1],
+    [SECOND_ID, FIRST_ID, 2],
+  ]);
+  const scoped = expectSuccess(tree.getTreeSnapshotFor({ kind: "agent", agent_id: FIRST_ID }));
+  assert.deepEqual(scoped.scope, { kind: "subtree", agent_id: FIRST_ID });
+  assert.deepEqual(scoped.nodes.map((node) => [node.agent_id, node.parent_agent_id, node.depth]), [
+    [FIRST_ID, null, 1],
+    [SECOND_ID, FIRST_ID, 2],
+  ]);
+
+  const stale = expectSuccess(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
+    scope_agent_id: FIRST_ID,
+    subtree_revision: 1,
+    nodes: Object.freeze([parentSnapshot]),
+  }));
+  assert.equal(stale.applied, false);
+  assert.equal(stale.tree_revision, accepted.tree_revision);
+  assert.equal(stale.subtree_revision, 1);
+});
+
+test("根快照拒绝未经过 reserve_child 预登记的未知身份", () => {
+  const tree = controller([FIRST_ID, SECOND_ID], {
+    config: {
+      maxDepth: 3,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 16,
+      waitTimeoutMs: 60_000,
+    },
+  });
+  const parent = reserveRootChild(tree, "父代理");
+  expectSuccess(applyEvent(tree, parent.node.agent_id, { type: "startup_ready" }));
+  const parentSnapshot = expectSuccess(tree.getStatus(parent.node.agent_id));
+  expectFailure(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
+    scope_agent_id: parent.node.agent_id,
+    subtree_revision: 1,
+    nodes: Object.freeze([parentSnapshot, Object.freeze({
+      agent_id: SECOND_ID,
+      parent_agent_id: FIRST_ID,
+      template_id: "child",
+      name: "伪造后代",
+      depth: 2,
+      state: "idle" as const,
+      pending_message_count: 0,
+      revision: 1,
+      observed_at: "2026-01-02T03:04:06.000Z",
+      created_at: "2026-01-02T03:04:06.000Z",
+      lifecycle_elapsed_ms: 0,
+    })]),
+  }), "invalid_argument");
+  assert.deepEqual(expectSuccess(tree.getTreeSnapshot()).nodes.map((node) => node.agent_id), [FIRST_ID]);
+});
+
+test("子树投影采用根 grant，监督快照保留真实父关系且公开查询隐藏祖先", () => {
+  const tree = controller([], {
+    config: {
+      maxDepth: 3,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 16,
+      waitTimeoutMs: 60_000,
+    },
+    initialActor: {
+      agentId: FIRST_ID,
+      parentAgentId: THIRD_ID,
+      depth: 2,
+      templateId: "parent",
+      name: "投影根",
+      managementEnabled: true,
+    },
+  });
+  const actor = Object.freeze({ kind: "agent" as const, agent_id: FIRST_ID });
+  const adopted = expectSuccess(tree.adoptSpawnGrant(actor, {
+    node: Object.freeze({
+      agent_id: SECOND_ID,
+      parent_agent_id: FIRST_ID,
+      template_id: "child",
+      name: "已授权子代理",
+      depth: 3,
+      state: "starting" as const,
+      pending_message_count: 0,
+      revision: 1,
+      observed_at: "2026-01-02T03:04:06.000Z",
+    }),
+    lifecycle_generation: 0,
+    management_enabled: false,
+  }));
+  assert.equal(adopted.node.agent_id, SECOND_ID);
+  expectSuccess(tree.applyLifecycleEvent(SECOND_ID, {
+    type: "startup_ready",
+    expected_generation: adopted.lifecycle_generation,
+  }));
+
+  const supervision = expectSuccess(tree.getSupervisionSubtreeSnapshot(actor));
+  assert.deepEqual(supervision.nodes.map((node) => [node.agent_id, node.parent_agent_id, node.depth]), [
+    [FIRST_ID, THIRD_ID, 2],
+    [SECOND_ID, FIRST_ID, 3],
+  ]);
+  const publicView = expectSuccess(tree.getTreeSnapshotFor(actor));
+  assert.deepEqual(publicView.nodes.map((node) => [node.agent_id, node.parent_agent_id, node.depth]), [
+    [FIRST_ID, null, 2],
+    [SECOND_ID, FIRST_ID, 3],
+  ]);
+});

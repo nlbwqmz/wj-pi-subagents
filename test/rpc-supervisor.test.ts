@@ -179,8 +179,6 @@ class TestManagedRpcNode implements ManagedRpcNodeLike {
     return () => {};
   }
 
-  async publishSupervisorReply(): Promise<void> {}
-
   async requestGracefulClose(signal: AbortSignal): Promise<void> {
     this.gracefulCloseRequested = true;
     await this.waitForBindingSettlement();
@@ -754,7 +752,7 @@ test("abort 写入后不等待响应，interrupting 中的后续消息继续按�
   abortGate.resolve();
 });
 
-test("Pi 事件只归一化为生命周期、安全工具活动和普通 assistant 回复", async () => {
+test("Pi 任务 RPC 只归一化生命周期和安全活动，assistant 回复留给真正 child 监督端点", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
   const managedNode = new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter());
@@ -823,12 +821,7 @@ test("Pi 事件只归一化为生命周期、安全工具活动和普通 assista
       },
     ],
   );
-  assert.deepEqual(channel.publishedReplies(), [
-    {
-      text: "任务已完成",
-      images: [{ type: "image", data: "YWJj", mimeType: "image/png" }],
-    },
-  ]);
+  assert.deepEqual(channel.publishedReplies(), []);
   const serialized = JSON.stringify(events);
   for (const secret of [
     "call-secret",
@@ -843,7 +836,7 @@ test("Pi 事件只归一化为生命周期、安全工具活动和普通 assista
 });
 
 test("非法 Pi 事件和运行期 EOF 归一化为稳定故障且不泄露原始载荷", async () => {
-  for (const scenario of ["invalid_event", "unknown_content", "eof"] as const) {
+  for (const scenario of ["invalid_event", "eof"] as const) {
     const tree = createController();
     const rpcClient = new FakeRpcClient();
     const managedNode = new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter());
@@ -862,14 +855,6 @@ test("非法 Pi 事件和运行期 EOF 归一化为稳定故障且不泄露原�
 
     if (scenario === "invalid_event") {
       rpcClient.emitEvent({ type: "unknown_pi_event", error: "TOP_SECRET_STACK" });
-    } else if (scenario === "unknown_content") {
-      rpcClient.emitEvent({
-        type: "message_end",
-        message: {
-          role: "assistant",
-          content: [{ type: "future_secret_block", secret: "TOP_SECRET_STACK" }],
-        },
-      });
     } else {
       rpcClient.emitTransportFault("eof");
     }

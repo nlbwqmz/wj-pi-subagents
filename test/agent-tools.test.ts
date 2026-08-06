@@ -37,3 +37,19 @@ test("控制器失败映射为稳定 SubagentToolError 而不暴露异常", asyn
       && !String(error).includes("stack"),
   );
 });
+
+test("get_agent_tree 在执行层拒绝任何调用方指定的范围", async () => {
+  const registrations: Array<Record<string, unknown>> = [];
+  registerAgentTools({ registerTool: (tool) => registrations.push(tool as Record<string, unknown>) }, async () => ({
+    getAgentTree: () => ({ ok: true, data: { scope: { kind: "root" }, nodes: [] } }),
+  } as never));
+  const treeTool = registrations.find((tool) => tool.name === "get_agent_tree");
+  assert.ok(treeTool);
+  const execute = treeTool?.execute as (...args: unknown[]) => Promise<unknown>;
+  await assert.rejects(
+    execute("call", { agent_id: "550e8400-e29b-41d4-a716-446655440000" }, undefined, undefined, {}),
+    (error: unknown) => error instanceof SubagentToolError
+      && error.code === "invalid_argument"
+      && String(error).includes('"details":{}'),
+  );
+});

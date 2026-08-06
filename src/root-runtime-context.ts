@@ -44,7 +44,20 @@ export const RUNTIME_INTERNAL_ENV_KEYS = Object.freeze({
   agentId: "PI_SUBAGENT_AGENT_ID",
   depth: "PI_SUBAGENT_DEPTH",
   maxDepth: "PI_SUBAGENT_MAX_DEPTH",
+  maxChildrenPerAgent: "PI_SUBAGENT_MAX_CHILDREN_PER_AGENT",
+  maxAgentsPerTree: "PI_SUBAGENT_MAX_AGENTS_PER_TREE",
+  waitTimeoutMs: "PI_SUBAGENT_WAIT_TIMEOUT_MS",
+  managementEnabled: "PI_SUBAGENT_MANAGEMENT_ENABLED",
+  templateId: "PI_SUBAGENT_TEMPLATE_ID",
+  name: "PI_SUBAGENT_AGENT_NAME",
   protocolVersion: "PI_SUBAGENT_PROTOCOL_VERSION",
+});
+
+/** 每一跳本地监督连接独有，捕获根环境或创建下一代时必须剥离。 */
+export const RUNTIME_EPHEMERAL_ENV_KEYS = Object.freeze({
+  supervisorEndpoint: "PI_SUBAGENT_SUPERVISOR_ENDPOINT",
+  localSupervisorCredential: "PI_SUBAGENT_LOCAL_SUPERVISOR_CREDENTIAL",
+  supervisorCredential: "PI_SUBAGENT_SUPERVISOR_CREDENTIAL",
 });
 
 type RuntimeMetadataField = keyof typeof RUNTIME_INTERNAL_ENV_KEYS;
@@ -99,14 +112,21 @@ export interface RootRuntimeControllerMetadata {
 
 /** 仅控制器在创建一个节点时填写的节点身份。 */
 export interface ChildRuntimeIdentity {
-  readonly parentAgentId: string;
+  readonly parentAgentId: string | null;
   readonly agentId: string;
   readonly depth: number;
+  readonly managementEnabled?: boolean;
+  readonly templateId?: string;
+  readonly name?: string;
 }
 
 export interface ChildRuntimeMetadata extends ChildRuntimeIdentity {
   readonly rootId?: string;
   readonly maxDepth: number;
+  readonly maxChildrenPerAgent: number;
+  readonly maxAgentsPerTree: number;
+  readonly waitTimeoutMs: number;
+  readonly managementEnabled: boolean;
   readonly protocolVersion?: string;
 }
 
@@ -177,6 +197,7 @@ function snapshotEnvironment(input: EnvironmentInput): Readonly<Record<string, s
   const snapshot: Record<string, string> = {};
   try {
     for (const [key, value] of Object.entries(source)) {
+      if (isEphemeralEnvironmentKey(key)) continue;
       if (value !== undefined) {
         Object.defineProperty(snapshot, key, {
           configurable: true,
@@ -217,7 +238,10 @@ function appendInternalEnvironmentMetadata(
   metadata: ChildRuntimeMetadata,
 ): void {
   const caseInsensitive = process.platform === "win32";
-  const internalKeys = Object.values(RUNTIME_INTERNAL_ENV_KEYS);
+  const internalKeys = [
+    ...Object.values(RUNTIME_INTERNAL_ENV_KEYS),
+    ...Object.values(RUNTIME_EPHEMERAL_ENV_KEYS),
+  ];
   for (const existingKey of Object.keys(target)) {
     if (internalKeys.some((key) => caseInsensitive
       ? key.toLowerCase() === existingKey.toLowerCase()
@@ -232,10 +256,17 @@ function appendInternalEnvironmentMetadata(
     Object.defineProperty(target, key, {
       configurable: true,
       enumerable: true,
-      value: String(value),
+      value: field === "parentAgentId" && value === null ? "" : String(value),
       writable: true,
     });
   }
+}
+
+function isEphemeralEnvironmentKey(key: string): boolean {
+  const caseInsensitive = process.platform === "win32";
+  return Object.values(RUNTIME_EPHEMERAL_ENV_KEYS).some((candidate) => caseInsensitive
+    ? candidate.toLowerCase() === key.toLowerCase()
+    : candidate === key);
 }
 
 function isRuntimeConfigField(value: string): value is RuntimeConfigField {
@@ -508,14 +539,20 @@ export function resolveRuntimeConfig(
 function createChildMetadata(
   identity: ChildRuntimeIdentity,
   controllerMetadata: Readonly<RootRuntimeControllerMetadata>,
-  maxDepth: number,
+  config: RuntimeConfig,
 ): Readonly<ChildRuntimeMetadata> {
   return freezeRecord({
     ...(controllerMetadata?.rootId === undefined ? {} : { rootId: controllerMetadata.rootId }),
     parentAgentId: identity.parentAgentId,
     agentId: identity.agentId,
     depth: identity.depth,
-    maxDepth,
+    maxDepth: config.maxDepth,
+    maxChildrenPerAgent: config.maxChildrenPerAgent,
+    maxAgentsPerTree: config.maxAgentsPerTree,
+    waitTimeoutMs: config.waitTimeoutMs,
+    managementEnabled: identity.managementEnabled !== false,
+    ...(identity.templateId === undefined ? {} : { templateId: identity.templateId }),
+    ...(identity.name === undefined ? {} : { name: identity.name }),
     ...(controllerMetadata?.protocolVersion === undefined
       ? {}
       : { protocolVersion: controllerMetadata.protocolVersion }),
@@ -585,7 +622,7 @@ class RootRuntimeContextImpl implements RootRuntimeContext {
     this.resolvePath = (path: string) => safePath(this.cwd, path);
     let diagnosticsNotified = false;
     const createChild = (identity: ChildRuntimeIdentity): ChildRuntimeContext => {
-      const metadata = createChildMetadata(identity, controllerMetadata, this.config.maxDepth);
+      const metadata = createChildMetadata(identity, controllerMetadata, this.config);
       const childEnvironment: Record<string, string> = { ...this.environment };
       // 启动环境始终回到根快照，再由控制器追加当前节点元数据。
       appendInternalEnvironmentMetadata(childEnvironment, metadata);

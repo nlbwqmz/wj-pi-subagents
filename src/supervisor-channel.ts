@@ -2,11 +2,14 @@ import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import {
   AGENT_LIFECYCLE_EVENT_TYPES,
   AGENT_LIFECYCLE_STATES,
+  PUBLIC_ERROR_CODES,
   isCanonicalUuid,
   type AgentFault,
   type AgentLifecycleEventType,
   type AgentLifecycleState,
   type AgentSnapshot,
+  type PublicControlError,
+  type PublicErrorCode,
 } from "./tree-controller.ts";
 
 /** 父子监督通道与 Pi 任务 RPC 完全隔离的固定协议版本。 */
@@ -19,6 +22,8 @@ export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "snapshot_request",
   "snapshot",
   "reply",
+  "control_request",
+  "control_response",
   "ack",
   "close",
 ] as const);
@@ -97,6 +102,47 @@ export interface SupervisorReply {
   readonly images?: readonly SupervisorReplyImage[];
 }
 
+/** 监督控制正文只允许可复制、可深冻结的纯 JSON 值。 */
+export type SupervisorJsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | readonly SupervisorJsonValue[]
+  | { readonly [key: string]: SupervisorJsonValue };
+
+/** 子树控制请求允许进入父级路由器的内部操作闭集。 */
+export const SUPERVISOR_CONTROL_OPERATIONS = Object.freeze([
+  "resolve_template",
+  "reserve_child",
+  "admit_control",
+  "begin_termination",
+  "confirm_resources",
+] as const);
+
+export type SupervisorControlOperation = (typeof SUPERVISOR_CONTROL_OPERATIONS)[number];
+
+/** child 沿唯一祖先方向上行的内部控制请求。 */
+export interface SupervisorControlRequest {
+  readonly operation_id: string;
+  readonly operation: SupervisorControlOperation;
+  readonly route: readonly string[];
+  readonly body: SupervisorJsonValue;
+}
+
+/** parent 下行的内部控制结果不重复携带已由请求验证的 route。 */
+export type SupervisorControlResponse =
+  | {
+      readonly operation_id: string;
+      readonly ok: true;
+      readonly data: SupervisorJsonValue;
+    }
+  | {
+      readonly operation_id: string;
+      readonly ok: false;
+      readonly error: PublicControlError;
+    };
+
 /** 监督器向直接父/子控制器传播的脱敏生命周期事实。 */
 export interface SupervisorEvent {
   readonly root_id: string;
@@ -167,6 +213,14 @@ export interface SupervisorReceiveAccepted {
   readonly replies: readonly SupervisorReply[];
   /** 仅供本地监督器递交给 TreeController 的脱敏生命周期事实。 */
   readonly event?: SupervisorEvent;
+  /** 本次接收原子替换的完整快照；调用方可直接交给树控制器。 */
+  readonly snapshot?: SupervisorSnapshot;
+  /** 本次通过身份、分支和正文边界校验的上行内部控制请求。 */
+  readonly control_request?: SupervisorControlRequest;
+  /** 本次通过公开结果外壳校验的下行内部控制响应。 */
+  readonly control_response?: SupervisorControlResponse;
+  /** 对端请求本端完成后代清理；传输层在清理完成前不得关闭字节流。 */
+  readonly close_requested?: true;
 }
 
 export interface SupervisorReceiveDuplicate {
@@ -226,6 +280,10 @@ export interface SupervisorChannelOptions {
   readonly requestIdRegistry: SupervisorRequestIdRegistry;
   /** 父端在普通回复可安全注入会话后调用；返回 false 时不确认该回复。 */
   readonly onReply?: (reply: SupervisorReply) => boolean;
+  /** EOF/断序后允许对端完成完整快照重同步的内部期限。 */
+  readonly resyncTimeoutMs?: number;
+  /** 重同步期限耗尽时的本地通知；不携带帧或底层错误。 */
+  readonly onProtocolFault?: () => void;
 }
 
 interface InternalFrame extends SupervisorFrame<Record<string, unknown>> {}
@@ -246,6 +304,25 @@ const EMPTY_FAULT: SupervisorChannelFault = Object.freeze({ code: "internal_erro
 const EMPTY_NODES: readonly AgentSnapshot[] = Object.freeze([]);
 const EMPTY_FRAMES: readonly SupervisorFrame[] = Object.freeze([]);
 const EMPTY_REPLIES: readonly SupervisorReply[] = Object.freeze([]);
+const PUBLIC_ERROR_CODE_SET: ReadonlySet<string> = new Set(PUBLIC_ERROR_CODES);
+const CONTROL_SENSITIVE_FIELD_TOKENS = new Set([
+  "prompt",
+  "reply",
+  "path",
+  "filepath",
+  "env",
+  "environment",
+  "endpoint",
+  "credential",
+  "credentials",
+  "stack",
+]);
+const CONTROL_RESERVED_FIELD_NAMES = new Set([
+  "__proto__",
+  "prototype",
+  "constructor",
+  "request_id",
+]);
 
 function hasOwn(value: object, key: PropertyKey): boolean {
   return Object.prototype.hasOwnProperty.call(value, key);
@@ -294,13 +371,22 @@ function validPeerAgentId(value: string): boolean {
   return value === "" || isCanonicalUuid(value);
 }
 
+function definePlainValue(output: Record<string, unknown>, key: string, value: unknown): void {
+  Object.defineProperty(output, key, {
+    value,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
+}
+
 function freezePlain<T>(value: T): T {
   if (Array.isArray(value)) {
     return Object.freeze(value.map((item) => freezePlain(item))) as T;
   }
   if (typeof value === "object" && value !== null) {
     const output: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value)) output[key] = freezePlain(item);
+    for (const [key, item] of Object.entries(value)) definePlainValue(output, key, freezePlain(item));
     return Object.freeze(output) as T;
   }
   return value;
@@ -310,14 +396,39 @@ function cloneJson(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(cloneJson);
   if (typeof value === "object" && value !== null) {
     const output: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value)) output[key] = cloneJson(item);
+    for (const [key, item] of Object.entries(value)) definePlainValue(output, key, cloneJson(item));
     return output;
   }
   return value;
 }
 
+function sameSnapshotNodes(left: readonly AgentSnapshot[], right: readonly AgentSnapshot[]): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
 function frameError(code: SupervisorProtocolErrorCode): never {
   throw new SupervisorProtocolError(code);
+}
+
+function plainJsonEntries(value: unknown): readonly (readonly [string, unknown])[] {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) frameError("invalid_frame");
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) frameError("invalid_frame");
+  const entries: Array<readonly [string, unknown]> = [];
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== "string") frameError("invalid_frame");
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable || !hasOwn(descriptor, "value")) {
+      frameError("invalid_frame");
+    }
+    entries.push(Object.freeze([key, descriptor.value] as const));
+  }
+  return entries;
+}
+
+function asPlainJsonRecord(value: unknown): Record<string, unknown> {
+  plainJsonEntries(value);
+  return value as Record<string, unknown>;
 }
 
 function assertJsonBounds(
@@ -325,6 +436,7 @@ function assertJsonBounds(
   limits: SupervisorChannelLimits,
   depth = 0,
   counter: { entries: number } = { entries: 0 },
+  ancestors: Set<object> = new Set(),
 ): void {
   if (depth > limits.maxJsonDepth) frameError("invalid_frame");
   if (typeof value === "string") {
@@ -339,18 +451,159 @@ function assertJsonBounds(
   if (Array.isArray(value)) {
     counter.entries += value.length;
     if (counter.entries > limits.maxJsonEntries) frameError("frame_too_large");
-    for (const item of value) assertJsonBounds(item, limits, depth + 1, counter);
+    if (ancestors.has(value)) frameError("invalid_frame");
+    const ownKeys = Reflect.ownKeys(value);
+    if (
+      ownKeys.some((key) => typeof key !== "string") ||
+      ownKeys.length !== value.length + 1 ||
+      !ownKeys.includes("length")
+    ) frameError("invalid_frame");
+    ancestors.add(value);
+    try {
+      for (let index = 0; index < value.length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        if (descriptor === undefined || !descriptor.enumerable || !hasOwn(descriptor, "value")) {
+          frameError("invalid_frame");
+        }
+        assertJsonBounds(descriptor.value, limits, depth + 1, counter, ancestors);
+      }
+    } finally {
+      ancestors.delete(value);
+    }
     return;
   }
-  if (typeof value !== "object") frameError("invalid_frame");
-  const object = value as Record<string, unknown>;
-  const entries = Object.entries(object);
+  const object = value as object;
+  if (ancestors.has(object)) frameError("invalid_frame");
+  const entries = plainJsonEntries(object);
   counter.entries += entries.length;
   if (counter.entries > limits.maxJsonEntries) frameError("frame_too_large");
-  for (const [key, item] of entries) {
-    if (!validBoundedString(key, limits)) frameError("frame_too_large");
-    assertJsonBounds(item, limits, depth + 1, counter);
+  ancestors.add(object);
+  try {
+    for (const [key, item] of entries) {
+      if (!validBoundedString(key, limits)) frameError("frame_too_large");
+      assertJsonBounds(item, limits, depth + 1, counter, ancestors);
+    }
+  } finally {
+    ancestors.delete(object);
   }
+}
+
+function hasExactObjectKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value);
+  return actual.length === expected.length && actual.every((key) => expected.includes(key));
+}
+
+function isForbiddenControlFieldName(key: string): boolean {
+  const lower = key.toLowerCase();
+  if (CONTROL_RESERVED_FIELD_NAMES.has(lower)) return true;
+  const snakeCase = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
+  const normalized = snakeCase.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  if (CONTROL_RESERVED_FIELD_NAMES.has(normalized)) return true;
+  return normalized.split("_").some((token) => CONTROL_SENSITIVE_FIELD_TOKENS.has(token));
+}
+
+function assertNoSensitiveControlFields(value: unknown): void {
+  if (Array.isArray(value)) {
+    for (const item of value) assertNoSensitiveControlFields(item);
+    return;
+  }
+  if (typeof value !== "object" || value === null) return;
+  for (const [key, item] of plainJsonEntries(value)) {
+    if (isForbiddenControlFieldName(key)) frameError("invalid_frame");
+    assertNoSensitiveControlFields(item);
+  }
+}
+
+function parseControlJson(value: unknown, limits: SupervisorChannelLimits): SupervisorJsonValue {
+  assertJsonBounds(value, limits);
+  assertNoSensitiveControlFields(value);
+  return freezePlain(cloneJson(value)) as SupervisorJsonValue;
+}
+
+function parseControlRoute(
+  value: unknown,
+  expectedRouteRoot: string,
+  snapshot: readonly AgentSnapshot[],
+  limits: SupervisorChannelLimits,
+): readonly string[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > limits.maxDepth) frameError("invalid_frame");
+  assertJsonBounds(value, limits);
+  const route = value.map((agentId) => {
+    if (!isCanonicalUuid(agentId)) frameError("invalid_frame");
+    return agentId;
+  });
+  if (route[0] !== expectedRouteRoot) frameError("identity_mismatch");
+  const nodesById = new Map(snapshot.map((node) => [node.agent_id, node] as const));
+  for (let index = 1; index < route.length; index += 1) {
+    const node = nodesById.get(route[index]!);
+    if (node === undefined || node.parent_agent_id !== route[index - 1]) frameError("identity_mismatch");
+  }
+  return Object.freeze(route);
+}
+
+function parseControlRequest(
+  value: unknown,
+  expectedRouteRoot: string,
+  snapshot: readonly AgentSnapshot[],
+  limits: SupervisorChannelLimits,
+): SupervisorControlRequest {
+  const request = asPlainJsonRecord(value);
+  if (!hasExactObjectKeys(request, ["operation_id", "operation", "route", "body"])) {
+    frameError("invalid_frame");
+  }
+  if (!validOpaqueId(request.operation_id, limits)) frameError("invalid_frame");
+  if (
+    typeof request.operation !== "string" ||
+    !(SUPERVISOR_CONTROL_OPERATIONS as readonly string[]).includes(request.operation)
+  ) frameError("invalid_frame");
+  const route = parseControlRoute(request.route, expectedRouteRoot, snapshot, limits);
+  const body = parseControlJson(request.body, limits);
+  return Object.freeze({
+    operation_id: request.operation_id,
+    operation: request.operation as SupervisorControlOperation,
+    route,
+    body,
+  });
+}
+
+function parsePublicControlError(value: unknown, limits: SupervisorChannelLimits): PublicControlError {
+  const error = asPlainJsonRecord(value);
+  if (!hasExactObjectKeys(error, ["code", "message", "retryable", "details"])) frameError("invalid_frame");
+  if (
+    typeof error.code !== "string" ||
+    !PUBLIC_ERROR_CODE_SET.has(error.code) ||
+    !validBoundedString(error.message, limits) ||
+    typeof error.retryable !== "boolean"
+  ) frameError("invalid_frame");
+  const details = asPlainJsonRecord(error.details);
+  if (Object.keys(details).length !== 0) frameError("invalid_frame");
+  return Object.freeze({
+    code: error.code as PublicErrorCode,
+    message: error.message,
+    retryable: error.retryable,
+    details: Object.freeze({}),
+  });
+}
+
+function parseControlResponse(value: unknown, limits: SupervisorChannelLimits): SupervisorControlResponse {
+  const response = asPlainJsonRecord(value);
+  if (!validOpaqueId(response.operation_id, limits)) frameError("invalid_frame");
+  if (response.ok === true) {
+    if (!hasExactObjectKeys(response, ["operation_id", "ok", "data"])) frameError("invalid_frame");
+    return Object.freeze({
+      operation_id: response.operation_id,
+      ok: true,
+      data: parseControlJson(response.data, limits),
+    });
+  }
+  if (response.ok !== false || !hasExactObjectKeys(response, ["operation_id", "ok", "error"])) {
+    frameError("invalid_frame");
+  }
+  return Object.freeze({
+    operation_id: response.operation_id,
+    ok: false,
+    error: parsePublicControlError(response.error, limits),
+  });
 }
 
 function parseFrameObject(value: unknown, limits: SupervisorChannelLimits): InternalFrame {
@@ -765,6 +1018,9 @@ export class SupervisorChannel {
   private readonly streamIdFactory: () => string;
   private readonly requestIdRegistry: SupervisorRequestIdRegistry;
   private readonly onReply: ((reply: SupervisorReply) => boolean) | undefined;
+  private readonly resyncTimeoutMs: number;
+  private readonly onProtocolFault: (() => void) | undefined;
+  private resyncTimer: ReturnType<typeof setTimeout> | undefined;
   private outgoingStreamId: string;
   private readonly retiredIncomingStreams = new Set<string>();
   private readonly retiredIncomingOrder: string[] = [];
@@ -800,6 +1056,10 @@ export class SupervisorChannel {
     this.streamIdFactory = options.streamIdFactory ?? randomStreamId;
     this.requestIdRegistry = options.requestIdRegistry;
     this.onReply = options.onReply;
+    this.resyncTimeoutMs = Number.isSafeInteger(options.resyncTimeoutMs) && (options.resyncTimeoutMs as number) > 0
+      ? options.resyncTimeoutMs as number
+      : 5_000;
+    this.onProtocolFault = options.onProtocolFault;
     this.outgoingStreamId = this.allocateStreamId();
   }
 
@@ -854,6 +1114,11 @@ export class SupervisorChannel {
       nodes,
       ...(resetRequestId === undefined ? {} : { reset: true }),
     }, this.localAgentId ?? "", this.parentAgentId, this.depth, this.limits);
+    if (
+      nextRevision === this.localSubtreeRevision
+      && resetRequestId === undefined
+      && (this.state !== "awaiting_snapshot" || !sameSnapshotNodes(parsed.snapshot.nodes, this.localLatestSnapshot))
+    ) throw new SupervisorProtocolError("snapshot_invalid");
     this.localSubtreeRevision = parsed.snapshot.subtree_revision;
     this.localLatestSnapshot = Object.freeze(parsed.snapshot.nodes.map((node) => freezePlain(cloneJson(node) as AgentSnapshot)));
     const frame = this.createFrame("snapshot", {
@@ -885,6 +1150,27 @@ export class SupervisorChannel {
     this.outboundReplies.set(parsed.reply_seq, { reply: parsed });
     this.nextReplySeq += 1;
     return frame;
+  }
+
+  /** child 发布已绑定自身分支的内部控制请求；operation_id 不占用监督 request_id。 */
+  publishControlRequest(request: SupervisorControlRequest): SupervisorFrame {
+    if (
+      this.role !== "child" ||
+      this.localAgentId === null ||
+      this.terminationBarrier ||
+      this.state !== "ready"
+    ) throw new SupervisorProtocolError("closed");
+    const parsed = parseControlRequest(request, this.localAgentId, this.localLatestSnapshot, this.limits);
+    return this.createFrame("control_request", parsed as unknown as Record<string, unknown>);
+  }
+
+  /** parent 发布固定成功/失败外壳；响应不携带 route 或监督 request_id。 */
+  publishControlResponse(response: SupervisorControlResponse): SupervisorFrame {
+    if (this.role !== "parent" || this.terminationBarrier || this.state !== "ready") {
+      throw new SupervisorProtocolError("closed");
+    }
+    const parsed = parseControlResponse(response, this.limits);
+    return this.createFrame("control_response", parsed as unknown as Record<string, unknown>);
   }
 
   /**
@@ -922,6 +1208,7 @@ export class SupervisorChannel {
   /** 显式建立终止屏障后，旧流和普通控制帧只会被丢弃。 */
   establishTerminationBarrier(): void {
     this.terminationBarrier = true;
+    this.clearResyncTimeout();
     if (this.state !== "closed" && this.state !== "faulted") this.state = "closing";
   }
 
@@ -955,6 +1242,7 @@ export class SupervisorChannel {
    */
   receiveEof(): SupervisorReceiveEof {
     if (this.terminationBarrier) {
+      this.clearResyncTimeout();
       this.state = "closed";
     } else if (this.state !== "faulted" && this.state !== "closed") {
       this.beginReconnect();
@@ -964,7 +1252,11 @@ export class SupervisorChannel {
 
   /** 传输解码器在收到截断/损坏字节时使用；不携带底层错误正文。 */
   markProtocolFault(): void {
-    if (this.state !== "closed") this.state = "faulted";
+    if (this.state !== "closed") {
+      this.clearResyncTimeout();
+      this.state = "faulted";
+      this.notifyProtocolFault();
+    }
   }
 
   /** 仅公开安全快照，不泄露凭据、端点、流 ID、序号或原始异常。 */
@@ -1093,6 +1385,9 @@ export class SupervisorChannel {
     let applied = false;
     let replies: readonly SupervisorReply[] = EMPTY_REPLIES;
     let event: SupervisorEvent | undefined;
+    let controlRequest: SupervisorControlRequest | undefined;
+    let controlResponse: SupervisorControlResponse | undefined;
+    let closeRequested = false;
     const outbound: SupervisorFrame[] = [];
     switch (frame.kind) {
       case "hello":
@@ -1116,6 +1411,14 @@ export class SupervisorChannel {
         if (result.ackReplySeq > 0) outbound.push(this.createReplyAck(result.ackReplySeq));
         break;
       }
+      case "control_request":
+        if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
+        controlRequest = parseControlRequest(frame.payload, this.peerAgentId, this.latestSnapshot, this.limits);
+        break;
+      case "control_response":
+        if (this.role !== "child" || this.state !== "ready") frameError("sequence_violation");
+        controlResponse = parseControlResponse(frame.payload, this.limits);
+        break;
       case "ack":
         outbound.push(...this.applyAck(frame));
         break;
@@ -1124,10 +1427,14 @@ export class SupervisorChannel {
         break;
       case "close":
         this.applyClose(frame);
+        closeRequested = true;
         break;
     }
-    // ACK 本身不再产生 ACK，避免双向确认形成无界回声；其他帧均确认最高连续序号。
-    if (frame.kind !== "ack") outbound.push(this.createAckFrame(this.incomingLastSeq));
+    // close 由接收端完成后代清理并关闭字节流作为受控确认，不能提前 ACK。
+    if (frame.kind !== "ack" && frame.kind !== "close") {
+      outbound.push(this.createAckFrame(this.incomingLastSeq));
+    }
+    const acceptedSnapshot = frame.kind === "snapshot" && applied ? this.getLatestSnapshot() : undefined;
     return Object.freeze({
       kind: "accepted",
       ack: this.incomingLastSeq,
@@ -1136,6 +1443,10 @@ export class SupervisorChannel {
       outbound: Object.freeze(outbound),
       replies,
       ...(event === undefined ? {} : { event }),
+      ...(acceptedSnapshot === undefined ? {} : { snapshot: acceptedSnapshot }),
+      ...(controlRequest === undefined ? {} : { control_request: controlRequest }),
+      ...(controlResponse === undefined ? {} : { control_response: controlResponse }),
+      ...(closeRequested ? { close_requested: true as const } : {}),
     });
   }
 
@@ -1195,6 +1506,7 @@ export class SupervisorChannel {
     }
     if (parsed.snapshot.subtree_revision <= this.acceptedSubtreeRevision) {
       this.state = "ready";
+      this.clearResyncTimeout();
       return false;
     }
     // 先完整验证，再一次性替换缓存并分配根侧 tree_revision。
@@ -1202,6 +1514,7 @@ export class SupervisorChannel {
     this.acceptedSubtreeRevision = parsed.snapshot.subtree_revision;
     this.treeRevision += 1;
     this.state = "ready";
+    this.clearResyncTimeout();
     return true;
   }
 
@@ -1300,6 +1613,7 @@ export class SupervisorChannel {
       payload.expected_generation !== undefined &&
       (!Number.isSafeInteger(payload.expected_generation) || (payload.expected_generation as number) < 0)
     ) frameError("invalid_frame");
+    if (!this.eventAgentIsInScope(payload.agent_id as string)) frameError("identity_mismatch");
     if (Object.keys(payload).some((key) => !["root_id", "agent_id", "type", "expected_generation", "error_code"].includes(key))) {
       frameError("invalid_frame");
     }
@@ -1323,12 +1637,22 @@ export class SupervisorChannel {
     });
   }
 
+  private eventAgentIsInScope(agentId: string): boolean {
+    if (this.role === "parent") {
+      if (agentId === this.peerAgentId) return true;
+      return this.latestSnapshot.some((node) => node.agent_id === agentId);
+    }
+    if (agentId === this.localAgentId) return true;
+    return this.localLatestSnapshot.some((node) => node.agent_id === agentId);
+  }
+
   private applyClose(frame: InternalFrame): void {
     if (frame.payload.root_id !== this.rootId || Object.keys(frame.payload).some((key) => key !== "root_id")) {
       frameError("identity_mismatch");
     }
     this.state = "closing";
     this.terminationBarrier = true;
+    this.clearResyncTimeout();
   }
 
   private createFrame(
@@ -1366,6 +1690,7 @@ export class SupervisorChannel {
     const requestId = this.allocateRequestId();
     this.pendingSnapshotRequest = Object.freeze({ requestId });
     this.state = "resyncing";
+    this.scheduleResyncTimeout();
     return this.createFrame("snapshot_request", {
       root_id: this.rootId,
       reset: true,
@@ -1404,6 +1729,26 @@ export class SupervisorChannel {
     this.sendSeq = 0;
     this.outgoingStreamId = this.allocateStreamId();
     this.state = "resyncing";
+    this.scheduleResyncTimeout();
+  }
+
+  private scheduleResyncTimeout(): void {
+    if (this.resyncTimer !== undefined) clearTimeout(this.resyncTimer);
+    const timer = setTimeout(() => {
+      this.resyncTimer = undefined;
+      if (this.state === "resyncing" || this.state === "awaiting_snapshot") {
+        this.state = "faulted";
+        this.notifyProtocolFault();
+      }
+    }, this.resyncTimeoutMs);
+    timer.unref?.();
+    this.resyncTimer = timer;
+  }
+
+  private clearResyncTimeout(): void {
+    if (this.resyncTimer === undefined) return;
+    clearTimeout(this.resyncTimer);
+    this.resyncTimer = undefined;
   }
 
   private retireIncomingStream(streamId: string): boolean {
@@ -1417,8 +1762,18 @@ export class SupervisorChannel {
   private protocolFault(error: unknown): SupervisorReceiveFault {
     const code = error instanceof SupervisorProtocolError ? error.code : "invalid_frame";
     // 运行期协议故障不尝试恢复为 ready；调用方据此映射节点 failed/terminating。
+    this.clearResyncTimeout();
     this.state = "faulted";
+    this.notifyProtocolFault();
     return Object.freeze({ kind: "protocol_fault", error: code });
+  }
+
+  private notifyProtocolFault(): void {
+    try {
+      this.onProtocolFault?.();
+    } catch {
+      // 协议观察者不能改变已完成的故障裁决。
+    }
   }
 }
 

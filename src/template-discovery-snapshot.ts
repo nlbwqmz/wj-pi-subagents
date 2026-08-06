@@ -556,7 +556,7 @@ export function notifyTemplateDiscoveryDiagnostics(
 /** 根控制器拥有的发布器：首次发现固定一次，根 reload 以完整新快照替换旧快照。 */
 export class TemplateSnapshotController {
   private snapshot: TemplateDiscoverySnapshot | undefined;
-  private readonly options: TemplateDiscoveryOptions;
+  private options: TemplateDiscoveryOptions;
 
   constructor(options: TemplateSnapshotControllerOptions) {
     const root = freezeRecord({
@@ -575,7 +575,16 @@ export class TemplateSnapshotController {
     return this.publish(context);
   }
 
-  reload(context: RuntimeUiContext | null | undefined = undefined): TemplateDiscoverySnapshot {
+  reload(
+    context: RuntimeUiContext | null | undefined = undefined,
+    knownTools?: ReadonlySet<string>,
+  ): TemplateDiscoverySnapshot {
+    if (knownTools !== undefined) {
+      this.options = freezeRecord({
+        ...this.options,
+        knownTools,
+      });
+    }
     return this.publish(context);
   }
 

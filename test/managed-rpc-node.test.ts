@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import test from "node:test";
-import { BridgeSupervisorEndpoint } from "../src/bridge-supervisor-endpoint.ts";
+import { BridgeSupervisorEndpoint } from "./helpers/bridge-supervisor-endpoint.ts";
 import {
   FakeManagedRpcNode,
   MANAGED_RPC_BRIDGE_PROTOCOL,
@@ -88,8 +88,6 @@ class RecordingBridge implements ManagedRpcBridge {
   onSupervisorFrame(): () => void {
     return () => {};
   }
-
-  async publishSupervisorReply(): Promise<void> {}
 
   release(): Promise<void> {
     this.operations.push("bridge:release");
@@ -394,7 +392,7 @@ test("桥接客户端拒绝带未知字段的外层响应帧", async () => {
   await client.release();
 });
 
-test("桥接客户端拒绝安全事件中嵌套的未知字段", async () => {
+test("桥接客户端拒绝任何伪造的任务 RPC assistant 回复事件", async () => {
   const parentInput = new PassThrough();
   const parentOutput = new PassThrough();
   const client = new ManagedRpcBridgeClient({
@@ -424,7 +422,7 @@ test("桥接客户端拒绝安全事件中嵌套的未知字段", async () => {
       type: "message_end",
       message: {
         role: "assistant",
-        content: [{ type: "text", text: "安全正文", secret: "不得透传" }],
+        content: [{ type: "text", text: "即使字段完全合法也不得从 bridge 上行" }],
       },
     },
   }));
@@ -483,7 +481,6 @@ test("桥接客户端在唯一读写流上复用有界监督帧并传递启动�
   } as const;
   await client.start(undefined, { supervisor: init });
   await client.sendSupervisorFrame(new Uint8Array([1, 2, 3]));
-  await client.publishSupervisorReply({ text: "reply" });
   parentOutput.write(encodeFrame({
     protocol: MANAGED_RPC_BRIDGE_PROTOCOL,
     kind: "supervisor_frame",
@@ -495,7 +492,6 @@ test("桥接客户端在唯一读写流上复用有界监督帧并传递启动�
   assert.deepEqual(observed, [new Uint8Array([4, 5, 6])]);
   assert.equal((commands[0]?.payload as Record<string, unknown>).credential, "bridge-credential-01234567890123456789");
   assert.deepEqual((commands[0]?.payload as Record<string, unknown>).supervisor, init);
-  assert.equal(commands[1]?.command, "supervisor_reply");
   await client.release();
 });
 
@@ -595,13 +591,13 @@ class LinkedManagedNode extends FakeManagedRpcNode {
     this.endpoint?.receive(frame);
   }
 
-  override async publishSupervisorReply(reply: ManagedRpcReply): Promise<void> {
+  async publishReply(reply: ManagedRpcReply): Promise<void> {
     this.publishedReplies += 1;
     this.endpoint?.publishReply(reply);
   }
 }
 
-test("RpcSupervisor 通过身份后通道工厂完成桥接双握手和回复 ACK", async () => {
+test("RpcSupervisor 通过真正 child 端点完成双握手和回复 ACK", async () => {
   const id = "99999999-9999-4999-8999-999999999999";
   const controller = new TreeController({
     config: { maxDepth: 2, maxChildrenPerAgent: 4, maxAgentsPerTree: 16, waitTimeoutMs: 60_000 },
@@ -654,17 +650,14 @@ test("RpcSupervisor 通过身份后通道工厂完成桥接双握手和回复 AC
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(node.supervisorState(), "ready");
   assert.deepEqual(await supervisor.prompt("触发回复"), { ok: true, accepted: true });
-  node.emitEvent({
-    type: "message_end",
-    message: { role: "assistant", content: [{ type: "text", text: "桥接回复" }] },
-  });
+  await node.publishReply({ text: "桥接回复" });
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(node.publishedReplies, 1);
   assert.equal(node.supervisorState(), "ready");
   assert.deepEqual(delivered, ["桥接回复"]);
   assert.equal(events.some((event) => (
     typeof event === "object" && event !== null && (event as { kind?: unknown }).kind === "reply"
-  )), true);
+  )), false);
 });
 
 function encodeFrame(value: unknown): Uint8Array {

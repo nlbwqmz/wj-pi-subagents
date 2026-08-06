@@ -115,6 +115,7 @@ function controlSuccess<T>(data: T): ControlSuccess<T> {
 
 const CANONICAL_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const CANONICAL_UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const RFC3339_MILLIS_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const MAX_ID_GENERATION_ATTEMPTS = 32;
 
 /** 判断输入是否为 RFC 9562 传输用的小写 canonical UUID 文本。 */
@@ -199,6 +200,43 @@ export interface LifecycleEventOutcome {
   readonly tree_revision: number;
 }
 
+/** 一次树级终止屏障的固定成员和线性化修订。 */
+export interface TerminationBarrierOutcome {
+  readonly barrier_id: string;
+  readonly agent_id: string;
+  /** 成员按后代优先排列；这是清理协调的唯一固定顺序。 */
+  readonly agent_ids: readonly string[];
+  readonly changed: boolean;
+  readonly tree_revision: number;
+}
+
+/** 父端接收的完整子树安全快照；正文不属于该结构。 */
+export interface SubtreeSnapshotInput {
+  readonly scope_agent_id: string;
+  readonly subtree_revision: number;
+  readonly nodes: readonly AgentSnapshot[];
+}
+
+export interface SubtreeSnapshotOutcome {
+  readonly applied: boolean;
+  readonly scope_agent_id: string;
+  readonly subtree_revision: number;
+  readonly tree_revision: number;
+}
+
+/** 子树投影采用根权威已经签发的身份，不得在本地重新生成 UUID。 */
+export interface AdoptSpawnGrantInput {
+  readonly node: AgentSnapshot;
+  readonly lifecycle_generation: number;
+  readonly management_enabled: boolean;
+}
+
+/** 监督通道专用完整子树读取；保留作用域根的真实直接父标识。 */
+export interface SupervisionSubtreeSnapshot {
+  readonly tree_revision: number;
+  readonly nodes: readonly AgentSnapshot[];
+}
+
 /** 创建旅程的稳定返回名称；字段与生命周期事件结果保持相同安全外壳。 */
 export type ReservedAgentOutcome = LifecycleEventOutcome;
 
@@ -257,6 +295,15 @@ export interface TreeControllerOptions {
   readonly now?: () => Date;
   readonly monotonicNow?: () => number;
   readonly rootManagementEnabled?: boolean;
+  /** 子运行时在未接入同根权威时用于恢复自身作用域根的最小安全事实。 */
+  readonly initialActor?: {
+    readonly agentId: string;
+    readonly parentAgentId: string | null;
+    readonly depth: number;
+    readonly templateId?: string;
+    readonly name?: string;
+    readonly managementEnabled: boolean;
+  };
 }
 
 interface AgentRecord {
@@ -275,6 +322,14 @@ interface AgentRecord {
   lifecycleStartedAt: number | undefined;
   frozenLifecycleElapsedMs: number | undefined;
   error: AgentFault | undefined;
+  readonly scopeActorOnly: boolean;
+}
+
+interface TerminationBarrierRecord {
+  readonly barrierId: string;
+  readonly targetAgentId: string;
+  readonly memberIds: readonly string[];
+  readonly createdTreeRevision: number;
 }
 
 interface ResolvedActor {
@@ -342,6 +397,113 @@ function validReserveInput(value: unknown): value is ReserveStartingChildInput {
   return candidate.subagents === undefined || candidate.subagents === "inherit" || candidate.subagents === "disabled";
 }
 
+function isAgentLifecycleState(value: unknown): value is AgentLifecycleState {
+  return typeof value === "string"
+    && (AGENT_LIFECYCLE_STATES as readonly string[]).includes(value);
+}
+
+function isSafeAgentFault(value: unknown): value is AgentFault {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  return isAgentFaultCode(candidate.code)
+    && typeof candidate.message === "string"
+    && typeof candidate.retryable === "boolean"
+    && typeof candidate.observed_at === "string"
+    && RFC3339_MILLIS_PATTERN.test(candidate.observed_at)
+    && Object.keys(candidate).every((key) => ["code", "message", "retryable", "observed_at"].includes(key));
+}
+
+function isPublicAgentSnapshot(value: unknown): value is AgentSnapshot {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  if (
+    !isCanonicalUuid(candidate.agent_id)
+    || (candidate.parent_agent_id !== null && !isCanonicalUuid(candidate.parent_agent_id))
+    || typeof candidate.template_id !== "string"
+    || typeof candidate.name !== "string"
+    || !Number.isSafeInteger(candidate.depth)
+    || (candidate.depth as number) < 1
+    || !isAgentLifecycleState(candidate.state)
+    || !Number.isSafeInteger(candidate.pending_message_count)
+    || (candidate.pending_message_count as number) < 0
+    || !Number.isSafeInteger(candidate.revision)
+    || (candidate.revision as number) < 1
+    || typeof candidate.observed_at !== "string"
+    || !RFC3339_MILLIS_PATTERN.test(candidate.observed_at)
+  ) return false;
+  if (
+    candidate.created_at !== undefined
+    && (typeof candidate.created_at !== "string" || !RFC3339_MILLIS_PATTERN.test(candidate.created_at))
+  ) return false;
+  if (
+    candidate.lifecycle_elapsed_ms !== undefined
+    && (!Number.isSafeInteger(candidate.lifecycle_elapsed_ms) || (candidate.lifecycle_elapsed_ms as number) < 0)
+  ) return false;
+  if (candidate.error !== undefined && !isSafeAgentFault(candidate.error)) return false;
+  if (candidate.state === "failed" && candidate.error === undefined) return false;
+  if (candidate.state === "terminated" && (candidate.pending_message_count !== 0 || candidate.error !== undefined)) return false;
+  const allowed = new Set([
+    "agent_id", "parent_agent_id", "template_id", "name", "depth", "state",
+    "pending_message_count", "revision", "observed_at", "created_at",
+    "lifecycle_elapsed_ms", "error",
+  ]);
+  return Object.keys(candidate).every((key) => allowed.has(key));
+}
+
+function isSubtreeSnapshotInput(value: unknown): value is SubtreeSnapshotInput {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  return isCanonicalUuid(candidate.scope_agent_id)
+    && Number.isSafeInteger(candidate.subtree_revision)
+    && (candidate.subtree_revision as number) >= 1
+    && Array.isArray(candidate.nodes)
+    && candidate.nodes.every(isPublicAgentSnapshot)
+    && Object.keys(candidate).every((key) => ["scope_agent_id", "subtree_revision", "nodes"].includes(key));
+}
+
+function isAdoptSpawnGrantInput(value: unknown): value is AdoptSpawnGrantInput {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  return isPublicAgentSnapshot(candidate.node)
+    && Number.isSafeInteger(candidate.lifecycle_generation)
+    && (candidate.lifecycle_generation as number) >= 0
+    && typeof candidate.management_enabled === "boolean"
+    && Object.keys(candidate).every((key) => [
+      "node", "lifecycle_generation", "management_enabled",
+    ].includes(key));
+}
+
+function cloneAgentFault(fault: AgentFault | undefined): AgentFault | undefined {
+  return fault === undefined ? undefined : Object.freeze({ ...fault });
+}
+
+function sameSnapshot(
+  record: AgentRecord,
+  node: AgentSnapshot,
+  hiddenParent: boolean,
+): boolean {
+  const currentFault = record.error;
+  const nextFault = node.error;
+  const lifecycleMatches = record.frozenLifecycleElapsedMs === node.lifecycle_elapsed_ms
+    || (
+      (record.state === "idle" || record.state === "working" || record.state === "interrupting")
+      && node.lifecycle_elapsed_ms !== undefined
+    );
+  return (
+    record.parentAgentId === (hiddenParent ? record.parentAgentId : node.parent_agent_id)
+    && record.templateId === node.template_id
+    && record.name === node.name
+    && record.depth === node.depth
+    && record.state === node.state
+    && record.pendingMessageCount === node.pending_message_count
+    && record.revision === node.revision
+    && record.observedAt === node.observed_at
+    && record.createdAt === node.created_at
+    && lifecycleMatches
+    && JSON.stringify(currentFault) === JSON.stringify(nextFault)
+  );
+}
+
 function safeObservedAt(now: () => Date): string {
   try {
     const value = now();
@@ -381,8 +543,11 @@ export class TreeController {
   private readonly now: () => Date;
   private readonly monotonicNow: () => number;
   private readonly rootManagementEnabled: boolean;
+  private readonly authoritative: boolean;
   private readonly agents = new Map<string, AgentRecord>();
   private readonly issuedAgentIds = new Set<string>();
+  private readonly terminationBarriers = new Map<string, TerminationBarrierRecord>();
+  private readonly subtreeRevisions = new Map<string, number>();
   private readonly changeListeners = new Set<() => void>();
   private treeRevision = 0;
   private treeObservedAt = new Date(0).toISOString();
@@ -398,12 +563,91 @@ export class TreeController {
     this.now = options.now ?? (() => new Date());
     this.monotonicNow = options.monotonicNow ?? (() => performance.now());
     this.rootManagementEnabled = options.rootManagementEnabled !== false;
+    const initialActor = options.initialActor;
+    this.authoritative = initialActor === undefined;
+    if (initialActor !== undefined) {
+      if (
+        !isCanonicalUuid(initialActor.agentId)
+        || (initialActor.parentAgentId !== null && !isCanonicalUuid(initialActor.parentAgentId))
+        || initialActor.parentAgentId === initialActor.agentId
+        || !Number.isSafeInteger(initialActor.depth)
+        || initialActor.depth < 1
+        || initialActor.depth > this.config.maxDepth
+        || typeof initialActor.managementEnabled !== "boolean"
+      ) throw new TypeError("子运行时身份无效");
+      const observedAt = safeObservedAt(this.now);
+      const monotonicAt = this.safeMonotonicNow();
+      this.agents.set(initialActor.agentId, {
+        agentId: initialActor.agentId,
+        parentAgentId: initialActor.parentAgentId,
+        templateId: initialActor.templateId ?? "inherited",
+        name: initialActor.name ?? "子代理",
+        depth: initialActor.depth,
+        managementEnabled: initialActor.managementEnabled,
+        state: "idle",
+        pendingMessageCount: 0,
+        revision: 1,
+        observedAt,
+        lifecycleGeneration: 0,
+        createdAt: observedAt,
+        lifecycleStartedAt: monotonicAt,
+        frozenLifecycleElapsedMs: undefined,
+        error: undefined,
+        scopeActorOnly: true,
+      });
+      this.issuedAgentIds.add(initialActor.agentId);
+      this.treeObservedAt = observedAt;
+    }
   }
 
   /** 只读观察树事实变化；观察者异常不会影响控制器顺序域。 */
   onChange(listener: () => void): () => void {
     this.changeListeners.add(listener);
     return () => this.changeListeners.delete(listener);
+  }
+
+  /** 返回节点当前生命周期代际，供受管监督事件构造安全事件。 */
+  getLifecycleGeneration(agentId: unknown): ControlResult<number> {
+    const resolved = this.findAgent(agentId);
+    return resolved.ok ? controlSuccess(resolved.data.lifecycleGeneration) : resolved;
+  }
+
+  /** 返回调用者作用域内、按后代优先排列的当前节点标识。 */
+  getSubtreeAgentIds(actor: TreeActor | unknown): ControlResult<readonly string[]> {
+    const resolved = this.resolveActor(actor);
+    if (!resolved.ok) return resolved;
+    const record = resolved.data.record;
+    const records = record === undefined
+      ? [...this.agents.values()].filter((candidate) => !candidate.scopeActorOnly)
+      : [...this.agents.values()].filter((candidate) =>
+        candidate.agentId === record.agentId || this.isDescendantOf(candidate, record.agentId),
+      );
+    return controlSuccess(Object.freeze(this.orderDescendantsFirst(records).map((candidate) => candidate.agentId)));
+  }
+
+  /**
+   * 在一个树级线性化点建立不可逆终止屏障。支持两参数的直接父授权形式，
+   * 以及供根关闭协调使用的单参数根形式。
+   */
+  beginTerminationBarrier(
+    actor: TreeActor | unknown,
+    agentId?: unknown,
+  ): ControlResult<TerminationBarrierOutcome> {
+    const caller = agentId === undefined ? ROOT_TREE_ACTOR : actor;
+    const targetId = agentId === undefined ? actor : agentId;
+    const authorization = this.assertDirectChild(caller, targetId);
+    if (!authorization.ok) return authorization;
+    return this.beginTerminationBarrierInternal(authorization.data.agent_id, false);
+  }
+
+  /** 读取已经建立的屏障固定成员；不存在时返回 agent_not_found。 */
+  getTerminationBarrier(agentId: unknown): ControlResult<TerminationBarrierOutcome> {
+    const target = this.findAgent(agentId);
+    if (!target.ok) return target;
+    const barrier = this.terminationBarriers.get(target.data.agentId)
+      ?? [...this.terminationBarriers.values()].find((candidate) => candidate.memberIds.includes(target.data.agentId));
+    if (barrier === undefined) return controlFailure("agent_unavailable");
+    return controlSuccess(this.barrierOutcome(barrier, false));
   }
 
   /** 创建调用在同步临界区内同时预留两类名额并登记 starting。 */
@@ -450,11 +694,72 @@ export class TreeController {
       lifecycleStartedAt: undefined,
       frozenLifecycleElapsedMs: undefined,
       error: undefined,
+      scopeActorOnly: false,
     };
 
     // 写入注册表即完成配额预留，之后任何同步竞争者都会看到该节点。
     this.agents.set(agentId, record);
     this.issuedAgentIds.add(agentId);
+    this.treeRevision += 1;
+    this.treeObservedAt = record.observedAt;
+    this.notifyChange();
+    return controlSuccess(this.outcome(record, true));
+  }
+
+  /**
+   * 子运行时在根权威 reserve_child 成功后采用精确 grant。根控制器本身调用时
+   * 只会命中已经登记的同一节点，不重新计数、分配或推进修订。
+   */
+  adoptSpawnGrant(
+    actor: TreeActor | unknown,
+    input: AdoptSpawnGrantInput | unknown,
+  ): ControlResult<ReservedAgentOutcome> {
+    if (!isAdoptSpawnGrantInput(input)) return controlFailure("invalid_argument");
+    const parent = this.resolveActor(actor);
+    if (!parent.ok) return parent;
+    const node = input.node;
+    if (
+      node.state !== "starting"
+      || node.parent_agent_id !== parent.data.parentAgentId
+      || node.depth !== parent.data.depth + 1
+      || node.depth > this.config.maxDepth
+    ) return controlFailure("invalid_argument");
+    const existing = this.agents.get(node.agent_id);
+    if (existing !== undefined) {
+      if (
+        existing.parentAgentId !== node.parent_agent_id
+        || existing.templateId !== node.template_id
+        || existing.name !== node.name
+        || existing.depth !== node.depth
+        || existing.state !== node.state
+        || existing.lifecycleGeneration !== input.lifecycle_generation
+        || existing.managementEnabled !== input.management_enabled
+      ) return controlFailure("invalid_argument");
+      return controlSuccess(this.outcome(existing, false));
+    }
+    if (this.authoritative || this.issuedAgentIds.has(node.agent_id) || !isCanonicalUuidV4(node.agent_id)) {
+      return controlFailure("invalid_argument");
+    }
+    const record: AgentRecord = {
+      agentId: node.agent_id,
+      parentAgentId: node.parent_agent_id,
+      templateId: node.template_id,
+      name: node.name,
+      depth: node.depth,
+      managementEnabled: input.management_enabled,
+      state: "starting",
+      pendingMessageCount: node.pending_message_count,
+      revision: node.revision,
+      observedAt: node.observed_at,
+      lifecycleGeneration: input.lifecycle_generation,
+      createdAt: undefined,
+      lifecycleStartedAt: undefined,
+      frozenLifecycleElapsedMs: undefined,
+      error: undefined,
+      scopeActorOnly: false,
+    };
+    this.agents.set(record.agentId, record);
+    this.issuedAgentIds.add(record.agentId);
     this.treeRevision += 1;
     this.treeObservedAt = record.observedAt;
     this.notifyChange();
@@ -536,11 +841,7 @@ export class TreeController {
           record.state === "working" ||
           record.state === "interrupting"
         ) {
-          applied = this.mutate(record, {
-            state: "failed",
-            pendingMessageCount: 0,
-            errorCode: eventFaultCode(event, "spawn_failed"),
-          });
+          applied = this.failRuntimeAndOrphans(record, eventFaultCode(event, "spawn_failed"));
         }
         break;
       case "termination_requested":
@@ -597,14 +898,268 @@ export class TreeController {
     return controlSuccess(Object.freeze({ enabled }));
   }
 
+  /**
+   * 仅用于已预留节点启动子运行时前写入受控 bootstrap。这里读取的是创建时
+   * 已经收窄的授权，不把 starting 的暂时不可接单误判为永久叶节点。
+   */
+  getManagementBootstrapCapability(agentId: unknown): ControlResult<ManagementCapabilitySnapshot> {
+    const record = this.findAgent(agentId);
+    if (!record.ok) return record;
+    const enabled = record.data.managementEnabled
+      && (record.data.state === "starting" || isManagementState(record.data.state));
+    return controlSuccess(Object.freeze({ enabled }));
+  }
+
   /** 返回整个当前根树的安全、创建顺序快照。 */
   getTreeSnapshot(): ControlResult<AgentTreeSnapshot> {
     const monotonicAt = this.safeMonotonicNow();
     return controlSuccess(Object.freeze({
       tree_revision: this.treeRevision,
       observed_at: this.treeObservedAt,
-      nodes: Object.freeze(Array.from(this.agents.values(), (record) => this.snapshot(record, monotonicAt))),
+      nodes: Object.freeze(this.orderParentFirst(
+        [...this.agents.values()].filter((record) => !record.scopeActorOnly),
+      )
+        .map((record) => this.snapshot(record, monotonicAt))),
     }));
+  }
+
+  /** child 监督端发布自身及全部后代，且不应用公开查询的祖先隐藏规则。 */
+  getSupervisionSubtreeSnapshot(actor: TreeActor | unknown): ControlResult<SupervisionSubtreeSnapshot> {
+    const resolved = this.resolveActor(actor);
+    if (!resolved.ok) return resolved;
+    const scope = resolved.data.record;
+    if (scope === undefined) return controlFailure("invalid_argument");
+    const records = [...this.agents.values()].filter((record) =>
+      record.agentId === scope.agentId || this.isDescendantOf(record, scope.agentId),
+    );
+    const monotonicAt = this.safeMonotonicNow();
+    return controlSuccess(Object.freeze({
+      tree_revision: this.treeRevision,
+      nodes: Object.freeze(this.orderParentFirst(records).map((record) => this.snapshot(record, monotonicAt))),
+    }));
+  }
+
+  /** 根会话完全关闭后释放终止历史；未全部确认时保持原注册表不变。 */
+  clearTerminatedRecords(): boolean {
+    for (const record of this.agents.values()) {
+      if (record.state !== "terminated") return false;
+    }
+    if (this.agents.size === 0) return true;
+    this.agents.clear();
+    this.terminationBarriers.clear();
+    this.subtreeRevisions.clear();
+    this.notifyChange();
+    return true;
+  }
+
+  /**
+   * 原子接收直接子代理发布的完整安全子树。所有校验完成前不触碰本地注册表；
+   * 迟到或重复的 subtree_revision 只被丢弃，不改变公开 tree_revision。
+   */
+  applySubtreeSnapshot(
+    actor: TreeActor | unknown,
+    input: SubtreeSnapshotInput | unknown,
+  ): ControlResult<SubtreeSnapshotOutcome> {
+    if (!isSubtreeSnapshotInput(input)) return controlFailure("invalid_argument");
+    const parent = this.resolveActor(actor);
+    if (!parent.ok) return parent;
+    const scope = this.agents.get(input.scope_agent_id);
+    if (scope === undefined) return controlFailure("agent_not_found");
+    if (scope.parentAgentId !== parent.data.parentAgentId) return controlFailure("not_direct_child");
+    const previousRevision = this.subtreeRevisions.get(scope.agentId) ?? 0;
+    if (input.subtree_revision <= previousRevision) {
+      return controlSuccess(Object.freeze({
+        applied: false,
+        scope_agent_id: scope.agentId,
+        subtree_revision: previousRevision,
+        tree_revision: this.treeRevision,
+      }));
+    }
+
+    const parsed = this.validateSubtreeSnapshot(scope, input.nodes);
+    if (!parsed.ok) return parsed;
+    const addedActiveChildren = new Map<string, number>();
+    let addedActiveNodes = 0;
+    for (const node of parsed.data) {
+      const current = this.agents.get(node.agent_id);
+      if (current !== undefined) {
+        const isScopeNode = current.agentId === scope.agentId;
+        if (
+          !this.isDescendantOrSelf(current, scope.agentId)
+          || current.parentAgentId !== node.parent_agent_id
+          || current.templateId !== node.template_id
+          || current.name !== node.name
+          || current.depth !== node.depth
+          || (!isScopeNode && current.state === "terminated" && node.state !== "terminated")
+          || (!isScopeNode
+            && this.isTerminationBarrierMember(current.agentId)
+            && node.state !== "terminating"
+            && node.state !== "terminated")
+        ) return controlFailure("invalid_argument");
+        continue;
+      }
+      // 根权威只接受 reserve_child 已经预登记的身份；完整快照不能成为绕过
+      // UUID/深度/两类配额裁决的第二条创建路径。
+      if (this.authoritative) return controlFailure("invalid_argument");
+      if (!isCanonicalUuidV4(node.agent_id) || this.issuedAgentIds.has(node.agent_id)) {
+        return controlFailure("invalid_argument");
+      }
+      if (node.state === "terminated") continue;
+      addedActiveNodes += 1;
+      if (node.parent_agent_id !== null) {
+        addedActiveChildren.set(
+          node.parent_agent_id,
+          (addedActiveChildren.get(node.parent_agent_id) ?? 0) + 1,
+        );
+      }
+    }
+    if (this.activeTreeAgentCount() + addedActiveNodes > this.config.maxAgentsPerTree) {
+      return controlFailure("invalid_argument");
+    }
+    for (const [parentAgentId, count] of addedActiveChildren) {
+      if (this.activeChildrenOf(parentAgentId) + count > this.config.maxChildrenPerAgent) {
+        return controlFailure("invalid_argument");
+      }
+    }
+    const existingIds = new Set(parsed.data.map((node) => node.agent_id));
+    for (const record of this.agents.values()) {
+      if (
+        record.agentId !== scope.agentId
+        && this.isDescendantOf(record, scope.agentId)
+        && record.state !== "terminated"
+        && !existingIds.has(record.agentId)
+      ) return controlFailure("invalid_argument");
+    }
+
+    const now = safeObservedAt(this.now);
+    const monotonicAt = this.safeMonotonicNow();
+    const changes: Array<{ readonly record: AgentRecord; readonly node: AgentSnapshot }> = [];
+    const additions: AgentRecord[] = [];
+    const additionById = new Map<string, AgentRecord>();
+    for (const node of parsed.data) {
+      const current = this.agents.get(node.agent_id);
+      if (current === undefined) {
+        const parentRecord = node.agent_id === scope.agentId
+          ? undefined
+          : this.agents.get(node.parent_agent_id ?? "")
+            ?? additionById.get(node.parent_agent_id ?? "");
+        if (node.agent_id !== scope.agentId && parentRecord === undefined) return controlFailure("invalid_argument");
+        const added: AgentRecord = {
+          agentId: node.agent_id,
+          parentAgentId: node.agent_id === scope.agentId ? scope.parentAgentId : node.parent_agent_id,
+          templateId: node.template_id,
+          name: node.name,
+          depth: node.depth,
+          managementEnabled: parentRecord?.managementEnabled ?? scope.managementEnabled,
+          state: node.state,
+          pendingMessageCount: node.pending_message_count,
+          revision: node.revision,
+          observedAt: node.observed_at,
+          lifecycleGeneration: 0,
+          createdAt: node.created_at,
+          lifecycleStartedAt: undefined,
+          frozenLifecycleElapsedMs: node.lifecycle_elapsed_ms,
+          error: node.error,
+          scopeActorOnly: false,
+        };
+        additions.push(added);
+        additionById.set(added.agentId, added);
+        continue;
+      }
+      // 作用域根的生命周期只由其直接父 RpcSupervisor 裁决。child 快照中的
+      // 同一节点只证明不可变身份，不能把 starting 提前改成 idle，或越过屏障。
+      if (current.agentId === scope.agentId) continue;
+      if (node.revision < current.revision) return controlFailure("invalid_argument");
+      if (node.revision === current.revision && !sameSnapshot(
+        current,
+        node,
+        current.parentAgentId === scope.parentAgentId && current.agentId === scope.agentId,
+      )) return controlFailure("invalid_argument");
+      if (!sameSnapshot(current, node, current.parentAgentId === scope.parentAgentId && current.agentId === scope.agentId)) {
+        changes.push({ record: current, node });
+      }
+    }
+    for (const record of additions) {
+      this.agents.set(record.agentId, record);
+      this.issuedAgentIds.add(record.agentId);
+    }
+    for (const change of changes) this.applySnapshotToRecord(change.record, change.node, now, monotonicAt);
+    this.subtreeRevisions.set(scope.agentId, input.subtree_revision);
+    if (additions.length > 0 || changes.length > 0) {
+      this.treeRevision += 1;
+      this.treeObservedAt = now;
+      this.notifyChange();
+    }
+    return controlSuccess(Object.freeze({
+      applied: additions.length > 0 || changes.length > 0,
+      scope_agent_id: scope.agentId,
+      subtree_revision: input.subtree_revision,
+      tree_revision: this.treeRevision,
+    }));
+  }
+
+  private validateSubtreeSnapshot(
+    scope: AgentRecord,
+    nodes: readonly AgentSnapshot[],
+  ): ControlResult<readonly AgentSnapshot[]> {
+    if (nodes.length === 0 || nodes[0]?.agent_id !== scope.agentId) return controlFailure("invalid_argument");
+    const ids = new Set<string>();
+    for (let index = 0; index < nodes.length; index += 1) {
+      const node = nodes[index]!;
+      if (ids.has(node.agent_id)) return controlFailure("invalid_argument");
+      ids.add(node.agent_id);
+      if (node.agent_id === scope.agentId) {
+        if (node.parent_agent_id !== scope.parentAgentId || node.depth !== scope.depth) {
+          return controlFailure("invalid_argument");
+        }
+        if (node.template_id !== scope.templateId || node.name !== scope.name) return controlFailure("invalid_argument");
+      } else {
+        if (node.parent_agent_id === null) return controlFailure("invalid_argument");
+        const parentIndex = nodes.findIndex((candidate) => candidate.agent_id === node.parent_agent_id);
+        if (
+          node.depth > this.config.maxDepth
+          || parentIndex < 0
+          || parentIndex >= index
+          || node.depth !== nodes[parentIndex]!.depth + 1
+        ) {
+          return controlFailure("invalid_argument");
+        }
+      }
+    }
+    return controlSuccess(Object.freeze(nodes.map((node) => {
+      const copy: AgentSnapshot = node.error === undefined
+        ? Object.freeze({ ...node })
+        : Object.freeze({ ...node, error: cloneAgentFault(node.error)! });
+      return copy;
+    })));
+  }
+
+  private applySnapshotToRecord(
+    record: AgentRecord,
+    node: AgentSnapshot,
+    observedAt: string,
+    _monotonicAt: number,
+  ): void {
+    const stateChanged = record.state !== node.state;
+    const elapsedAtMutation = this.lifecycleElapsed(record, _monotonicAt);
+    record.state = node.state;
+    record.pendingMessageCount = node.pending_message_count;
+    record.revision = node.revision;
+    record.observedAt = node.observed_at || observedAt;
+    record.createdAt = node.created_at;
+    record.frozenLifecycleElapsedMs = node.lifecycle_elapsed_ms;
+    record.error = cloneAgentFault(node.error);
+    if (stateChanged) record.lifecycleGeneration += 1;
+    if (node.state === "idle" && record.lifecycleStartedAt === undefined) {
+      record.lifecycleStartedAt = _monotonicAt;
+    }
+    if (stateChanged && node.state === "terminating" && record.frozenLifecycleElapsedMs !== undefined) {
+      record.lifecycleStartedAt = _monotonicAt - record.frozenLifecycleElapsedMs;
+      record.frozenLifecycleElapsedMs = undefined;
+    }
+    if (stateChanged && (node.state === "failed" || node.state === "terminated") && elapsedAtMutation !== undefined) {
+      record.frozenLifecycleElapsedMs = elapsedAtMutation;
+    }
   }
 
   /** 按调用者作用域裁剪安全树快照，不触发 RPC 或生命周期变化。 */
@@ -618,7 +1173,7 @@ export class TreeController {
       : Array.from(this.agents.values()).filter((record) =>
         record.agentId === scope.agentId || this.isDescendantOf(record, scope.agentId),
       );
-    const nodes = records.map((record) => {
+    const nodes = this.orderParentFirst(records).map((record) => {
       const snapshot = this.snapshot(record, monotonicAt);
       if (scope !== undefined && record.agentId === scope.agentId) {
         return Object.freeze({ ...snapshot, parent_agent_id: null });
@@ -696,7 +1251,7 @@ export class TreeController {
   private activeTreeAgentCount(): number {
     let count = 0;
     for (const record of this.agents.values()) {
-      if (isQuotaConsumingState(record.state)) count += 1;
+      if (!record.scopeActorOnly && isQuotaConsumingState(record.state)) count += 1;
     }
     return count;
   }
@@ -704,7 +1259,7 @@ export class TreeController {
   private activeChildrenOf(parentAgentId: string | null): number {
     let count = 0;
     for (const record of this.agents.values()) {
-      if (record.parentAgentId === parentAgentId && isQuotaConsumingState(record.state)) count += 1;
+      if (!record.scopeActorOnly && record.parentAgentId === parentAgentId && isQuotaConsumingState(record.state)) count += 1;
     }
     return count;
   }
@@ -716,6 +1271,98 @@ export class TreeController {
     return true;
   }
 
+  private beginTerminationBarrierInternal(
+    targetAgentId: string,
+    preserveTargetFailure: boolean,
+  ): ControlResult<TerminationBarrierOutcome> {
+    const existing = this.terminationBarriers.get(targetAgentId)
+      ?? [...this.terminationBarriers.values()].find((barrier) => barrier.memberIds.includes(targetAgentId));
+    if (existing !== undefined) {
+      let changed = false;
+      if (!preserveTargetFailure && existing.targetAgentId === targetAgentId) {
+        const existingTarget = this.agents.get(targetAgentId);
+        if (existingTarget?.state === "failed") {
+          changed = this.mutate(existingTarget, {
+            state: "terminating",
+            pendingMessageCount: 0,
+            clearError: true,
+          });
+        }
+      }
+      return controlSuccess(this.barrierOutcome(existing, changed));
+    }
+    const target = this.agents.get(targetAgentId);
+    if (target === undefined) return controlFailure("agent_not_found");
+    const records = this.collectSubtree(targetAgentId);
+    const memberRecords = this.orderDescendantsFirst(records.filter((record) => record.state !== "terminated"));
+    const memberIds = Object.freeze(memberRecords.map((record) => record.agentId));
+    const changed = this.mutateMany(memberRecords, (record) => {
+      if (preserveTargetFailure && record.agentId === targetAgentId) return {};
+      return { state: "terminating", clearError: true };
+    });
+    const barrier: TerminationBarrierRecord = Object.freeze({
+      barrierId: `termination_${targetAgentId}`,
+      targetAgentId,
+      memberIds,
+      createdTreeRevision: this.treeRevision,
+    });
+    this.terminationBarriers.set(targetAgentId, barrier);
+    return controlSuccess(this.barrierOutcome(barrier, changed));
+  }
+
+  private barrierOutcome(barrier: TerminationBarrierRecord, changed: boolean): TerminationBarrierOutcome {
+    return Object.freeze({
+      barrier_id: barrier.barrierId,
+      agent_id: barrier.targetAgentId,
+      agent_ids: barrier.memberIds,
+      changed,
+      tree_revision: changed ? this.treeRevision : barrier.createdTreeRevision,
+    });
+  }
+
+  private collectSubtree(agentId: string): AgentRecord[] {
+    return [...this.agents.values()].filter((record) =>
+      record.agentId === agentId || this.isDescendantOf(record, agentId),
+    );
+  }
+
+  private orderDescendantsFirst(records: readonly AgentRecord[]): AgentRecord[] {
+    const insertionOrder = new Map<string, number>();
+    let index = 0;
+    for (const record of this.agents.values()) insertionOrder.set(record.agentId, index++);
+    return [...records].sort((left, right) => {
+      if (left.depth !== right.depth) return right.depth - left.depth;
+      return (insertionOrder.get(left.agentId) ?? 0) - (insertionOrder.get(right.agentId) ?? 0);
+    });
+  }
+
+  private orderParentFirst(records: readonly AgentRecord[]): AgentRecord[] {
+    const insertionOrder = new Map<string, number>();
+    let index = 0;
+    for (const record of this.agents.values()) insertionOrder.set(record.agentId, index++);
+    return [...records].sort((left, right) => {
+      if (left.depth !== right.depth) return left.depth - right.depth;
+      return (insertionOrder.get(left.agentId) ?? 0) - (insertionOrder.get(right.agentId) ?? 0);
+    });
+  }
+
+  private failRuntimeAndOrphans(record: AgentRecord, errorCode: AgentFaultCode): boolean {
+    const descendants = this.collectSubtree(record.agentId)
+      .filter((candidate) => candidate.agentId !== record.agentId && candidate.state !== "terminated");
+    const members = [record, ...this.orderDescendantsFirst(descendants)];
+    const applied = this.mutateMany(members, (candidate) => candidate.agentId === record.agentId
+      ? { state: "failed", pendingMessageCount: 0, errorCode }
+      : { state: "terminating", pendingMessageCount: 0, clearError: true });
+    const barrier: TerminationBarrierRecord = Object.freeze({
+      barrierId: `termination_${record.agentId}`,
+      targetAgentId: record.agentId,
+      memberIds: Object.freeze(this.orderDescendantsFirst(members).map((candidate) => candidate.agentId)),
+      createdTreeRevision: this.treeRevision,
+    });
+    this.terminationBarriers.set(record.agentId, barrier);
+    return applied;
+  }
+
   /** 启动残骸先留存失败事实，再在同一顺序域建立不可逆清理屏障。 */
   private failStartingNode(record: AgentRecord, errorCode: AgentFaultCode): boolean {
     const failedApplied = this.mutate(record, {
@@ -724,10 +1371,46 @@ export class TreeController {
       errorCode,
     });
     const terminatingApplied = this.mutate(record, { state: "terminating" });
+    if (!this.terminationBarriers.has(record.agentId)) {
+      const members = this.orderDescendantsFirst(this.collectSubtree(record.agentId));
+      this.terminationBarriers.set(record.agentId, Object.freeze({
+        barrierId: `termination_${record.agentId}`,
+        targetAgentId: record.agentId,
+        memberIds: Object.freeze(members.filter((candidate) => candidate.state !== "terminated").map((candidate) => candidate.agentId)),
+        createdTreeRevision: this.treeRevision,
+      }));
+    }
     return failedApplied || terminatingApplied;
   }
 
   private mutate(record: AgentRecord, mutation: PublicMutation): boolean {
+    return this.mutateMany([record], () => mutation);
+  }
+
+  /** 将多个节点的公开事实批量提交为一个 tree_revision。 */
+  private mutateMany(
+    records: readonly AgentRecord[],
+    mutationFor: (record: AgentRecord) => PublicMutation,
+  ): boolean {
+    const observedAt = safeObservedAt(this.now);
+    const monotonicAt = this.safeMonotonicNow();
+    let changed = false;
+    for (const record of records) {
+      if (this.applyMutation(record, mutationFor(record), observedAt, monotonicAt)) changed = true;
+    }
+    if (!changed) return false;
+    this.treeRevision += 1;
+    this.treeObservedAt = observedAt;
+    this.notifyChange();
+    return true;
+  }
+
+  private applyMutation(
+    record: AgentRecord,
+    mutation: PublicMutation,
+    observedAt: string,
+    monotonicAt: number,
+  ): boolean {
     const nextState = mutation.state ?? record.state;
     const nextPending = mutation.pendingMessageCount ?? record.pendingMessageCount;
     const nextErrorCode = mutation.errorCode === undefined
@@ -738,8 +1421,6 @@ export class TreeController {
     const errorChanged = nextErrorCode !== record.error?.code;
     if (!stateChanged && !pendingChanged && !errorChanged) return false;
 
-    const observedAt = safeObservedAt(this.now);
-    const monotonicAt = this.safeMonotonicNow();
     const elapsedAtMutation = this.lifecycleElapsed(record, monotonicAt);
     const nextError = mutation.errorCode === undefined
       ? (mutation.clearError === true ? undefined : record.error)
@@ -761,17 +1442,14 @@ export class TreeController {
       record.frozenLifecycleElapsedMs = undefined;
     }
     if (
-      stateChanged &&
-      (nextState === "failed" || nextState === "terminated") &&
-      elapsedAtMutation !== undefined
+      stateChanged
+      && (nextState === "failed" || nextState === "terminated")
+      && elapsedAtMutation !== undefined
     ) {
       record.frozenLifecycleElapsedMs = elapsedAtMutation;
     }
     record.revision += 1;
     record.observedAt = observedAt;
-    this.treeRevision += 1;
-    this.treeObservedAt = observedAt;
-    this.notifyChange();
     return true;
   }
 
@@ -784,6 +1462,14 @@ export class TreeController {
       parentId = this.agents.get(parentId)?.parentAgentId ?? null;
     }
     return false;
+  }
+
+  private isDescendantOrSelf(record: AgentRecord, ancestorAgentId: string): boolean {
+    return record.agentId === ancestorAgentId || this.isDescendantOf(record, ancestorAgentId);
+  }
+
+  private isTerminationBarrierMember(agentId: string): boolean {
+    return [...this.terminationBarriers.values()].some((barrier) => barrier.memberIds.includes(agentId));
   }
 
   private notifyChange(): void {

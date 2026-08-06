@@ -2,7 +2,13 @@ import type {
   ManagedRpcNodeLike,
   ManagedRpcNodeStartContext,
 } from "./managed-rpc-node.ts";
-import type { SupervisorEvent, SupervisorReply } from "./supervisor-channel.ts";
+import type {
+  SupervisorControlRequest,
+  SupervisorControlResponse,
+  SupervisorEvent,
+  SupervisorReply,
+  SupervisorSnapshot,
+} from "./supervisor-channel.ts";
 import type {
   AgentLifecycleEvent,
   AgentLifecycleState,
@@ -14,6 +20,7 @@ import type {
   ReservedAgentOutcome,
   TreeActor,
 } from "./tree-controller.ts";
+import type { SpawnGrant } from "./tree-authority.ts";
 
 export type RpcSupervisorTransportFault = "eof" | "protocol_fault" | "process_exit";
 
@@ -301,6 +308,13 @@ export interface RpcSupervisorChannel {
   onFault(listener: (fault: RpcSupervisorChannelFault) => void): () => void;
   /** 父端收到子端安全生命周期事实时调用；旧替身可省略。 */
   onEvent?(listener: (event: SupervisorEvent) => void): () => void;
+  onSnapshot?(listener: (snapshot: SupervisorSnapshot) => void): () => void;
+  /** child 端沿唯一祖先方向发布内部控制请求。 */
+  publishControlRequest?(request: SupervisorControlRequest): Promise<void>;
+  /** parent 端向直接子控制器返回内部控制结果。 */
+  publishControlResponse?(response: SupervisorControlResponse): Promise<void>;
+  onControlRequest?(listener: (request: SupervisorControlRequest) => void): () => void;
+  onControlResponse?(listener: (response: SupervisorControlResponse) => void): () => void;
   /** 子端向直接父端发布安全生命周期事实；旧替身可省略。 */
   publishEvent?(event: Omit<SupervisorEvent, "root_id" | "agent_id"> & {
     readonly agent_id?: string;
@@ -317,6 +331,8 @@ export interface RpcSupervisorChannelFactoryContext {
 export interface RpcSupervisorChannelBinding {
   readonly channel: RpcSupervisorChannel;
   readonly nodeStartContext?: ManagedRpcNodeStartContext;
+  /** 通道上的控制路由等附属资源，随监督器最终释放。 */
+  readonly cleanup?: () => void;
 }
 
 export interface RpcSupervisorController {
@@ -328,12 +344,18 @@ export interface RpcSupervisorController {
     agentId: unknown,
     event: AgentLifecycleEvent | unknown,
   ): ControlResult<LifecycleEventOutcome>;
+  applySubtreeSnapshot?(
+    actor: TreeActor | unknown,
+    input: SupervisorSnapshot,
+  ): ControlResult<unknown>;
 }
 
 export interface RpcSupervisorOptions {
   readonly controller: RpcSupervisorController;
   readonly actor: TreeActor;
   readonly reservation: ReserveStartingChildInput;
+  /** AgentController 已从根权威取得的预留；生产路径必须提供。 */
+  readonly grant?: SpawnGrant;
   /** RPC 命令面和进程树必须由同一受管节点在同一启动事务中提供。 */
   readonly managedNode: ManagedRpcNodeLike;
   readonly channel?: RpcSupervisorChannel;
@@ -454,17 +476,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function freezeReply(
-  text: string,
-  images: readonly RpcSupervisorImage[],
-): Omit<SupervisorReply, "reply_seq"> {
-  if (images.length === 0) return Object.freeze({ text });
-  return Object.freeze({
-    text,
-    images: Object.freeze(images.map((image) => Object.freeze({ ...image }))),
-  });
-}
-
 type MessageCommandKind = "prompt" | "steer";
 
 interface QueuedMessageCommand {
@@ -490,6 +501,7 @@ export class RpcSupervisor {
   private readonly now: () => number;
   private channel: RpcSupervisorChannel | undefined;
   private managedNodeStartContext: ManagedRpcNodeStartContext | undefined;
+  private channelBindingCleanup: (() => void) | undefined;
   private phase: "new" | "starting" | "ready" | "failed" | "terminating" | "terminated" = "new";
   private agentId: string | undefined;
   private lifecycleGeneration = 0;
@@ -500,6 +512,7 @@ export class RpcSupervisor {
   private unsubscribeRpcFault: (() => void) | undefined;
   private unsubscribeChannelFault: (() => void) | undefined;
   private unsubscribeChannelEvent: (() => void) | undefined;
+  private unsubscribeChannelSnapshot: (() => void) | undefined;
   private readonly commandQueue: QueuedCommand[] = [];
   private activeCommand: QueuedCommand | undefined;
   private acceptancePending = false;
@@ -617,6 +630,22 @@ export class RpcSupervisor {
     return this.forcedTerminationUsed;
   }
 
+  /**
+   * 中间父故障后回收其整棵平台进程树，但不把故障父记录伪装成 terminated。
+   * 根权威随后只确认该边界覆盖的后代，故障父继续占名额等待显式终止。
+   */
+  async reapOrphanedDescendants(): Promise<{ readonly confirmed: boolean; readonly forced: boolean }> {
+    if (this.phase !== "failed" || this.agentId === undefined) {
+      return Object.freeze({ confirmed: false, forced: this.forcedTerminationUsed });
+    }
+    this.channel?.establishTerminationBarrier();
+    const cleanup = await this.cleanupResources(true, false);
+    return Object.freeze({
+      confirmed: cleanup === "confirmed",
+      forced: this.forcedTerminationUsed,
+    });
+  }
+
   private beginTerminationAttempt(): Promise<RpcSupervisorTerminationResult> {
     const attempt = this.runTermination();
     this.terminationPromise = attempt;
@@ -637,10 +666,19 @@ export class RpcSupervisor {
     }
     this.phase = "starting";
 
-    const reserved = this.options.controller.reserveStartingChild(
-      this.options.actor,
-      this.options.reservation,
-    );
+    const reserved = this.options.grant === undefined
+      ? this.options.controller.reserveStartingChild(
+          this.options.actor,
+          this.options.reservation,
+        )
+      : Object.freeze({
+          ok: true as const,
+          data: Object.freeze({
+            node: this.options.grant.node,
+            lifecycle_generation: this.options.grant.lifecycle_generation,
+            tree_revision: this.options.grant.tree_revision,
+          }),
+        });
     if (!reserved.ok) {
       this.phase = "terminated";
       return Object.freeze({ ok: false, code: reserved.error.code });
@@ -666,6 +704,7 @@ export class RpcSupervisor {
         }
         this.channel = binding.channel;
         this.managedNodeStartContext = binding.nodeStartContext;
+        this.channelBindingCleanup = binding.cleanup;
       }
       this.subscribeToDependencies();
       await this.withStartupTimeout(this.performStartup(abortController.signal), abortController);
@@ -751,6 +790,12 @@ export class RpcSupervisor {
         this.receiveSupervisorEvent(event);
       });
     }
+    const onChannelSnapshot = channel.onSnapshot;
+    if (typeof onChannelSnapshot === "function") {
+      this.unsubscribeChannelSnapshot = onChannelSnapshot.call(channel, (snapshot) => {
+        this.receiveSupervisorSnapshot(snapshot);
+      });
+    }
   }
 
   private receiveRpcEvent(event: unknown): void {
@@ -774,7 +819,7 @@ export class RpcSupervisor {
         this.receiveToolEnd(event);
         return;
       case "message_end":
-        this.receiveMessageEnd(event);
+        // 回复只能由真正 child 扩展经监督通道上行；任务 RPC 事件不再发布回复。
         return;
       case "extension_error":
         this.failRuntime("rpc_protocol_fault");
@@ -832,6 +877,19 @@ export class RpcSupervisor {
     }
   }
 
+  /** 完整快照先由通道校验，再由树控制器在一个修订中合并。 */
+  private receiveSupervisorSnapshot(snapshot: SupervisorSnapshot): void {
+    if (this.phase !== "ready" && this.phase !== "starting") return;
+    const applySnapshot = this.options.controller.applySubtreeSnapshot;
+    if (typeof applySnapshot !== "function") return;
+    try {
+      const outcome = applySnapshot.call(this.options.controller, this.options.actor, snapshot);
+      if (!outcome.ok) this.receiveTransportFault("protocol_fault", "supervisor");
+    } catch {
+      this.receiveTransportFault("protocol_fault", "supervisor");
+    }
+  }
+
   private throwIfStartupFaulted(): void {
     if (this.startupFault !== undefined) throw new Error("RPC 监督通道提前退出");
   }
@@ -875,54 +933,6 @@ export class RpcSupervisor {
       kind: "activity",
       activity: Object.freeze({ category, phase: "finished", active_count: activeCount }),
     }));
-  }
-
-  private receiveMessageEnd(event: Record<string, unknown>): void {
-    if (!isRecord(event.message)) {
-      this.failRuntime("invalid_rpc_event");
-      return;
-    }
-    if (event.message.role !== "assistant") return;
-    if (!Array.isArray(event.message.content)) {
-      this.failRuntime("invalid_rpc_event");
-      return;
-    }
-
-    const text: string[] = [];
-    const images: RpcSupervisorImage[] = [];
-    for (const item of event.message.content) {
-      if (!isRecord(item) || typeof item.type !== "string") {
-        this.failRuntime("invalid_rpc_event");
-        return;
-      }
-      if (item.type === "text") {
-        if (typeof item.text !== "string") {
-          this.failRuntime("invalid_rpc_event");
-          return;
-        }
-        text.push(item.text);
-      } else if (item.type === "image") {
-        if (typeof item.data !== "string" || typeof item.mimeType !== "string") {
-          this.failRuntime("invalid_rpc_event");
-          return;
-        }
-        images.push(Object.freeze({
-          type: "image",
-          data: item.data,
-          mimeType: item.mimeType,
-        }));
-      } else if (item.type !== "thinking" && item.type !== "toolCall") {
-        // Pi 的合法 assistant 内容仅允许显式忽略 thinking/toolCall；未知类型不能静默丢失。
-        this.failRuntime("invalid_rpc_event");
-        return;
-      }
-    }
-    if (text.length === 0 && images.length === 0) return;
-    const reply = freezeReply(text.join(""), images);
-    void this.channelOrThrow().publishReply(reply).then(
-      () => this.emitEvent(Object.freeze({ kind: "reply", reply })),
-      () => this.failRuntime("supervisor_protocol_fault"),
-    );
   }
 
   private failRuntime(code: RpcSupervisorFaultCode): void {
@@ -1083,7 +1093,7 @@ export class RpcSupervisor {
       this.applyLifecycle({ type: "startup_failed", error_code: code });
     }
     this.phase = "terminating";
-    const cleanup = await this.cleanupResources(false);
+    const cleanup = await this.cleanupResources(false, true);
     return Object.freeze({
       ok: false,
       ...(this.agentId === undefined ? {} : { agent_id: this.agentId }),
@@ -1093,7 +1103,7 @@ export class RpcSupervisor {
   }
 
   private async runTermination(): Promise<RpcSupervisorTerminationResult> {
-    const cleanup = await this.cleanupResources(true);
+    const cleanup = await this.cleanupResources(true, true);
     if (cleanup === "confirmed" && this.agentId !== undefined) {
       return Object.freeze({
         ok: true,
@@ -1113,14 +1123,15 @@ export class RpcSupervisor {
 
   private cleanupResources(
     barrierEstablished: boolean,
+    confirmNode: boolean,
   ): Promise<"confirmed" | "incomplete"> {
     const previous = this.cleanupInFlight;
     const cleanup = (async () => {
       if (previous !== undefined) {
         const previousResult = await previous;
-        if (previousResult === "confirmed") return previousResult;
+        if (previousResult === "confirmed" && !confirmNode) return previousResult;
       }
-      return this.performCleanupResources(barrierEstablished);
+      return this.performCleanupResources(barrierEstablished, confirmNode);
     })();
     this.cleanupInFlight = cleanup;
     void cleanup.then(
@@ -1136,24 +1147,37 @@ export class RpcSupervisor {
 
   private async performCleanupResources(
     barrierEstablished: boolean,
+    confirmNode: boolean,
   ): Promise<"confirmed" | "incomplete"> {
     if (!barrierEstablished) this.channel?.establishTerminationBarrier();
     const node = this.options.managedNode;
 
-    const closeAbort = new AbortController();
-    const gracefulRequests: Promise<unknown>[] = [];
+    // 第一阶段只请求真正 child 递归关闭后代，并以监督字节流 EOF 作为受控
+    // 确认；在此之前不得停止当前 Pi 进程，否则会截断 child 的级联清理。
     if (this.channel !== undefined) {
-      gracefulRequests.push(this.startOperation(() => this.channel!.requestClose(closeAbort.signal)));
+      const childCloseAbort = new AbortController();
+      const childCloseDeadline = this.now() + this.options.gracefulShutdownMs;
+      await this.waitForDeadline(
+        this.startOperation(() => this.channel!.requestClose(childCloseAbort.signal)),
+        childCloseDeadline,
+      );
+      if (!this.channelResourcesConfirmed && !this.channelHandleReleased) {
+        this.channelResourcesConfirmed = await this.observeChannelClose(childCloseDeadline);
+      }
+      childCloseAbort.abort();
     } else {
       this.channelResourcesConfirmed = true;
       this.channelHandleReleased = true;
     }
-    gracefulRequests.push(this.startOperation(
-      () => node.requestGracefulClose(closeAbort.signal),
-    ));
 
+    // 第二阶段才关闭当前 Pi/bridge。即使 child 未在第一阶段确认，也保留一次
+    // 平台优雅窗口；随后才允许整棵平台进程树强制回收。
+    const closeAbort = new AbortController();
     const gracefulDeadline = this.now() + this.options.gracefulShutdownMs;
-    await this.waitForDeadline(Promise.allSettled(gracefulRequests), gracefulDeadline);
+    await this.waitForDeadline(
+      this.startOperation(() => node.requestGracefulClose(closeAbort.signal)),
+      gracefulDeadline,
+    );
     closeAbort.abort();
     if (!this.processResourcesConfirmed) {
       this.processResourcesConfirmed = await this.observeManagedNode(gracefulDeadline);
@@ -1181,7 +1205,7 @@ export class RpcSupervisor {
     }
 
     if (!this.processResourcesConfirmed || !this.channelResourcesConfirmed) {
-      if (this.agentId !== undefined) this.applyLifecycle({ type: "termination_incomplete" });
+      if (confirmNode && this.agentId !== undefined) this.applyLifecycle({ type: "termination_incomplete" });
       return "incomplete";
     }
 
@@ -1203,11 +1227,15 @@ export class RpcSupervisor {
     const releaseDeadline = this.now() + this.options.gracefulShutdownMs;
     await this.waitForDeadline(Promise.allSettled(releaseOperations), releaseDeadline);
     if (!this.nodeHandleReleased || !this.channelHandleReleased) {
-      if (this.agentId !== undefined) this.applyLifecycle({ type: "termination_incomplete" });
+      if (confirmNode && this.agentId !== undefined) this.applyLifecycle({ type: "termination_incomplete" });
       return "incomplete";
     }
 
     if (this.agentId === undefined) return "incomplete";
+    if (!confirmNode) {
+      this.unsubscribeDependencies();
+      return "confirmed";
+    }
     const confirmation = this.applyLifecycle({ type: "resources_confirmed" });
     if (confirmation.node.state !== "terminated") {
       this.applyLifecycle({ type: "termination_incomplete" });
@@ -1289,7 +1317,7 @@ export class RpcSupervisor {
     queueMicrotask(() => {
       this.lateStartupCleanupScheduled = false;
       if (this.phase !== "terminating") return;
-      void this.cleanupResources(true).catch(() => {
+      void this.cleanupResources(true, true).catch(() => {
         // 已公开 termination_incomplete；后台重试失败不能伪造确认或泄露异常。
       });
     });
@@ -1326,9 +1354,13 @@ export class RpcSupervisor {
     this.unsubscribeRpcFault?.();
     this.unsubscribeChannelFault?.();
     this.unsubscribeChannelEvent?.();
+    this.unsubscribeChannelSnapshot?.();
+    this.channelBindingCleanup?.();
     this.unsubscribeRpcEvent = undefined;
     this.unsubscribeRpcFault = undefined;
     this.unsubscribeChannelFault = undefined;
     this.unsubscribeChannelEvent = undefined;
+    this.unsubscribeChannelSnapshot = undefined;
+    this.channelBindingCleanup = undefined;
   }
 }

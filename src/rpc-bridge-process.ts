@@ -5,8 +5,8 @@
  * 拥有者，stdin/stdout 只承载本模块定义的有界高层帧；Pi JSONL 永远不会被
  * 转发给父监督器。
  */
+import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { BridgeSupervisorEndpoint } from "./bridge-supervisor-endpoint.ts";
 import {
   MANAGED_RPC_BRIDGE_CREDENTIAL_ENV,
   MANAGED_RPC_BRIDGE_MAX_FRAME_BYTES,
@@ -15,7 +15,13 @@ import {
   type ManagedRpcSupervisorInit,
 } from "./managed-rpc-node.ts";
 import { LengthPrefixedFrameDecoder } from "./length-prefixed-frame-decoder.ts";
+import {
+  nativeLocalSupervisorTransportAdapter,
+  type LocalSupervisorTransportListener,
+} from "./local-supervisor-transport.ts";
 import { normalizeRpcBridgeEvent } from "./rpc-bridge-event.ts";
+import { RUNTIME_EPHEMERAL_ENV_KEYS } from "./root-runtime-context.ts";
+import type { SupervisorByteTransport } from "./stream-supervisor-channel.ts";
 
 const MAX_FRAME_BYTES = MANAGED_RPC_BRIDGE_MAX_FRAME_BYTES;
 const PROTOCOL = MANAGED_RPC_BRIDGE_PROTOCOL;
@@ -58,7 +64,11 @@ let commandQueue: Promise<void> = Promise.resolve();
 let outputQueue: Promise<void> = Promise.resolve();
 let exitScheduled = false;
 let config: Record<string, unknown> = {};
-let supervisorEndpoint: BridgeSupervisorEndpoint | undefined;
+let supervisorListener: LocalSupervisorTransportListener | undefined;
+let supervisorTransport: SupervisorByteTransport | undefined;
+let supervisorWriteQueue: Promise<void> = Promise.resolve();
+let supervisorTransportEnded = false;
+let childSupervisorEnvironment: Record<string, string> | undefined;
 const configuredCredential = process.env[CREDENTIAL_ENV];
 // 凭据只用于桥接首帧认证；Pi RpcClient 不应继承它。
 try {
@@ -136,7 +146,11 @@ function failAndExit(faultCode: "protocol_fault" | "process_exit"): void {
   decoder.reset();
   process.stdin.pause();
   fault(faultCode);
-  void flushOutput().finally(() => process.exit(1));
+  void Promise.allSettled([
+    flushOutput(),
+    closeLocalSupervisor(),
+    client?.stop() ?? Promise.resolve(),
+  ]).finally(() => process.exit(1));
 }
 
 function emitEvent(event: unknown): void {
@@ -163,6 +177,94 @@ function emitSupervisorFrame(frame: Uint8Array): void {
   } catch {
     failAndExit("protocol_fault");
   }
+}
+
+function emitSupervisorBytes(bytes: Uint8Array): void {
+  if (bytes.byteLength === 0) return;
+  for (let offset = 0; offset < bytes.byteLength; offset += MANAGED_RPC_SUPERVISOR_MAX_FRAME_BYTES) {
+    emitSupervisorFrame(bytes.subarray(
+      offset,
+      Math.min(bytes.byteLength, offset + MANAGED_RPC_SUPERVISOR_MAX_FRAME_BYTES),
+    ));
+  }
+}
+
+function bindSupervisorTransport(transport: SupervisorByteTransport): void {
+  if (supervisorTransport !== undefined) throw new Error("本地监督传输已绑定");
+  supervisorTransport = transport;
+  transport.stdout.on("data", (chunk: Uint8Array | string) => {
+    const bytes = typeof chunk === "string" ? new TextEncoder().encode(chunk) : new Uint8Array(chunk);
+    emitSupervisorBytes(bytes);
+  });
+  const onEnd = (): void => {
+    if (supervisorTransportEnded) return;
+    supervisorTransportEnded = true;
+    if (!stopping) failAndExit("process_exit");
+  };
+  transport.stdout.on("end", onEnd);
+  transport.stdout.on("close", onEnd);
+  transport.stdout.on("error", () => {
+    if (!stopping) failAndExit("protocol_fault");
+  });
+  transport.stdin.on("error", () => {
+    if (!stopping) failAndExit("protocol_fault");
+  });
+}
+
+function forwardSupervisorBytes(bytes: Uint8Array): void {
+  const transport = supervisorTransport;
+  if (transport === undefined || supervisorTransportEnded) {
+    failAndExit("protocol_fault");
+    return;
+  }
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  const write = supervisorWriteQueue.catch(() => {}).then(() => new Promise<void>((resolve, reject) => {
+    try {
+      transport.stdin.write(copy, (error?: Error | null) => {
+        if (error === undefined || error === null) resolve();
+        else reject(error);
+      });
+    } catch (error) {
+      reject(error instanceof Error ? error : new Error("本地监督写入失败"));
+    }
+  }));
+  supervisorWriteQueue = write.catch(() => {});
+  void write.catch(() => failAndExit("protocol_fault"));
+}
+
+function installChildSupervisorEnvironment(
+  endpoint: string,
+  localCredential: string,
+  supervisorCredential: string,
+): void {
+  const values = {
+    [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorEndpoint]: endpoint,
+    [RUNTIME_EPHEMERAL_ENV_KEYS.localSupervisorCredential]: localCredential,
+    [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorCredential]: supervisorCredential,
+  };
+  childSupervisorEnvironment = values;
+  for (const [key, value] of Object.entries(values)) process.env[key] = value;
+}
+
+function clearBridgeSupervisorEnvironment(): void {
+  childSupervisorEnvironment = undefined;
+  for (const key of Object.values(RUNTIME_EPHEMERAL_ENV_KEYS)) {
+    try {
+      delete process.env[key];
+    } catch {
+      // 受限宿主可能禁止删除；RpcClient 已经完成唯一一次 spawn。
+    }
+  }
+}
+
+async function closeLocalSupervisor(): Promise<void> {
+  const listener = supervisorListener;
+  supervisorListener = undefined;
+  supervisorTransport = undefined;
+  supervisorTransportEnded = true;
+  clearBridgeSupervisorEnvironment();
+  if (listener !== undefined) await listener.close();
 }
 
 function parseArgs(): void {
@@ -259,7 +361,19 @@ async function ensureClient(): Promise<BridgeClient> {
   const cliPath = typeof options.cliPath === "string" && options.cliPath.length > 0
     ? options.cliPath
     : defaultPiCliPath();
-  const clientOptions = cliPath === undefined ? options : { ...options, cliPath };
+  const configuredEnvironment = isRecord(options.env)
+    ? Object.fromEntries(Object.entries(options.env).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      ))
+    : {};
+  const clientOptions = {
+    ...options,
+    ...(cliPath === undefined ? {} : { cliPath }),
+    env: {
+      ...configuredEnvironment,
+      ...(childSupervisorEnvironment ?? {}),
+    },
+  };
   client = new RpcClient(clientOptions as never) as unknown as BridgeClient;
   client.onEvent((event) => {
     const normalized = normalizeRpcBridgeEvent(event);
@@ -287,7 +401,7 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
     || command.id <= 0
     || command.id <= lastCommandId
     || typeof command.command !== "string"
-    || !["start", "prompt", "steer", "abort", "get_state", "supervisor_reply", "close"].includes(command.command)
+    || !["start", "prompt", "steer", "abort", "get_state", "close"].includes(command.command)
   ) {
     failAndExit("protocol_fault");
     return;
@@ -316,15 +430,25 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
       authenticated = true;
       started = true;
       if (supervisorInit !== undefined) {
-        supervisorEndpoint = new BridgeSupervisorEndpoint({
-          init: supervisorInit,
-          send: emitSupervisorFrame,
-          onFault: () => failAndExit("protocol_fault"),
+        const localCredential = randomBytes(32).toString("base64url");
+        supervisorListener = await nativeLocalSupervisorTransportAdapter.listen({
+          agentId: supervisorInit.local_agent_id,
+          credential: localCredential,
         });
-        supervisorEndpoint.start();
+        installChildSupervisorEnvironment(
+          supervisorListener.endpoint,
+          localCredential,
+          supervisorInit.credential,
+        );
       }
       const current = await ensureClient();
-      await current.start();
+      const connection = supervisorListener?.waitForConnection();
+      try {
+        await current.start();
+        if (connection !== undefined) bindSupervisorTransport(await connection);
+      } finally {
+        clearBridgeSupervisorEnvironment();
+      }
       response(command.id, true);
       return;
     }
@@ -359,29 +483,10 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
       response(command.id, true, await current.getState());
       return;
     }
-    if (command.command === "supervisor_reply") {
-      if (supervisorEndpoint === undefined || !isRecord(command.payload)
-        || typeof command.payload.text !== "string"
-        || new TextEncoder().encode(command.payload.text).byteLength > MAX_MESSAGE_BYTES
-        || Object.keys(command.payload).some((key) => key !== "text" && key !== "images")) {
-        response(command.id, false);
-        return;
-      }
-      const images = command.payload.images === undefined ? undefined : normalizeImages(command.payload.images);
-      if (command.payload.images !== undefined && images === undefined) {
-        response(command.id, false);
-        return;
-      }
-      supervisorEndpoint.publishReply({
-        text: command.payload.text,
-        ...(images === undefined ? {} : { images }),
-      });
-      response(command.id, true);
-      return;
-    }
     if (command.command === "close") {
       stopping = true;
       await current.stop();
+      await closeLocalSupervisor();
       response(command.id, true);
       await flushOutput();
       exitScheduled = true;
@@ -390,6 +495,13 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
     }
     response(command.id, false);
   } catch {
+    if (command.command === "start") {
+      try {
+        await closeLocalSupervisor();
+      } catch {
+        // 启动失败仍只返回固定桥接失败，不泄露本地端点。
+      }
+    }
     response(command.id, false);
   }
 }
@@ -415,7 +527,7 @@ function consume(bytes: Uint8Array): void {
           : undefined;
         if (
           !authenticated
-          || supervisorEndpoint === undefined
+          || supervisorTransport === undefined
           || supervisorFrame === undefined
           || supervisorFrame.byteLength === 0
           || supervisorFrame.byteLength > MANAGED_RPC_SUPERVISOR_MAX_FRAME_BYTES
@@ -424,7 +536,7 @@ function consume(bytes: Uint8Array): void {
           failAndExit("protocol_fault");
           return false;
         }
-        supervisorEndpoint.receive(supervisorFrame);
+        forwardSupervisorBytes(supervisorFrame);
         return !protocolFailed;
       }
       if (
@@ -463,6 +575,7 @@ process.stdin.on("end", () => {
   stopping = true;
   void commandQueue
     .then(() => client?.stop())
+    .then(() => closeLocalSupervisor())
     .then(() => flushOutput())
     .then(() => {
       if (exitScheduled) return;

@@ -30,16 +30,20 @@ class ReadyChannel implements RpcSupervisorChannel {
 
 class ControlledSupervisor implements AgentSupervisor {
   terminationCalls = 0;
+  orphanCalls = 0;
   private readonly listeners = new Set<(event: RpcSupervisorEvent) => void>();
   private readonly startOperation: () => Promise<RpcSupervisorStartupResult>;
   private readonly terminateOperation: (attempt: number) => Promise<RpcSupervisorTerminationResult>;
+  private readonly orphanOperation: (() => Promise<boolean>) | undefined;
 
   constructor(
     startOperation: () => Promise<RpcSupervisorStartupResult>,
     terminateOperation: (attempt: number) => Promise<RpcSupervisorTerminationResult>,
+    orphanOperation?: () => Promise<boolean>,
   ) {
     this.startOperation = startOperation;
     this.terminateOperation = terminateOperation;
+    this.orphanOperation = orphanOperation;
   }
 
   start(): Promise<RpcSupervisorStartupResult> { return this.startOperation(); }
@@ -55,6 +59,13 @@ class ControlledSupervisor implements AgentSupervisor {
   terminate(): Promise<RpcSupervisorTerminationResult> {
     this.terminationCalls += 1;
     return this.terminateOperation(this.terminationCalls);
+  }
+  async reapOrphanedDescendants(): Promise<{ readonly confirmed: boolean; readonly forced: boolean }> {
+    this.orphanCalls += 1;
+    return {
+      confirmed: this.orphanOperation === undefined ? false : await this.orphanOperation(),
+      forced: false,
+    };
   }
   onEvent(listener: (event: RpcSupervisorEvent) => void): () => void {
     this.listeners.add(listener);
@@ -240,7 +251,8 @@ test("监督器 start 抛错后尝试回收，并按回收结果区分内部错�
   if (!incompleteResult.ok) assert.equal(incompleteResult.error.code, "termination_incomplete");
   assert.equal(incomplete.terminationCalls, 1);
   assert.equal(incomplete.listenerCount(), 1);
-  await incompleteController.shutdown();
+  const shutdownComplete = await incompleteController.shutdown();
+  assert.equal(shutdownComplete, true);
   assert.equal(incomplete.terminationCalls, 2);
   assert.equal(incomplete.listenerCount(), 0);
 
@@ -270,6 +282,86 @@ test("监督器 start 抛错后尝试回收，并按回收结果区分内部错�
   await unknownController.shutdown();
   assert.equal(unknown.terminationCalls, 2);
   assert.equal(unknown.listenerCount(), 0);
+});
+
+test("运行期监督故障自动清理后代但保留 failed 父节点，显式终止再清理父资源", async () => {
+  const parentId = "a1111111-1111-4111-8111-111111111111";
+  const childId = "a2222222-2222-4222-8222-222222222222";
+  const ids = [parentId, childId];
+  let nextId = 0;
+  const tree = new TreeController({
+    config: { maxDepth: 3, maxChildrenPerAgent: 4, maxAgentsPerTree: 16, waitTimeoutMs: 60_000 },
+    idFactory: () => ids[nextId++]!,
+  });
+  const reserveReady = (actor: typeof ROOT_TREE_ACTOR | { kind: "agent"; agent_id: string }, input: { templateId: string; name: string }): string => {
+    const reserved = tree.reserveStartingChild(actor, input);
+    assert.equal(reserved.ok, true);
+    if (!reserved.ok) throw new Error("预留失败");
+    const ready = tree.applyLifecycleEvent(reserved.data.node.agent_id, {
+      type: "startup_ready",
+      expected_generation: reserved.data.lifecycle_generation,
+    });
+    assert.equal(ready.ok, true);
+    return reserved.data.node.agent_id;
+  };
+  let parentSupervisor: ControlledSupervisor;
+  const root = new AgentController({
+    tree,
+    allowUnvalidatedTemplates: true,
+    createSupervisor: () => {
+      parentSupervisor = new ControlledSupervisor(
+        async () => ({ ok: true, agent_id: parentId, state: "idle" }),
+        async () => ({ ok: true, agent_id: parentId, state: "terminated", cleanup: "confirmed" }),
+        async () => true,
+      );
+      reserveReady(ROOT_TREE_ACTOR, { templateId: "parent", name: "父" });
+      return parentSupervisor;
+    },
+  });
+  let childSupervisor: ControlledSupervisor;
+  const child = new AgentController({
+    tree,
+    actor: { kind: "agent", agent_id: parentId },
+    allowUnvalidatedTemplates: true,
+    createSupervisor: () => {
+      childSupervisor = new ControlledSupervisor(
+        async () => ({ ok: true, agent_id: childId, state: "idle" }),
+        async () => ({ ok: true, agent_id: childId, state: "terminated", cleanup: "confirmed" }),
+      );
+      reserveReady({ kind: "agent", agent_id: parentId }, { templateId: "child", name: "子" });
+      return childSupervisor;
+    },
+  });
+  const parent = await root.spawnAgent({ template_id: "parent", name: "父" });
+  assert.equal(parent.ok, true);
+  const childResult = await child.spawnAgent({ template_id: "child", name: "子" });
+  assert.equal(childResult.ok, true);
+  assert.ok(parentSupervisor!);
+  assert.ok(childSupervisor!);
+
+  const generation = tree.getLifecycleGeneration(parentId);
+  assert.equal(generation.ok, true);
+  if (!generation.ok) return;
+  const failure = tree.applyLifecycleEvent(parentId, {
+    type: "runtime_failed",
+    expected_generation: generation.data,
+    error_code: "internal_error",
+  });
+  assert.equal(failure.ok, true);
+  parentSupervisor!.emitEvent({ kind: "fault", code: "rpc_process_exit" });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const parentStatus = tree.getStatus(parentId);
+  const childStatus = tree.getStatus(childId);
+  assert.equal(parentStatus.ok ? parentStatus.data.state : "missing", "failed");
+  assert.equal(childStatus.ok ? childStatus.data.state : "missing", "terminated");
+  assert.equal(parentSupervisor!.terminationCalls, 0);
+  assert.equal(parentSupervisor!.orphanCalls, 1);
+  assert.equal(childSupervisor!.terminationCalls, 0);
+
+  const explicit = await root.terminateAgent(parentId);
+  assert.equal(explicit.ok, true);
+  assert.equal(parentSupervisor!.terminationCalls, 1);
 });
 
 test("启动失败只在清理不完整时保留监督器供 terminate_agent 重试", async () => {
@@ -479,4 +571,111 @@ test("后台资源确认后立即释放活动监督器引用，shutdown 不重�
   assert.equal(supervisor.listenerCount(), 0);
   await controller.shutdown();
   assert.equal(supervisor.terminationCalls, 0);
+});
+
+test("terminate_agent 以同一树屏障后代优先级联，并在部分确认后只重试残留节点", async () => {
+  const parentId = "f1111111-1111-4111-8111-111111111111";
+  const childId = "f2222222-2222-4222-8222-222222222222";
+  const ids = [parentId, childId];
+  let nextId = 0;
+  const tree = new TreeController({
+    config: { maxDepth: 3, maxChildrenPerAgent: 4, maxAgentsPerTree: 16, waitTimeoutMs: 60_000 },
+    idFactory: () => ids[nextId++]!,
+  });
+  const parentReservation = tree.reserveStartingChild(ROOT_TREE_ACTOR, { templateId: "parent", name: "父" });
+  assert.equal(parentReservation.ok, true);
+  if (!parentReservation.ok) return;
+  const parentReady = tree.applyLifecycleEvent(parentId, {
+    type: "startup_ready",
+    expected_generation: parentReservation.data.lifecycle_generation,
+  });
+  assert.equal(parentReady.ok, true);
+  if (!parentReady.ok) return;
+  const childReservation = tree.reserveStartingChild({ kind: "agent", agent_id: parentId }, {
+    templateId: "child",
+    name: "子",
+  });
+  assert.equal(childReservation.ok, true);
+  if (!childReservation.ok) return;
+  const childReady = tree.applyLifecycleEvent(childId, {
+    type: "startup_ready",
+    expected_generation: childReservation.data.lifecycle_generation,
+  });
+  assert.equal(childReady.ok, true);
+
+  const trace: string[] = [];
+  let childController: AgentController;
+  const parentSupervisor = new ControlledSupervisor(
+    async () => ({ ok: true, agent_id: parentId, state: "idle" }),
+    async () => {
+      const descendantsConfirmed = await childController.shutdown();
+      if (!descendantsConfirmed) {
+        return {
+          ok: false,
+          agent_id: parentId,
+          code: "termination_incomplete",
+          state: "terminating",
+          cleanup: "incomplete",
+        };
+      }
+      trace.push("parent");
+      return { ok: true, agent_id: parentId, state: "terminated", cleanup: "confirmed" };
+    },
+  );
+  const childSupervisor = new ControlledSupervisor(
+    async () => ({ ok: true, agent_id: childId, state: "idle" }),
+    async (attempt) => {
+      trace.push(`child-${attempt}`);
+      return attempt === 1
+        ? { ok: false, agent_id: childId, code: "termination_incomplete", state: "terminating", cleanup: "incomplete" }
+        : { ok: true, agent_id: childId, state: "terminated", cleanup: "confirmed" };
+    },
+  );
+  const root = new AgentController({
+    tree,
+    actor: ROOT_TREE_ACTOR,
+    allowUnvalidatedTemplates: true,
+    createSupervisor: () => parentSupervisor,
+  });
+  const child = new AgentController({
+    tree,
+    actor: { kind: "agent", agent_id: parentId },
+    allowUnvalidatedTemplates: true,
+    createSupervisor: () => childSupervisor,
+  });
+  childController = child;
+  assert.equal((await root.spawnAgent({ template_id: "parent", name: "父" })).ok, true);
+  assert.equal((await child.spawnAgent({ template_id: "child", name: "子" })).ok, true);
+
+  const [first, concurrent] = await Promise.all([root.terminateAgent(parentId), root.terminateAgent(parentId)]);
+  assert.equal(first.ok, false);
+  assert.equal(concurrent.ok, false);
+  assert.deepEqual(trace, ["child-1"]);
+  assert.equal(childSupervisor.terminationCalls, 1);
+  assert.equal(parentSupervisor.terminationCalls, 1);
+  const firstChildStatus = tree.getStatus(childId);
+  const firstParentStatus = tree.getStatus(parentId);
+  assert.equal(firstChildStatus.ok, true);
+  assert.equal(firstParentStatus.ok, true);
+  if (firstChildStatus.ok) assert.equal(firstChildStatus.data.state, "terminating");
+  if (firstParentStatus.ok) assert.equal(firstParentStatus.data.state, "terminating");
+
+  const retry = await root.terminateAgent(parentId);
+  assert.equal(retry.ok, true);
+  if (retry.ok) assert.deepEqual(retry.data, {
+    agent_id: parentId,
+    state: "terminated",
+    changed: true,
+    forced: false,
+    terminated_count: 2,
+  });
+  assert.deepEqual(trace, ["child-1", "child-2", "parent"]);
+  assert.equal(parentSupervisor.terminationCalls, 2);
+  assert.equal(childSupervisor.terminationCalls, 2);
+  const finalChildStatus = tree.getStatus(childId);
+  const finalParentStatus = tree.getStatus(parentId);
+  assert.equal(finalChildStatus.ok, true);
+  assert.equal(finalParentStatus.ok, true);
+  if (finalChildStatus.ok) assert.equal(finalChildStatus.data.state, "terminated");
+  if (finalParentStatus.ok) assert.equal(finalParentStatus.data.state, "terminated");
 });

@@ -5,11 +5,12 @@ import {
   type SupervisorEvent,
   type SupervisorFrame,
   type SupervisorReply,
-} from "./supervisor-channel.ts";
+  type SupervisorSnapshot,
+} from "../../src/supervisor-channel.ts";
 import {
   MANAGED_RPC_SUPERVISOR_MAX_BODY_BYTES,
   type ManagedRpcSupervisorInit,
-} from "./managed-rpc-node.ts";
+} from "../../src/managed-rpc-node.ts";
 
 export interface BridgeSupervisorEndpointOptions {
   readonly init: ManagedRpcSupervisorInit;
@@ -18,8 +19,8 @@ export interface BridgeSupervisorEndpointOptions {
 }
 
 /**
- * 桥接进程内的 child 监督端点。它只接收完整监督帧，不接触 Pi JSONL，
- * 并把协议自动产生的 hello、快照、ACK 和重同步帧交还桥接写入器。
+ * 旧 bridge child 端点只作为协议测试替身保留。生产 bridge 是透明字节中继，
+ * 真正 child runtime 才拥有监督端点、子树发布器和关闭级联。
  */
 export class BridgeSupervisorEndpoint {
   private readonly protocol: SupervisorChannel;
@@ -64,10 +65,7 @@ export class BridgeSupervisorEndpoint {
     if (result.kind === "accepted" || result.kind === "duplicate" || result.kind === "gap") {
       for (const outbound of result.outbound) this.send(outbound);
     }
-    if (
-      !this.snapshotSent
-      && this.protocol.getPublicState().state === "awaiting_snapshot"
-    ) {
+    if (!this.snapshotSent && this.protocol.getPublicState().state === "awaiting_snapshot") {
       this.snapshotSent = true;
       try {
         this.send(this.protocol.publishSnapshot(
@@ -76,7 +74,6 @@ export class BridgeSupervisorEndpoint {
         ));
       } catch {
         this.fail();
-        return;
       }
     }
   }
@@ -87,6 +84,14 @@ export class BridgeSupervisorEndpoint {
 
   publishEvent(event: Omit<SupervisorEvent, "root_id" | "agent_id">): void {
     this.send(this.protocol.publishEvent(event));
+  }
+
+  publishSnapshot(nodes: readonly SupervisorSnapshot["nodes"][number][], subtreeRevision: number): void {
+    this.send(this.protocol.publishSnapshot(nodes, subtreeRevision));
+  }
+
+  getLatestSnapshot(): SupervisorSnapshot | undefined {
+    return this.protocol.getLatestSnapshot();
   }
 
   establishTerminationBarrier(): void {
@@ -118,7 +123,7 @@ export class BridgeSupervisorEndpoint {
     try {
       this.onFault?.();
     } catch {
-      // 故障观察者异常不能再次进入协议路径。
+      // 测试替身的故障观察者不能再次进入协议路径。
     }
   }
 }

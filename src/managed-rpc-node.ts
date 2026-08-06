@@ -70,7 +70,6 @@ export interface ManagedRpcBridge {
   /** 与任务 RPC 复用同一读取者的父子监督帧转发。 */
   sendSupervisorFrame(frame: Uint8Array): Promise<void>;
   onSupervisorFrame(listener: (frame: Uint8Array) => void): () => void;
-  publishSupervisorReply(reply: ManagedRpcReply): Promise<void>;
   release?(): Promise<void>;
 }
 
@@ -143,7 +142,6 @@ export interface ManagedRpcNodeLike {
   onTransportFault(listener: (fault: ManagedRpcTransportFault) => void): () => void;
   sendSupervisorFrame(frame: Uint8Array): Promise<void>;
   onSupervisorFrame(listener: (frame: Uint8Array) => void): () => void;
-  publishSupervisorReply(reply: ManagedRpcReply): Promise<void>;
   requestGracefulClose(signal: AbortSignal): Promise<void>;
   forceTerminate(): Promise<void>;
   waitForExit(deadline: number | Date): Promise<ExitObservation>;
@@ -240,15 +238,6 @@ export class ManagedRpcNode implements ManagedRpcNodeLike {
   onSupervisorFrame(listener: (frame: Uint8Array) => void): () => void {
     this.supervisorFrameListeners.add(listener);
     return () => this.supervisorFrameListeners.delete(listener);
-  }
-
-  async publishSupervisorReply(reply: ManagedRpcReply): Promise<void> {
-    const bridge = this.requireBridge();
-    const images = copyImages(reply.images);
-    await bridge.publishSupervisorReply({
-      text: reply.text,
-      ...(images === undefined ? {} : { images }),
-    });
   }
 
   async requestGracefulClose(signal: AbortSignal): Promise<void> {
@@ -621,13 +610,6 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
     return () => this.supervisorFrameListeners.delete(listener);
   }
 
-  async publishSupervisorReply(reply: ManagedRpcReply): Promise<void> {
-    await this.request("supervisor_reply", {
-      text: reply.text,
-      ...(reply.images === undefined ? {} : { images: copyImages(reply.images) }),
-    });
-  }
-
   async release(): Promise<void> {
     this.closed = true;
     for (const pending of this.pending.values()) pending.reject(new Error("桥接传输已释放"));
@@ -830,7 +812,6 @@ const BRIDGE_COMMAND_NAMES = new Set([
   "steer",
   "abort",
   "get_state",
-  "supervisor_reply",
   "close",
 ]);
 
@@ -854,50 +835,8 @@ function isSafeBridgeEvent(value: unknown): boolean {
         && Object.keys(value).every((key) => key === "type" || key === "toolCallId" || key === "toolName");
     case "extension_error":
       return Object.keys(value).length === 1;
-    case "message_end": {
-      if (!isRecord(value.message) || value.message.role !== "assistant" || !Array.isArray(value.message.content)) {
-        return false;
-      }
-      if (Object.keys(value).some((key) => key !== "type" && key !== "message")) return false;
-      if (Object.keys(value.message).some((key) => key !== "role" && key !== "content")) return false;
-      return value.message.content.length <= 64 && value.message.content.every((item) => {
-        if (!isRecord(item) || typeof item.type !== "string") return false;
-        if (item.type === "text") {
-          return typeof item.text === "string"
-            && utf8Length(item.text) <= 16 * 1024
-            && Object.keys(item).every((key) => key === "type" || key === "text");
-        }
-        if (item.type === "image") {
-          return typeof item.data === "string"
-            && validBase64(item.data)
-            && decodedBase64Length(item.data) <= 24 * 1024
-            && typeof item.mimeType === "string"
-            && /^image\/[a-z0-9.+-]+$/.test(item.mimeType)
-            && Object.keys(item).every((key) => key === "type" || key === "data" || key === "mimeType");
-        }
-        return false;
-      });
-    }
     default:
       return false;
-  }
-}
-
-function utf8Length(value: string): number {
-  return new TextEncoder().encode(value).byteLength;
-}
-
-function validBase64(value: string): boolean {
-  if (value.length === 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return false;
-  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
-  if (padding > 0 && value.length % 4 !== 0) return false;
-  if ((value.length - padding) % 4 === 1) return false;
-  try {
-    const normalized = padding > 0 ? value : value + "=".repeat((4 - (value.length % 4)) % 4);
-    return Buffer.from(normalized, "base64").toString("base64").replace(/=+$/, "")
-      === normalized.replace(/=+$/, "");
-  } catch {
-    return false;
   }
 }
 
@@ -915,10 +854,6 @@ function decodeBase64Bytes(value: string): Uint8Array | undefined {
   } catch {
     return undefined;
   }
-}
-
-function decodedBase64Length(value: string): number {
-  return Math.floor(value.length * 3 / 4) - (value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0);
 }
 
 function withBridgeCredential(
@@ -969,7 +904,6 @@ export class FakeManagedRpcNode implements ManagedRpcNodeLike {
   onTransportFault(listener: (fault: ManagedRpcTransportFault) => void): () => void { this.faultListeners.add(listener); return () => this.faultListeners.delete(listener); }
   async sendSupervisorFrame(_frame: Uint8Array): Promise<void> { this.record("supervisor_frame"); }
   onSupervisorFrame(listener: (frame: Uint8Array) => void): () => void { this.supervisorFrameListeners.add(listener); return () => this.supervisorFrameListeners.delete(listener); }
-  async publishSupervisorReply(_reply: ManagedRpcReply): Promise<void> { this.record("supervisor_reply"); }
   async requestGracefulClose(): Promise<void> { this.record("graceful_close"); }
   async forceTerminate(): Promise<void> { this.record("force_terminate"); }
   async waitForExit(): Promise<ExitObservation> { this.record("wait_for_exit"); return { state: "exited" }; }

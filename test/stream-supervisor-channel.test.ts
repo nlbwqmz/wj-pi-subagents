@@ -92,6 +92,25 @@ test("真实字节流完成 child hello、首快照、ACK 和 ready 双握手", 
   await pair.child.release();
 });
 
+test("父端在原子接受完整快照后向订阅者发布安全副本", async () => {
+  const pair = channelPair();
+  const snapshots: unknown[] = [];
+  pair.parent.onSnapshot((value) => snapshots.push(value));
+  await pair.parent.bind(new AbortController().signal);
+  await pair.child.bind(new AbortController().signal);
+  await Promise.all([
+    pair.parent.waitForReady(new AbortController().signal),
+    pair.child.waitForReady(new AbortController().signal),
+  ]);
+  assert.deepEqual(snapshots, [{
+    scope_agent_id: CHILD_ID,
+    subtree_revision: 1,
+    nodes: [snapshot()],
+  }]);
+  await pair.parent.release();
+  await pair.child.release();
+});
+
 test("回复与生命周期事件通过安全回调传递，观察者异常不破坏传输", async () => {
   const replies: string[] = [];
   const events: unknown[] = [];

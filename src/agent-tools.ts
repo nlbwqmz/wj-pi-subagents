@@ -1,5 +1,5 @@
 import type { AgentController } from "./agent-controller.ts";
-import type { ControlResult } from "./tree-controller.ts";
+import { controlFailure, type ControlResult } from "./tree-controller.ts";
 
 /** Pi 扩展 API 的最小结构面；生产类型由宿主包提供，核心包不复制其定义。 */
 export interface AgentToolRegistrationApi {
@@ -27,13 +27,19 @@ export class SubagentToolError extends Error {
   readonly code: string;
   readonly retryable: boolean;
 
-  constructor(error: { readonly code: string; readonly message: string; readonly retryable: boolean }) {
+  constructor(error: {
+    readonly code: string;
+    readonly message: string;
+    readonly retryable: boolean;
+    readonly details?: Readonly<Record<string, never>>;
+  }) {
     super(JSON.stringify({
       ok: false,
       error: {
         code: error.code,
         message: error.message,
         retryable: error.retryable,
+        details: error.details ?? {},
       },
     }));
     this.name = "SubagentToolError";
@@ -201,7 +207,10 @@ export function registerAgentTools(
       const agentId = readAgentId(params);
       return Promise.resolve(controller.getAgentStatus(agentId));
     }),
-    executeTool("get_agent_tree", provider, async (controller) => Promise.resolve(controller.getAgentTree())),
+    executeTool("get_agent_tree", provider, async (controller, params) => {
+      if (!isEmptyObject(params)) return controlFailure("invalid_argument");
+      return Promise.resolve(controller.getAgentTree());
+    }),
   ];
   for (const tool of tools) api.registerTool(tool);
   return AGENT_TOOL_NAMES;
@@ -210,4 +219,8 @@ export function registerAgentTools(
 function readAgentId(value: unknown): unknown {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   return (value as Record<string, unknown>).agent_id;
+}
+
+function isEmptyObject(value: unknown): value is Readonly<Record<string, never>> {
+  return typeof value === "object" && value !== null && !Array.isArray(value) && Object.keys(value).length === 0;
 }

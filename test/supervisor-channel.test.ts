@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   SUPERVISOR_CHANNEL_LIMITS,
   SupervisorFrameDecoder,
+  FakeSupervisorChannel,
   SupervisorProtocolError,
   SupervisorRequestIdRegistry,
   decodeSupervisorFrame,
@@ -46,6 +47,12 @@ function handshake(
   pair.flush();
   assert.equal(pair.parent.getPublicState().state, "ready");
   assert.equal(pair.child.getPublicState().state, "ready");
+}
+
+function assertProtocolError(action: () => unknown, code: SupervisorProtocolError["code"]): void {
+  assert.throws(action, (error: unknown) => {
+    return error instanceof SupervisorProtocolError && error.code === code;
+  });
 }
 
 test("长度边界 UTF-8 JSON 可处理分块与拼接帧，拒绝截断/损坏载荷", () => {
@@ -294,6 +301,307 @@ test("回复注入未成功时不发送 reply ACK，也不把通道裁决为协�
   assert.equal(pair.child.getPublicState().pending_reply_count, 1);
 });
 
+test("内部控制请求与响应沿现有序号和 ACK 合法往返", () => {
+  const pair = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+  });
+  handshake(pair);
+  pair.child.sendSnapshot([
+    node(CHILD_ID, null, 1),
+    node(GRANDCHILD_ID, CHILD_ID, 2),
+  ], 2);
+  pair.flush();
+
+  const mutableBody = { template_id: "researcher", options: { subagents: "inherit" } };
+  const mutableRoute = [CHILD_ID, GRANDCHILD_ID];
+  const request = pair.child.publishControlRequest({
+    operation_id: "operation_roundtrip_1",
+    operation: "reserve_child",
+    route: mutableRoute,
+    body: mutableBody,
+  });
+  mutableBody.template_id = "不得改写已发布帧";
+  mutableRoute[1] = SIBLING_ID;
+  assert.equal(request.kind, "control_request");
+  assert.equal("request_id" in request, false);
+  assert.deepEqual(Object.keys(request.payload).sort(), ["body", "operation", "operation_id", "route"]);
+  assert.equal((request.payload.body as { template_id: string }).template_id, "researcher");
+  assert.deepEqual(request.payload.route, [CHILD_ID, GRANDCHILD_ID]);
+
+  pair.child.send(request);
+  const acceptedRequest = pair.child.deliverNext();
+  assert.equal(acceptedRequest?.kind, "accepted");
+  if (acceptedRequest?.kind !== "accepted") return;
+  assert.deepEqual(acceptedRequest.control_request, {
+    operation_id: "operation_roundtrip_1",
+    operation: "reserve_child",
+    route: [CHILD_ID, GRANDCHILD_ID],
+    body: { template_id: "researcher", options: { subagents: "inherit" } },
+  });
+  assert.equal(Object.isFrozen(acceptedRequest.control_request), true);
+  assert.deepEqual(acceptedRequest.outbound.map((frame) => frame.kind), ["ack"]);
+  pair.parent.deliverNext();
+
+  const response = pair.parent.publishControlResponse({
+    operation_id: "operation_roundtrip_1",
+    ok: true,
+    data: { agent_id: GRANDCHILD_ID, reserved: true },
+  });
+  assert.equal(response.kind, "control_response");
+  assert.equal("request_id" in response, false);
+  assert.deepEqual(Object.keys(response.payload).sort(), ["data", "ok", "operation_id"]);
+  pair.parent.send(response);
+  const acceptedResponse = pair.parent.deliverNext();
+  assert.equal(acceptedResponse?.kind, "accepted");
+  if (acceptedResponse?.kind !== "accepted") return;
+  assert.deepEqual(acceptedResponse.control_response, {
+    operation_id: "operation_roundtrip_1",
+    ok: true,
+    data: { agent_id: GRANDCHILD_ID, reserved: true },
+  });
+  assert.equal(Object.isFrozen(acceptedResponse.control_response), true);
+  assert.deepEqual(acceptedResponse.outbound.map((frame) => frame.kind), ["ack"]);
+});
+
+test("控制请求拒绝空 route、非规范身份和跨分支伪造", () => {
+  const pair = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+  });
+  handshake(pair);
+  pair.child.sendSnapshot([
+    node(CHILD_ID, null, 1),
+    node(GRANDCHILD_ID, CHILD_ID, 2),
+    node(SIBLING_ID, CHILD_ID, 2),
+  ], 2);
+  pair.flush();
+
+  const request = (route: readonly string[]) => ({
+    operation_id: "operation_route_1",
+    operation: "admit_control" as const,
+    route,
+    body: {},
+  });
+  assertProtocolError(() => pair.child.publishControlRequest(request([])), "invalid_frame");
+  assertProtocolError(
+    () => pair.child.publishControlRequest(request([CHILD_ID, "NOT-A-CANONICAL-UUID"])),
+    "invalid_frame",
+  );
+  assertProtocolError(
+    () => pair.child.publishControlRequest(request(Array.from(
+      { length: SUPERVISOR_CHANNEL_LIMITS.maxDepth + 1 },
+      () => CHILD_ID,
+    ))),
+    "invalid_frame",
+  );
+  assertProtocolError(() => pair.child.publishControlRequest(request([SIBLING_ID])), "identity_mismatch");
+  assertProtocolError(
+    () => pair.child.publishControlRequest(request([CHILD_ID, GRANDCHILD_ID, SIBLING_ID])),
+    "identity_mismatch",
+  );
+
+  const valid = pair.child.publishControlRequest(request([CHILD_ID, GRANDCHILD_ID]));
+  const forged = {
+    ...valid,
+    payload: { ...valid.payload, route: [SIBLING_ID] },
+  } as SupervisorFrame;
+  assert.deepEqual(pair.parent.receive(forged), { kind: "protocol_fault", error: "identity_mismatch" });
+});
+
+test("两类控制帧拒绝额外字段、敏感字段和监督 request_id", () => {
+  const pair = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+  });
+  handshake(pair);
+  const baseRequest = {
+    operation_id: "operation_fields_1",
+    operation: "resolve_template" as const,
+    route: [CHILD_ID],
+    body: { template_id: "researcher" },
+  };
+  assertProtocolError(
+    () => pair.child.publishControlRequest({ ...baseRequest, operation: "spawn_agent" } as never),
+    "invalid_frame",
+  );
+  assertProtocolError(
+    () => pair.child.publishControlRequest({ ...baseRequest, credential: "secret-canary" } as never),
+    "invalid_frame",
+  );
+  for (const field of ["systemPrompt", "reply", "file_path", "environment", "rpc_endpoint", "credential", "request_id"]) {
+    assertProtocolError(
+      () => pair.child.publishControlRequest({ ...baseRequest, body: { nested: { [field]: "secret-canary" } } }),
+      "invalid_frame",
+    );
+  }
+  assertProtocolError(() => pair.parent.publishControlResponse({
+    operation_id: "operation_fields_1",
+    ok: true,
+    data: {},
+    route: [CHILD_ID],
+  } as never), "invalid_frame");
+  assertProtocolError(() => pair.parent.publishControlResponse({
+    operation_id: "operation_fields_1",
+    ok: true,
+    data: { runtime: { endpoint: "pipe://secret-canary" } },
+  }), "invalid_frame");
+
+  const valid = pair.child.publishControlRequest(baseRequest);
+  const extraPayload = {
+    ...valid,
+    payload: { ...valid.payload, prompt: "secret-canary" },
+  } as SupervisorFrame;
+  assert.deepEqual(pair.parent.receive(extraPayload), { kind: "protocol_fault", error: "invalid_frame" });
+
+  const requestIdPair = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+  });
+  handshake(requestIdPair);
+  const control = requestIdPair.child.publishControlRequest(baseRequest);
+  const withRequestId = { ...control, request_id: "req_must_not_be_reused" } as SupervisorFrame;
+  assert.deepEqual(requestIdPair.parent.receive(withRequestId), { kind: "protocol_fault", error: "invalid_frame" });
+});
+
+test("控制响应严格校验公开错误码和固定失败外壳", () => {
+  const pair = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+  });
+  handshake(pair);
+  const validError = {
+    code: "agent_unavailable",
+    message: "代理当前不可用",
+    retryable: false,
+    details: {},
+  } as const;
+  const invalidResponses: readonly unknown[] = [
+    {
+      operation_id: "operation_error_1",
+      ok: false,
+      error: { ...validError, code: "private_exception" },
+    },
+    {
+      operation_id: "operation_error_1",
+      ok: false,
+      error: { code: "agent_unavailable", message: "代理当前不可用", retryable: false },
+    },
+    {
+      operation_id: "operation_error_1",
+      ok: false,
+      error: { ...validError, details: { reason: "secret-canary" } },
+    },
+    {
+      operation_id: "operation_error_1",
+      ok: false,
+      error: { ...validError, stack: "secret-canary" },
+    },
+    {
+      operation_id: "operation_error_1",
+      ok: false,
+      error: validError,
+      data: {},
+    },
+    {
+      operation_id: "operation_error_1",
+      ok: true,
+      data: {},
+      error: validError,
+    },
+    {
+      operation_id: "operation_error_1",
+      ok: false,
+      error: "agent_unavailable",
+    },
+  ];
+  for (const response of invalidResponses) {
+    assertProtocolError(() => pair.parent.publishControlResponse(response as never), "invalid_frame");
+  }
+
+  const failure = pair.parent.publishControlResponse({
+    operation_id: "operation_error_1",
+    ok: false,
+    error: validError,
+  });
+  const accepted = pair.child.receive(failure);
+  assert.equal(accepted.kind, "accepted");
+  if (accepted.kind === "accepted") {
+    assert.deepEqual(accepted.control_response, {
+      operation_id: "operation_error_1",
+      ok: false,
+      error: validError,
+    });
+  }
+
+  const nextFailure = pair.parent.publishControlResponse({
+    operation_id: "operation_error_2",
+    ok: false,
+    error: validError,
+  });
+  const forged = {
+    ...nextFailure,
+    payload: {
+      ...nextFailure.payload,
+      error: { ...(nextFailure.payload.error as Record<string, unknown>), stack: "secret-canary" },
+    },
+  } as SupervisorFrame;
+  assert.deepEqual(pair.child.receive(forged), { kind: "protocol_fault", error: "invalid_frame" });
+});
+
+test("控制正文遵守字符串、条目、深度、帧大小和纯 JSON 边界", () => {
+  const pair = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+  });
+  handshake(pair);
+  const request = (body: unknown) => ({
+    operation_id: "operation_bounds_1",
+    operation: "confirm_resources" as const,
+    route: [CHILD_ID],
+    body: body as never,
+  });
+
+  const boundary = pair.child.publishControlRequest(request("x".repeat(SUPERVISOR_CHANNEL_LIMITS.maxStringBytes)));
+  assert.equal(boundary.kind, "control_request");
+  assertProtocolError(
+    () => pair.child.publishControlRequest(request("x".repeat(SUPERVISOR_CHANNEL_LIMITS.maxStringBytes + 1))),
+    "frame_too_large",
+  );
+  assertProtocolError(
+    () => pair.child.publishControlRequest(request(Array.from(
+      { length: SUPERVISOR_CHANNEL_LIMITS.maxJsonEntries + 1 },
+      () => null,
+    ))),
+    "frame_too_large",
+  );
+
+  let tooDeep: unknown = null;
+  for (let depth = 0; depth <= SUPERVISOR_CHANNEL_LIMITS.maxJsonDepth; depth += 1) tooDeep = [tooDeep];
+  assertProtocolError(() => pair.child.publishControlRequest(request(tooDeep)), "invalid_frame");
+  assertProtocolError(() => pair.child.publishControlRequest(request(Number.NaN)), "invalid_frame");
+  assertProtocolError(() => pair.child.publishControlRequest(request(new Date())), "invalid_frame");
+  const cyclic: Record<string, unknown> = {};
+  cyclic.self = cyclic;
+  assertProtocolError(() => pair.child.publishControlRequest(request(cyclic)), "invalid_frame");
+  assertProtocolError(() => pair.child.publishControlRequest(request(new Array(1))), "invalid_frame");
+
+  const padding = "x".repeat(SUPERVISOR_CHANNEL_LIMITS.maxStringBytes);
+  const oversizedFrame = pair.child.publishControlRequest(request({
+    one: padding,
+    two: padding,
+    three: padding,
+    four: padding,
+  }));
+  assertProtocolError(() => pair.child.encode(oversizedFrame), "frame_too_large");
+});
+
 test("有限重连使用新流，首快照确认后重放未确认回复且丢弃旧流", () => {
   const replies: string[] = [];
   const pair = createFakeSupervisorChannelPair({
@@ -389,6 +697,64 @@ test("生命周期 event 只携带安全事实，并可由父监督器递交给�
     payload: { ...unsafe.payload, prompt: "secret-canary" },
   } as SupervisorFrame;
   assert.deepEqual(pair.parent.receive(injected), { kind: "protocol_fault", error: "invalid_frame" });
+});
+
+test("直接子通道伪造兄弟生命周期事件时父端进入身份故障且不改快照", () => {
+  const pair = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+  });
+  handshake(pair);
+  const before = pair.parent.getTreeSnapshot();
+  const valid = pair.child.publishEvent({ type: "agent_settled", expected_generation: 0 });
+  const forged = {
+    ...valid,
+    payload: { ...valid.payload, agent_id: SIBLING_ID },
+  } as SupervisorFrame;
+  assert.deepEqual(pair.parent.receive(forged), { kind: "protocol_fault", error: "identity_mismatch" });
+  assert.equal(pair.parent.getPublicState().state, "faulted");
+  assert.deepEqual(pair.parent.getTreeSnapshot(), before);
+});
+
+test("EOF 后未在重同步期限内完成完整快照会固定为协议故障", async () => {
+  const faults: string[] = [];
+  const requestIds = new SupervisorRequestIdRegistry();
+  const parent = new FakeSupervisorChannel({
+    role: "parent",
+    rootId: ROOT_ID,
+    localAgentId: null,
+    peerAgentId: CHILD_ID,
+    parentAgentId: null,
+    depth: 1,
+    credential: CREDENTIAL,
+    requestIdRegistry: requestIds,
+    resyncTimeoutMs: 10,
+    onProtocolFault: () => faults.push("protocol_fault"),
+  });
+  const child = new FakeSupervisorChannel({
+    role: "child",
+    rootId: ROOT_ID,
+    localAgentId: CHILD_ID,
+    peerAgentId: "",
+    parentAgentId: null,
+    depth: 1,
+    credential: CREDENTIAL,
+    requestIdRegistry: requestIds,
+  });
+  parent.connect(child);
+  child.connect(parent);
+  child.sendHello();
+  child.flush();
+  child.sendSnapshot([node(CHILD_ID, null, 1)], 1);
+  child.flush();
+  assert.equal(parent.getPublicState().state, "ready");
+
+  assert.equal(parent.injectEof().kind, "eof");
+  assert.equal(parent.getPublicState().state, "resyncing");
+  await new Promise<void>((resolve) => setTimeout(resolve, 30));
+  assert.equal(parent.getPublicState().state, "faulted");
+  assert.deepEqual(faults, ["protocol_fault"]);
 });
 
 test("EOF、损坏载荷、终止屏障和旧流不会伪造健康状态；公开状态无秘密字段", () => {

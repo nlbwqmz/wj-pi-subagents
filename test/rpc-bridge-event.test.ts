@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { normalizeRpcBridgeEvent } from "../src/rpc-bridge-event.ts";
+import {
+  normalizeAssistantMessageEnd,
+  normalizeRpcBridgeEvent,
+} from "../src/rpc-bridge-event.ts";
 
-test("桥接事件只公开文本和图片，明确丢弃合法 thinking 与 toolCall 内容", () => {
-  const result = normalizeRpcBridgeEvent({
+test("真正 child 回复端点只公开文本和图片，明确丢弃合法 thinking 与 toolCall 内容", () => {
+  const result = normalizeAssistantMessageEnd({
     type: "message_end",
     message: {
       role: "assistant",
@@ -32,7 +35,7 @@ test("桥接事件只公开文本和图片，明确丢弃合法 thinking 与 too
   });
 });
 
-test("桥接事件区分无关顶层事件与已知事件中的未知内容块", () => {
+test("任务桥接忽略全部 message_end，真正 child 回复端点仍拒绝未知内容块", () => {
   assert.deepEqual(normalizeRpcBridgeEvent({ type: "message_update", delta: "忽略" }), {
     kind: "ignored",
   });
@@ -43,9 +46,18 @@ test("桥接事件区分无关顶层事件与已知事件中的未知内容块",
       content: [{ type: "future_secret_block", secret: "不得静默丢弃" }],
     },
   }), {
+    kind: "ignored",
+  });
+  assert.deepEqual(normalizeAssistantMessageEnd({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "future_secret_block", secret: "不得静默丢弃" }],
+    },
+  }), {
     kind: "invalid",
   });
-  assert.deepEqual(normalizeRpcBridgeEvent({
+  assert.deepEqual(normalizeAssistantMessageEnd({
     type: "message_end",
     message: { role: "assistant", content: [{ type: "text", text: 42 }] },
   }), {
@@ -53,8 +65,8 @@ test("桥接事件区分无关顶层事件与已知事件中的未知内容块",
   });
 });
 
-test("非 assistant 的 message_end 是 Pi 正常事件，不作为直接回复或协议故障", () => {
-  assert.deepEqual(normalizeRpcBridgeEvent({
+test("真正 child 端忽略非 assistant 的 message_end，不把它当成直接回复或协议故障", () => {
+  assert.deepEqual(normalizeAssistantMessageEnd({
     type: "message_end",
     message: { role: "toolResult", content: [{ type: "text", text: "工具结果" }] },
   }), {

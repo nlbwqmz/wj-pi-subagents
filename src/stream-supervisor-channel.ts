@@ -3,10 +3,13 @@ import {
   SupervisorChannel,
   SupervisorFrameDecoder,
   type SupervisorChannelOptions,
+  type SupervisorControlRequest,
+  type SupervisorControlResponse,
   type SupervisorFrame,
   type SupervisorEvent,
   type SupervisorReceiveResult,
   type SupervisorReply,
+  type SupervisorSnapshot,
   type SupervisorChannelPublicState,
 } from "./supervisor-channel.ts";
 import type {
@@ -14,6 +17,13 @@ import type {
   RpcSupervisorChannelCloseState,
   RpcSupervisorChannelFault,
 } from "./rpc-supervisor.ts";
+import {
+  createDeferred,
+  notifySupervisorListeners,
+  raceSupervisorAbort,
+  supervisorAbortError,
+  waitForSupervisorSignal,
+} from "./supervisor-channel-async.ts";
 
 export interface SupervisorByteTransport {
   readonly stdin: Writable;
@@ -27,32 +37,9 @@ export interface StreamSupervisorChannelOptions extends SupervisorChannelOptions
   readonly initialSubtreeRevision?: number;
   /** 父端收到已经通过协议校验的生命周期事实。 */
   readonly onEvent?: (event: SupervisorEvent) => void;
-}
-
-interface Deferred<T> {
-  readonly promise: Promise<T>;
-  resolve(value: T): void;
-  reject(error: Error): void;
-  settled(): boolean;
-}
-
-function deferred<T>(): Deferred<T> {
-  let resolvePromise!: (value: T) => void;
-  let rejectPromise!: (reason: Error) => void;
-  let done = false;
-  const promise = new Promise<T>((resolve, reject) => {
-    resolvePromise = (value) => {
-      if (done) return;
-      done = true;
-      resolve(value);
-    };
-    rejectPromise = (reason) => {
-      if (done) return;
-      done = true;
-      reject(reason);
-    };
-  });
-  return { promise, resolve: resolvePromise, reject: rejectPromise, settled: () => done };
+  readonly onSnapshot?: (snapshot: SupervisorSnapshot) => void;
+  /** child 收到 close 后执行后代优先清理；只有 true 才关闭本地字节流。 */
+  readonly onCloseRequested?: () => boolean | Promise<boolean>;
 }
 
 /**
@@ -65,16 +52,21 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
   private readonly decoder: SupervisorFrameDecoder;
   private readonly initialSnapshot: readonly unknown[];
   private readonly initialSubtreeRevision: number | undefined;
-  private readonly ready = deferred<void>();
-  private readonly closed = deferred<void>();
+  private readonly onCloseRequested: (() => boolean | Promise<boolean>) | undefined;
+  private readonly ready = createDeferred<void>();
+  private readonly closed = createDeferred<void>();
   private readonly faults = new Set<(fault: RpcSupervisorChannelFault) => void>();
   private readonly eventListeners = new Set<(event: SupervisorEvent) => void>();
+  private readonly snapshotListeners = new Set<(snapshot: SupervisorSnapshot) => void>();
+  private readonly controlRequestListeners = new Set<(request: SupervisorControlRequest) => void>();
+  private readonly controlResponseListeners = new Set<(response: SupervisorControlResponse) => void>();
   private writeQueue: Promise<void> = Promise.resolve();
   private bound = false;
   private snapshotSent = false;
   private released = false;
   private faultNotified = false;
   private endpointClosed = false;
+  private closeHandling: Promise<void> | undefined;
 
   constructor(options: StreamSupervisorChannelOptions) {
     this.transport = options.transport;
@@ -90,11 +82,15 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
       ...(options.limits === undefined ? {} : { limits: options.limits }),
       ...(options.streamIdFactory === undefined ? {} : { streamIdFactory: options.streamIdFactory }),
       ...(options.onReply === undefined ? {} : { onReply: options.onReply }),
+      ...(options.resyncTimeoutMs === undefined ? {} : { resyncTimeoutMs: options.resyncTimeoutMs }),
+      onProtocolFault: () => this.fail("protocol_fault"),
     });
     this.decoder = new SupervisorFrameDecoder(options.limits);
     this.initialSnapshot = Object.freeze([...(options.initialSnapshot ?? [])]);
     this.initialSubtreeRevision = options.initialSubtreeRevision;
+    this.onCloseRequested = options.onCloseRequested;
     if (options.onEvent !== undefined) this.eventListeners.add(options.onEvent);
+    if (options.onSnapshot !== undefined) this.snapshotListeners.add(options.onSnapshot);
     this.transport.stdout.on("data", (chunk: Uint8Array | string) => {
       try {
         const bytes = typeof chunk === "string" ? new TextEncoder().encode(chunk) : new Uint8Array(chunk);
@@ -113,7 +109,7 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
   async bind(signal: AbortSignal): Promise<void> {
     if (this.bound) return;
     this.bound = true;
-    if (signal.aborted) throw abortError();
+    if (signal.aborted) throw supervisorAbortError();
     if (this.protocol.role === "child") {
       await this.send(this.protocol.startHandshake());
     }
@@ -121,8 +117,8 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
 
   async waitForReady(signal: AbortSignal): Promise<void> {
     if (this.isReady()) return;
-    if (signal.aborted) throw abortError();
-    await raceAbort(this.ready.promise, signal);
+    if (signal.aborted) throw supervisorAbortError();
+    await raceSupervisorAbort(this.ready.promise, signal);
   }
 
   isReady(): boolean {
@@ -140,12 +136,25 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     await this.send(this.protocol.publishEvent(event));
   }
 
+  /** child 端发布新的完整子树；修订和正文边界仍由协议状态机校验。 */
+  async publishSnapshot(nodes: readonly unknown[], subtreeRevision: number): Promise<void> {
+    await this.send(this.protocol.publishSnapshot(nodes, subtreeRevision));
+  }
+
+  async publishControlRequest(request: SupervisorControlRequest): Promise<void> {
+    await this.send(this.protocol.publishControlRequest(request));
+  }
+
+  async publishControlResponse(response: SupervisorControlResponse): Promise<void> {
+    await this.send(this.protocol.publishControlResponse(response));
+  }
+
   establishTerminationBarrier(): void {
     this.protocol.establishTerminationBarrier();
   }
 
   async requestClose(signal: AbortSignal): Promise<void> {
-    if (signal.aborted) throw abortError();
+    if (signal.aborted) throw supervisorAbortError();
     try {
       await this.send(this.protocol.createCloseFrame());
     } catch {
@@ -158,10 +167,7 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     const end = deadline instanceof Date ? deadline.getTime() : deadline;
     const remaining = Math.max(0, end - Date.now());
     if (!this.closed.settled() && remaining > 0) {
-      await Promise.race([
-        this.closed.promise,
-        new Promise<void>((resolve) => setTimeout(resolve, remaining)),
-      ]);
+      await waitForSupervisorSignal(this.closed.promise, remaining);
     }
     return this.endpointClosed ? "released" : "present";
   }
@@ -188,6 +194,27 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     return () => this.eventListeners.delete(listener);
   }
 
+  onSnapshot(listener: (snapshot: SupervisorSnapshot) => void): () => void {
+    this.snapshotListeners.add(listener);
+    return () => this.snapshotListeners.delete(listener);
+  }
+
+  onControlRequest(listener: (request: SupervisorControlRequest) => void): () => void {
+    this.controlRequestListeners.add(listener);
+    return () => this.controlRequestListeners.delete(listener);
+  }
+
+  onControlResponse(listener: (response: SupervisorControlResponse) => void): () => void {
+    this.controlResponseListeners.add(listener);
+    return () => this.controlResponseListeners.delete(listener);
+  }
+
+  /** 路由相关性或 operation_id 复用违约时固定为监督协议故障。 */
+  failProtocol(): void {
+    this.protocol.markProtocolFault();
+    this.fail("protocol_fault");
+  }
+
   /** 只读协议状态用于测试/诊断，不暴露凭据或端点。 */
   getPublicState(): SupervisorChannelPublicState {
     return this.protocol.getPublicState();
@@ -207,6 +234,24 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
           // 观察者异常不能改变协议状态或破坏后续帧读取。
         }
       }
+    }
+    if (result.kind === "accepted" && result.snapshot !== undefined) {
+      for (const listener of this.snapshotListeners) {
+        try {
+          listener(result.snapshot);
+        } catch {
+          // 快照观察者异常不能回滚协议已接受的原子替换。
+        }
+      }
+    }
+    if (result.kind === "accepted" && result.control_request !== undefined) {
+      notifySupervisorListeners(this.controlRequestListeners, result.control_request);
+    }
+    if (result.kind === "accepted" && result.control_response !== undefined) {
+      notifySupervisorListeners(this.controlResponseListeners, result.control_response);
+    }
+    if (result.kind === "accepted" && result.close_requested === true) {
+      this.handleCloseRequested();
     }
     if (result.kind === "accepted" || result.kind === "duplicate" || result.kind === "gap") {
       const sends: Promise<void>[] = [];
@@ -272,6 +317,19 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     this.fail("eof");
   }
 
+  private handleCloseRequested(): void {
+    if (this.closeHandling !== undefined || this.onCloseRequested === undefined) return;
+    const operation = Promise.resolve()
+      .then(() => this.onCloseRequested?.() ?? false)
+      .then(async (complete) => {
+        if (complete === true) await this.release();
+      })
+      .catch(() => {
+        // 未确认清理时保持传输存在，由父端内部期限和平台树回收继续裁决。
+      });
+    this.closeHandling = operation;
+  }
+
   private fail(fault: RpcSupervisorChannelFault): void {
     if (this.released) return;
     if (this.faultNotified) return;
@@ -286,38 +344,4 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
       }
     }
   }
-}
-
-function abortError(): Error {
-  const error = new Error("监督通道阶段已取消");
-  error.name = "AbortError";
-  return error;
-}
-
-async function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) throw abortError();
-  return new Promise<T>((resolve, reject) => {
-    let settled = false;
-    const onAbort = (): void => {
-      if (settled) return;
-      settled = true;
-      signal.removeEventListener("abort", onAbort);
-      reject(abortError());
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-    void promise.then(
-      (value) => {
-        if (settled) return;
-        settled = true;
-        signal.removeEventListener("abort", onAbort);
-        resolve(value);
-      },
-      (error: unknown) => {
-        if (settled) return;
-        settled = true;
-        signal.removeEventListener("abort", onAbort);
-        reject(error instanceof Error ? error : new Error("监督通道不可用"));
-      },
-    );
-  });
 }

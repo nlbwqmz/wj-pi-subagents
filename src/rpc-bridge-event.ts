@@ -6,20 +6,21 @@ export type SafeRpcBridgeEvent =
       readonly toolCallId: string;
       readonly toolName: string;
     }
-  | {
-      readonly type: "message_end";
-      readonly message: {
-        readonly role: "assistant";
-        readonly content: readonly (
-          | { readonly type: "text"; readonly text: string }
-          | { readonly type: "image"; readonly data: string; readonly mimeType: string }
-        )[];
-      };
-    }
   | { readonly type: "extension_error" };
 
+export interface SafeAssistantMessageEndEvent {
+  readonly type: "message_end";
+  readonly message: {
+    readonly role: "assistant";
+    readonly content: readonly (
+      | { readonly type: "text"; readonly text: string }
+      | { readonly type: "image"; readonly data: string; readonly mimeType: string }
+    )[];
+  };
+}
+
 export type RpcBridgeEventNormalization =
-  | { readonly kind: "event"; readonly event: SafeRpcBridgeEvent }
+  | { readonly kind: "event"; readonly event: SafeRpcBridgeEvent | SafeAssistantMessageEndEvent }
   | { readonly kind: "ignored" }
   | { readonly kind: "invalid" };
 
@@ -52,7 +53,8 @@ export function normalizeRpcBridgeEvent(event: unknown): RpcBridgeEventNormaliza
         toolName: event.toolName,
       }));
     case "message_end":
-      return normalizeMessageEnd(event);
+      // 最终回复由真正 child 扩展经独立监督通道上行，任务 RPC 不再复制正文。
+      return IGNORED_EVENT;
     case "extension_error":
       return safeEvent(Object.freeze({ type: "extension_error" }));
     default:
@@ -60,7 +62,9 @@ export function normalizeRpcBridgeEvent(event: unknown): RpcBridgeEventNormaliza
   }
 }
 
-function normalizeMessageEnd(event: Record<string, unknown>): RpcBridgeEventNormalization {
+/** child 扩展把最终 assistant 消息收窄为可进入监督 reply 的安全内容。 */
+export function normalizeAssistantMessageEnd(event: unknown): RpcBridgeEventNormalization {
+  if (!isRecord(event) || event.type !== "message_end") return INVALID_EVENT;
   if (!isRecord(event.message)) return INVALID_EVENT;
   // Pi 会为 user、toolResult 等角色发布同名事件，它们不属于直接回复。
   if (event.message.role !== "assistant") return IGNORED_EVENT;
@@ -110,7 +114,9 @@ function normalizeMessageEnd(event: Record<string, unknown>): RpcBridgeEventNorm
   }));
 }
 
-function safeEvent(event: SafeRpcBridgeEvent): RpcBridgeEventNormalization {
+function safeEvent(
+  event: SafeRpcBridgeEvent | SafeAssistantMessageEndEvent,
+): RpcBridgeEventNormalization {
   return Object.freeze({ kind: "event", event });
 }
 
