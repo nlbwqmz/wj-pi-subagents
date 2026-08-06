@@ -51,7 +51,7 @@ Blocked by: none
 
 参数必须包含直接子代理 `agent_id` 和非空文本，可选图片沿用 Pi `ImageContent`：`data` 是不带 `data:` 前缀的原始 Base64，`mimeType` 单独传递。扩展负责长度、Base64 和 MIME 校验。
 
-控制器向子代理发送单条 RPC `prompt`，固定使用 `streamingBehavior: "steer"`：空闲节点开始处理，繁忙节点引导当前处理。消息被 RPC 接受或进入 steering 队列后立即成功，不等待任务完成，也不区分 `started`/`steered`。
+控制器在该节点的命令顺序域内读取已确认生命周期状态后选择公开 RPC 命令：空闲节点发送 `prompt` 开始处理，工作中或中断中的节点发送 `steer` 引导当前处理。状态观察、命令入队和生命周期代际必须由同一顺序域线性化；状态在写入或接受前发生变化且无法证明消息已接受时返回 `message_delivery_failed`，不得自动重发。消息被对应 RPC 接受或进入 steering 队列后立即成功，不等待任务完成，也不区分 `started`/`steered`。该路由不宣称具备底层 `prompt + streamingBehavior: "steer"` 的原子语义。
 
 成功结果为：
 

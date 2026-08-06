@@ -269,8 +269,8 @@ export class AgentController {
     const messageId = this.allocateMessageId();
     let result: RpcSupervisorCommandResult;
     try {
-      // Pi 0.83.0 的公共 RpcClient 未暴露 prompt.streamingBehavior；本工单按
-      // Issue 24 冻结的空闲 prompt / 工作 steering 路由，避免访问私有 JSONL。
+      // Pi 0.83.0 的公共 RpcClient 未暴露 prompt.streamingBehavior；REQ-026
+      // 采用控制器已确认状态的空闲 prompt / 工作 steering 兼容路由，避免访问私有 JSONL。
       result = target.data.state === "idle"
         ? await entry.supervisor.prompt(input.message, input.images)
         : await entry.supervisor.steer(input.message, input.images);

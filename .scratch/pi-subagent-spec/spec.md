@@ -384,7 +384,9 @@ Pi `get_state` 只可用于启动同步、事件缺口后的异常重同步和�
 }
 ```
 
-实现必须校验文本、数量、长度、Base64 和 MIME。任务通道始终发送 Pi RPC `prompt` 并固定 `streamingBehavior: "steer"`：空闲节点启动处理，活动节点原子接受 steering。消息被 RPC 接受或进入 Pi steering 队列后立即成功：
+实现必须校验文本、数量、长度、Base64 和 MIME。任务通道在该节点的命令顺序域内读取控制器已确认的生命周期状态后，选择公开 Pi RPC 命令：`idle` 发送 `prompt` 以启动处理，`working` 或 `interrupting` 发送 `steer` 以引导当前处理。状态观察、命令入队和生命周期代际必须在同一顺序域线性化；不得在顺序域外自行读取状态后旁路写入 RPC transport。消息被对应 RPC 接受（`prompt` 开始处理或 `steer` 进入队列）后立即成功，不等待任务完成，也不区分 `started`/`steered`。
+
+该状态路由是 Pi `0.83.0` 公共 `RpcClient` 的兼容边界，不声称等价于底层 `prompt + streamingBehavior: "steer"` 的原子语义。若状态在控制器线性化后、RPC 写入或接受前发生变化，且无法证明消息已被接受，返回 `message_delivery_failed`；不得自动重发，以避免重复交付。
 
 ```json
 { "ok": true, "data": { "message_id": "msg_...", "accepted": true } }

@@ -12,7 +12,7 @@ Blocked by: none
 
 Pi 原生足以承载单个长期、无会话持久化的 RPC 子代理进程，并直接提供 prompt/steering、abort、状态、队列、完整事件流、动态工具与扩展/TUI 生命周期 API；但 Pi 没有父子代理、深度预算或跨进程代理树领域对象。
 
-统一 `send_message` 在线协议上宜始终发送 `prompt` 并携带 `streamingBehavior: "steer"`：空闲时正常启动，繁忙时原子进入 steering 队列。直接在空闲状态调用原生 `steer` 只会入队，不会启动运行。
+Pi 底层协议支持用 `prompt + streamingBehavior: "steer"` 原子覆盖空闲启动和繁忙 steering；但 `0.83.0` 公共 `RpcClient.prompt()` 没有暴露该字段。当前扩展因此采用兼容决策：控制器在单节点顺序域内读取已确认状态，空闲使用 `prompt`，工作中或中断中使用 `steer`；无法确认交付时不自动重发。直接在空闲状态调用原生 `steer` 只会入队，不会启动运行。
 
 扩展必须自行实现节点注册表、逐节点 RPC 串行化、深度与直接父子授权、树状态上报/汇聚、根只读投影和进程 supervisor。两项原生缺口尤其影响契约：`abort` 不清已排队消息且 RPC 没有 `clear_queue`；Windows 的整树终止 helper 未公开，公开 `RpcClient.stop()` 只处理直接子进程。
 

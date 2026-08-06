@@ -14,7 +14,7 @@ Status: ready-for-human
 - [x] 单节点 prompt、steering、abort、优雅关闭和强制清理共用一个状态变更顺序域；终止屏障最高优先级，迟到响应按状态代际丢弃，同一节点之外允许并行。
 - [x] 注入 `FakeRpcClient`、资源替身和监督通道替身，确定性覆盖启动超时、提前退出、settle 竞态、EOF、非法事件和命令串行。（REQ-038..040；AC-012、AC-021）
 - [x] 将 `spawn_agent` 接入模板快照、能力/模型/配额预检和真实受管节点启动；只有监督握手、首个快照和 RPC 就绪后才返回 `idle` 与 canonical UUID，启动失败区分清理完整与不完整。（REQ-015..016、REQ-025；AC-009、AC-012）
-- [ ] 将 `send_message`、直接回复、`wait_agent` 和 `interrupt_agent` 接入同一节点顺序域：空闲 prompt、工作 steering、settled 边界、reply ACK/去重、未知交付不得重发，协作式中断保留节点和上下文。（REQ-026..028、REQ-036；AC-013、AC-014、AC-015、AC-020）
+- [x] 将 `send_message`、直接回复、`wait_agent` 和 `interrupt_agent` 接入同一节点顺序域：按已确认状态选择空闲 prompt/工作 steering、settled 边界、reply ACK/去重、未知交付不得重发，协作式中断保留节点和上下文。（REQ-026..028、REQ-036；AC-013、AC-014、AC-015、AC-020）
 - [ ] 在 Windows 完成受管节点的真实子进程/孙进程归属、启动回滚、双握手、直接父子六段旅程和无孤儿验证；macOS/Linux 只运行代码、类型、纯逻辑和 fake 测试，不把 Unix 原生测试列为本工单通过条件。
 
 ## 计划决策
@@ -36,3 +36,4 @@ Status: ready-for-human
 - 2026-08-06：最终验证为 `npm run typecheck` 通过；`npm test` 共 152 项，147 通过、5 项为当前 Windows 平台按条件跳过的 Unix 原生场景；`git diff --check` 无 whitespace error。Windows Job Object 的直接子进程、孙进程、启动回滚、优雅超时、强制整树回收和未确认资源测试均通过。
 - 2026-08-06：最后一项真实 Windows Pi 旅程未勾选。本仓库未安装 `@earendil-works/pi-coding-agent` peer，上游源码工作区 `D:\code\open-source\pi` 固定在 `a96fb984d8c8b065fc5d193309fc812a882adee0`，但没有可执行 `dist` 或可复用依赖，也没有可执行真实模型请求的认证环境；因此没有把 fake/native Job Object 证据冒充为真实桥接 + Pi RPC 子/孙进程、双握手及六段旅程。真实 Pi reload 跨 runtime 保树属于 Issue 25 / Issue 09，不在本工单完成声明内。
 - 2026-08-06：用户明确要求排除正式真实测试，因此本工单不执行本机 Pi/API key 的真实 bridge + RPC 子/孙进程六段旅程，也不新增依赖真实模型的自动化用例。该复选项继续保持未勾选；本次只以类型检查、fake/协议测试和既有 Windows Job Object 边界测试作为代码回归证据。
+- 2026-08-06：用户决定将 REQ-026 改为 Pi `0.83.0` 公共 API 可实现的状态路由：节点命令顺序域读取已确认状态，`idle` 使用 `prompt`，`working`/`interrupting` 使用 `steer`；写入或接受前状态竞态导致无法确认时返回 `message_delivery_failed` 且不自动重发。该决策不再要求底层单条 `prompt + streamingBehavior: "steer"` 原子语义，因此直接父子控制复选项已勾选；真实 Windows 旅程仍按用户要求未勾选。

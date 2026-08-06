@@ -13,7 +13,7 @@ Pi **没有**原生的“子代理”“父子所有权”“深度预算”或�
 | 能力 | 判定 | 规格含义 |
 | --- | --- | --- |
 | `pi --mode rpc --no-session` 长期进程 | 原生直接支持 | 会话仅驻留内存，进程持续读取 stdin，适合作为临时子代理运行时。 |
-| 空闲启动、繁忙纠偏的统一 `send_message` | 原生能力可组合实现 | 线协议宜始终使用 `prompt` 并携带 `streamingBehavior: "steer"`，无需先查状态。 |
+| 空闲启动、繁忙纠偏的统一 `send_message` | 底层协议原生支持，公共 `RpcClient` 有接口缺口 | 严格原子映射需要 `prompt + streamingBehavior: "steer"`；本项目按 REQ-026 采用控制器顺序域的已确认状态路由：空闲 `prompt`、工作中/中断中 `steer`。 |
 | `prompt`、`steer`、`abort` 与流式事件 | 原生直接支持，但有语义边界 | 接受响应不代表任务完成；完成应以 `agent_settled` 为准。 |
 | 强中断并保证节点保持空闲 | 存在缺口 | `abort` 不清空已经排队的 steering/follow-up，RPC 又没有 `clear_queue`。 |
 | 状态和队列观测 | 原生直接支持 | `get_state`、`queue_update`、agent/turn/message/tool 事件足以维护单节点状态机。 |
@@ -53,9 +53,9 @@ Pi 只提供“RPC 会话进程”，不会把它命名为子代理，也不维�
 
 ### 2. `send_message`、`prompt` 与 `steer`
 
-#### 推荐的原子映射
+#### 底层原子映射（参考能力）
 
-对外保留单一 `send_message` 是可行的，但线协议不应实现成“先 `get_state`，再按结果二选一发送 `prompt` 或 `steer`”。更稳妥的单命令形式是：
+对外保留单一 `send_message` 是可行的。Pi 底层协议支持不查状态的单命令形式：
 
 ```json
 {"id":"message-42","type":"prompt","message":"...","streamingBehavior":"steer"}
@@ -72,7 +72,7 @@ Pi 只提供“RPC 会话进程”，不会把它命名为子代理，也不维�
 
 原生 `steer` 命令只调用 `session.steer(...)`：[rpc-mode.ts](D:/code/open-source/pi/packages/coding-agent/src/modes/rpc/rpc-mode.ts:418)。`AgentSession.steer()` 无空闲检查，只把消息交给 `_queueSteer`：[agent-session.ts](D:/code/open-source/pi/packages/coding-agent/src/core/agent-session.ts:1334)，底层 `Agent.steer()` 也只是 enqueue：[agent.ts](D:/code/open-source/pi/packages/agent/src/agent.ts:282)。现有单元测试明确验证消息只是进入 steering queue、尚未出现在会话消息中：[agent.test.ts](D:/code/open-source/pi/packages/agent/test/agent.test.ts:481)。
 
-因此，对空闲节点直接发 `steer` 会成功入队，却不会主动开始一次运行；消息要等未来某个 prompt 才可能被消费。统一 `send_message` 应统一使用上述 `prompt + streamingBehavior: "steer"`，而不是统一使用 `steer` 命令。
+因此，对空闲节点直接发 `steer` 会成功入队，却不会主动开始一次运行；消息要等未来某个 prompt 才可能被消费。由于 Pi `0.83.0` 公共 `RpcClient` 没有暴露 `streamingBehavior`，本项目不调用私有 `send()` 或复制 JSONL，而采用以下兼容路由：控制器在单节点命令顺序域内读取已确认状态，空闲发送 `prompt`，工作中或中断中发送 `steer`；状态竞态导致无法确认接受时返回 `message_delivery_failed` 且不自动重发。这是扩展的明确兼容决策，不宣称等价于底层原子映射。
 
 #### 响应与完成不是一回事
 
@@ -240,7 +240,7 @@ Pi 内部确实实现了跨平台 `killProcessTree(pid)`。Windows 分支启动 
 ### 可以直接依赖的 Pi 契约
 
 1. 每个临时子代理可由一个 `pi --mode rpc --no-session` 进程承载，并在该进程存活期间连续保持上下文。
-2. `send_message` 可用单条 `prompt` + `streamingBehavior: "steer"` 原子实现空闲启动和繁忙 steering；不要使用“先查状态再选择命令”的两步路由，也不要在空闲时直接发 `steer`。
+2. `send_message` 在扩展的单节点命令顺序域内先读取已确认状态：空闲发送 `prompt`，工作中或中断中发送 `steer`；无法确认交付时不得自动重发。底层 `prompt + streamingBehavior: "steer"` 仍是 Pi 协议能力，但不是本项目对公共 `RpcClient` 的依赖要求。
 3. 命令 response 只表示接受；节点完整 settle 以 `agent_settled` 为准，并结合 `queue_update`、`get_state` 和 tool/message events 派生状态。
 4. `--no-extensions -e <受控扩展>` 可以让中间节点只加载指定递归能力；达到最大深度时可以条件注册或过滤掉整套管理工具。
 5. 根交互会话可以用现有 TUI widget/status/tool renderer 显示只读树视图。
