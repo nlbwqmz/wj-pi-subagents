@@ -493,7 +493,10 @@ export class TreeController {
         }
         break;
       case "steering_accepted":
-        if (record.state === "working" && record.pendingMessageCount > 0) {
+        if (
+          (record.state === "working" || record.state === "interrupting") &&
+          record.pendingMessageCount > 0
+        ) {
           applied = this.mutate(record, { pendingMessageCount: record.pendingMessageCount - 1 });
         }
         break;
