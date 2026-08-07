@@ -147,7 +147,6 @@ export interface ReserveStartingChildInput {
 
 export interface AgentTreeSnapshot {
   readonly tree_revision: number;
-  readonly observed_at: string;
   readonly nodes: readonly AgentSnapshot[];
 }
 
@@ -294,7 +293,6 @@ interface AgentRecord {
   state: AgentLifecycleState;
   pendingMessageCount: number;
   revision: number;
-  observedAt: string;
   lifecycleGeneration: number;
   createdAt: string | undefined;
   lifecycleStartedAt: number | undefined;
@@ -457,7 +455,6 @@ function sameSnapshot(
     && record.state === node.state
     && record.pendingMessageCount === node.pending_message_count
     && record.revision === node.revision
-    && record.observedAt === node.observed_at
     && record.createdAt === node.created_at
     && lifecycleMatches
     && JSON.stringify(record.activity) === JSON.stringify(node.activity)
@@ -466,7 +463,7 @@ function sameSnapshot(
   );
 }
 
-function safeObservedAt(now: () => Date): string {
+function safeWallClockNow(now: () => Date): string {
   try {
     const value = now();
     if (value instanceof Date && Number.isFinite(value.getTime())) return value.toISOString();
@@ -512,7 +509,6 @@ export class TreeController {
   private readonly subtreeRevisions = new Map<string, number>();
   private readonly changeListeners = new Set<() => void>();
   private treeRevision = 0;
-  private treeObservedAt = new Date(0).toISOString();
 
   constructor(options: TreeControllerOptions) {
     this.config = Object.freeze({
@@ -537,7 +533,7 @@ export class TreeController {
         || initialActor.depth > this.config.maxDepth
         || typeof initialActor.managementEnabled !== "boolean"
       ) throw new TypeError("子运行时身份无效");
-      const observedAt = safeObservedAt(this.now);
+      const createdAt = safeWallClockNow(this.now);
       const monotonicAt = this.safeMonotonicNow();
       this.agents.set(initialActor.agentId, {
         agentId: initialActor.agentId,
@@ -549,9 +545,8 @@ export class TreeController {
         state: "idle",
         pendingMessageCount: 0,
         revision: 1,
-        observedAt,
         lifecycleGeneration: 0,
-        createdAt: observedAt,
+        createdAt,
         lifecycleStartedAt: monotonicAt,
         frozenLifecycleElapsedMs: undefined,
         activity: undefined,
@@ -563,7 +558,6 @@ export class TreeController {
         scopeActorOnly: true,
       });
       this.issuedAgentIds.add(initialActor.agentId);
-      this.treeObservedAt = observedAt;
     }
   }
 
@@ -721,7 +715,6 @@ export class TreeController {
       state: "starting",
       pendingMessageCount: 0,
       revision: 1,
-      observedAt: safeObservedAt(this.now),
       lifecycleGeneration: 0,
       createdAt: undefined,
       lifecycleStartedAt: undefined,
@@ -739,7 +732,6 @@ export class TreeController {
     this.agents.set(agentId, record);
     this.issuedAgentIds.add(agentId);
     this.treeRevision += 1;
-    this.treeObservedAt = record.observedAt;
     this.notifyChange();
     return controlSuccess(this.outcome(record, true));
   }
@@ -788,7 +780,6 @@ export class TreeController {
       state: "starting",
       pendingMessageCount: node.pending_message_count,
       revision: node.revision,
-      observedAt: node.observed_at,
       lifecycleGeneration: input.lifecycle_generation,
       createdAt: undefined,
       lifecycleStartedAt: undefined,
@@ -804,7 +795,6 @@ export class TreeController {
     this.agents.set(record.agentId, record);
     this.issuedAgentIds.add(record.agentId);
     this.treeRevision += 1;
-    this.treeObservedAt = record.observedAt;
     this.notifyChange();
     return controlSuccess(this.outcome(record, true));
   }
@@ -989,7 +979,6 @@ export class TreeController {
     const monotonicAt = this.safeMonotonicNow();
     return controlSuccess(Object.freeze({
       tree_revision: this.treeRevision,
-      observed_at: this.treeObservedAt,
       nodes: Object.freeze(this.orderParentFirst(
         [...this.agents.values()].filter((record) => !record.scopeActorOnly),
       )
@@ -1105,7 +1094,6 @@ export class TreeController {
       ) return controlFailure("invalid_argument");
     }
 
-    const now = safeObservedAt(this.now);
     const monotonicAt = this.safeMonotonicNow();
     const changes: Array<{ readonly record: AgentRecord; readonly node: AgentSnapshot }> = [];
     const additions: AgentRecord[] = [];
@@ -1128,7 +1116,6 @@ export class TreeController {
           state: node.state,
           pendingMessageCount: node.pending_message_count,
           revision: node.revision,
-          observedAt: node.observed_at,
           lifecycleGeneration: 0,
           createdAt: node.created_at,
           lifecycleStartedAt: node.lifecycle_elapsed_ms === undefined
@@ -1169,11 +1156,10 @@ export class TreeController {
       this.agents.set(record.agentId, record);
       this.issuedAgentIds.add(record.agentId);
     }
-    for (const change of changes) this.applySnapshotToRecord(change.record, change.node, now, monotonicAt);
+    for (const change of changes) this.applySnapshotToRecord(change.record, change.node, monotonicAt);
     this.subtreeRevisions.set(scope.agentId, input.subtree_revision);
     if (additions.length > 0 || changes.length > 0) {
       this.treeRevision += 1;
-      this.treeObservedAt = now;
       this.notifyChange();
     }
     return controlSuccess(Object.freeze({
@@ -1226,14 +1212,12 @@ export class TreeController {
   private applySnapshotToRecord(
     record: AgentRecord,
     node: AgentSnapshot,
-    observedAt: string,
     monotonicAt: number,
   ): void {
     const stateChanged = record.state !== node.state;
     record.state = node.state;
     record.pendingMessageCount = node.pending_message_count;
     record.revision = node.revision;
-    record.observedAt = node.observed_at || observedAt;
     record.createdAt = node.created_at;
     record.activity = node.activity === undefined ? undefined : Object.freeze({ ...node.activity });
     record.activityCounts = node.activity === undefined
@@ -1287,7 +1271,6 @@ export class TreeController {
         ? { kind: "root" as const }
         : { kind: "subtree" as const, agent_id: scope.agentId }),
       tree_revision: this.treeRevision,
-      observed_at: this.treeObservedAt,
       nodes: Object.freeze(nodes),
     });
     return controlSuccess(scoped);
@@ -1491,15 +1474,14 @@ export class TreeController {
     records: readonly AgentRecord[],
     mutationFor: (record: AgentRecord) => PublicMutation,
   ): boolean {
-    const observedAt = safeObservedAt(this.now);
+    const createdAt = safeWallClockNow(this.now);
     const monotonicAt = this.safeMonotonicNow();
     let changed = false;
     for (const record of records) {
-      if (this.applyMutation(record, mutationFor(record), observedAt, monotonicAt)) changed = true;
+      if (this.applyMutation(record, mutationFor(record), createdAt, monotonicAt)) changed = true;
     }
     if (!changed) return false;
     this.treeRevision += 1;
-    this.treeObservedAt = observedAt;
     this.notifyChange();
     return true;
   }
@@ -1507,7 +1489,7 @@ export class TreeController {
   private applyMutation(
     record: AgentRecord,
     mutation: PublicMutation,
-    observedAt: string,
+    createdAt: string,
     monotonicAt: number,
   ): boolean {
     const nextState = mutation.state ?? record.state;
@@ -1529,7 +1511,7 @@ export class TreeController {
     const elapsedAtMutation = this.lifecycleElapsed(record, monotonicAt);
     const nextError = mutation.errorCode === undefined
       ? (mutation.clearError === true ? undefined : record.error)
-      : this.createFault(mutation.errorCode, observedAt);
+      : this.createFault(mutation.errorCode);
     record.state = nextState;
     record.pendingMessageCount = nextPending;
     record.activity = nextActivity;
@@ -1546,7 +1528,7 @@ export class TreeController {
     // 允许同一状态快照上并行获准的多条消息各自完成，不互相误判为迟到。
     if (stateChanged) record.lifecycleGeneration += 1;
     if (stateChanged && nextState === "idle" && record.lifecycleStartedAt === undefined) {
-      record.createdAt = observedAt;
+      record.createdAt = createdAt;
       record.lifecycleStartedAt = monotonicAt;
     }
     if (stateChanged && nextState === "terminating" && record.frozenLifecycleElapsedMs !== undefined) {
@@ -1567,7 +1549,6 @@ export class TreeController {
       record.activityCounts.clear();
     }
     record.revision += 1;
-    record.observedAt = observedAt;
     return true;
   }
 
@@ -1600,13 +1581,12 @@ export class TreeController {
     }
   }
 
-  private createFault(code: AgentFaultCode, observedAt: string): AgentFault {
+  private createFault(code: AgentFaultCode): AgentFault {
     const metadata = ERROR_METADATA[code];
     return Object.freeze({
       code,
       message: metadata.message,
       retryable: metadata.retryable,
-      observed_at: observedAt,
     });
   }
 
@@ -1635,7 +1615,6 @@ export class TreeController {
       state: record.state,
       pending_message_count: record.pendingMessageCount,
       revision: record.revision,
-      observed_at: record.observedAt,
     } as const;
     const base = record.createdAt === undefined
       ? common

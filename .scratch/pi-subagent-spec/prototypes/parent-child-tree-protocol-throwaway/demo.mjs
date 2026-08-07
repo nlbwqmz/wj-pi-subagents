@@ -19,7 +19,7 @@ class ChildStream {
   frame(kind, payload = {}, requestId) {
     this.seq += 1;
     return {
-      protocol: "pi-subagent/1",
+      protocol: "pi-subagent/2",
       kind,
       stream_id: this.streamId,
       sender_agent_id: this.agentId,
@@ -72,7 +72,7 @@ class RootController {
   }
 
   accept(frame) {
-    assert(frame.protocol === "pi-subagent/1", "协议版本错误");
+    assert(frame.protocol === "pi-subagent/2", "协议版本错误");
     assert(frame.sender_agent_id === this.expectedAgentId, "发送者身份错误");
 
     if (this.streamId === null) this.streamId = frame.stream_id;

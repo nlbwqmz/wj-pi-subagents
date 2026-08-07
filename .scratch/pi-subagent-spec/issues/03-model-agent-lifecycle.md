@@ -97,7 +97,7 @@ Blocked by: 01, 02
 | `terminating` | 继续等待资源确认；期限到达时为 `timeout` |
 | 期限先于上述事件提交 | `timeout` |
 
-`outcome` 锁定结束本次等待的触发原因；结果中的 `state`、`revision` 和 `observed_at` 则取生成结果前控制器持有的最新一致快照。因此并发新消息可以产生合法的 `outcome: "settled", state: "working"`；等待因 `failed` 完成后若并发终止已经开始，也可以产生 `outcome: "terminal", state: "terminating"`。首版不增加触发事件修订号，调用者通过返回修订号或再次查询判断新鲜度。
+`outcome` 锁定结束本次等待的触发原因；结果中的 `state` 和 `revision` 则取生成结果前控制器持有的最新一致快照。因此并发新消息可以产生合法的 `outcome: "settled", state: "working"`；等待因 `failed` 完成后若并发终止已经开始，也可以产生 `outcome: "terminal", state: "terminating"`。首版不增加触发事件修订号，调用者通过返回修订号或再次查询判断新鲜度。
 
 超时与 settle/终态事件在同一顺序点裁决，先提交者决定唯一 `outcome`。超时只结束观察窗口，绝不改变节点、中断当前处理或升级为终止。
 
@@ -130,10 +130,10 @@ starting -> failed -> terminating -> terminated
 
 根会话退出、`new`、`resume`、`fork` 或扩展 runtime 真正关闭时，自动对所有直接子代理启动同一套级联终止，无需用户逐个调用工具。成功的 Pi `/reload` 通过控制器交接保留既有节点，只刷新模板发现和 Pi 动态资源；若新扩展实例兼容门禁失败，则按 09 号票据清理整棵树。中间节点意外崩溃时，该节点先保留为 `failed`，监督器只对其后代自动建立防孤儿终止屏障；故障父节点继续占用其直接父会话名额，直到直接父会话显式终止。根会话清理结束后释放所有终止记录，不跨会话恢复。
 
-### 修订号、时间与当前故障
+### 修订号与当前故障
 
 - 节点的公开状态、`pending_message_count` 或当前 `error` 发生真实变化时，节点 `revision` 单调递增；内部句柄、命令阶段或被忽略事件变化不递增。
-- `observed_at` 使用控制器接受该公开变化时的 UTC RFC 3339 毫秒时间，只表示新鲜度；状态顺序始终由 `revision` 判断。
+- 不提供独立的新鲜度时间字段；状态顺序始终由 `revision` 判断。
 - 原子级联终止中的所有节点变化属于同一个树修订，节点仍分别递增自己的 `revision`。
 - `data.error` 表示当前故障而不是历史列表：`failed` 必须携带；发生 `termination_incomplete` 的 `terminating` 必须携带；成功进入 `terminated` 后省略。历史故障留在工具错误详情、状态转换轨迹或内部日志中。
 
@@ -173,7 +173,7 @@ node .scratch/pi-subagent-spec/prototypes/lifecycle-state-machine-throwaway/tui.
 - 2026-08-04：用户确认 `wait_agent` 的稳定终态只有 `failed` 与 `terminated`，均立即返回 `outcome: "terminal"`，前者必须附带 `data.error`、后者不附错误；`terminating` 不是终态，继续等待资源回收确认，期限内未完成则返回 `timeout` 并保留状态及终止故障。`idle` 立即返回 `settled`；`working`、`interrupting` 等待 `agent_settled`；`starting` 等待握手进入 `idle` 后返回 `settled`，启动失败或被终止则返回 `terminal`；任何超时都不改变节点。
 - 2026-08-04：用户确认 `pending_message_count` 统计已被控制器受理但尚未开始实际处理的父子消息，统一覆盖控制器本地等待队列与 Pi steering 队列，当前活动 prompt 不计入且跨队列迁移不重复计数。消息进入节点串行通道时加一，转为活动处理、确认消费、交付失败、明确拒绝或在写入前被终止屏障取消时减一；`failed` 与 `terminated` 必须归零，`terminating` 只暂时保留已被 Pi 接受但尚未确认消费的消息，最终终止归零。计数不暴露正文或标识、不驱动生命周期，但每次变化都递增节点 `revision`。
 - 2026-08-04：用户确认 `send_message` 的工具结果与节点健康相互独立：只有 RPC 明确接受 prompt 后，空闲节点才进入 `working`，活动节点被接受的 steering 只更新计数而不改变生命周期。能够证明未接受且节点仍健康时返回 `message_delivery_failed`、移除待处理记录并保持原状态；接受状态未知但连接仍可观察时返回不可自动重试的同码错误，不立即置为 `failed`，而由后续事件或重同步消解内部未决交付。只有确认进程、RPC 或协议状态无法继续可信使用时才进入 `failed`；已经返回 `accepted: true` 的结果不因后续执行失败而回写。
-- 2026-08-04：用户确认 `wait_agent` 使用原子的检查、登记、复查流程避免丢失事件，多个等待器可由同一事件完成；`outcome` 锁定结束等待的触发原因，返回的 `state`、`revision`、`observed_at` 则取结果生成前的最新一致快照，因此允许 `settled + working` 或 `terminal + terminating` 等并发推进组合。超时与事件按同一顺序点裁决，先提交者决定唯一结果；首版不增加触发事件修订号或时间字段，调用方通过返回修订号或再次查询判断新鲜度。
+- 2026-08-04：用户确认 `wait_agent` 使用原子的检查、登记、复查流程避免丢失事件，多个等待器可由同一事件完成；`outcome` 锁定结束等待的触发原因，返回的 `state`、`revision` 则取结果生成前的最新一致快照，因此允许 `settled + working` 或 `terminal + terminating` 等并发推进组合。超时与事件按同一顺序点裁决，先提交者决定唯一结果；首版不增加触发事件修订号或时间字段，调用方通过返回修订号或再次查询判断新鲜度。
 - 2026-08-04：用户确认根会话退出、切换会话或扩展 runtime 关闭时，控制器无需用户逐个调用工具即对全部直接子代理建立终止屏障并级联清理全树；正常终止的中间节点与后代属于同一终止流程。中间节点意外崩溃时先进入并保留 `failed`，监督器自动对其全部后代建立防孤儿终止屏障，使后代终止；故障父节点本身继续占名额，直到直接父会话显式终止。根会话清理完成后释放全部终止记录且不跨会话保存，具体进程回收机制由 08、12 号票据细化。
 - 2026-08-04：用户最终确认七态工具操作矩阵：`starting` 只允许观察、等待和终止；`idle`、`working`、`interrupting` 按消息接受与 settle 规则推进；`failed`、`terminating`、`terminated` 拒绝新消息但保留查询、等待和幂等中断/终止语义。当前故障只在 `failed` 或发生 `termination_incomplete` 的 `terminating` 中公开，成功 `terminated` 省略错误。
 - 2026-08-04：throwaway 原型已完成并验证 26 个演示动作；确认等待结果可出现 `settled + working`、终止屏障忽略迟到 settle、未知交付不等于节点故障、启动失败自动清理、级联终止同树修订且父节点后于后代确认，以及中间节点崩溃后的防孤儿清理。

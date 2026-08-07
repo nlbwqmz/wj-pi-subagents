@@ -181,7 +181,6 @@ test("远程端口拒绝夹带未声明节点字段的权威响应", async () =>
         state: "working",
         pending_message_count: 0,
         revision: 1,
-        observed_at: "2026-08-06T08:00:00.000Z",
         created_at: "2026-08-06T07:59:59.000Z",
         lifecycle_elapsed_ms: 1_000,
         activity: Object.freeze({ category: "reading", active_count: 1 }),

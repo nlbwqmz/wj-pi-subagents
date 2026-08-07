@@ -62,7 +62,7 @@ widget 和面板都只消费 11 号票据规定的控制器确认快照，不读
 
 ### 3. 时间与状态反馈
 
-控制器在子代理创建成功的线性化点记录 `created_at`，并使用单调时钟计算 elapsed；RFC 3339 的 `observed_at` 只用于诊断和快照新鲜度，不能用于计算时长或排序。
+控制器在子代理创建成功的线性化点记录 `created_at`，并使用单调时钟计算 elapsed；快照新旧只通过节点 `revision` 和树 `tree_revision` 判断。
 
 - `starting` 尚未成功创建，不显示正常生命周期时长；
 - `idle`、`working`、`interrupting` 和 `terminating` 显示从创建成功开始的累计时长；

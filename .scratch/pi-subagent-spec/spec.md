@@ -314,7 +314,7 @@ Pi `get_state` 只可用于启动同步、事件缺口后的异常重同步和�
 - 当前活动 prompt 不计数，因此 `working` 可以为 0；
 - `failed` 和 `terminated` 必须为 0；`terminating` 可暂时保留 Pi 已接受但未确认消费的项，资源回收后归零。
 
-节点公开状态、pending 或当前安全故障真实变化时，节点 `revision` 必须单调递增。内部句柄、命令阶段和被忽略的迟到事件不得增加它。`observed_at` 使用控制器接受变化时的 UTC RFC 3339、固定毫秒和 `Z` 后缀，只表示新鲜度；状态顺序由 `revision` 决定。树原子变化使用独立 `tree_revision`。
+节点公开状态、pending 或当前安全故障真实变化时，节点 `revision` 必须单调递增。内部句柄、命令阶段和被忽略的迟到事件不得增加它。状态顺序由 `revision` 决定；树原子变化使用独立 `tree_revision`。
 
 ### 6.4 共通工具契约
 
@@ -456,8 +456,7 @@ Pi `get_state` 只可用于启动同步、事件缺口后的异常重同步和�
     "agent_id": "550e8400-e29b-41d4-a716-446655440000",
     "outcome": "settled",
     "state": "idle",
-    "revision": 12,
-    "observed_at": "2026-08-04T04:34:57.123Z"
+    "revision": 12
   }
 }
 ```
@@ -516,7 +515,7 @@ Pi `get_state` 只可用于启动同步、事件缺口后的异常重同步和�
 
 ### 6.10 状态与树查询
 
-**REQ-030**：`get_agent_status` 只接受一个直接子代理 `agent_id`，必须立即返回最近确认的安全快照，不触发 RPC、不等待、不改变状态。字段至少包含 `agent_id`、`name`、`template_id`、`depth`、`state`、`pending_message_count`、`revision`、`observed_at`。故障节点查询仍为 `ok:true`，在 `data.error` 提供当前 `code`、安全 `message`、`retryable` 和故障时间；健康或已成功终止节点省略当前错误。
+**REQ-030**：`get_agent_status` 只接受一个直接子代理 `agent_id`，必须立即返回最近确认的安全快照，不触发 RPC、不等待、不改变状态。字段至少包含 `agent_id`、`name`、`template_id`、`depth`、`state`、`pending_message_count`、`revision`，以及适用时的生命周期时间。故障节点查询仍为 `ok:true`，在 `data.error` 提供当前 `code`、安全 `message` 与 `retryable`；健康或已成功终止节点省略当前错误。
 
 **REQ-031**：`get_agent_tree` 不接受目标参数，必须按调用者自动裁剪并返回一个 `tree_revision` 的完整扁平快照：
 
@@ -533,7 +532,6 @@ Pi `get_state` 只可用于启动同步、事件缺口后的异常重同步和�
   "data": {
     "scope": { "kind": "root" },
     "tree_revision": 42,
-    "observed_at": "2026-08-04T04:36:12.004Z",
     "nodes": []
   }
 }
@@ -578,7 +576,7 @@ Unix 使用本地 Unix socket，Windows 使用命名管道。上层必须用带�
 
 ```json
 {
-  "protocol": "pi-subagent/1",
+  "protocol": "pi-subagent/2",
   "kind": "hello|hello_ack|event|snapshot_request|snapshot|reply|control_request|control_response|ack|close",
   "stream_id": "stream_...",
   "sender_agent_id": "550e8400-e29b-41d4-a716-446655440000",

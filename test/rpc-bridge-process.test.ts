@@ -319,7 +319,6 @@ function supervisorInit(childId: string, credential: string): NonNullable<Manage
       state: "starting" as const,
       pending_message_count: 0,
       revision: 1,
-      observed_at: "2026-08-06T00:00:00.000Z",
     })]),
     initial_subtree_revision: 1,
   });

@@ -628,7 +628,6 @@ test("桥接客户端在唯一读写流上复用有界监督帧并传递启动�
       state: "starting" as const,
       pending_message_count: 0,
       revision: 1,
-      observed_at: "2026-08-06T00:00:00.000Z",
     }],
     initial_subtree_revision: 1,
   } as const;
@@ -715,7 +714,6 @@ test("桥接 child 监督端点完成 hello、首快照与双端 ready", () => {
         state: "starting",
         pending_message_count: 0,
         revision: 1,
-        observed_at: "2026-08-06T00:00:00.000Z",
       }],
       initial_subtree_revision: 1,
     },
@@ -810,7 +808,6 @@ test("受管监督通道重组分片后的最大 final 图片回复", async () =
         state: "starting",
         pending_message_count: 0,
         revision: 1,
-        observed_at: "2026-08-06T00:00:00.000Z",
       }],
       initial_subtree_revision: 1,
     },

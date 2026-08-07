@@ -18,7 +18,7 @@ Blocked by: none
 - 定向工具只接受 UUID `agent_id`。控制器以随机 UUID v4 分配新标识，文本值使用 RFC 9562 canonical 小写格式且不带 `agent_` 前缀；标识在当前根会话内唯一、节点生命周期内稳定、终止后不复用。名称只用于展示，不能寻址或推断树结构。非 canonical UUID 文本返回 `invalid_argument`，格式正确但未注册返回 `agent_not_found`。
 - 成功结果统一为 `{ "ok": true, "data": ... }`；预期失败以工具错误交给 Pi，使 `isError: true`，错误结构为 `{ "ok": false, "error": { "code", "message", "retryable", "details?" } }`。调用方只依赖稳定错误码，不依赖消息文本或 `details` 的具体结构。
 - 公开生命周期状态固定为 `starting`、`idle`、`working`、`interrupting`、`failed`、`terminating`、`terminated`。待处理消息使用计数，不单独建 `queued` 状态；意外进程退出归入 `failed`，终止流程中的预期退出归入 `terminated`。
-- 所有时间使用 UTC RFC 3339、固定毫秒精度和 `Z` 后缀；状态新旧顺序由单调 `revision` 判断，不能用时间字符串排序。
+- `created_at` 使用 UTC RFC 3339、固定毫秒精度和 `Z` 后缀；状态新旧顺序由单调 `revision` 判断，不能用时间字符串排序。
 
 ### `spawn_agent`
 
@@ -79,8 +79,7 @@ Blocked by: none
     "agent_id": "550e8400-e29b-41d4-a716-446655440000",
     "outcome": "settled",
     "state": "idle",
-    "revision": 12,
-    "observed_at": "2026-08-04T04:34:57.123Z"
+    "revision": 12
   }
 }
 ```
@@ -134,7 +133,7 @@ Blocked by: none
 
 ### `get_agent_status`
 
-只接受一个必填的直接子代理 `agent_id`，立即返回控制器最近确认的安全快照；不等待事件、不触发 Pi 请求、不改变节点或队列状态。快照包含身份字段（`agent_id`、`name`、`template_id`、`depth`）、`state`、`pending_message_count`、单调 `revision` 和 `observed_at`。故障节点成功查询仍为 `ok: true`，在 `data.error` 中提供 `code`、`message`、`retryable` 和故障时间；健康节点省略该字段。
+只接受一个必填的直接子代理 `agent_id`，立即返回控制器最近确认的安全快照；不等待事件、不触发 Pi 请求、不改变节点或队列状态。快照包含身份字段（`agent_id`、`name`、`template_id`、`depth`）、`state`、`pending_message_count`、单调 `revision` 及适用时的生命周期时间。故障节点成功查询仍为 `ok: true`，在 `data.error` 中提供 `code`、`message` 与 `retryable`；健康节点省略该字段。
 
 ### `get_agent_tree`
 
@@ -148,7 +147,6 @@ Blocked by: none
   "data": {
     "scope": { "kind": "root" },
     "tree_revision": 42,
-    "observed_at": "2026-08-04T04:36:12.004Z",
     "nodes": [
       {
         "agent_id": "550e8400-e29b-41d4-a716-446655440000",
@@ -158,8 +156,7 @@ Blocked by: none
         "depth": 1,
         "state": "working",
         "pending_message_count": 0,
-        "revision": 18,
-        "observed_at": "2026-08-04T04:36:11.998Z"
+        "revision": 18
       }
     ]
   }
@@ -219,9 +216,9 @@ Blocked by: none
 - 2026-08-04：用户确认 `spawn_agent` 返回 `agent_id`、`name`、`template_id`、`depth` 和 `state: "idle"` 的最小结构，并新增第七项职责：查询指定直接子代理的运行状态。
 - 2026-08-04：用户确认新增工具命名为 `get_agent_status`。
 - 2026-08-04：用户确认 `get_agent_status` 只接受一个必填 `agent_id`，立即返回控制器最近已确认的快照；它不等待事件、不触发 Pi 请求、不改变节点或队列状态，等待语义由 `wait_agent` 独占。
-- 2026-08-04：用户确认 `get_agent_status` 快照包含身份字段、生命周期 `state`、待处理消息数量、可选安全 `data.error`、单调递增 `revision` 和 `observed_at`；不返回队列正文、进程句柄、环境或后代控制句柄，整棵子树由 `get_agent_tree` 单独提供。
-- 2026-08-04：用户确认 `get_agent_status` 成功查询故障节点时仍返回 `ok: true`，并在 `data.error` 中提供当前故障的 `code`、`message`、`retryable` 与时间；健康节点省略该字段。顶层 `error` 仅表示工具调用本身失败，字段不命名为 `last_error`。
-- 2026-08-04：用户确认 `observed_at` 使用 UTC RFC 3339 时间，固定毫秒精度和 `Z` 后缀；它只用于新鲜度与诊断，状态顺序由 `revision` 决定，汇聚时间以当前控制器接受更新的时刻为准。
+- 2026-08-04：用户确认 `get_agent_status` 快照包含身份字段、生命周期 `state`、待处理消息数量、可选安全 `data.error`、单调递增 `revision` 与适用时的生命周期时间；不返回队列正文、进程句柄、环境或后代控制句柄，整棵子树由 `get_agent_tree` 单独提供。
+- 2026-08-04：用户确认 `get_agent_status` 成功查询故障节点时仍返回 `ok: true`，并在 `data.error` 中提供当前故障的 `code`、`message` 与 `retryable`；健康节点省略该字段。顶层 `error` 仅表示工具调用本身失败，字段不命名为 `last_error`。
+- 状态顺序只由 `revision` 决定；快照不携带独立的新鲜度时间字段。
 - 2026-08-04：用户确认 `send_message` 支持必填文本和可选图片；图片沿用 Pi `ImageContent`，`data` 为不带 data URL 前缀的原始 Base64，`mimeType` 单独传递，扩展负责额外的编码、大小和 MIME 校验。
 - 2026-08-04：用户确认 `send_message` 只在消息被 RPC 接受或进入 steering 队列后立即成功返回 `{ message_id, accepted: true }`；不等待完成、不返回启动/steering 分类，接受后的失败通过状态或事件报告。
 - 2026-08-04：用户确认 `message_id` 由控制器生成，调用者不得自定义；它在根会话生命周期内唯一、不复用且对外不透明，后续内部事件用它关联消息，但编码与线协议序号留给协议票据。
@@ -245,11 +242,11 @@ Blocked by: none
 - 2026-08-04：用户确认重复或并发 `terminate_agent` 调用幂等且合并：已 `terminated` 的节点立即成功且不重复操作，`terminating` 的调用等待并复用同一终止流程，`failed` 节点重新执行清理确认；不启动竞争性的第二套回收流程。
 - 2026-08-04：用户确认优雅关闭阶段失败但强制回收最终确认整棵子树退出时，`terminate_agent` 仍返回 `ok: true`，并在数据中标记 `forced: true`；只有最终无法确认资源退出才返回顶层终止错误，成功结果不放置 `error`。
 - 2026-08-04：用户确认 `get_agent_tree` 按调用者身份自动裁剪只读视图：根会话可查看整棵代理树，非根父会话只能查看自身及其后代子树；不接受任意目标 `agent_id` 作为越级查询入口，视图不包含连接句柄、进程句柄、环境、队列正文或其他控制秘密。
-- 2026-08-04：用户确认 `get_agent_tree` 返回带单一 `tree_revision` 与 `observed_at` 的完整点时快照，不暴露增量、游标或事件确认协议；节点只在故障时附带错误信息，健康节点省略 `error`。
+- 2026-08-04：用户确认 `get_agent_tree` 返回带单一 `tree_revision` 的完整点时快照，不暴露增量、游标或事件确认协议；节点只在故障时附带错误信息，健康节点省略 `error`。
 - 2026-08-04：用户确认 `get_agent_tree` 的快照使用扁平 `nodes` 列表，以 `parent_agent_id` 与 `depth` 表达拓扑，按父节点优先及稳定创建顺序排序；不递归嵌套 `children`。
 - 2026-08-04：用户确认树快照不把根会话伪装成可寻址节点；根作用域的直接子代理以 `parent_agent_id: null` 表示，非根作用域以当前父会话作为隐式锚点并隐藏其作用域外父标识，`depth` 仍是相对整棵树根会话的深度。
-- 2026-08-04：用户确认 `get_agent_tree.nodes[]` 复用单节点状态查询的安全字段：身份、父标识、深度、生命周期状态、待处理消息数量、节点 `revision` 与 `observed_at`；故障节点才附带 `data.error`，不携带消息或回复正文、图片、进程/RPC 句柄、环境或配置秘密。
-- 2026-08-04：用户确认 `get_agent_tree` 在单一 `tree_revision` 下捕获不可混合的完整视图；顶层 `observed_at` 是快照捕获时间，节点自身 `revision`/`observed_at` 只用于诊断，快照不保证捕获后外部进程状态不变。
+- 2026-08-04：用户确认 `get_agent_tree.nodes[]` 复用单节点状态查询的安全字段：身份、父标识、深度、生命周期状态、待处理消息数量、节点 `revision` 与适用时的生命周期时间；故障节点才附带 `data.error`，不携带消息或回复正文、图片、进程/RPC 句柄、环境或配置秘密。
+- 2026-08-04：用户确认 `get_agent_tree` 在单一 `tree_revision` 下捕获不可混合的完整视图；节点 `revision` 只用于判断状态新旧，快照不保证捕获后外部进程状态不变。
 - 2026-08-04：用户确认公开错误码采用闭合的稳定 `snake_case` 集合；调用方不依赖错误消息或 `details` 的具体结构，未知内部异常统一映射为 `internal_error`，`retryable` 表示是否值得重试。节点故障中的 `data.error` 可复用同一错误码，但不改变成功状态查询的 `ok: true`。
 - 2026-08-04：用户确认目标标识解析错误区分为 `agent_not_found`（当前根会话注册表中不存在或属于其他根会话）与 `not_direct_child`（节点存在但不是调用者的直接子代理）；已终止且仍注册的节点不归入前者。
 - 2026-08-04：用户确认调用方提供的字段缺失、类型、范围、长度、Base64 或 MIME 校验失败统一返回不可重试的 `invalid_argument`，稳定诊断字段可放在 `details.field` 与 `details.reason`，不为每种字段问题新增公共错误码。

@@ -31,7 +31,7 @@ Blocked by: 02, 03
 
 ```json
 {
-  "protocol": "pi-subagent/1",
+  "protocol": "pi-subagent/2",
   "kind": "hello|hello_ack|event|snapshot_request|snapshot|reply|ack|close",
   "stream_id": "stream_...",
   "sender_agent_id": "550e8400-e29b-41d4-a716-446655440000",
@@ -74,8 +74,7 @@ Blocked by: 02, 03
       "depth": 1,
       "state": "working",
       "pending_message_count": 0,
-      "revision": 18,
-      "observed_at": "2026-08-05T04:36:11.998Z"
+      "revision": 18
     }
   ]
 }

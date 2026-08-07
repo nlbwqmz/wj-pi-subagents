@@ -149,6 +149,7 @@ test("直接父子旅程闭合 spawn、prompt、steering、wait 和协作式 int
     assert.equal(one.data.outcome, "settled");
     assert.equal(two.data.outcome, "settled");
     assert.equal(one.data.state, "idle");
+    assert.equal("observed_at" in one.data, false);
   }
 });
 

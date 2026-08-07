@@ -53,7 +53,6 @@ function publicFields(node) {
     state: node.state,
     pending_message_count: pendingCount(node),
     revision: node.revision,
-    observed_at: node.observed_at,
   };
 
   if (node.error) {
@@ -104,9 +103,8 @@ function mutateVisible(model, nodes, actionType, mutate) {
   for (const node of changed) {
     model.clock += 1;
     node.revision += 1;
-    node.observed_at = new Date(BASE_TIME_MS + model.clock).toISOString();
     if (node.error?.at === null) {
-      node.error.at = node.observed_at;
+      node.error.at = new Date(BASE_TIME_MS + model.clock).toISOString();
     }
 
     const previous = before.get(node.agent_id);
@@ -199,7 +197,6 @@ function registerNode(model, action) {
     creation_order: model.next_creation_order++,
     state: "starting",
     revision: 1,
-    observed_at: new Date(BASE_TIME_MS + model.clock).toISOString(),
     pending_messages: [],
     active_message_id: null,
     error: null,

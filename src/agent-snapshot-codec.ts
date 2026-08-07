@@ -43,7 +43,6 @@ export interface AgentFault {
   readonly code: AgentFaultCode;
   readonly message: string;
   readonly retryable: boolean;
-  readonly observed_at: string;
 }
 
 /** `finished` 中只保存稳定、脱敏的终止历史分类。 */
@@ -64,7 +63,6 @@ export interface AgentSnapshot {
   readonly state: AgentLifecycleState;
   readonly pending_message_count: number;
   readonly revision: number;
-  readonly observed_at: string;
   /** 成功创建的线性化点；starting 节点没有该时间。 */
   readonly created_at?: string;
   /** 由单调时钟派生，活动节点持续累加，终态节点固定。 */
@@ -104,7 +102,6 @@ const SNAPSHOT_KEYS = new Set([
   "state",
   "pending_message_count",
   "revision",
-  "observed_at",
   "created_at",
   "lifecycle_elapsed_ms",
   "activity",
@@ -112,7 +109,7 @@ const SNAPSHOT_KEYS = new Set([
   "termination_result",
 ]);
 const ACTIVITY_KEYS = new Set(["category", "active_count"]);
-const FAULT_KEYS = new Set(["code", "message", "retryable", "observed_at"]);
+const FAULT_KEYS = new Set(["code", "message", "retryable"]);
 const UTF8_ENCODER = new TextEncoder();
 
 /** 判断输入是否为 RFC 9562 传输用的小写 canonical UUID 文本。 */
@@ -145,7 +142,6 @@ export function parseAgentSnapshot(
       || !(AGENT_LIFECYCLE_STATES as readonly unknown[]).includes(record.state)
       || !nonNegativeSafeInteger(record.pending_message_count)
       || !positiveSafeInteger(record.revision)
-      || !isRfc3339Millis(record.observed_at)
       || (record.created_at !== undefined && !isRfc3339Millis(record.created_at))
       || (record.lifecycle_elapsed_ms !== undefined && !nonNegativeSafeInteger(record.lifecycle_elapsed_ms))
     ) return undefined;
@@ -193,7 +189,6 @@ export function parseAgentSnapshot(
       state,
       pending_message_count: record.pending_message_count as number,
       revision: record.revision as number,
-      observed_at: record.observed_at,
       ...(record.created_at === undefined ? {} : { created_at: record.created_at as string }),
       ...(record.lifecycle_elapsed_ms === undefined
         ? {}
@@ -231,7 +226,6 @@ export function parseAgentFault(value: unknown, maxStringBytes?: number): AgentF
     || !(AGENT_FAULT_CODES as readonly unknown[]).includes(record.code)
     || !boundedString(record.message, maxStringBytes)
     || typeof record.retryable !== "boolean"
-    || !isRfc3339Millis(record.observed_at)
   ) return undefined;
   const code = record.code as AgentFaultCode;
   const metadata = AGENT_FAULT_METADATA[code];
@@ -240,7 +234,6 @@ export function parseAgentFault(value: unknown, maxStringBytes?: number): AgentF
     code,
     message: metadata.message,
     retryable: metadata.retryable,
-    observed_at: record.observed_at,
   });
 }
 

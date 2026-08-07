@@ -94,7 +94,7 @@ test("创建原子预留 canonical UUID v4、直接父关系与初始 starting �
   assert.equal(created.node.state, "starting");
   assert.equal(created.node.pending_message_count, 0);
   assert.equal(created.node.revision, 1);
-  assert.match(created.node.observed_at, /^2026-01-02T03:04:05\.000Z$/);
+  assert.equal("observed_at" in created.node, false);
   assert.equal(created.lifecycle_generation, 0);
   assert.equal(created.tree_revision, 1);
   assert.equal(isCanonicalUuid(created.node.agent_id), true);
@@ -323,7 +323,7 @@ test("生命周期时间从 idle 线性化点开始，并在故障后由单调�
   assert.equal(expectSuccess(tree.getStatus(created.node.agent_id)).lifecycle_elapsed_ms, terminatedElapsed);
 });
 
-test("pending、revision、observed_at 与 tree_revision 只在公开事实变化时更新", () => {
+test("pending、revision 与 tree_revision 只在公开事实变化时更新", () => {
   const tree = controller();
   const created = reserveRootChild(tree);
   const id = created.node.agent_id;
@@ -335,7 +335,6 @@ test("pending、revision、observed_at 与 tree_revision 只在公开事实变�
   assert.equal(admitted.node.state, "idle");
   assert.equal(admitted.node.pending_message_count, 1);
   assert.equal(admitted.node.revision, idle.revision + 1);
-  assert.match(admitted.node.observed_at, /^2026-01-02T03:04:05\.\d{3}Z$/);
   assert.equal(admitted.tree_revision, beforeTreeRevision + 1);
 
   const accepted = expectSuccess(applyEvent(tree, id, { type: "prompt_accepted" }));
@@ -355,12 +354,12 @@ test("pending、revision、observed_at 与 tree_revision 只在公开事实变�
   assert.equal(failed.node.error?.code, "spawn_failed");
   assert.equal(failed.node.error?.message, "代理启动失败");
   assert.equal(failed.node.error?.retryable, false);
-  assert.match(failed.node.error?.observed_at ?? "", /Z$/);
+  assert.equal("observed_at" in (failed.node.error ?? {}), false);
   assert.doesNotMatch(JSON.stringify(failed.node), /secret|path|stack/i);
 
   const treeSnapshot = expectSuccess(tree.getTreeSnapshot());
   assert.equal(treeSnapshot.tree_revision, failed.tree_revision);
-  assert.match(treeSnapshot.observed_at, /Z$/);
+  assert.equal("observed_at" in treeSnapshot, false);
   assert.deepEqual(treeSnapshot.nodes.map((node) => node.agent_id), [id]);
 });
 
@@ -423,7 +422,6 @@ test("starting 节点不接纳活动，递归快照也不能注入不可能的�
         code: "internal_error" as const,
         message: "D:\\private\\secret-canary.txt",
         retryable: false,
-        observed_at: "2026-01-02T03:04:06.000Z",
       }),
     })]),
   }), "invalid_argument");
@@ -697,7 +695,6 @@ test("child 首快照只能校验作用域根身份，不能越过直接父把 s
       state: "idle" as const,
       pending_message_count: 7,
       revision: before.revision + 100,
-      observed_at: "2099-01-01T00:00:00.000Z",
     })]),
   }));
 
@@ -735,7 +732,6 @@ test("根端只合入已预留完整子树并丢弃旧修订，查询保持稳�
     ...currentChild,
     state: "working" as const,
     revision: currentChild.revision + 1,
-    observed_at: "2026-01-02T03:04:06.000Z",
   });
   const accepted = expectSuccess(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
     scope_agent_id: FIRST_ID,
@@ -797,7 +793,6 @@ test("递归子树的活动时长从快照基线继续累计并在终态精确�
     state: "working" as const,
     lifecycle_elapsed_ms: 5_000,
     revision: childSnapshot.revision + 1,
-    observed_at: "2026-01-02T03:04:06.000Z",
   });
   expectSuccess(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
     scope_agent_id: parent.node.agent_id,
@@ -813,12 +808,10 @@ test("递归子树的活动时长从快照基线继续累计并在终态精确�
     state: "failed" as const,
     lifecycle_elapsed_ms: 7_000,
     revision: working.revision + 1,
-    observed_at: "2026-01-02T03:04:07.000Z",
     error: Object.freeze({
       code: "internal_error" as const,
       message: "控制器内部错误",
       retryable: false,
-      observed_at: "2026-01-02T03:04:07.000Z",
     }),
   });
   expectSuccess(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
@@ -866,24 +859,20 @@ test("递归已登记节点在批量终止后保留故障与清理不完整分�
         ...failedSnapshot,
         state: "failed" as const,
         revision: failedSnapshot.revision + 1,
-        observed_at: "2026-01-02T03:04:06.000Z",
         error: Object.freeze({
           code: "internal_error" as const,
           message: "控制器内部错误",
           retryable: false,
-          observed_at: "2026-01-02T03:04:06.000Z",
         }),
       }),
       Object.freeze({
         ...incompleteSnapshot,
         state: "terminating" as const,
         revision: incompleteSnapshot.revision + 1,
-        observed_at: "2026-01-02T03:04:06.000Z",
         error: Object.freeze({
           code: "termination_incomplete" as const,
           message: "代理资源尚未完全回收",
           retryable: true,
-          observed_at: "2026-01-02T03:04:06.000Z",
         }),
       }),
     ]),
@@ -931,7 +920,6 @@ test("非权威中继首次接收的故障后代在终止后保留历史分类",
       state: "starting" as const,
       pending_message_count: 0,
       revision: 1,
-      observed_at: "2026-01-02T03:04:05.000Z",
     }),
     lifecycle_generation: 0,
     management_enabled: true,
@@ -950,14 +938,12 @@ test("非权威中继首次接收的故障后代在终止后保留历史分类",
     state: "failed" as const,
     pending_message_count: 0,
     revision: 2,
-    observed_at: "2026-01-02T03:04:07.000Z",
     created_at: "2026-01-02T03:04:02.000Z",
     lifecycle_elapsed_ms: 5_000,
     error: Object.freeze({
       code: "internal_error" as const,
       message: "控制器内部错误",
       retryable: false,
-      observed_at: "2026-01-02T03:04:07.000Z",
     }),
   });
   const incompleteDescendant = Object.freeze({
@@ -969,14 +955,12 @@ test("非权威中继首次接收的故障后代在终止后保留历史分类",
     state: "terminating" as const,
     pending_message_count: 0,
     revision: 2,
-    observed_at: "2026-01-02T03:04:07.000Z",
     created_at: "2026-01-02T03:04:02.000Z",
     lifecycle_elapsed_ms: 5_000,
     error: Object.freeze({
       code: "termination_incomplete" as const,
       message: "代理资源尚未完全回收",
       retryable: true,
-      observed_at: "2026-01-02T03:04:07.000Z",
     }),
   });
   expectSuccess(tree.applySubtreeSnapshot(relayActor, {
@@ -1036,7 +1020,6 @@ test("递归子树其他节点变化时允许 terminating 节点在同一节点�
     state: "terminating" as const,
     lifecycle_elapsed_ms: 5_000,
     revision: firstSnapshot.revision + 1,
-    observed_at: "2026-01-02T03:04:06.000Z",
   });
   expectSuccess(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
     scope_agent_id: parent.node.agent_id,
@@ -1050,7 +1033,6 @@ test("递归子树其他节点变化时允许 terminating 节点在同一节点�
     state: "working" as const,
     lifecycle_elapsed_ms: 7_000,
     revision: secondSnapshot.revision + 1,
-    observed_at: "2026-01-02T03:04:07.000Z",
   });
   const accepted = expectSuccess(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
     scope_agent_id: parent.node.agent_id,
@@ -1095,7 +1077,6 @@ test("非权威中继首次接收的新活动后代从快照时长继续累计",
       state: "starting" as const,
       pending_message_count: 0,
       revision: 1,
-      observed_at: "2026-01-02T03:04:06.000Z",
     }),
     lifecycle_generation: 0,
     management_enabled: true,
@@ -1114,7 +1095,6 @@ test("非权威中继首次接收的新活动后代从快照时长继续累计",
     state: "working" as const,
     pending_message_count: 0,
     revision: 2,
-    observed_at: "2026-01-02T03:04:07.000Z",
     created_at: "2026-01-02T03:04:02.000Z",
     lifecycle_elapsed_ms: 5_000,
   });
@@ -1153,7 +1133,6 @@ test("根快照拒绝未经过 reserve_child 预登记的未知身份", () => {
       state: "idle" as const,
       pending_message_count: 0,
       revision: 1,
-      observed_at: "2026-01-02T03:04:06.000Z",
       created_at: "2026-01-02T03:04:06.000Z",
       lifecycle_elapsed_ms: 0,
     })]),
@@ -1189,7 +1168,6 @@ test("子树投影采用根 grant，监督快照保留真实父关系且公开�
       state: "starting" as const,
       pending_message_count: 0,
       revision: 1,
-      observed_at: "2026-01-02T03:04:06.000Z",
     }),
     lifecycle_generation: 0,
     management_enabled: false,

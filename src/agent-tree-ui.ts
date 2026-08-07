@@ -766,7 +766,6 @@ function compareElapsedRefresh(
 ): "changed" | "ignored" | "error" {
   if (
     previous.tree_revision !== next.tree_revision
-    || previous.observed_at !== next.observed_at
     || !sameScope(previous, next)
     || previous.nodes.length !== next.nodes.length
   ) return "error";
@@ -800,7 +799,6 @@ function sameAgentFactsExceptElapsed(left: AgentSnapshot, right: AgentSnapshot):
     && left.state === right.state
     && left.pending_message_count === right.pending_message_count
     && left.revision === right.revision
-    && left.observed_at === right.observed_at
     && left.created_at === right.created_at
     && JSON.stringify(left.activity) === JSON.stringify(right.activity)
     && JSON.stringify(left.error) === JSON.stringify(right.error)
@@ -814,7 +812,6 @@ function isValidScopedSnapshot(value: unknown): value is ScopedAgentTreeSnapshot
     typeof candidate.tree_revision !== "number"
     || !Number.isSafeInteger(candidate.tree_revision)
     || candidate.tree_revision < 0
-    || typeof candidate.observed_at !== "string"
     || !Array.isArray(candidate.nodes)
     || typeof candidate.scope !== "object"
     || candidate.scope === null
@@ -827,7 +824,7 @@ function isValidScopedSnapshot(value: unknown): value is ScopedAgentTreeSnapshot
     if (!isCanonicalUuid(scope.agent_id)) return false;
     if (Object.keys(scope).some((key) => !["kind", "agent_id"].includes(key))) return false;
   } else return false;
-  if (Object.keys(candidate).some((key) => !["scope", "tree_revision", "observed_at", "nodes"].includes(key))) {
+  if (Object.keys(candidate).some((key) => !["scope", "tree_revision", "nodes"].includes(key))) {
     return false;
   }
   const ids = new Set<string>();

@@ -33,7 +33,6 @@ function node(
     state,
     pending_message_count: 0,
     revision: 1,
-    observed_at: "2026-08-05T12:00:00.000Z",
   } as const;
 }
 
@@ -57,7 +56,7 @@ function assertProtocolError(action: () => unknown, code: SupervisorProtocolErro
 
 test("长度边界 UTF-8 JSON 可处理分块与拼接帧，拒绝截断/损坏载荷", () => {
   const frame: SupervisorFrame = {
-    protocol: "pi-subagent/1",
+    protocol: "pi-subagent/2",
     kind: "event",
     stream_id: "stream_test",
     sender_agent_id: CHILD_ID,
@@ -98,6 +97,9 @@ test("长度边界 UTF-8 JSON 可处理分块与拼接帧，拒绝截断/损坏�
   });
   assert.throws(() => encodeSupervisorFrame({ ...frame, unexpected: "不得透传" }), (error: unknown) => {
     return error instanceof SupervisorProtocolError && error.code === "invalid_frame";
+  });
+  assert.throws(() => encodeSupervisorFrame({ ...frame, protocol: "pi-subagent/1" }), (error: unknown) => {
+    return error instanceof SupervisorProtocolError && error.code === "protocol_mismatch";
   });
 });
 
@@ -197,6 +199,10 @@ test("递归快照只往返固定安全活动类别和计数", () => {
 
   assertProtocolError(() => pair.child.publishSnapshot([Object.freeze({
     ...node(CHILD_ID, null, 1, "working"),
+    observed_at: "2026-08-05T12:00:01.000Z",
+  })], 3), "snapshot_invalid");
+  assertProtocolError(() => pair.child.publishSnapshot([Object.freeze({
+    ...node(CHILD_ID, null, 1, "working"),
     activity: {
       category: "editing",
       active_count: 1,
@@ -210,7 +216,6 @@ test("递归快照只往返固定安全活动类别和计数", () => {
       code: "internal_error" as const,
       message: "D:\\private\\secret-canary.txt",
       retryable: false,
-      observed_at: "2026-08-05T12:00:01.000Z",
     }),
   })], 3), "snapshot_invalid");
   assertProtocolError(() => pair.child.publishSnapshot([Object.freeze({

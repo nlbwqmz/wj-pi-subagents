@@ -127,7 +127,6 @@ export interface WaitAgentData {
   readonly outcome: WaitAgentOutcome;
   readonly state: AgentSnapshot["state"];
   readonly revision: number;
-  readonly observed_at: string;
   readonly error?: AgentSnapshot["error"];
 }
 
@@ -956,7 +955,6 @@ function makeWaitData(status: AgentSnapshot, outcome: WaitAgentOutcome): WaitAge
     outcome,
     state: status.state,
     revision: status.revision,
-    observed_at: status.observed_at,
     ...(status.error === undefined ? {} : { error: status.error }),
   });
 }

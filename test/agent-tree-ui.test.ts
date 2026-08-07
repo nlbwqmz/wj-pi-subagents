@@ -34,7 +34,6 @@ function node(overrides: Partial<AgentSnapshot> & Pick<AgentSnapshot, "agent_id"
     state: "idle",
     pending_message_count: 0,
     revision: 1,
-    observed_at: "2026-08-06T08:00:00.000Z",
     created_at: "2026-08-06T07:59:00.000Z",
     lifecycle_elapsed_ms: 60_000,
     ...rest,
@@ -45,7 +44,6 @@ function subtreeSnapshot(nodes: readonly AgentSnapshot[], revision = 1): ScopedA
   return Object.freeze({
     scope: Object.freeze({ kind: "subtree" as const, agent_id: PARENT_ID }),
     tree_revision: revision,
-    observed_at: "2026-08-06T08:00:00.000Z",
     nodes: Object.freeze([...nodes]),
   });
 }
@@ -74,7 +72,6 @@ test("常驻 Agents widget 只按稳定字段顺序显示作用域直接子代�
         code: "internal_error",
         message: "控制器内部错误",
         retryable: false,
-        observed_at: "2026-08-06T08:00:00.000Z",
       }),
     }),
     node({
@@ -126,7 +123,6 @@ test("所有 UI 文本出口净化模板与名称中的终端控制字符", () =
           code: "internal_error",
           message: "控制器内部错误",
           retryable: false,
-          observed_at: "2026-08-06T08:00:01.000Z",
         }),
       })
     : item), 2);
@@ -181,7 +177,6 @@ test("代理树面板默认展开直接子代理、折叠深层分支并优先�
         code: "internal_error",
         message: "控制器内部错误",
         retryable: false,
-        observed_at: "2026-08-06T08:00:00.000Z",
       }),
     }),
     node({
@@ -196,7 +191,6 @@ test("代理树面板默认展开直接子代理、折叠深层分支并优先�
         code: "termination_incomplete",
         message: "代理资源尚未完全回收",
         retryable: true,
-        observed_at: "2026-08-06T08:00:00.000Z",
       }),
     }),
     node({
@@ -501,7 +495,6 @@ test("新故障按同一可见修订聚合为脱敏 UI-only 通知", () => {
         code: "internal_error",
         message: "控制器内部错误",
         retryable: false,
-        observed_at: "2026-08-06T08:00:00.000Z",
       }),
     }),
   ], 10);
@@ -523,7 +516,6 @@ test("新故障按同一可见修订聚合为脱敏 UI-only 通知", () => {
           code: "internal_error",
           message: "控制器内部错误",
           retryable: false,
-          observed_at: "2026-08-06T08:00:01.000Z",
         }),
       })
     : item).concat(
@@ -537,7 +529,6 @@ test("新故障按同一可见修订聚合为脱敏 UI-only 通知", () => {
           code: "internal_error",
           message: "控制器内部错误",
           retryable: false,
-          observed_at: "2026-08-06T08:00:01.000Z",
         }),
       }),
       node({
@@ -550,7 +541,6 @@ test("新故障按同一可见修订聚合为脱敏 UI-only 通知", () => {
           code: "termination_incomplete",
           message: "代理资源尚未完全回收",
           retryable: true,
-          observed_at: "2026-08-06T08:00:01.000Z",
         }),
       }),
       node({
@@ -563,7 +553,6 @@ test("新故障按同一可见修订聚合为脱敏 UI-only 通知", () => {
           code: "termination_incomplete",
           message: "代理资源尚未完全回收",
           retryable: true,
-          observed_at: "2026-08-06T08:00:01.000Z",
         }),
       }),
     ), 11);
@@ -593,7 +582,6 @@ test("伪造故障消息和秘密 canary 在 UI 缓存前被拒绝", () => {
           code: "internal_error",
           message: "D:\\private\\secret-canary.txt",
           retryable: false,
-          observed_at: "2026-08-06T08:00:01.000Z",
         }),
       })
     : item), 11);
@@ -687,7 +675,6 @@ test("UI 绑定通过 widget、overlay 和 notify 跟随树修订并完整清理
           code: "internal_error",
           message: "控制器内部错误",
           retryable: false,
-          observed_at: "2026-08-06T08:00:01.000Z",
         }),
       })
     : item), 2);
