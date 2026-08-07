@@ -1,5 +1,5 @@
 node_modules/
 dist/
-.scratch/package-smoke/
+/package-smoke/
 coverage/
 *.log

@@ -4,7 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const smokeRoot = join(repositoryRoot, ".scratch", "package-smoke");
+const smokeRoot = join(repositoryRoot, "package-smoke");
 
 function readPackageArchiveName() {
   const manifest = JSON.parse(readFileSync(join(repositoryRoot, "package.json"), "utf8"));

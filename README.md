@@ -700,7 +700,7 @@ npm run check
 
 ### 打包后安装到 Pi 测试
 
-以下命令以扩展仓库 `D:\code\pi-subagent-wj` 和测试项目 `D:\code\your-project` 为例。请把测试项目路径替换成你的实际路径。Smoke 打包命令会读取当前包名和版本，生成 tarball，并将其安装到 `.scratch\package-smoke`；版本变化后不需要修改命令。
+以下命令以扩展仓库 `D:\code\pi-subagent-wj` 和测试项目 `D:\code\your-project` 为例。请把测试项目路径替换成你的实际路径。Smoke 打包命令会读取当前包名和版本，生成 tarball，并将其安装到仓库根目录下的 `package-smoke`；版本变化后不需要修改命令。
 
 1. 进入扩展源码目录：
 
@@ -735,13 +735,13 @@ npm run check
 6. 把隔离目录中的 package 安装到当前 Pi 项目：
 
    ```powershell
-   pi install "D:\code\pi-subagent-wj\.scratch\package-smoke\node_modules\pi-subagent" -l
+   pi install "D:\code\pi-subagent-wj\package-smoke\node_modules\pi-subagent" -l
    ```
 
    如果 Pi 提示项目未信任，并且你明确同意信任当前项目，则改用：
 
    ```powershell
-   pi install "D:\code\pi-subagent-wj\.scratch\package-smoke\node_modules\pi-subagent" -l --approve
+   pi install "D:\code\pi-subagent-wj\package-smoke\node_modules\pi-subagent" -l --approve
    ```
 
 7. 确认 package 已登记：
@@ -767,7 +767,7 @@ npm run check
 1. 退出 Pi，回到 PowerShell 后移除项目级 package：
 
    ```powershell
-   pi remove "D:\code\pi-subagent-wj\.scratch\package-smoke\node_modules\pi-subagent" -l
+   pi remove "D:\code\pi-subagent-wj\package-smoke\node_modules\pi-subagent" -l
    ```
 
 2. 返回扩展源码目录：
@@ -779,13 +779,13 @@ npm run check
 3. 核对即将删除的测试目录：
 
    ```powershell
-   Resolve-Path -LiteralPath "D:\code\pi-subagent-wj\.scratch\package-smoke"
+   Resolve-Path -LiteralPath "D:\code\pi-subagent-wj\package-smoke"
    ```
 
 4. 仅在上一步输出完全符合预期时，删除隔离测试目录：
 
    ```powershell
-   Remove-Item -LiteralPath "D:\code\pi-subagent-wj\.scratch\package-smoke" -Recurse -Force
+   Remove-Item -LiteralPath "D:\code\pi-subagent-wj\package-smoke" -Recurse -Force
    ```
 
 项目的实现规格与决策背景位于：
