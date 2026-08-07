@@ -101,7 +101,7 @@ Pi 解析 npm source 时把精确 semver 标成 `pinned`，其它合法 semver/r
 
 ```json
 {
-  "name": "pi-subagent",
+  "name": "pi-subagents-wj",
   "version": "0.1.0",
   "keywords": ["pi-package"],
   "dependencies": {

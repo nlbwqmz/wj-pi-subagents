@@ -38,19 +38,19 @@ const TREE = Object.freeze({ kind: "tree" });
 
 test("受管节点只为源码 bridge 启用 TypeScript stripping", () => {
   const compiled = createManagedRpcNodeLaunchSpec({
-    bridgeScriptPath: "C:/pi-subagent/dist/src/rpc-bridge-process.js",
+    bridgeScriptPath: "C:/pi-subagents-wj/dist/src/rpc-bridge-process.js",
   });
   assert.deepEqual(compiled.args?.slice(0, 2), [
-    "C:/pi-subagent/dist/src/rpc-bridge-process.js",
+    "C:/pi-subagents-wj/dist/src/rpc-bridge-process.js",
     "--config",
   ]);
 
   const source = createManagedRpcNodeLaunchSpec({
-    bridgeScriptPath: "C:/pi-subagent/src/rpc-bridge-process.ts",
+    bridgeScriptPath: "C:/pi-subagents-wj/src/rpc-bridge-process.ts",
   });
   assert.deepEqual(source.args?.slice(0, 3), [
     "--experimental-strip-types",
-    "C:/pi-subagent/src/rpc-bridge-process.ts",
+    "C:/pi-subagents-wj/src/rpc-bridge-process.ts",
     "--config",
   ]);
 });

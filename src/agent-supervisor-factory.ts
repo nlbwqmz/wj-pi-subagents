@@ -241,7 +241,7 @@ interface ChildPiPaths {
 }
 
 /**
- * RpcClient 在子进程中运行，不能依赖 pi-subagent 包目录中的 peer 依赖解析。
+ * RpcClient 在子进程中运行，不能依赖 pi-subagents-wj 包目录中的 peer 依赖解析。
  * Pi CLI 的 argv[1] 是可靠的宿主入口；仅识别 cli.js，避免测试 runner 等路径
  * 被误判为 Pi CLI。
  */
@@ -273,7 +273,7 @@ function normalizePath(value: string | undefined): string | undefined {
 
 function defaultChildExtensionPath(): string {
   try {
-    return fileURLToPath(new URL("../extensions/pi-subagent.ts", import.meta.url));
+    return fileURLToPath(new URL("../extensions/pi-subagents-wj.ts", import.meta.url));
   } catch {
     throw new Error("子代理扩展入口不可用");
   }

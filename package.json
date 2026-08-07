@@ -1,5 +1,5 @@
 {
-  "name": "pi-subagent",
+  "name": "pi-subagents-wj",
   "version": "0.1.0",
   "description": "Pi 子代理扩展包",
   "type": "module",
@@ -29,7 +29,7 @@
     "check": "npm run typecheck && npm test"
   },
   "pi": {
-    "extensions": ["./extensions/pi-subagent.ts"]
+    "extensions": ["./extensions/pi-subagents-wj.ts"]
   },
   "piSubagent": {
     "requiresPi": ">=0.83.0"

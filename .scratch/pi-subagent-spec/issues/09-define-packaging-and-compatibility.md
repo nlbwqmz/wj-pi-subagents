@@ -25,7 +25,7 @@ Blocked by: 01, 04, 05, 12
     "@earendil-works/pi-coding-agent": "*"
   },
   "pi": {
-    "extensions": ["./extensions/pi-subagent.ts"]
+    "extensions": ["./extensions/pi-subagents-wj.ts"]
   },
   "piSubagent": {
     "requiresPi": ">=0.83.0"

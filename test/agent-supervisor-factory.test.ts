@@ -179,14 +179,14 @@ test("受管 RPC 选项按模板覆盖或在创建瞬间继承模型与 thinking
   ]);
 
   const withExtension = buildManagedRpcOptions(template(), {
-    extensionPath: "C:/pi-subagent/extensions/pi-subagent.ts",
+    extensionPath: "C:/pi-subagents-wj/extensions/pi-subagents-wj.ts",
     cliPath: "C:/pi/dist/cli.js",
     piModulePath: "C:/pi/dist/index.js",
   });
   assert.deepEqual(withExtension.args, [
     "--no-session",
     "-e",
-    "C:/pi-subagent/extensions/pi-subagent.ts",
+    "C:/pi-subagents-wj/extensions/pi-subagents-wj.ts",
     "--no-context-files",
     "--tools",
     "",

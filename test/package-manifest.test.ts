@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -10,6 +10,7 @@ const REQUIRED_PI_RANGE = ">=0.83.0";
 
 test("package manifest 只暴露一个显式 Pi 扩展入口", () => {
   const manifest = JSON.parse(readFileSync(join(repositoryRoot, "package.json"), "utf8")) as {
+    name?: string;
     private?: boolean;
     files?: string[];
     engines?: { node?: string };
@@ -20,6 +21,7 @@ test("package manifest 只暴露一个显式 Pi 扩展入口", () => {
     piSubagent?: { requiresPi?: string };
   };
 
+  assert.equal(manifest.name, "pi-subagents-wj");
   assert.equal(manifest.private, undefined);
   assert.deepEqual(manifest.files, ["dist", "extensions", "src"]);
   assert.equal(manifest.engines?.node, REQUIRED_NODE_RANGE);
@@ -27,7 +29,7 @@ test("package manifest 只暴露一个显式 Pi 扩展入口", () => {
   assert.equal(manifest.peerDependencies?.["@earendil-works/pi-coding-agent"], "*");
   assert.ok(manifest.dependencies?.semver, "生产安装必须能够解析 semver");
   assert.deepEqual(manifest.pi, {
-    extensions: ["./extensions/pi-subagent.ts"],
+    extensions: ["./extensions/pi-subagents-wj.ts"],
   });
   assert.equal(manifest.piSubagent?.requiresPi, REQUIRED_PI_RANGE);
 });
@@ -43,7 +45,8 @@ test("package manifest 不注册额外 Pi 资源", () => {
 });
 
 test("manifest 入口存在且只导出一个 Pi factory", async () => {
-  const entryModule = await import("../extensions/pi-subagent.ts");
+  assert.equal(existsSync(join(repositoryRoot, "extensions", "pi-subagent.ts")), false);
+  const entryModule = await import("../extensions/pi-subagents-wj.ts");
 
   assert.equal(typeof entryModule.default, "function");
   assert.deepEqual(Object.keys(entryModule), ["default"]);

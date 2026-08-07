@@ -70,7 +70,7 @@ pi --version
 取得本仓库源码后，在扩展目录安装生产依赖。Pi 是宿主提供的 peer dependency，不需要再安装一份到扩展目录：
 
 ```powershell
-Set-Location D:\path\to\pi-subagent
+Set-Location D:\path\to\pi-subagents-wj
 npm ci --omit=dev --legacy-peer-deps
 ```
 
@@ -82,7 +82,7 @@ npm ci --omit=dev --legacy-peer-deps
 
 ```powershell
 Set-Location D:\path\to\your-project
-pi -e "D:\path\to\pi-subagent"
+pi -e "D:\path\to\pi-subagents-wj"
 ```
 
 `-e` 只对当前 Pi 进程生效，不会修改 Pi 的持久设置。工作目录来自启动 Pi 时所在的项目目录，而不是扩展目录。
@@ -92,7 +92,7 @@ pi -e "D:\path\to\pi-subagent"
 用户级安装会在所有项目中启用这个本地 package：
 
 ```powershell
-pi install "D:\path\to\pi-subagent"
+pi install "D:\path\to\pi-subagents-wj"
 pi list
 ```
 
@@ -100,18 +100,18 @@ pi list
 
 ```powershell
 Set-Location D:\path\to\your-project
-pi install "D:\path\to\pi-subagent" -l
+pi install "D:\path\to\pi-subagents-wj" -l
 ```
 
 项目级安装受 Pi 的 project trust 保护。如果项目尚未获信任，请在 Pi 的提示中确认；只有你明确希望信任该项目时，才使用 `--approve` 完成非交互安装：
 
 ```powershell
-pi install "D:\path\to\pi-subagent" -l --approve
+pi install "D:\path\to\pi-subagents-wj" -l --approve
 ```
 
 本地 package 只是登记并直接引用源目录，不会复制源码。请保留该目录及其中的 `node_modules`；移动、重命名或删除目录都会使已登记的来源失效。项目设置中登记的本机绝对路径通常也不能直接供其他团队成员使用。
 
-当前没有可用的 `npm:pi-subagent` 安装来源，也没有可在本文中提供的公开 Git 安装地址。
+当前没有可用的 `npm:pi-subagents-wj` 安装来源，也没有可在本文中提供的公开 Git 安装地址。
 
 ## 更新与卸载
 
@@ -120,7 +120,7 @@ pi install "D:\path\to\pi-subagent" -l --approve
 Pi 不管理本地路径中的源码副本。请先通过你实际取得源码的方式更新该目录，然后重新按锁文件装配生产依赖：
 
 ```powershell
-Set-Location D:\path\to\pi-subagent
+Set-Location D:\path\to\pi-subagents-wj
 npm ci --omit=dev --legacy-peer-deps
 ```
 
@@ -139,13 +139,13 @@ npm ci --omit=dev --legacy-peer-deps
 使用安装时的同一绝对路径移除来源。用户级安装：
 
 ```powershell
-pi remove "D:\path\to\pi-subagent"
+pi remove "D:\path\to\pi-subagents-wj"
 ```
 
 项目级安装：
 
 ```powershell
-pi remove "D:\path\to\pi-subagent" -l
+pi remove "D:\path\to\pi-subagents-wj" -l
 ```
 
 `pi uninstall` 是 `pi remove` 的别名。对于本地路径，这些命令只会移除 Pi 设置中的来源引用，不会删除源码目录或其中的 `node_modules`；如需删除文件，请在移除引用后自行处理。
@@ -700,12 +700,12 @@ npm run check
 
 ### 打包后安装到 Pi 测试
 
-以下命令以扩展仓库 `D:\code\pi-subagent-wj` 和测试项目 `D:\code\your-project` 为例。请把测试项目路径替换成你的实际路径。Smoke 打包命令会读取当前包名和版本，生成 tarball，并将其安装到仓库根目录下的 `package-smoke`；版本变化后不需要修改命令。
+以下命令以扩展仓库 `D:\code\pi-subagents-wj` 和测试项目 `D:\code\your-project` 为例。请把测试项目路径替换成你的实际路径。Smoke 打包命令会读取当前包名和版本，生成 tarball，并将其安装到仓库根目录下的 `package-smoke`；版本变化后不需要修改命令。
 
 1. 进入扩展源码目录：
 
    ```powershell
-   Set-Location "D:\code\pi-subagent-wj"
+   Set-Location "D:\code\pi-subagents-wj"
    ```
 
 2. 安装开发依赖：
@@ -735,13 +735,13 @@ npm run check
 6. 把隔离目录中的 package 安装到当前 Pi 项目：
 
    ```powershell
-   pi install "D:\code\pi-subagent-wj\package-smoke\node_modules\pi-subagent" -l
+   pi install "D:\code\pi-subagents-wj\package-smoke\node_modules\pi-subagents-wj" -l
    ```
 
    如果 Pi 提示项目未信任，并且你明确同意信任当前项目，则改用：
 
    ```powershell
-   pi install "D:\code\pi-subagent-wj\package-smoke\node_modules\pi-subagent" -l --approve
+   pi install "D:\code\pi-subagents-wj\package-smoke\node_modules\pi-subagents-wj" -l --approve
    ```
 
 7. 确认 package 已登记：
@@ -767,25 +767,25 @@ npm run check
 1. 退出 Pi，回到 PowerShell 后移除项目级 package：
 
    ```powershell
-   pi remove "D:\code\pi-subagent-wj\package-smoke\node_modules\pi-subagent" -l
+   pi remove "D:\code\pi-subagents-wj\package-smoke\node_modules\pi-subagents-wj" -l
    ```
 
 2. 返回扩展源码目录：
 
    ```powershell
-   Set-Location "D:\code\pi-subagent-wj"
+   Set-Location "D:\code\pi-subagents-wj"
    ```
 
 3. 核对即将删除的测试目录：
 
    ```powershell
-   Resolve-Path -LiteralPath "D:\code\pi-subagent-wj\package-smoke"
+   Resolve-Path -LiteralPath "D:\code\pi-subagents-wj\package-smoke"
    ```
 
 4. 仅在上一步输出完全符合预期时，删除隔离测试目录：
 
    ```powershell
-   Remove-Item -LiteralPath "D:\code\pi-subagent-wj\package-smoke" -Recurse -Force
+   Remove-Item -LiteralPath "D:\code\pi-subagents-wj\package-smoke" -Recurse -Force
    ```
 
 项目的实现规格与决策背景位于：

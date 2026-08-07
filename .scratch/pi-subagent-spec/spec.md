@@ -59,7 +59,7 @@ Minimum host: Pi `0.83.0`, Node `22.19.0`
     "@earendil-works/pi-coding-agent": "*"
   },
   "pi": {
-    "extensions": ["./extensions/pi-subagent.ts"]
+    "extensions": ["./extensions/pi-subagents-wj.ts"]
   },
   "piSubagent": {
     "requiresPi": ">=0.83.0"

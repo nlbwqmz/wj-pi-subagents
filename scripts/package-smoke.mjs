@@ -6,18 +6,21 @@ import { fileURLToPath } from "node:url";
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const smokeRoot = join(repositoryRoot, "package-smoke");
 
-function readPackageArchiveName() {
+function readPackageMetadata() {
   const manifest = JSON.parse(readFileSync(join(repositoryRoot, "package.json"), "utf8"));
   if (typeof manifest.name !== "string" || typeof manifest.version !== "string") {
     throw new Error("package.json 缺少有效的 name 或 version");
   }
-  const packageName = manifest.name.startsWith("@")
+  const archivePackageName = manifest.name.startsWith("@")
     ? manifest.name.slice(1).replaceAll("/", "-")
     : manifest.name;
-  if (!/^[A-Za-z0-9._-]+$/.test(packageName) || !/^[A-Za-z0-9._+-]+$/.test(manifest.version)) {
+  if (!/^[A-Za-z0-9._-]+$/.test(archivePackageName) || !/^[A-Za-z0-9._+-]+$/.test(manifest.version)) {
     throw new Error("package.json 的包名或版本不能用于生成 tarball 文件名");
   }
-  return `${packageName}-${manifest.version}.tgz`;
+  return Object.freeze({
+    archiveName: `${archivePackageName}-${manifest.version}.tgz`,
+    packageName: manifest.name,
+  });
 }
 
 function runNpm(args) {
@@ -35,7 +38,9 @@ function runNpm(args) {
 
 try {
   mkdirSync(smokeRoot, { recursive: true });
-  const archivePath = join(smokeRoot, readPackageArchiveName());
+  const packageMetadata = readPackageMetadata();
+  const archivePath = join(smokeRoot, packageMetadata.archiveName);
+  const installedPackagePath = join(smokeRoot, "node_modules", packageMetadata.packageName);
   runNpm(["pack", "--pack-destination", smokeRoot]);
   if (!existsSync(archivePath)) throw new Error("npm pack 未生成预期 tarball");
   runNpm([
@@ -48,7 +53,10 @@ try {
     "--no-save",
     archivePath,
   ]);
-  console.log(`Smoke 测试包已安装：${join(smokeRoot, "node_modules", "pi-subagent")}`);
+  if (!existsSync(join(installedPackagePath, "package.json"))) {
+    throw new Error("Smoke 测试包未安装到清单声明的包目录");
+  }
+  console.log(`Smoke 测试包已安装：${installedPackagePath}`);
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   console.error(`Smoke 打包失败：${message}`);
