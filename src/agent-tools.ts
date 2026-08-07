@@ -1,5 +1,6 @@
 import type { AgentController } from "./agent-controller.ts";
 import type { ChildReplyCoordinator } from "./child-reply-coordinator.ts";
+import { displayWidth, truncateToDisplayWidth } from "./agent-tree-ui.ts";
 import { controlFailure, type ControlResult } from "./tree-controller.ts";
 
 /** Pi 扩展 API 的最小结构面；生产类型由宿主包提供，核心包不复制其定义。 */
@@ -176,6 +177,156 @@ const childReplySchema: JsonSchema = Object.freeze({
 const childReplyDescription =
   "向创建你的直接父会话发送一条工作中的回复，可用于汇报进度、提出问题或发送阶段性发现。无需提供 agent_id 或目标；调用成功后不会结束当前处理，请继续原任务。最终结果由运行时在完全 settled 后自动发送，不要使用本工具模拟最终完成。";
 
+const TOOL_ARGUMENT_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+const MAX_COLLAPSED_ARGUMENT_LINES = 6;
+const RAW_UNSAFE_JSON_PATTERN = /[\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/gu;
+
+interface AgentToolRenderTheme {
+  fg(color: "toolTitle" | "dim", text: string): string;
+  bold(text: string): string;
+}
+
+interface AgentToolRenderContext {
+  readonly expanded?: boolean;
+  readonly lastComponent?: unknown;
+}
+
+interface AgentToolCallComponent {
+  render(width: number): string[];
+  invalidate(): void;
+}
+
+/** 在默认工具外壳内显示调用名称与参数，并保持每行不超过终端宽度。 */
+class AgentToolCallText implements AgentToolCallComponent {
+  private name: string;
+  private argumentText: string;
+  private expanded: boolean;
+  private theme: AgentToolRenderTheme;
+
+  constructor(
+    name: string,
+    args: unknown,
+    expanded: boolean,
+    theme: AgentToolRenderTheme,
+  ) {
+    this.name = name;
+    this.argumentText = formatToolArguments(args, expanded);
+    this.expanded = expanded;
+    this.theme = theme;
+  }
+
+  update(
+    name: string,
+    args: unknown,
+    expanded: boolean,
+    theme: AgentToolRenderTheme,
+  ): void {
+    this.name = name;
+    this.argumentText = formatToolArguments(args, expanded);
+    this.expanded = expanded;
+    this.theme = theme;
+  }
+
+  render(width: number): string[] {
+    const availableWidth = Number.isSafeInteger(width) && width > 0 ? width : 1;
+    const titleLines = wrapToDisplayWidth(this.name, availableWidth)
+      .map((line) => this.theme.fg("toolTitle", this.theme.bold(line)));
+    const prefix = availableWidth >= 3 ? "  " : "";
+    const argumentWidth = Math.max(1, availableWidth - displayWidth(prefix));
+    let argumentLines = this.argumentText
+      .split("\n")
+      .flatMap((line) => wrapToDisplayWidth(line, argumentWidth));
+    if (!this.expanded && argumentLines.length > MAX_COLLAPSED_ARGUMENT_LINES) {
+      argumentLines = [
+        ...argumentLines.slice(0, MAX_COLLAPSED_ARGUMENT_LINES - 1),
+        truncateToDisplayWidth("…（展开查看完整入参）", argumentWidth),
+      ];
+    }
+    return [
+      ...titleLines,
+      ...argumentLines.map((line) => this.theme.fg("dim", `${prefix}${line}`)),
+    ];
+  }
+
+  invalidate(): void {}
+}
+
+function renderToolCall(
+  name: string,
+  args: unknown,
+  theme: AgentToolRenderTheme,
+  context: AgentToolRenderContext,
+): AgentToolCallComponent {
+  if (context.lastComponent instanceof AgentToolCallText) {
+    context.lastComponent.update(name, args, context.expanded === true, theme);
+    return context.lastComponent;
+  }
+  return new AgentToolCallText(name, args, context.expanded === true, theme);
+}
+
+function formatToolArguments(args: unknown, expanded: boolean): string {
+  try {
+    const serialized = JSON.stringify(redactImagePayloads(args), null, expanded ? 2 : 0);
+    return escapeUnsafeJson(serialized ?? "undefined");
+  } catch {
+    return "<入参暂不可显示>";
+  }
+}
+
+function redactImagePayloads(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (Array.isArray(value)) {
+    if (seen.has(value)) return "<循环引用>";
+    seen.add(value);
+    return value.map((item) => redactImagePayloads(item, seen));
+  }
+  if (typeof value !== "object" || value === null) return value;
+  if (seen.has(value)) return "<循环引用>";
+  seen.add(value);
+  const source = value as Record<string, unknown>;
+  const imageData = typeof source.data === "string" ? source.data : undefined;
+  const imagePayload = source.type === "image" && imageData !== undefined;
+  const result: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(source)) {
+    result[key] = imagePayload && key === "data"
+      ? `<已省略 ${imageData.length} 个 base64 字符>`
+      : redactImagePayloads(item, seen);
+  }
+  return result;
+}
+
+function escapeUnsafeJson(value: string): string {
+  return value.replace(RAW_UNSAFE_JSON_PATTERN, (character) =>
+    `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+}
+
+function wrapToDisplayWidth(value: string, width: number): string[] {
+  if (value.length === 0) return [""];
+  const lines: string[] = [];
+  let line = "";
+  let lineWidth = 0;
+  for (const { segment } of TOOL_ARGUMENT_SEGMENTER.segment(value)) {
+    const segmentWidth = displayWidth(segment);
+    if (segmentWidth > width) {
+      if (line.length > 0) lines.push(line);
+      lines.push(truncateToDisplayWidth(segment, width));
+      line = "";
+      lineWidth = 0;
+      continue;
+    }
+    if (line.length > 0 && lineWidth + segmentWidth > width) {
+      lines.push(line);
+      line = segment;
+      lineWidth = segmentWidth;
+      continue;
+    }
+    line += segment;
+    lineWidth += segmentWidth;
+  }
+  if (line.length > 0) lines.push(line);
+  return lines.length > 0 ? lines : [""];
+}
+
 /** 返回给 Pi 的固定工具结果；details 只包含控制器安全数据。 */
 function toolResult<T>(result: ControlResult<T>, dataOnly = false): unknown {
   if (!result.ok) throw new SubagentToolError(result.error);
@@ -210,6 +361,11 @@ function executeTool(
     description: descriptions[name],
     parameters: schemas[name],
     executionMode: "sequential",
+    renderCall: (
+      params: unknown,
+      theme: AgentToolRenderTheme,
+      context: AgentToolRenderContext,
+    ) => renderToolCall(name, params, theme, context),
     execute: async (
       _toolCallId: string,
       params: unknown,
@@ -271,6 +427,11 @@ export function registerReplyToParentTool(
     description: childReplyDescription,
     parameters: childReplySchema,
     executionMode: "sequential",
+    renderCall: (
+      params: unknown,
+      theme: AgentToolRenderTheme,
+      context: AgentToolRenderContext,
+    ) => renderToolCall(CHILD_REPLY_TOOL_NAME, params, theme, context),
     execute: async (
       _toolCallId: string,
       params: unknown,
