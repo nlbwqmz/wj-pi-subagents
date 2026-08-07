@@ -74,6 +74,8 @@ export interface AgentSupervisor {
   /** 故障节点的平台进程树边界回收；节点记录本身继续保持 failed。 */
   reapOrphanedDescendants?(): Promise<{ readonly confirmed: boolean; readonly forced: boolean }>;
   onEvent(listener: (event: RpcSupervisorEvent) => void): () => void;
+  /** reload 后让直接子监督器重试尚未进入父会话的回复。 */
+  retryPendingReplies?(): Promise<void>;
   wasForcedTerminationUsed(): boolean;
 }
 
@@ -591,6 +593,13 @@ export class AgentController {
   updateTemplateSnapshot(snapshot: TemplateDiscoverySnapshot): void {
     this.templateSnapshot = snapshot;
     this.createSupervisor.updateTemplateSnapshot?.(snapshot);
+  }
+
+  /** 新 Pi API 已绑定后，逐个重试直接子通道中已接收但尚未确认的回复。 */
+  async retryPendingReplies(): Promise<void> {
+    await Promise.allSettled([...this.agents.values()].map(async ({ supervisor }) => {
+      await supervisor.retryPendingReplies?.();
+    }));
   }
 
   /**

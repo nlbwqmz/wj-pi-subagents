@@ -3,6 +3,7 @@ import {
   isManagedProcessTreeAdapter,
   type ProcessTreeAdapter,
 } from "./process-tree-capability.ts";
+import { holdRuntimeReloadLeaseDuringActivation } from "./runtime-reload-coordinator.ts";
 
 interface PackageManifestRequirements {
   engines?: { node?: unknown };
@@ -345,14 +346,19 @@ export function createPiSubagentExtension(
   options: PiSubagentExtensionOptions = {},
 ): PiSubagentExtensionFactory {
   return async (extensionApi) => {
-    const capabilities = await checkHostCapabilities({
-      ...options.probe,
-      extensionApi,
-    });
-    if (!capabilities.ok) {
-      registerUnavailableDiagnostic(extensionApi, capabilities.diagnostic);
-      return;
+    const reloadHold = holdRuntimeReloadLeaseDuringActivation();
+    try {
+      const capabilities = await checkHostCapabilities({
+        ...options.probe,
+        extensionApi,
+      });
+      if (!capabilities.ok) {
+        registerUnavailableDiagnostic(extensionApi, capabilities.diagnostic);
+        return;
+      }
+      await options.activate?.(extensionApi, capabilities);
+    } finally {
+      await reloadHold.release();
     }
-    await options.activate?.(extensionApi, capabilities);
   };
 }

@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   discoverTemplateSnapshot,
   listAgentTemplates,
+  MAX_TEMPLATE_BODY_BYTES,
   TemplateSnapshotController,
   type TemplateDirectoryEntry,
   type TemplateDiscoveryFileSystem,
@@ -130,6 +131,37 @@ test("严格解析完整 frontmatter，保留正文并静默忽略未知字段",
     body: "先制定执行计划。",
   }]);
   assert.doesNotMatch(JSON.stringify(snapshot.templates), /SHOULD_NOT_APPEAR/);
+});
+
+test("模板正文以 UTF-8 64 KiB 边界参与发现，供直接和递归创建共同使用", () => {
+  const userDirectory = join(homedir(), ".pi", "agent", "agents");
+  const fileSystem = new MemoryTemplateFileSystem(
+    new Map([[userDirectory, [
+      { name: "boundary.md", kind: "file" as const },
+      { name: "oversized.md", kind: "file" as const },
+    ]]]),
+    new Map([
+      [
+        join(userDirectory, "boundary.md"),
+        `---\ntools: read\n---\n${"x".repeat(MAX_TEMPLATE_BODY_BYTES)}`,
+      ],
+      [
+        join(userDirectory, "oversized.md"),
+        `---\ntools: read\n---\n${"x".repeat(MAX_TEMPLATE_BODY_BYTES + 1)}`,
+      ],
+    ]),
+  );
+
+  const snapshot = discoverTemplateSnapshot({
+    root: { cwd: "C:\\workspace\\project", projectTrust: false },
+    knownTools: new Set(["read"]),
+    fileSystem,
+  });
+
+  assert.deepEqual(snapshot.templates.map((template) => template.templateId), ["boundary"]);
+  assert.deepEqual(snapshot.invalidCandidates.map((candidate) => [candidate.fileName, candidate.reason]), [
+    ["oversized.md", "body_too_large"],
+  ]);
 });
 
 test("接受 Pi 精确模型引用中包含斜杠的模型标识", () => {

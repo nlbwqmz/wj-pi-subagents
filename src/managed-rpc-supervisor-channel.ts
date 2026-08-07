@@ -132,6 +132,17 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
     throw new Error("父端监督通道不能发布代理回复");
   }
 
+  async retryPendingReplies(): Promise<void> {
+    const replyAck = this.protocol.retryPendingReplies();
+    if (replyAck === undefined) return;
+    try {
+      await this.send(replyAck);
+    } catch {
+      this.fail("protocol_fault");
+      throw new Error("监督回复确认发送失败");
+    }
+  }
+
   establishTerminationBarrier(): void {
     this.protocol.establishTerminationBarrier();
   }

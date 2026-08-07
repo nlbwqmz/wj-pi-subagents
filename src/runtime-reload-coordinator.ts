@@ -21,6 +21,11 @@ export interface IncomingRuntimeReloadLease<TRuntime> {
   readonly expired: boolean;
 }
 
+/** 扩展 factory 仍在门禁或装配时，暂缓无人接管 watchdog。 */
+export interface RuntimeReloadActivationHold {
+  release(): Promise<void>;
+}
+
 export interface RuntimeReloadCoordinatorOptions<TRuntime, TTransfer> {
   readonly eventBus?: RuntimeReloadEventBus;
   readonly timeoutMs?: number;
@@ -50,6 +55,7 @@ interface ReloadLeaseRequest {
 interface PendingRuntimeReloadLease<TRuntime, TTransfer> {
   readonly runtime: TRuntime;
   readonly transfer: TTransfer;
+  readonly activationHolds: Set<string>;
   timer: ReturnType<typeof setTimeout> | undefined;
   sharedLeaseId: string | undefined;
 }
@@ -57,6 +63,7 @@ interface PendingRuntimeReloadLease<TRuntime, TTransfer> {
 interface SharedRuntimeReloadLease {
   readonly identity: RuntimeReloadIdentity;
   claim(identity: RuntimeReloadIdentity, accept: (transfer: unknown) => boolean): boolean;
+  holdActivation(): RuntimeReloadActivationHold | undefined;
 }
 
 interface SharedRuntimeReloadLeaseRegistry {
@@ -65,7 +72,6 @@ interface SharedRuntimeReloadLeaseRegistry {
 }
 
 interface MutableIncomingRuntimeReloadLease<TRuntime> extends IncomingRuntimeReloadLease<TRuntime> {
-  timer: ReturnType<typeof setTimeout> | undefined;
   cleanup: Promise<boolean> | undefined;
   expired: boolean;
 }
@@ -101,26 +107,13 @@ export class RuntimeReloadCoordinator<TRuntime, TTransfer> {
     const lease: PendingRuntimeReloadLease<TRuntime, TTransfer> = {
       runtime,
       transfer: this.options.createTransfer(runtime),
+      activationHolds: new Set<string>(),
       timer: undefined,
       sharedLeaseId: undefined,
     };
     this.outgoing = lease;
     this.publishSharedOutgoing(lease);
-    const timer = setTimeout(() => {
-      if (this.outgoing !== lease || this.options.getActive() !== runtime) return;
-      this.clearOutgoing(lease);
-      this.options.setHandoffPending(runtime, false);
-      void this.options.cleanup(runtime).then((complete) => {
-        if (!complete) return;
-        if (this.options.getActive() === runtime) this.options.setActive(undefined);
-        this.unsubscribe();
-        this.options.release(runtime);
-      }).catch(() => {
-        // watchdog 失败时保留 owner，后续 shutdown 事件仍可重试。
-      });
-    }, this.timeoutMs);
-    timer.unref?.();
-    lease.timer = timer;
+    this.armOutgoingTimeout(lease);
     return true;
   }
 
@@ -150,8 +143,6 @@ export class RuntimeReloadCoordinator<TRuntime, TTransfer> {
     const lease = this.incoming;
     if (lease === undefined) throw new Error("reload 交接 lease 不可用");
     if (lease.expired) throw new Error("reload 交接 lease 已过期");
-    if (lease.timer !== undefined) clearTimeout(lease.timer);
-    lease.timer = undefined;
     return lease;
   }
 
@@ -168,8 +159,6 @@ export class RuntimeReloadCoordinator<TRuntime, TTransfer> {
     const lease = candidate as MutableIncomingRuntimeReloadLease<TRuntime>;
     if (this.incoming !== lease) return false;
     lease.expired = true;
-    if (lease.timer !== undefined) clearTimeout(lease.timer);
-    lease.timer = undefined;
     const cleanup = lease.cleanup ?? this.options.cleanup(lease.runtime);
     lease.cleanup = cleanup;
     let complete: boolean;
@@ -217,16 +206,9 @@ export class RuntimeReloadCoordinator<TRuntime, TTransfer> {
     }
     const lease: MutableIncomingRuntimeReloadLease<TRuntime> = {
       runtime,
-      timer: undefined,
       cleanup: undefined,
       expired: false,
     };
-    const timer = setTimeout(() => {
-      if (this.incoming !== lease || this.options.getActive() === runtime) return;
-      void this.cleanupIncoming(lease);
-    }, this.timeoutMs);
-    timer.unref?.();
-    lease.timer = timer;
     this.incoming = lease;
     return true;
   }
@@ -250,6 +232,7 @@ export class RuntimeReloadCoordinator<TRuntime, TTransfer> {
         this.unsubscribe();
         return true;
       },
+      holdActivation: () => this.holdOutgoingActivation(lease),
     }));
   }
 
@@ -293,9 +276,58 @@ export class RuntimeReloadCoordinator<TRuntime, TTransfer> {
     }
   }
 
+  private holdOutgoingActivation(
+    lease: PendingRuntimeReloadLease<TRuntime, TTransfer>,
+  ): RuntimeReloadActivationHold | undefined {
+    if (this.outgoing !== lease || this.options.getActive() !== lease.runtime) return undefined;
+    const holdId = randomUUID();
+    lease.activationHolds.add(holdId);
+    if (lease.timer !== undefined) clearTimeout(lease.timer);
+    lease.timer = undefined;
+    let released = false;
+    return Object.freeze({
+      release: async (): Promise<void> => {
+        if (released) return;
+        released = true;
+        if (!lease.activationHolds.delete(holdId)) return;
+        if (this.outgoing !== lease || lease.activationHolds.size > 0) return;
+        await this.expireOutgoing(lease);
+      },
+    });
+  }
+
+  private armOutgoingTimeout(lease: PendingRuntimeReloadLease<TRuntime, TTransfer>): void {
+    if (this.outgoing !== lease || lease.activationHolds.size > 0) return;
+    const timer = setTimeout(() => {
+      if (lease.timer !== timer) return;
+      lease.timer = undefined;
+      void this.expireOutgoing(lease);
+    }, this.timeoutMs);
+    timer.unref?.();
+    lease.timer = timer;
+  }
+
+  private async expireOutgoing(lease: PendingRuntimeReloadLease<TRuntime, TTransfer>): Promise<void> {
+    if (this.outgoing !== lease || this.options.getActive() !== lease.runtime) return;
+    this.clearOutgoing(lease);
+    this.options.setHandoffPending(lease.runtime, false);
+    let complete: boolean;
+    try {
+      complete = await this.options.cleanup(lease.runtime);
+    } catch {
+      // watchdog 失败时保留 owner，后续 shutdown 事件仍可重试。
+      return;
+    }
+    if (!complete) return;
+    if (this.options.getActive() === lease.runtime) this.options.setActive(undefined);
+    this.unsubscribe();
+    this.options.release(lease.runtime);
+  }
+
   private clearOutgoing(lease: PendingRuntimeReloadLease<TRuntime, TTransfer>): void {
     if (lease.timer !== undefined) clearTimeout(lease.timer);
     lease.timer = undefined;
+    lease.activationHolds.clear();
     if (lease.sharedLeaseId !== undefined) {
       sharedReloadLeaseRegistry().leases.delete(lease.sharedLeaseId);
       lease.sharedLeaseId = undefined;
@@ -334,6 +366,28 @@ function sharedReloadLeaseRegistry(): SharedRuntimeReloadLeaseRegistry {
   });
   store[SHARED_RELOAD_LEASE_REGISTRY] = created;
   return created;
+}
+
+const EMPTY_RUNTIME_RELOAD_ACTIVATION_HOLD: RuntimeReloadActivationHold = Object.freeze({
+  release: async () => {},
+});
+
+/**
+ * 新扩展 factory 一开始即持有唯一待交接 lease，避免异步宿主门禁耗时被误判
+ * 为无人接管。成功激活时 coordinator 会先认领 lease；失败时 release 负责清树。
+ */
+export function holdRuntimeReloadLeaseDuringActivation(): RuntimeReloadActivationHold {
+  const candidates = [...sharedReloadLeaseRegistry().leases.values()];
+  if (candidates.length !== 1) return EMPTY_RUNTIME_RELOAD_ACTIVATION_HOLD;
+  const candidate = candidates[0] as SharedRuntimeReloadLease & {
+    readonly holdActivation?: unknown;
+  };
+  if (typeof candidate.holdActivation !== "function") return EMPTY_RUNTIME_RELOAD_ACTIVATION_HOLD;
+  try {
+    return candidate.holdActivation() ?? EMPTY_RUNTIME_RELOAD_ACTIVATION_HOLD;
+  } catch {
+    return EMPTY_RUNTIME_RELOAD_ACTIVATION_HOLD;
+  }
 }
 
 export function readRuntimeReloadEventBus(candidate: unknown): RuntimeReloadEventBus | undefined {

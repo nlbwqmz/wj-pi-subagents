@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { fileURLToPath } from "node:url";
 import type { Readable, Writable } from "node:stream";
@@ -12,9 +13,14 @@ import type {
 
 const DEFAULT_READY_TIMEOUT_MS = 5_000;
 const DEFAULT_COMMAND_TIMEOUT_MS = 5_000;
-const WINDOWS_JOB_HELPER_PATH = fileURLToPath(
-  new URL("./windows-job-object-helper.ps1", import.meta.url),
-);
+function defaultWindowsJobHelperPath(): string {
+  const colocated = fileURLToPath(new URL("./windows-job-object-helper.ps1", import.meta.url));
+  if (existsSync(colocated)) return colocated;
+  // 编译适配器位于 dist/src；发布包仍保留 extension 所需的 src helper。
+  return fileURLToPath(new URL("../../src/windows-job-object-helper.ps1", import.meta.url));
+}
+
+const WINDOWS_JOB_HELPER_PATH = defaultWindowsJobHelperPath();
 
 export interface WindowsJobObjectLaunchOptions {
   /** 要在专用 Job Object 内启动的可执行文件，不能是已运行的进程。 */

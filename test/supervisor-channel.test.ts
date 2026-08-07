@@ -326,6 +326,33 @@ test("普通回复按 reply_seq 有序注入并以累计 ACK 去重，窗口有�
   });
 });
 
+test("最大合法图片 final 以解码字节计量，并可超过单个桥接分片", () => {
+  const received: Array<{ text: string; imageCount: number }> = [];
+  const pair = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+    onReply: (reply) => {
+      received.push({ text: reply.text, imageCount: reply.images?.length ?? 0 });
+      return true;
+    },
+  });
+  handshake(pair);
+  const imageData = Buffer.alloc(SUPERVISOR_CHANNEL_LIMITS.maxImageBytes, 0x5a).toString("base64");
+  const images = Array.from({ length: SUPERVISOR_CHANNEL_LIMITS.maxImagesPerReply }, () => ({
+    type: "image" as const,
+    data: imageData,
+    mimeType: "image/png",
+  }));
+  const reply = pair.child.publishReply({ kind: "final", text: "附带最大合法图片", images });
+  const encoded = pair.child.encode(reply);
+  assert.ok(encoded.byteLength > 64 * 1024);
+
+  const result = pair.parent.receive(encoded);
+  assert.equal(result.kind, "accepted");
+  assert.deepEqual(received, [{ text: "附带最大合法图片", imageCount: 8 }]);
+});
+
 test("工作中 message 为 final 预留窗口槽位，二者按同一 reply_seq 顺序提交", () => {
   const replies: Array<{ kind: string; text: string }> = [];
   const pair = createFakeSupervisorChannelPair({
@@ -401,14 +428,23 @@ test("原始 reply 帧必须显式携带 kind，message 正文不能为空", () 
     () => emptyMessage.child.publishReply({ kind: "message", text: "   " }),
     (error: unknown) => error instanceof SupervisorProtocolError && error.code === "reply_invalid",
   );
+  assert.throws(
+    () => emptyMessage.child.publishReply({
+      kind: "final",
+      text: "",
+      images: [{ type: "image", data: "YWJj", mimeType: "text/plain" }],
+    }),
+    (error: unknown) => error instanceof SupervisorProtocolError && error.code === "reply_invalid",
+  );
 });
 
-test("回复注入未成功时不发送 reply ACK，也不把通道裁决为协议故障", () => {
+test("回复注入未成功时保留正文，父会话恢复后重试并发送 reply ACK", () => {
+  let parentAvailable = false;
   const pair = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,
     childAgentId: CHILD_ID,
     credential: CREDENTIAL,
-    onReply: () => false,
+    onReply: () => parentAvailable,
   });
   handshake(pair);
   const reply = pair.child.publishReply({ text: "等待父会话可用" });
@@ -418,7 +454,22 @@ test("回复注入未成功时不发送 reply ACK，也不把通道裁决为协�
   assert.deepEqual(result.replies, []);
   assert.equal(result.outbound.some((frame) => frame.payload.kind === "reply"), false);
   assert.equal(pair.parent.getPublicState().state, "ready");
+  assert.equal(pair.parent.getPublicState().pending_reply_count, 1);
   assert.equal(pair.child.getPublicState().pending_reply_count, 1);
+  for (const transportAck of result.outbound) {
+    assert.equal(pair.child.receive(transportAck).kind, "accepted");
+  }
+
+  parentAvailable = true;
+  const replyAck = pair.parent.retryPendingReplies();
+  assert.ok(replyAck);
+  assert.equal(replyAck.payload.kind, "reply");
+  assert.equal(replyAck.payload.reply_seq, 1);
+  assert.equal(pair.parent.getPublicState().pending_reply_count, 0);
+  const acceptedAck = pair.child.receive(replyAck);
+  assert.equal(acceptedAck.kind, "accepted");
+  assert.equal(pair.child.getPublicState().pending_reply_count, 0);
+  assert.equal(pair.parent.retryPendingReplies(), undefined);
 });
 
 test("内部控制请求与响应沿现有序号和 ACK 合法往返", () => {
@@ -508,6 +559,37 @@ test("模板目录查询作为只读控制操作合法往返", () => {
     route: [CHILD_ID],
     body: {},
   });
+});
+
+test("根权威控制响应可传递超过普通回复文本边界的模板正文", () => {
+  const pair = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+  });
+  handshake(pair);
+  const body = "x".repeat(SUPERVISOR_CHANNEL_LIMITS.maxStringBytes + 1);
+  const response = pair.parent.publishControlResponse({
+    operation_id: "resolve_large_template",
+    ok: true,
+    data: {
+      template: {
+        template_id: "large",
+        body,
+      },
+      template_revision: 1,
+    },
+  });
+  const result = pair.child.receive(pair.parent.encode(response));
+  assert.equal(result.kind, "accepted");
+  if (result.kind === "accepted") {
+    assert.equal(
+      ((result.control_response?.ok === true
+        ? result.control_response.data as { template: { body: string } }
+        : undefined)?.template.body),
+      body,
+    );
+  }
 });
 
 test("控制请求拒绝空 route、非规范身份和跨分支伪造", () => {
@@ -713,10 +795,14 @@ test("控制正文遵守字符串、条目、深度、帧大小和纯 JSON 边�
     body: body as never,
   });
 
-  const boundary = pair.child.publishControlRequest(request("x".repeat(SUPERVISOR_CHANNEL_LIMITS.maxStringBytes)));
+  const boundary = pair.child.publishControlRequest(request(
+    "x".repeat(SUPERVISOR_CHANNEL_LIMITS.maxControlStringBytes),
+  ));
   assert.equal(boundary.kind, "control_request");
   assertProtocolError(
-    () => pair.child.publishControlRequest(request("x".repeat(SUPERVISOR_CHANNEL_LIMITS.maxStringBytes + 1))),
+    () => pair.child.publishControlRequest(request(
+      "x".repeat(SUPERVISOR_CHANNEL_LIMITS.maxControlStringBytes + 1),
+    )),
     "frame_too_large",
   );
   assertProtocolError(
@@ -737,12 +823,17 @@ test("控制正文遵守字符串、条目、深度、帧大小和纯 JSON 边�
   assertProtocolError(() => pair.child.publishControlRequest(request(cyclic)), "invalid_frame");
   assertProtocolError(() => pair.child.publishControlRequest(request(new Array(1))), "invalid_frame");
 
-  const padding = "x".repeat(SUPERVISOR_CHANNEL_LIMITS.maxStringBytes);
+  const padding = "x".repeat(SUPERVISOR_CHANNEL_LIMITS.maxControlStringBytes);
   const oversizedFrame = pair.child.publishControlRequest(request({
     one: padding,
     two: padding,
     three: padding,
     four: padding,
+    five: padding,
+    six: padding,
+    seven: padding,
+    eight: padding,
+    nine: padding,
   }));
   assertProtocolError(() => pair.child.encode(oversizedFrame), "frame_too_large");
 });
@@ -913,7 +1004,8 @@ test("EOF、损坏载荷、终止屏障和旧流不会伪造健康状态；公�
   assert.doesNotMatch(JSON.stringify(pair.parent.getPublicState()), /test-one-time|credential|endpoint|stream|seq|path|stack/i);
 
   const corruptPair = createFakeSupervisorChannelPair({ rootId: ROOT_ID, childAgentId: CHILD_ID, credential: CREDENTIAL });
-  const corrupt = new Uint8Array([0, 0, 0, SUPERVISOR_CHANNEL_LIMITS.maxFrameBytes + 1]);
+  const corrupt = new Uint8Array(4);
+  new DataView(corrupt.buffer).setUint32(0, SUPERVISOR_CHANNEL_LIMITS.maxFrameBytes + 1, false);
   assert.equal(corruptPair.parent.inject(corrupt).kind, "protocol_fault");
   assert.equal(corruptPair.parent.getPublicState().state, "faulted");
 });

@@ -157,6 +157,11 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     }
   }
 
+  async retryPendingReplies(): Promise<void> {
+    const replyAck = this.protocol.retryPendingReplies();
+    if (replyAck !== undefined) await this.send(replyAck);
+  }
+
   /** child 端发布已经由 SupervisorChannel 校验的生命周期事实。 */
   async publishEvent(
     event: Omit<SupervisorEvent, "root_id" | "agent_id"> & { readonly agent_id?: string },

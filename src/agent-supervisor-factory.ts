@@ -89,6 +89,7 @@ export function createAgentSupervisorFactory(
       rpcOptions: buildManagedRpcOptions(template, {
         currentModel: options.currentModel,
         currentThinking: options.currentThinking,
+        projectTrust: options.rootRuntime.projectTrust,
         extensionPath: options.childExtensionPath ?? defaultChildExtensionPath(),
         ...(childPiPaths.cliPath === undefined ? {} : { cliPath: childPiPaths.cliPath }),
         ...(childPiPaths.modulePath === undefined ? {} : { piModulePath: childPiPaths.modulePath }),
@@ -198,6 +199,8 @@ export function buildManagedRpcOptions(
   options: {
     readonly currentModel?: AgentSupervisorFactoryOptions["currentModel"];
     readonly currentThinking?: AgentSupervisorFactoryOptions["currentThinking"];
+    /** 根会话捕获的信任结论必须以 Pi CLI 覆盖参数传给全部后代。 */
+    readonly projectTrust?: boolean;
     readonly childReplyTools?: readonly string[];
     readonly managementTools?: readonly string[];
     readonly extensionPath?: string;
@@ -205,7 +208,10 @@ export function buildManagedRpcOptions(
     readonly piModulePath?: string;
   } = {},
 ): Readonly<Record<string, unknown>> {
-  const args: string[] = ["--no-session"];
+  const args: string[] = [
+    "--no-session",
+    ...(options.projectTrust === undefined ? [] : [options.projectTrust ? "--approve" : "--no-approve"]),
+  ];
   if (options.extensionPath !== undefined) {
     // 保留显式加载本扩展，同时允许 Pi 按根会话 settings 发现 provider 等扩展。
     // 子 Pi 若关闭扩展发现，将无法解析根会话使用的动态 provider。
@@ -214,9 +220,12 @@ export function buildManagedRpcOptions(
   if (template.contextFiles === "disabled") args.push("--no-context-files");
   const thinking = template.thinking ?? resolveCurrent(options.currentThinking);
   if (thinking !== undefined) args.push("--thinking", thinking);
-  if (template.body.trim() !== "") {
-    args.push(template.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", template.body);
-  }
+  const templatePrompt = template.body.trim() === ""
+    ? undefined
+    : Object.freeze({
+      mode: template.systemPromptMode,
+      body: template.body,
+    });
   const tools = [...new Set([
     ...template.tools,
     ...(options.childReplyTools ?? []),
@@ -231,6 +240,7 @@ export function buildManagedRpcOptions(
     ...(options.piModulePath === undefined ? {} : { piModulePath: options.piModulePath }),
     ...(provider === undefined ? {} : { provider }),
     ...(model === undefined ? {} : { model }),
+    ...(templatePrompt === undefined ? {} : { templatePrompt }),
     args: Object.freeze(args),
   });
 }

@@ -157,12 +157,11 @@ test("受管 RPC 选项按模板覆盖或在创建瞬间继承模型与 thinking
   assert.deepEqual(explicit, {
     provider: "google",
     model: "gemini-exp",
+    templatePrompt: { mode: "replace", body: "固定提示" },
     args: [
       "--no-session",
       "--thinking",
       "xhigh",
-      "--system-prompt",
-      "固定提示",
       "--tools",
       "read,grep",
     ],
@@ -193,6 +192,11 @@ test("受管 RPC 选项按模板覆盖或在创建瞬间继承模型与 thinking
   ]);
   assert.equal(withExtension.cliPath, "C:/pi/dist/cli.js");
   assert.equal(withExtension.piModulePath, "C:/pi/dist/index.js");
+
+  const trusted = buildManagedRpcOptions(template(), { projectTrust: true });
+  const untrusted = buildManagedRpcOptions(template(), { projectTrust: false });
+  assert.deepEqual(trusted.args, ["--no-session", "--approve", "--no-context-files", "--tools", ""]);
+  assert.deepEqual(untrusted.args, ["--no-session", "--no-approve", "--no-context-files", "--tools", ""]);
 });
 
 test("身份预留后才建立监督上下文并追加最终子代理环境", async () => {

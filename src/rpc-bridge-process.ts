@@ -6,10 +6,14 @@
  * 转发给父监督器。
  */
 import { randomBytes } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   MANAGED_RPC_BRIDGE_CREDENTIAL_ENV,
+  MANAGED_RPC_BRIDGE_COMMAND_CHUNK_BYTES,
+  MANAGED_RPC_BRIDGE_MAX_COMMAND_PAYLOAD_BYTES,
   MANAGED_RPC_BRIDGE_MAX_FRAME_BYTES,
   MANAGED_RPC_BRIDGE_PROTOCOL,
   MANAGED_RPC_SUPERVISOR_MAX_FRAME_BYTES,
@@ -53,6 +57,20 @@ interface BridgeCommand {
   readonly payload?: unknown;
 }
 
+interface PendingChunkedCommand {
+  readonly id: number;
+  readonly command: string;
+  readonly chunkCount: number;
+  readonly chunks: Uint8Array[];
+  byteLength: number;
+  nextChunkIndex: number;
+}
+
+interface TemplatePromptConfig {
+  readonly mode: "append" | "replace";
+  readonly body: string;
+}
+
 const decoder = new LengthPrefixedFrameDecoder(MAX_FRAME_BYTES);
 let client: BridgeClient | undefined;
 let stopping = false;
@@ -65,6 +83,8 @@ let commandQueue: Promise<void> = Promise.resolve();
 let outputQueue: Promise<void> = Promise.resolve();
 let exitScheduled = false;
 let config: Record<string, unknown> = {};
+let pendingChunkedCommand: PendingChunkedCommand | undefined;
+let templatePromptDirectory: string | undefined;
 let supervisorListener: LocalSupervisorTransportListener | undefined;
 let supervisorTransport: SupervisorByteTransport | undefined;
 let supervisorWriteQueue: Promise<void> = Promise.resolve();
@@ -145,6 +165,8 @@ function failAndExit(faultCode: "protocol_fault" | "process_exit"): void {
   stopping = true;
   protocolFailed = true;
   decoder.reset();
+  pendingChunkedCommand = undefined;
+  cleanupTemplatePromptFile();
   process.stdin.pause();
   fault(faultCode);
   void Promise.allSettled([
@@ -259,6 +281,34 @@ function clearBridgeSupervisorEnvironment(): void {
   }
 }
 
+function createTemplatePromptFile(prompt: TemplatePromptConfig): string {
+  const directory = mkdtempSync(join(tmpdir(), "pi-subagent-prompt-"));
+  const filePath = join(directory, "system-prompt.txt");
+  try {
+    writeFileSync(filePath, prompt.body, { encoding: "utf8", mode: 0o600 });
+  } catch (error) {
+    try {
+      rmSync(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
+    } catch {
+      // 原始写入错误是唯一可归类的启动失败原因。
+    }
+    throw error;
+  }
+  templatePromptDirectory = directory;
+  return filePath;
+}
+
+function cleanupTemplatePromptFile(): void {
+  const directory = templatePromptDirectory;
+  templatePromptDirectory = undefined;
+  if (directory === undefined) return;
+  try {
+    rmSync(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
+  } catch {
+    // 临时文件无法删除不能改变子进程或监督协议状态；退出后由系统回收。
+  }
+}
+
 async function closeLocalSupervisor(): Promise<void> {
   const listener = supervisorListener;
   supervisorListener = undefined;
@@ -269,6 +319,8 @@ async function closeLocalSupervisor(): Promise<void> {
 }
 
 function parseArgs(): void {
+  // 兼容旧 bridge 入口；生产节点已改为在首个有界 start 命令中传递配置，
+  // 防止模板正文因 Windows 命令行编码膨胀而无法启动。
   const index = process.argv.indexOf("--config");
   const encoded = index >= 0 ? process.argv[index + 1] : undefined;
   if (encoded === undefined) return;
@@ -279,6 +331,20 @@ function parseArgs(): void {
   } catch {
     config = {};
   }
+}
+
+function normalizeBridgeConfig(value: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["rpc"]) || !isRecord(value.rpc)) return undefined;
+  return Object.freeze({ rpc: Object.freeze({ ...value.rpc }) });
+}
+
+function normalizeTemplatePrompt(value: unknown): TemplatePromptConfig | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value) || !hasOnlyKeys(value, ["mode", "body"])) return undefined;
+  if ((value.mode !== "append" && value.mode !== "replace") || typeof value.body !== "string") {
+    return undefined;
+  }
+  return Object.freeze({ mode: value.mode, body: value.body });
 }
 
 function normalizeSupervisorInit(value: unknown): ManagedRpcSupervisorInit | undefined {
@@ -374,7 +440,26 @@ async function ensureClient(): Promise<BridgeClient> {
     ? await import("@earendil-works/pi-coding-agent")
     : await import(moduleSpecifier);
   const { RpcClient } = piModule;
-  const { piModulePath: _piModulePath, ...clientRpcOptions } = options;
+  const {
+    piModulePath: _piModulePath,
+    templatePrompt: rawTemplatePrompt,
+    args: rawArgs,
+    ...clientRpcOptions
+  } = options;
+  const templatePrompt = normalizeTemplatePrompt(rawTemplatePrompt);
+  if (rawTemplatePrompt !== undefined && templatePrompt === undefined) {
+    throw new Error("模板提示配置无效");
+  }
+  if (rawArgs !== undefined && (!Array.isArray(rawArgs) || rawArgs.some((arg) => typeof arg !== "string"))) {
+    throw new Error("Pi RPC 参数无效");
+  }
+  const args = rawArgs === undefined ? [] : [...rawArgs];
+  if (templatePrompt !== undefined) {
+    args.push(
+      templatePrompt.mode === "replace" ? "--system-prompt" : "--append-system-prompt",
+      createTemplatePromptFile(templatePrompt),
+    );
+  }
   const configuredEnvironment = isRecord(options.env)
     ? Object.fromEntries(Object.entries(options.env).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
@@ -382,13 +467,19 @@ async function ensureClient(): Promise<BridgeClient> {
     : {};
   const clientOptions = {
     ...clientRpcOptions,
+    ...(args.length === 0 ? {} : { args }),
     ...(cliPath === undefined ? {} : { cliPath }),
     env: {
       ...configuredEnvironment,
       ...(childSupervisorEnvironment ?? {}),
     },
   };
-  client = new RpcClient(clientOptions as never) as unknown as BridgeClient;
+  try {
+    client = new RpcClient(clientOptions as never) as unknown as BridgeClient;
+  } catch (error) {
+    cleanupTemplatePromptFile();
+    throw error;
+  }
   client.onEvent((event) => {
     const normalized = normalizeRpcBridgeEvent(event);
     if (normalized.kind === "invalid") {
@@ -435,17 +526,26 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
       if (!isRecord(command.payload) || typeof command.payload.credential !== "string"
         || command.payload.credential.length < 32
         || command.payload.credential !== configuredCredential
-        || Object.keys(command.payload).some((key) => key !== "credential" && key !== "supervisor")) {
+        || Object.keys(command.payload).some((key) => (
+          key !== "credential" && key !== "supervisor" && key !== "config"
+        ))) {
         failAndExit("protocol_fault");
         return;
       }
       const supervisorInit = command.payload.supervisor === undefined
         ? undefined
         : normalizeSupervisorInit(command.payload.supervisor);
-      if (command.payload.supervisor !== undefined && supervisorInit === undefined) {
+      const bridgeConfig = command.payload.config === undefined
+        ? undefined
+        : normalizeBridgeConfig(command.payload.config);
+      if (
+        (command.payload.supervisor !== undefined && supervisorInit === undefined)
+        || (command.payload.config !== undefined && bridgeConfig === undefined)
+      ) {
         failAndExit("protocol_fault");
         return;
       }
+      if (bridgeConfig !== undefined) config = bridgeConfig;
       authenticated = true;
       started = true;
       if (supervisorInit !== undefined) {
@@ -465,7 +565,11 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
       try {
         await current.start();
         if (connection !== undefined) bindSupervisorTransport(await connection);
+        // RpcClient.start() 仅确认子进程已经存活；等待一次只读 RPC 响应，
+        // 确保 Pi 已完成资源读取后再删除短生命周期的模板提示文件。
+        if (templatePromptDirectory !== undefined) await current.getState();
       } finally {
+        cleanupTemplatePromptFile();
         clearBridgeSupervisorEnvironment();
       }
       response(command.id, true);
@@ -505,6 +609,7 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
     if (command.command === "close") {
       stopping = true;
       await current.stop();
+      cleanupTemplatePromptFile();
       await closeLocalSupervisor();
       response(command.id, true);
       await flushOutput();
@@ -515,6 +620,7 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
     response(command.id, false);
   } catch {
     if (command.command === "start") {
+      cleanupTemplatePromptFile();
       try {
         await closeLocalSupervisor();
       } catch {
@@ -523,6 +629,83 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
     }
     response(command.id, false);
   }
+}
+
+function enqueueCommand(command: BridgeCommand): void {
+  commandQueue = commandQueue
+    .then(() => handleCommand(command))
+    .catch(() => failAndExit("process_exit"));
+}
+
+function acceptCommandChunk(value: Record<string, unknown>): boolean {
+  if (
+    !hasOnlyKeys(value, ["protocol", "kind", "id", "command", "chunk_index", "chunk_count", "chunk"])
+    || !Number.isSafeInteger(value.id)
+    || (value.id as number) <= 0
+    || typeof value.command !== "string"
+    || !["start", "prompt", "steer", "abort", "get_state", "close"].includes(value.command)
+    || !Number.isSafeInteger(value.chunk_index)
+    || (value.chunk_index as number) < 0
+    || !Number.isSafeInteger(value.chunk_count)
+    || (value.chunk_count as number) < 1
+    || (value.chunk_count as number) > Math.ceil(
+      MANAGED_RPC_BRIDGE_MAX_COMMAND_PAYLOAD_BYTES / MANAGED_RPC_BRIDGE_COMMAND_CHUNK_BYTES,
+    )
+    || typeof value.chunk !== "string"
+  ) return false;
+  const chunk = decodeBase64Url(value.chunk);
+  if (
+    chunk === undefined
+    || chunk.byteLength === 0
+    || chunk.byteLength > MANAGED_RPC_BRIDGE_COMMAND_CHUNK_BYTES
+  ) return false;
+  const chunkIndex = value.chunk_index as number;
+  const chunkCount = value.chunk_count as number;
+  let pending = pendingChunkedCommand;
+  if (pending === undefined) {
+    if (chunkIndex !== 0) return false;
+    pending = {
+      id: value.id as number,
+      command: value.command,
+      chunkCount,
+      chunks: [],
+      byteLength: 0,
+      nextChunkIndex: 0,
+    };
+    pendingChunkedCommand = pending;
+  }
+  if (
+    pending.id !== value.id
+    || pending.command !== value.command
+    || pending.chunkCount !== chunkCount
+    || pending.nextChunkIndex !== chunkIndex
+    || pending.byteLength + chunk.byteLength > MANAGED_RPC_BRIDGE_MAX_COMMAND_PAYLOAD_BYTES
+  ) return false;
+  pending.chunks.push(chunk);
+  pending.byteLength += chunk.byteLength;
+  pending.nextChunkIndex += 1;
+  if (pending.nextChunkIndex < pending.chunkCount) return true;
+
+  pendingChunkedCommand = undefined;
+  const payloadBytes = new Uint8Array(pending.byteLength);
+  let offset = 0;
+  for (const current of pending.chunks) {
+    payloadBytes.set(current, offset);
+    offset += current.byteLength;
+  }
+  let payload: unknown;
+  try {
+    payload = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(payloadBytes));
+  } catch {
+    return false;
+  }
+  enqueueCommand(Object.freeze({
+    kind: "command",
+    id: pending.id,
+    command: pending.command,
+    payload,
+  }));
+  return true;
 }
 
 function consume(bytes: Uint8Array): void {
@@ -539,6 +722,13 @@ function consume(bytes: Uint8Array): void {
       if (!isRecord(parsed) || parsed.protocol !== PROTOCOL || typeof parsed.kind !== "string") {
         failAndExit("protocol_fault");
         return false;
+      }
+      if (parsed.kind === "command_chunk") {
+        if (!acceptCommandChunk(parsed)) {
+          failAndExit("protocol_fault");
+          return false;
+        }
+        return !protocolFailed;
       }
       if (parsed.kind === "supervisor_frame") {
         const supervisorFrame = typeof parsed.frame === "string"
@@ -559,16 +749,15 @@ function consume(bytes: Uint8Array): void {
         return !protocolFailed;
       }
       if (
-        parsed.kind !== "command"
+        pendingChunkedCommand !== undefined
+        || parsed.kind !== "command"
         || !hasOnlyKeys(parsed, ["protocol", "kind", "id", "command", "payload"])
       ) {
         failAndExit("protocol_fault");
         return false;
       }
       const command = parsed as unknown as BridgeCommand;
-      commandQueue = commandQueue
-        .then(() => handleCommand(command))
-        .catch(() => failAndExit("process_exit"));
+      enqueueCommand(command);
       return !protocolFailed;
     });
   } catch {
@@ -586,7 +775,7 @@ process.stdin.on("data", (chunk: Uint8Array | string) => {
 });
 process.stdin.on("end", () => {
   if (stopping) return;
-  if (decoder.hasPendingBytes()) {
+  if (decoder.hasPendingBytes() || pendingChunkedCommand !== undefined) {
     failAndExit("protocol_fault");
     return;
   }
@@ -594,7 +783,10 @@ process.stdin.on("end", () => {
   stopping = true;
   void commandQueue
     .then(() => client?.stop())
-    .then(() => closeLocalSupervisor())
+    .then(() => {
+      cleanupTemplatePromptFile();
+      return closeLocalSupervisor();
+    })
     .then(() => flushOutput())
     .then(() => {
       if (exitScheduled) return;

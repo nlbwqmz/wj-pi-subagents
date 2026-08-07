@@ -250,7 +250,7 @@ thinking: medium
 | `model` | 否 | 父会话当前模型 | 必须是精确的 `provider/model`；模型 ID 本身可以继续包含 `/`。 |
 | `thinking` | 否 | 父会话当前等级 | 可选 `off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`。 |
 
-Markdown 正文可以为空。未列出的 frontmatter 字段会被静默忽略；尤其是 `name`、`env`、`skills`、`extensions` 和 `promptTemplates` 不会产生模板级覆盖。
+Markdown 正文可以为空，UTF-8 编码后最多 `64 KiB`；该边界同时适用于直接创建和递归创建。未列出的 frontmatter 字段会被静默忽略；尤其是 `name`、`env`、`skills`、`extensions` 和 `promptTemplates` 不会产生模板级覆盖。
 
 `description` 只是模板展示元数据，不会自动注入提示词。`get_agent_templates` 会列出当前发现且格式有效的模板，并返回 `template_id`、可选 `description` 和模板声明的业务 `tools`。八个代理管理工具与 `reply_to_parent` 都不能手动写进模板 `tools`，也不会出现在返回项的 `tools` 中；扩展会根据深度和祖先权限自动追加或移除完整管理工具集合，并为所有子代理单独保留 `reply_to_parent`。
 
@@ -633,7 +633,7 @@ pi list
 ```
 
 - Node 必须至少是 `22.19.0`，Pi 必须至少是 `0.83.0`。
-- 确认本地 package 路径仍存在，并且该目录已经安装 `semver`、`yaml` 等生产依赖。
+- 确认本地 package 路径仍存在，并且该目录已经安装 `semver`、`yaml` 等生产依赖。`pi list` 只显示用户级来源；若使用了项目级 `-l` 安装，请在对应项目内启动 Pi 后确认 `/agent` 可用。
 - Windows 需要能从 `PATH` 调用 `powershell.exe`。
 - 如果启动时出现 `host_capability_unavailable`，括号中的稳定原因可帮助区分版本、平台、运行依赖、进程树适配器或 Pi API 问题。
 - 如果通过 `-e` 试用，确认本次启动确实带了扩展路径；如果持久安装，确认没有在 `pi config` 中禁用该扩展。
@@ -746,19 +746,13 @@ npm run check
    pi install "D:\code\pi-subagents-wj\package-smoke\node_modules\pi-subagents-wj" -l --approve
    ```
 
-7. 确认 package 已登记：
-
-   ```powershell
-   pi list
-   ```
-
-8. 启动 Pi：
+7. `pi list` 只列出用户级 package，不能确认项目级 `-l` 安装。请在当前测试项目中启动 Pi：
 
    ```powershell
    pi
    ```
 
-9. 进入 Pi 后打开代理树，确认扩展已经加载：
+8. 进入 Pi 后打开代理树，确认扩展已经加载：
 
     ```text
     /agent

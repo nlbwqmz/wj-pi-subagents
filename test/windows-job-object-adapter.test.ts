@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 import {
+  createManagedRpcNode,
+} from "../src/managed-rpc-node.ts";
+import {
   WindowsJobObjectAdapter,
   type WindowsJobObjectLaunch,
 } from "../src/windows-job-object-adapter.ts";
@@ -141,6 +144,43 @@ test("Windows Job Object 在优雅期限超时后保持 present，强制阶段�
     await waitForResources(adapter, launch, "released");
   } finally {
     await forceRelease(adapter, launch);
+  }
+});
+
+test("Windows Job Object 通过 bridge 临时提示文件启动超过旧命令行阈值的模板", nativeTestOptions, async () => {
+  const adapter = new WindowsJobObjectAdapter();
+  const templateBody = "x".repeat(40 * 1024);
+  const node = createManagedRpcNode({
+    processTreeAdapter: adapter,
+    rpcOptions: {
+      piModulePath: new URL("./helpers/minimal-pi-rpc-client.mjs", import.meta.url).href,
+      args: ["--no-session"],
+      templatePrompt: { mode: "replace", body: templateBody },
+    },
+  });
+  let started = false;
+  try {
+    await node.start();
+    started = true;
+    const state = await node.getState() as {
+      args: string[];
+      promptBytes: number;
+      promptPathExistedAtStart: boolean;
+      promptPathExistsAfterStart: boolean;
+    };
+    assert.equal(state.promptBytes, Buffer.byteLength(templateBody));
+    assert.equal(state.promptPathExistedAtStart, true);
+    assert.equal(state.promptPathExistsAfterStart, false);
+    assert.equal(state.args.includes(templateBody), false);
+    assert.equal(state.args.includes("--system-prompt"), true);
+  } finally {
+    if (started) {
+      try {
+        await node.forceTerminate();
+      } finally {
+        await node.release();
+      }
+    }
   }
 });
 

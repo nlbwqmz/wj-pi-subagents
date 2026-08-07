@@ -6,6 +6,9 @@ import type { RuntimeUiContext } from "./root-runtime-context.ts";
 
 export type TemplateSource = "user" | "project";
 
+/** 递归控制通道和 bridge 启动配置共同支持的模板正文 UTF-8 上限。 */
+export const MAX_TEMPLATE_BODY_BYTES = 64 * 1024;
+
 export const TEMPLATE_THINKING_LEVELS = [
   "off",
   "minimal",
@@ -61,7 +64,8 @@ export type TemplateCandidateDiagnosticReason =
   | "context_files_invalid"
   | "system_prompt_mode_invalid"
   | "model_invalid"
-  | "thinking_invalid";
+  | "thinking_invalid"
+  | "body_too_large";
 
 /** 候选诊断不保存底层路径、模板正文、异常文本或堆栈。 */
 export interface TemplateCandidateDiagnostic {
@@ -196,6 +200,10 @@ function isMissing(error: unknown): boolean {
   } catch {
     return false;
   }
+}
+
+function utf8Length(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }
 
 function decodeUtf8(bytes: Uint8Array): string | undefined {
@@ -379,6 +387,9 @@ function parseCandidate(
     }
     thinking = thinkingValue;
   }
+  if (utf8Length(frontmatter.body) > MAX_TEMPLATE_BODY_BYTES) {
+    return invalidCandidate(source, fileName, "body_too_large");
+  }
   return {
     kind: "valid",
     template: createTemplateDefinition({
@@ -532,6 +543,8 @@ function candidateReasonLabel(reason: TemplateCandidateDiagnosticReason): string
       return "model 配置无效";
     case "thinking_invalid":
       return "thinking 配置无效";
+    case "body_too_large":
+      return "正文超过 64 KiB";
   }
 }
 

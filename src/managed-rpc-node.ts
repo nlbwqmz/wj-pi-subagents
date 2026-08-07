@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import type { Readable, Writable } from "node:stream";
 import type { AgentSnapshot } from "./tree-controller.ts";
+import { SUPERVISOR_CHANNEL_LIMITS } from "./supervisor-channel.ts";
 import { LengthPrefixedFrameDecoder } from "./length-prefixed-frame-decoder.ts";
 import {
   isManagedProcessTreeAdapter,
@@ -34,13 +35,19 @@ export const MANAGED_RPC_BRIDGE_PROTOCOL = "pi-subagent/managed-rpc/1" as const;
 export const MANAGED_RPC_BRIDGE_CREDENTIAL_ENV = "PI_SUBAGENT_MANAGED_RPC_CREDENTIAL" as const;
 /** 外层桥接 JSON 正文的硬边界。 */
 export const MANAGED_RPC_BRIDGE_MAX_FRAME_BYTES = 64 * 1024;
+/** 单个高层命令的重组边界，覆盖公开图片配额和长模板配置。 */
+export const MANAGED_RPC_BRIDGE_MAX_COMMAND_PAYLOAD_BYTES = 512 * 1024;
+/** Base64URL 分片为外层桥接 JSON 保留协议字段空间。 */
+export const MANAGED_RPC_BRIDGE_COMMAND_CHUNK_BYTES = 45 * 1024;
 /**
- * 监督帧经过 Base64URL 后再进入外层 JSON；46 KiB 为编码字段和协议字段
- * 保留了约 2.6 KiB 空间，且同时约束父、子两端的完整监督帧。
+ * 监督字节进入外层桥接前的传输分片上限。46 KiB 经 Base64URL 后仍能放入
+ * 64 KiB 外层帧；它不是完整 SupervisorChannel 帧的上限。
  */
 export const MANAGED_RPC_SUPERVISOR_MAX_FRAME_BYTES = 46 * 1024;
-/** SupervisorChannel 的 maxFrameBytes 只计算四字节头之后的正文。 */
-export const MANAGED_RPC_SUPERVISOR_MAX_BODY_BYTES = MANAGED_RPC_SUPERVISOR_MAX_FRAME_BYTES - 4;
+/** SupervisorChannel 的完整 JSON 正文边界。 */
+export const MANAGED_RPC_SUPERVISOR_MAX_BODY_BYTES = SUPERVISOR_CHANNEL_LIMITS.maxFrameBytes;
+/** 完整监督帧包含四字节长度头，桥接会将它拆成多个 tunnel chunk。 */
+export const MANAGED_RPC_SUPERVISOR_MAX_ENCODED_FRAME_BYTES = MANAGED_RPC_SUPERVISOR_MAX_BODY_BYTES + 4;
 
 /** 节点身份只在预留成功后传给桥接进程，用于建立独立监督通道。 */
 export interface ManagedRpcSupervisorInit {
@@ -79,6 +86,8 @@ export interface ManagedRpcBridge {
 export interface ManagedRpcBridgeFactoryOptions {
   /** 仅父端桥接客户端使用；不得写入日志、回复或树快照。 */
   readonly credential?: string;
+  /** 仅通过首个有界 start 命令交给 bridge，不进入任何进程命令行。 */
+  readonly rpcOptions?: Readonly<Record<string, unknown>>;
 }
 
 export type ManagedRpcBridgeFactory = (
@@ -96,6 +105,8 @@ export interface ManagedRpcNodeLaunchOptions {
 export interface ManagedRpcNodeOptions {
   readonly processTreeAdapter: ProcessTreeAdapter;
   readonly launch: ManagedRpcNodeLaunchOptions;
+  /** 首个 bridge start 命令携带的 Pi RpcClient 配置，不进入 OS 命令行。 */
+  readonly rpcOptions?: Readonly<Record<string, unknown>>;
   /** 测试可注入 bridge；生产默认使用有界本地帧桥。 */
   readonly bridgeFactory?: ManagedRpcBridgeFactory;
 }
@@ -112,18 +123,15 @@ export interface ManagedRpcNodeAssemblyOptions {
 
 /** 生成平台适配器在启动前接收的桥接进程说明。 */
 export function createManagedRpcNodeLaunchSpec(
-  options: Pick<ManagedRpcNodeAssemblyOptions, "cwd" | "env" | "rpcOptions" | "bridgeScriptPath">,
+  options: Pick<ManagedRpcNodeAssemblyOptions, "cwd" | "env" | "bridgeScriptPath">,
 ): ManagedRpcNodeLaunchOptions {
   const scriptPath = options.bridgeScriptPath
     ?? defaultBridgeScriptPath();
-  const config = Buffer.from(JSON.stringify({ rpc: options.rpcOptions ?? {} }), "utf8").toString("base64url");
   return Object.freeze({
     command: process.execPath,
     args: Object.freeze([
       ...(scriptPath.endsWith(".ts") ? ["--experimental-strip-types"] : []),
       scriptPath,
-      "--config",
-      config,
     ]),
     ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
     ...(options.env === undefined ? {} : { env: Object.freeze({ ...options.env }) }),
@@ -134,10 +142,20 @@ export function createManagedRpcNodeLaunchSpec(
  * Node 原生 type stripping 不允许执行 node_modules 内的 .ts 文件。发布包提供
  * 编译 bridge 时优先运行它；源码目录未构建时仍保留本地开发的 .ts 回退路径。
  */
+export function resolveManagedRpcBridgeScriptPath(
+  moduleUrl: string = import.meta.url,
+  fileExists: (path: string) => boolean = existsSync,
+): string {
+  // 编译后的模块本身位于 dist/src，优先使用同目录 bridge；源码模块则继续查找 dist。
+  const colocatedCompiled = fileURLToPath(new URL("./rpc-bridge-process.js", moduleUrl));
+  if (fileExists(colocatedCompiled)) return colocatedCompiled;
+  const compiled = fileURLToPath(new URL("../dist/src/rpc-bridge-process.js", moduleUrl));
+  if (fileExists(compiled)) return compiled;
+  return fileURLToPath(new URL("./rpc-bridge-process.ts", moduleUrl));
+}
+
 function defaultBridgeScriptPath(): string {
-  const compiled = fileURLToPath(new URL("../dist/src/rpc-bridge-process.js", import.meta.url));
-  if (existsSync(compiled)) return compiled;
-  return fileURLToPath(new URL("./rpc-bridge-process.ts", import.meta.url));
+  return resolveManagedRpcBridgeScriptPath();
 }
 
 /** 生产装配便捷入口；返回值仍是单一 `ManagedRpcNode` 深模块。 */
@@ -145,6 +163,7 @@ export function createManagedRpcNode(options: ManagedRpcNodeAssemblyOptions): Ma
   return new ManagedRpcNode({
     processTreeAdapter: options.processTreeAdapter,
     launch: createManagedRpcNodeLaunchSpec(options),
+    ...(options.rpcOptions === undefined ? {} : { rpcOptions: options.rpcOptions }),
     ...(options.bridgeFactory === undefined ? {} : { bridgeFactory: options.bridgeFactory }),
   });
 }
@@ -180,6 +199,7 @@ export class ManagedRpcNode implements ManagedRpcNodeLike {
     readonly launch: NonNullable<ProcessTreeAdapter["launch"]>;
   };
   private readonly launchSpec: ManagedRpcNodeLaunchOptions;
+  private readonly rpcOptions: Readonly<Record<string, unknown>> | undefined;
   private readonly bridgeFactory: ManagedRpcBridgeFactory;
   private phase: NodePhase = "new";
   private binding: {
@@ -211,6 +231,9 @@ export class ManagedRpcNode implements ManagedRpcNodeLike {
       ...(options.launch.cwd === undefined ? {} : { cwd: options.launch.cwd }),
       ...(options.launch.env === undefined ? {} : { env: Object.freeze({ ...options.launch.env }) }),
     });
+    this.rpcOptions = options.rpcOptions === undefined
+      ? undefined
+      : copyRpcOptions(options.rpcOptions);
     this.bridgeFactory = options.bridgeFactory ?? ((transport, bridgeOptions) =>
       new ManagedRpcBridgeClient(transport, bridgeOptions));
     this.bindingSettled = new Promise<void>((resolve) => {
@@ -250,7 +273,7 @@ export class ManagedRpcNode implements ManagedRpcNodeLike {
   }
 
   async sendSupervisorFrame(frame: Uint8Array): Promise<void> {
-    await this.requireBridge().sendSupervisorFrame(cloneBytes(frame));
+    await this.requireSupervisorBridge().sendSupervisorFrame(cloneBytes(frame));
   }
 
   onSupervisorFrame(listener: (frame: Uint8Array) => void): () => void {
@@ -352,7 +375,10 @@ export class ManagedRpcNode implements ManagedRpcNodeLike {
       this.binding = Object.freeze({ tree: binding.tree, transport: binding.transport });
       this.recordBindingSettlement();
       if (signal?.aborted || this.cleanupRequested()) throw abortError();
-      const bridge = this.bridgeFactory(binding.transport, Object.freeze({ credential }));
+      const bridge = this.bridgeFactory(binding.transport, Object.freeze({
+        credential,
+        ...(this.rpcOptions === undefined ? {} : { rpcOptions: this.rpcOptions }),
+      }));
       this.bridge = bridge;
       this.unsubscribeBridgeEvent = bridge.onEvent((event) => this.emitEvent(event));
       this.unsubscribeBridgeFault = bridge.onTransportFault((fault) => this.emitTransportFault(fault));
@@ -392,6 +418,13 @@ export class ManagedRpcNode implements ManagedRpcNodeLike {
 
   private requireBridge(): ManagedRpcBridge {
     if (this.phase !== "ready" || this.bridge === undefined) {
+      throw new Error("受管 RPC 节点尚未就绪");
+    }
+    return this.bridge;
+  }
+
+  private requireSupervisorBridge(): ManagedRpcBridge {
+    if ((this.phase !== "starting" && this.phase !== "ready") || this.bridge === undefined) {
       throw new Error("受管 RPC 节点尚未就绪");
     }
     return this.bridge;
@@ -460,6 +493,13 @@ function treeFromLaunchError(error: unknown): ProcessTreeHandle | undefined {
 
 function copyImages(images: readonly ManagedRpcImage[] | undefined): ManagedRpcImage[] | undefined {
   return images?.map((image) => ({ ...image }));
+}
+
+function copyRpcOptions(value: Readonly<Record<string, unknown>>): Readonly<Record<string, unknown>> {
+  return Object.freeze({
+    ...value,
+    ...(Array.isArray(value.args) ? { args: Object.freeze([...value.args]) } : {}),
+  });
 }
 
 function cloneBytes(value: Uint8Array): Uint8Array<ArrayBuffer> {
@@ -534,6 +574,8 @@ interface PendingBridgeRequest {
  */
 export interface ManagedRpcBridgeClientOptions {
   readonly credential?: string;
+  /** bridge 在启动子 Pi 前应用的私有 RpcClient 配置。 */
+  readonly rpcOptions?: Readonly<Record<string, unknown>>;
 }
 
 export class ManagedRpcBridgeClient implements ManagedRpcBridge {
@@ -544,6 +586,7 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
   private readonly faultListeners = new Set<(fault: ManagedRpcTransportFault) => void>();
   private readonly supervisorFrameListeners = new Set<(frame: Uint8Array) => void>();
   private readonly credential: string | undefined;
+  private readonly rpcOptions: Readonly<Record<string, unknown>> | undefined;
   private readonly decoder = new LengthPrefixedFrameDecoder(MAX_BRIDGE_FRAME_BYTES);
   private nextRequestId = 1;
   private closed = false;
@@ -555,6 +598,9 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
     options: ManagedRpcBridgeClientOptions | string = {},
   ) {
     this.credential = typeof options === "string" ? options : options.credential;
+    this.rpcOptions = typeof options === "string" || options.rpcOptions === undefined
+      ? undefined
+      : copyRpcOptions(options.rpcOptions);
     this.stdin = transport.stdin;
     this.stdout = transport.stdout;
     this.stdout.on("data", (chunk: Uint8Array | string) => this.receiveBytes(
@@ -569,9 +615,14 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
   async start(signal?: AbortSignal, context?: ManagedRpcNodeStartContext): Promise<void> {
     await this.request(
       "start",
-      context?.supervisor === undefined
+      context?.supervisor === undefined && this.rpcOptions === undefined
         ? undefined
-        : { supervisor: copySupervisorInit(context.supervisor) },
+        : {
+          ...(context?.supervisor === undefined
+            ? {}
+            : { supervisor: copySupervisorInit(context.supervisor) }),
+          ...(this.rpcOptions === undefined ? {} : { config: { rpc: this.rpcOptions } }),
+        },
       signal,
     );
     this.started = true;
@@ -612,15 +663,20 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
     if (
       !(frame instanceof Uint8Array)
       || frame.byteLength === 0
-      || frame.byteLength > MANAGED_RPC_SUPERVISOR_MAX_FRAME_BYTES
+      || frame.byteLength > MANAGED_RPC_SUPERVISOR_MAX_ENCODED_FRAME_BYTES
     ) {
       throw new Error("监督帧无效");
     }
-    await this.enqueueWrite(encodeBridgeFrame({
-      protocol: MANAGED_RPC_BRIDGE_PROTOCOL,
-      kind: "supervisor_frame",
-      frame: Buffer.from(frame).toString("base64url"),
-    }));
+    const chunks: Uint8Array[] = [];
+    for (let offset = 0; offset < frame.byteLength; offset += MANAGED_RPC_SUPERVISOR_MAX_FRAME_BYTES) {
+      const slice = frame.subarray(offset, Math.min(frame.byteLength, offset + MANAGED_RPC_SUPERVISOR_MAX_FRAME_BYTES));
+      chunks.push(encodeBridgeFrame({
+        protocol: MANAGED_RPC_BRIDGE_PROTOCOL,
+        kind: "supervisor_frame",
+        frame: Buffer.from(slice).toString("base64url"),
+      }));
+    }
+    await this.enqueueWrites(chunks);
   }
 
   onSupervisorFrame(listener: (frame: Uint8Array) => void): () => void {
@@ -652,7 +708,12 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
       command,
       ...(requestPayload === undefined ? {} : { payload: requestPayload }),
     });
-    const bytes = encodeBridgeFrame(request);
+    let frames: readonly Uint8Array[];
+    try {
+      frames = encodeBridgeCommandFrames(request);
+    } catch (error) {
+      return Promise.reject(error instanceof Error ? error : new Error("桥接命令负载无效"));
+    }
     return new Promise<unknown>((resolve, reject) => {
       const onAbort = (): void => {
         this.pending.delete(id);
@@ -673,7 +734,7 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
           reject(error);
         },
       });
-      void this.enqueueWrite(bytes).catch((error: unknown) => {
+      void this.enqueueWrites(frames).catch((error: unknown) => {
         this.pending.delete(id);
         reject(error instanceof Error ? error : new Error("桥接写入失败"));
       });
@@ -790,20 +851,67 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
     this.failTransport(this.decoder.hasPendingBytes() ? "protocol_fault" : "eof");
   }
 
-  private enqueueWrite(bytes: Uint8Array): Promise<void> {
-    const operation = this.writeQueue.catch(() => {}).then(() => writeChunk(this.stdin, bytes));
+  private enqueueWrites(frames: readonly Uint8Array[]): Promise<void> {
+    const operation = this.writeQueue.catch(() => {}).then(async () => {
+      for (const frame of frames) await writeChunk(this.stdin, frame);
+    });
     this.writeQueue = operation.catch(() => {});
     return operation;
   }
 }
 
+function encodeBridgeCommandFrames(request: Readonly<Record<string, unknown>>): readonly Uint8Array[] {
+  try {
+    return Object.freeze([encodeBridgeFrame(request)]);
+  } catch (error) {
+    if (!(error instanceof Error) || error.message !== "桥接帧超限") throw error;
+  }
+  if (!Object.hasOwn(request, "payload")) throw new Error("桥接命令负载无效");
+  if (
+    !Number.isSafeInteger(request.id)
+    || (request.id as number) <= 0
+    || typeof request.command !== "string"
+    || !isBridgeCommandName(request.command)
+  ) throw new Error("桥接命令无效");
+  const payload = encodeBridgeJson(request.payload);
+  if (payload.byteLength === 0 || payload.byteLength > MANAGED_RPC_BRIDGE_MAX_COMMAND_PAYLOAD_BYTES) {
+    throw new Error("桥接命令负载超限");
+  }
+  const chunkCount = Math.ceil(payload.byteLength / MANAGED_RPC_BRIDGE_COMMAND_CHUNK_BYTES);
+  const frames: Uint8Array[] = [];
+  for (let offset = 0, index = 0; offset < payload.byteLength; offset += MANAGED_RPC_BRIDGE_COMMAND_CHUNK_BYTES, index += 1) {
+    const chunk = payload.subarray(offset, Math.min(payload.byteLength, offset + MANAGED_RPC_BRIDGE_COMMAND_CHUNK_BYTES));
+    frames.push(encodeBridgeFrame({
+      protocol: MANAGED_RPC_BRIDGE_PROTOCOL,
+      kind: "command_chunk",
+      id: request.id,
+      command: request.command,
+      chunk_index: index,
+      chunk_count: chunkCount,
+      chunk: Buffer.from(chunk).toString("base64url"),
+    }));
+  }
+  return Object.freeze(frames);
+}
+
 function encodeBridgeFrame(value: unknown): Uint8Array {
-  const body = new TextEncoder().encode(JSON.stringify(value));
+  const body = encodeBridgeJson(value);
   if (body.byteLength > MAX_BRIDGE_FRAME_BYTES) throw new Error("桥接帧超限");
   const frame = new Uint8Array(body.byteLength + 4);
   new DataView(frame.buffer).setUint32(0, body.byteLength, false);
   frame.set(body, 4);
   return frame;
+}
+
+function encodeBridgeJson(value: unknown): Uint8Array {
+  let text: string | undefined;
+  try {
+    text = JSON.stringify(value);
+  } catch {
+    throw new Error("桥接帧无效");
+  }
+  if (typeof text !== "string") throw new Error("桥接帧无效");
+  return new TextEncoder().encode(text);
 }
 
 function writeChunk(stream: Writable, bytes: Uint8Array): Promise<void> {

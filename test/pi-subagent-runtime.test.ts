@@ -88,6 +88,10 @@ class RuntimeLinkedNode extends FakeManagedRpcNode {
     await this.channel?.publishReply(reply);
   }
 
+  pendingReplyCount(): number {
+    return this.channel?.getPublicState().pending_reply_count ?? 0;
+  }
+
   override async requestGracefulClose(): Promise<void> {
     await super.requestGracefulClose();
     await this.channel?.release();
@@ -226,6 +230,7 @@ class FakeExtensionApi {
   activeTools = ["read", "grep"];
   readonly events: Pick<FakeEventBus, "emit" | "on">;
   private readonly eventUnsubscribers = new Set<() => void>();
+  private valid = true;
 
   constructor(eventBus = new FakeEventBus()) {
     this.events = {
@@ -243,6 +248,7 @@ class FakeExtensionApi {
   }
 
   invalidate(): void {
+    this.valid = false;
     for (const unsubscribe of [...this.eventUnsubscribers]) unsubscribe();
   }
 
@@ -278,6 +284,7 @@ class FakeExtensionApi {
     this.activeToolHistory.push([...tools]);
   }
   sendMessage(message: unknown, options: unknown): void {
+    if (!this.valid) throw new Error("扩展 API 已失效");
     this.sentMessages.push({ message, options });
   }
   exec(): void {}
@@ -1086,6 +1093,12 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
     [],
   );
 
+  await firstNode.publishReply({ text: "交接窗口内的回复" });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(oldApi.sentMessages.length, 0);
+  assert.equal(firstNode.pendingReplyCount(), 1);
+
   let replacementRootIdCalls = 0;
   const newActivate = newRuntimeModule.createPiSubagentRuntimeActivator({
     rootIdFactory: () => {
@@ -1097,9 +1110,25 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
   });
   await newActivate(newApi as never, capabilities);
   await newApi.emit("session_start", { type: "session_start", reason: "reload" }, newContext);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(typeof newUi.widgetCalls.at(-1)?.content, "function");
   assert.equal(replacementRootIdCalls, 0);
   assert.strictEqual(newController, oldController);
+  assert.equal(firstNode.pendingReplyCount(), 0);
+  assert.equal(newApi.sentMessages.length, 1);
+  assert.deepEqual(newApi.sentMessages[0], {
+    message: {
+      customType: "pi-subagent-final",
+      content: [{
+        type: "text",
+        text: `Message Type: FINAL_ANSWER\nSender: ${firstId}\nPayload:\n交接窗口内的回复`,
+      }],
+      display: true,
+      details: { agent_id: firstId, kind: "final" },
+    },
+    options: { triggerTurn: true, deliverAs: "steer" },
+  });
   assert.deepEqual(
     firstNode.operations().filter((operation) => [
       "graceful_close",
@@ -1124,7 +1153,7 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(oldApi.sentMessages.length, 0);
-  assert.equal(newApi.sentMessages.length, 1);
+  assert.equal(newApi.sentMessages.length, 2);
 
   await newApi.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, newContext);
   assert.equal(firstNode.operations().includes("release"), true);
@@ -1336,7 +1365,7 @@ test("reload lease 未被新实例提交时在有界期限后清理旧树", asyn
   assert.equal(node.operations().includes("release"), true);
 });
 
-test("新实例认领 lease 后未启动会超时清理，并拒绝迟到的 reload start", async () => {
+test("新实例认领 lease 后可等待迟到的 reload start，不沿用 outgoing watchdog", async () => {
   const cwd = "C:\\workspace\\reload-claimed-timeout";
   const moduleNonce = `${Date.now()}-${Math.random()}`;
   const oldModuleUrl = new URL("../src/pi-subagent-runtime.ts", import.meta.url);
@@ -1384,11 +1413,11 @@ test("新实例认领 lease 后未启动会超时清理，并拒绝迟到的 rel
   });
   await newActivate(newApi as never, capabilities);
   await new Promise<void>((resolve) => setTimeout(resolve, 80));
+  assert.equal(node.operations().includes("release"), false);
+  await newApi.emit("session_start", { type: "session_start", reason: "reload" }, context);
+  assert.equal(node.operations().includes("release"), false);
+  await newApi.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
   assert.equal(node.operations().includes("release"), true);
-  await assert.rejects(
-    newApi.emit("session_start", { type: "session_start", reason: "reload" }, context),
-    /reload 交接 lease 不可用|reload 交接 lease 已过期/,
-  );
 });
 
 test("同一 activator 的 reload 也提交自身 lease，不会被 watchdog 误清理", async () => {

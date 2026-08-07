@@ -307,6 +307,8 @@ export interface RpcSupervisorChannel {
     reply: SupervisorReplyInput | SupervisorReply,
     signal?: AbortSignal,
   ): Promise<void>;
+  /** 父端在 reload 后重新尝试注入已接收但尚未确认的回复。 */
+  retryPendingReplies?(): Promise<void>;
   establishTerminationBarrier(): void;
   requestClose(signal: AbortSignal): Promise<void>;
   waitForClose(deadline: number | Date): Promise<RpcSupervisorChannelCloseState>;
@@ -567,6 +569,11 @@ export class RpcSupervisor {
   onEvent(listener: (event: RpcSupervisorEvent) => void): () => void {
     this.eventListeners.add(listener);
     return () => this.eventListeners.delete(listener);
+  }
+
+  async retryPendingReplies(): Promise<void> {
+    if (this.phase !== "ready") return;
+    await this.channel?.retryPendingReplies?.();
   }
 
   prompt(

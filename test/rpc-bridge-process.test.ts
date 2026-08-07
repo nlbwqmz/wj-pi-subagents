@@ -40,6 +40,22 @@ test("桥接进程拒绝未知外层字段，刷新单次故障后以失败码�
   assert.deepEqual(result.frames, [protocolFaultFrame()]);
 });
 
+test("桥接进程拒绝乱序的分片命令，且不进入部分配置状态", async () => {
+  const result = await runBridge(encodeFrame({
+    protocol: MANAGED_RPC_BRIDGE_PROTOCOL,
+    kind: "command_chunk",
+    id: 1,
+    command: "start",
+    chunk_index: 1,
+    chunk_count: 2,
+    chunk: Buffer.from("{}").toString("base64url"),
+  }));
+
+  assert.equal(result.signal, null);
+  assert.equal(result.code, 1, result.stderr);
+  assert.deepEqual(result.frames, [protocolFaultFrame()]);
+});
+
 test("桥接进程在只收到超长声明时立即拒绝且不会重复发送故障", async () => {
   const oversizedHeader = new Uint8Array(4);
   new DataView(oversizedHeader.buffer).setUint32(0, MANAGED_RPC_BRIDGE_MAX_FRAME_BYTES + 1, false);
@@ -145,6 +161,61 @@ test("生产桥接配合 fake RpcClient 完成真实本地监督握手、回复 
     /本地监督传输不可用/,
   );
   await channel.release();
+  await bridge.release();
+});
+
+test("bridge 通过首个分片 start 配置长模板，并在 Pi 启动后清理提示文件", async (context) => {
+  const script = fileURLToPath(new URL("../src/rpc-bridge-process.ts", import.meta.url));
+  const piModulePath = new URL("./helpers/minimal-pi-rpc-client.mjs", import.meta.url).href;
+  const bridgeCredential = "bridge-credential-01234567890123456789";
+  const templateBody = "长模板正文".repeat(24 * 1024);
+  const child = spawn(process.execPath, ["--experimental-strip-types", script], {
+    env: {
+      ...process.env,
+      [MANAGED_RPC_BRIDGE_CREDENTIAL_ENV]: bridgeCredential,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  const stderr: Uint8Array[] = [];
+  child.stderr.on("data", (chunk: Uint8Array) => stderr.push(new Uint8Array(chunk)));
+  const bridge = new ManagedRpcBridgeClient({
+    stdin: child.stdin,
+    stdout: child.stdout,
+    stderr: child.stderr,
+  }, {
+    credential: bridgeCredential,
+    rpcOptions: {
+      piModulePath,
+      args: ["--no-session"],
+      templatePrompt: { mode: "append", body: templateBody },
+    },
+  });
+  context.after(async () => {
+    await bridge.release();
+    if (!child.killed && child.exitCode === null) child.kill();
+  });
+
+  await bridge.start();
+  const state = await bridge.getState() as {
+    args: string[];
+    promptBytes: number;
+    promptPrefix: string;
+    promptPathExistedAtStart: boolean;
+    promptPathExistsAfterStart: boolean;
+  };
+  assert.equal(state.promptBytes, Buffer.byteLength(templateBody));
+  assert.equal(state.promptPrefix, templateBody.slice(0, 64));
+  assert.equal(state.promptPathExistedAtStart, true);
+  assert.equal(state.promptPathExistsAfterStart, false);
+  assert.equal(state.args.includes(templateBody), false);
+  assert.equal(state.args.includes("--append-system-prompt"), true);
+
+  const closeObservation = once(child, "close") as Promise<[number | null, NodeJS.Signals | null]>;
+  await bridge.requestClose(new AbortController().signal);
+  const [code, signal] = await closeObservation;
+  assert.equal(code, 0, Buffer.concat(stderr).toString("utf8"));
+  assert.equal(signal, null);
   await bridge.release();
 });
 

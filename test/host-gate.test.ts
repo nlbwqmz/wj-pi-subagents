@@ -13,6 +13,10 @@ import {
   type SupportedPlatform,
 } from "../src/host-gate.ts";
 import type { ProcessTreeAdapter } from "../src/process-tree-capability.ts";
+import {
+  RuntimeReloadCoordinator,
+  type RuntimeReloadEventBus,
+} from "../src/runtime-reload-coordinator.ts";
 
 const readyApi = (): ExtensionApiSurface => ({
   on: () => {},
@@ -341,6 +345,130 @@ test("通过门禁后只执行一次空操作激活", async () => {
   await extension(readyApi());
 
   assert.equal(activationCount, 1);
+});
+
+test("扩展 factory 探针期间保持 reload lease，成功时交接、失败时清理", async () => {
+  class ReloadEventBus implements RuntimeReloadEventBus {
+    private readonly handlers = new Map<string, Set<(value: unknown) => void>>();
+
+    emit(channel: string, value: unknown): void {
+      for (const handler of this.handlers.get(channel) ?? []) handler(value);
+    }
+
+    on(channel: string, handler: (value: unknown) => void): () => void {
+      const handlers = this.handlers.get(channel) ?? new Set<(value: unknown) => void>();
+      handlers.add(handler);
+      this.handlers.set(channel, handlers);
+      return () => {
+        handlers.delete(handler);
+        if (handlers.size === 0) this.handlers.delete(channel);
+      };
+    }
+  }
+
+  interface Runtime {
+    readonly id: string;
+    handoffPending: boolean;
+  }
+  interface Transfer {
+    readonly runtime: Runtime;
+  }
+
+  const eventBus = new ReloadEventBus();
+  const runtime: Runtime = { id: "reload-runtime", handoffPending: false };
+  let oldActive: Runtime | undefined = runtime;
+  let newActive: Runtime | undefined;
+  let cleanupCalls = 0;
+  const common = {
+    timeoutMs: 20,
+    activationIdentity: { isChild: false } as const,
+    isTransfer: (value: unknown): value is Transfer =>
+      typeof value === "object" && value !== null && "runtime" in value,
+    identityOfRuntime: () => ({ isChild: false } as const),
+    identityOfTransfer: () => ({ isChild: false } as const),
+    createTransfer: (current: Runtime): Transfer => ({ runtime: current }),
+    restoreTransfer: (transfer: Transfer): Runtime => transfer.runtime,
+    setHandoffPending: (current: Runtime, pending: boolean) => {
+      current.handoffPending = pending;
+    },
+    cleanup: async () => {
+      cleanupCalls += 1;
+      return true;
+    },
+    relinquish: () => {},
+    release: () => {},
+  };
+  const oldCoordinator = new RuntimeReloadCoordinator<Runtime, Transfer>({
+    ...common,
+    eventBus,
+    getActive: () => oldActive,
+    setActive: (current) => { oldActive = current; },
+  });
+  assert.equal(oldCoordinator.beginHandoff(runtime), true);
+
+  let releaseProbe!: () => void;
+  const probeGate = new Promise<void>((resolve) => { releaseProbe = resolve; });
+  let adopted: Runtime | undefined;
+  let newCoordinator: RuntimeReloadCoordinator<Runtime, Transfer> | undefined;
+  const api = readyApi();
+  api.events = {
+    emit: eventBus.emit.bind(eventBus),
+    on: eventBus.on.bind(eventBus),
+  };
+  const extension = createPiSubagentExtension({
+    probe: readyOverrides({
+      loadRuntimeDependency: async () => {
+        await probeGate;
+        return import("semver");
+      },
+    }),
+    activate: () => {
+      newCoordinator = new RuntimeReloadCoordinator<Runtime, Transfer>({
+        ...common,
+        eventBus,
+        getActive: () => newActive,
+        setActive: (current) => { newActive = current; },
+      });
+      const incoming = newCoordinator.prepareIncoming();
+      adopted = newCoordinator.commitIncoming(incoming);
+      newActive = adopted;
+    },
+  });
+
+  const loading = Promise.resolve(extension(api));
+  await new Promise<void>((resolve) => setTimeout(resolve, 60));
+  const cleanupDuringProbe = cleanupCalls;
+  const pendingDuringProbe = runtime.handoffPending;
+  releaseProbe();
+  const loadingError = await loading.then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+
+  assert.equal(cleanupDuringProbe, 0);
+  assert.equal(pendingDuringProbe, true);
+  if (loadingError !== undefined) throw loadingError;
+  assert.strictEqual(adopted, runtime);
+  assert.equal(cleanupCalls, 0);
+  assert.equal(oldActive, undefined);
+  newCoordinator?.releaseRuntime(runtime);
+
+  const failedRuntime: Runtime = { id: "failed-reload-runtime", handoffPending: false };
+  oldActive = failedRuntime;
+  const failedCoordinator = new RuntimeReloadCoordinator<Runtime, Transfer>({
+    ...common,
+    eventBus,
+    getActive: () => oldActive,
+    setActive: (current) => { oldActive = current; },
+  });
+  assert.equal(failedCoordinator.beginHandoff(failedRuntime), true);
+  const unavailableExtension = createPiSubagentExtension({
+    probe: readyOverrides({ nodeVersion: "22.18.9" }),
+  });
+  await unavailableExtension(api);
+  assert.equal(cleanupCalls, 1);
+  assert.equal(failedRuntime.handoffPending, false);
+  assert.equal(oldActive, undefined);
 });
 
 test("门禁失败只注册一次诊断桥，不注册公开面或运行副作用", async () => {

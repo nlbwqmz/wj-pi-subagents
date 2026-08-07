@@ -162,7 +162,7 @@ export interface PiSubagentRuntimeOptions {
   readonly nodeFactory?: AgentSupervisorFactoryOptions["nodeFactory"];
   /** 测试可替换本地 IPC；生产固定使用命名管道或 Unix socket。 */
   readonly localSupervisorTransportAdapter?: LocalSupervisorTransportAdapter;
-  /** reload 交接 lease 的有界等待期限；不影响代理终止内部期限。 */
+  /** 旧实例等待新扩展 factory 开始接管的 watchdog 期限；不影响已认领交接或代理终止期限。 */
   readonly reloadLeaseTimeoutMs?: number;
   /** 测试/宿主观察接缝；异常不会改变激活结果。 */
   readonly onController?: (controller: AgentControllerType) => void;
@@ -725,43 +725,7 @@ export function createPiSubagentRuntimeActivator(
     const reloadEventBus = bootstrapAtActivation.kind === "invalid"
       ? undefined
       : readRuntimeReloadEventBus(api.events);
-    const reloadCoordinator = new RuntimeReloadCoordinator<ActiveRuntime, RuntimeTransfer>({
-      ...(reloadEventBus === undefined ? {} : { eventBus: reloadEventBus }),
-      timeoutMs: reloadLeaseTimeoutMs,
-      activationIdentity,
-      isTransfer: isRuntimeTransfer,
-      identityOfRuntime: (runtime) => reloadIdentityOfRuntime(runtime),
-      identityOfTransfer: (transfer) => reloadIdentityOfTransfer(transfer),
-      createTransfer: (current) => Object.freeze({
-        controller: current.controller,
-        templates: current.templates,
-        tree: current.tree,
-        rootRuntime: current.rootRuntime,
-        rootId: current.rootId,
-        isChild: current.isChild,
-        managementEnabled: current.managementEnabled,
-        authority: current.authority,
-        ...(current.rootAuthority === undefined ? {} : { rootAuthority: current.rootAuthority }),
-        ...(current.upstream === undefined ? {} : { upstream: current.upstream }),
-        ...(current.replyCoordinator === undefined ? {} : { replyCoordinator: current.replyCoordinator }),
-        replyInbox: current.replyInbox,
-        bindings: current.bindings,
-        createSupervisor: current.createSupervisor,
-      }),
-      restoreTransfer: (transfer) => makeState(transfer, transfer.bindings.context),
-      getActive: () => active,
-      setActive: (runtime) => {
-        active = runtime;
-      },
-      setHandoffPending: (runtime, pending) => {
-        runtime.handoffPending = pending;
-      },
-      cleanup: (runtime) => shutdownRuntime(runtime),
-      relinquish: (runtime) => {
-        relinquishAuthority(runtime);
-      },
-      release: (runtime) => releaseAuthority(runtime),
-    });
+    let reloadCoordinator: RuntimeReloadCoordinator<ActiveRuntime, RuntimeTransfer>;
 
     const startSession = async (event: unknown, rawContext: unknown): Promise<void> => {
       const context = readContext(rawContext);
@@ -776,6 +740,7 @@ export function createPiSubagentRuntimeActivator(
         publishReloadSnapshot(active, context);
         applyAgentToolVisibility(api, active.managementEnabled, active.isChild);
         bindRuntimeUi(active, context);
+        await active.controller.retryPendingReplies();
         return;
       }
       if (sessionEvent.reason === "reload") {
@@ -807,6 +772,7 @@ export function createPiSubagentRuntimeActivator(
           } catch {
             // 测试/宿主观察者不属于控制面。
           }
+          await current.controller.retryPendingReplies();
           return;
         } catch (error) {
           await reloadCoordinator.cleanupIncoming(incoming);
@@ -1069,6 +1035,46 @@ export function createPiSubagentRuntimeActivator(
         () => shutdownSession(event),
       );
       return lifecycle;
+    });
+
+    // 所有可能抛错的公开面和生命周期注册完成后才认领旧树。此后 Pi 会等待
+    // 全部扩展 factory，再向这个已完整装配的新实例发送 session_start。
+    reloadCoordinator = new RuntimeReloadCoordinator<ActiveRuntime, RuntimeTransfer>({
+      ...(reloadEventBus === undefined ? {} : { eventBus: reloadEventBus }),
+      timeoutMs: reloadLeaseTimeoutMs,
+      activationIdentity,
+      isTransfer: isRuntimeTransfer,
+      identityOfRuntime: (runtime) => reloadIdentityOfRuntime(runtime),
+      identityOfTransfer: (transfer) => reloadIdentityOfTransfer(transfer),
+      createTransfer: (current) => Object.freeze({
+        controller: current.controller,
+        templates: current.templates,
+        tree: current.tree,
+        rootRuntime: current.rootRuntime,
+        rootId: current.rootId,
+        isChild: current.isChild,
+        managementEnabled: current.managementEnabled,
+        authority: current.authority,
+        ...(current.rootAuthority === undefined ? {} : { rootAuthority: current.rootAuthority }),
+        ...(current.upstream === undefined ? {} : { upstream: current.upstream }),
+        ...(current.replyCoordinator === undefined ? {} : { replyCoordinator: current.replyCoordinator }),
+        replyInbox: current.replyInbox,
+        bindings: current.bindings,
+        createSupervisor: current.createSupervisor,
+      }),
+      restoreTransfer: (transfer) => makeState(transfer, transfer.bindings.context),
+      getActive: () => active,
+      setActive: (runtime) => {
+        active = runtime;
+      },
+      setHandoffPending: (runtime, pending) => {
+        runtime.handoffPending = pending;
+      },
+      cleanup: (runtime) => shutdownRuntime(runtime),
+      relinquish: (runtime) => {
+        relinquishAuthority(runtime);
+      },
+      release: (runtime) => releaseAuthority(runtime),
     });
   };
 }

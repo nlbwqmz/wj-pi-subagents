@@ -47,14 +47,18 @@ const SUPERVISOR_FRAME_KEYS = new Set([
  * 不能改变树的公开配额、等待或模型行为。
  */
 export const SUPERVISOR_CHANNEL_LIMITS = Object.freeze({
-  maxFrameBytes: 64 * 1024,
+  /** 可承载 8 张最大合法图片、最终文本及 JSON 转义后的完整监督帧。 */
+  maxFrameBytes: 512 * 1024,
   maxStringBytes: 16 * 1024,
+  /** 根权威向递归子控制器交付模板正文时使用的独立有界字符串预算。 */
+  maxControlStringBytes: 64 * 1024,
   maxJsonDepth: 16,
   maxJsonEntries: 512,
   maxNodes: 64,
   maxReplyWindow: 32,
   maxRetiredStreams: 4,
   maxImagesPerReply: 8,
+  /** 单张 Base64 图片解码后的字节上限。 */
   maxImageBytes: 24 * 1024,
   maxDepth: 8,
 } as const);
@@ -62,6 +66,7 @@ export const SUPERVISOR_CHANNEL_LIMITS = Object.freeze({
 export interface SupervisorChannelLimits {
   readonly maxFrameBytes: number;
   readonly maxStringBytes: number;
+  readonly maxControlStringBytes: number;
   readonly maxJsonDepth: number;
   readonly maxJsonEntries: number;
   readonly maxNodes: number;
@@ -313,7 +318,7 @@ interface StoredReply {
 
 const SAFE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const SAFE_STREAM_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
-const SAFE_MIME_PATTERN = /^[a-z]+\/[a-z0-9.+-]+$/;
+const SAFE_MIME_PATTERN = /^image\/[a-z0-9.+-]+$/;
 const RFC3339_MILLIS_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const EMPTY_FAULT: SupervisorChannelFault = Object.freeze({ code: "internal_error" });
 const EMPTY_NODES: readonly AgentSnapshot[] = Object.freeze([]);
@@ -345,6 +350,37 @@ function hasOwn(value: object, key: PropertyKey): boolean {
 
 function utf8Length(value: string): number {
   return new TextEncoder().encode(value).byteLength;
+}
+
+function maxEncodedBase64Bytes(decodedBytes: number): number {
+  return Math.ceil(decodedBytes / 3) * 4;
+}
+
+function maxFrameStringBytes(limits: SupervisorChannelLimits): number {
+  return Math.max(
+    limits.maxStringBytes,
+    limits.maxControlStringBytes,
+    maxEncodedBase64Bytes(limits.maxImageBytes),
+  );
+}
+
+function validBase64(value: string): boolean {
+  if (value.length === 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return false;
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+  if (padding > 0 && value.length % 4 !== 0) return false;
+  if ((value.length - padding) % 4 === 1) return false;
+  try {
+    const normalized = padding > 0 ? value : value + "=".repeat((4 - (value.length % 4)) % 4);
+    return Buffer.from(normalized, "base64").toString("base64").replace(/=+$/, "")
+      === normalized.replace(/=+$/, "");
+  } catch {
+    return false;
+  }
+}
+
+function decodedBase64Length(value: string): number {
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+  return Math.floor(value.length * 3 / 4) - padding;
 }
 
 function cloneBytes(value: Uint8Array): Uint8Array<ArrayBuffer> {
@@ -449,13 +485,14 @@ function asPlainJsonRecord(value: unknown): Record<string, unknown> {
 function assertJsonBounds(
   value: unknown,
   limits: SupervisorChannelLimits,
+  maxStringBytes = limits.maxStringBytes,
   depth = 0,
   counter: { entries: number } = { entries: 0 },
   ancestors: Set<object> = new Set(),
 ): void {
   if (depth > limits.maxJsonDepth) frameError("invalid_frame");
   if (typeof value === "string") {
-    if (!validBoundedString(value, limits)) frameError("frame_too_large");
+    if (utf8Length(value) > maxStringBytes) frameError("frame_too_large");
     return;
   }
   if (
@@ -480,7 +517,7 @@ function assertJsonBounds(
         if (descriptor === undefined || !descriptor.enumerable || !hasOwn(descriptor, "value")) {
           frameError("invalid_frame");
         }
-        assertJsonBounds(descriptor.value, limits, depth + 1, counter, ancestors);
+        assertJsonBounds(descriptor.value, limits, maxStringBytes, depth + 1, counter, ancestors);
       }
     } finally {
       ancestors.delete(value);
@@ -496,7 +533,7 @@ function assertJsonBounds(
   try {
     for (const [key, item] of entries) {
       if (!validBoundedString(key, limits)) frameError("frame_too_large");
-      assertJsonBounds(item, limits, depth + 1, counter, ancestors);
+      assertJsonBounds(item, limits, maxStringBytes, depth + 1, counter, ancestors);
     }
   } finally {
     ancestors.delete(object);
@@ -530,7 +567,7 @@ function assertNoSensitiveControlFields(value: unknown): void {
 }
 
 function parseControlJson(value: unknown, limits: SupervisorChannelLimits): SupervisorJsonValue {
-  assertJsonBounds(value, limits);
+  assertJsonBounds(value, limits, limits.maxControlStringBytes);
   assertNoSensitiveControlFields(value);
   return freezePlain(cloneJson(value)) as SupervisorJsonValue;
 }
@@ -646,7 +683,7 @@ function parseFrameObject(value: unknown, limits: SupervisorChannelLimits): Inte
   if (typeof candidate.payload !== "object" || candidate.payload === null || Array.isArray(candidate.payload)) {
     frameError("invalid_frame");
   }
-  assertJsonBounds(candidate, limits);
+  assertJsonBounds(candidate, limits, maxFrameStringBytes(limits));
   return Object.freeze({
     protocol: SUPERVISOR_PROTOCOL_VERSION,
     kind: candidate.kind as SupervisorFrameKind,
@@ -904,8 +941,8 @@ function parseReply(payload: Record<string, unknown>, limits: SupervisorChannelL
       typeof candidate.data !== "string" ||
       typeof candidate.mimeType !== "string" ||
       !SAFE_MIME_PATTERN.test(candidate.mimeType) ||
-      utf8Length(candidate.data) > limits.maxImageBytes ||
-      !/^[A-Za-z0-9+/]*={0,2}$/.test(candidate.data) ||
+      !validBase64(candidate.data) ||
+      decodedBase64Length(candidate.data) > limits.maxImageBytes ||
       Object.keys(candidate).some((key) => key !== "type" && key !== "data" && key !== "mimeType")
     ) frameError("reply_invalid");
     parsedImages.push(Object.freeze({ type: "image", data: candidate.data, mimeType: candidate.mimeType }));
@@ -1152,6 +1189,21 @@ export class SupervisorChannel {
       throw new SupervisorProtocolError("closed");
     }
     return this.beginSnapshotRequest();
+  }
+
+  /**
+   * 父会话重新可用后重试尚未注入的连续回复。只有本轮确实推进 reply_seq
+   * 才返回新的累计 ACK；回复正文始终保留在有界窗口内直至接纳成功。
+   */
+  retryPendingReplies(): SupervisorFrame | undefined {
+    if (this.role !== "parent" || this.terminationBarrier || this.state !== "ready") {
+      throw new SupervisorProtocolError("closed");
+    }
+    const previousAck = this.highestReplyAck;
+    const result = this.deliverBufferedReplies();
+    return result.ackReplySeq === previousAck
+      ? undefined
+      : this.createReplyAck(result.ackReplySeq);
   }
 
   /** 显式建立终止屏障后，旧流和普通控制帧只会被丢弃。 */
@@ -1491,15 +1543,16 @@ export class SupervisorChannel {
     if (reply.reply_seq < this.nextExpectedReplySeq) {
       return Object.freeze({ replies: EMPTY_REPLIES, ackReplySeq: this.highestReplyAck });
     }
-    if (reply.reply_seq > this.nextExpectedReplySeq) {
-      if (!this.bufferedReplies.has(reply.reply_seq) && this.bufferedReplies.size >= this.limits.maxReplyWindow) {
-        frameError("reply_window_full");
-      }
-      this.bufferedReplies.set(reply.reply_seq, reply);
-      return Object.freeze({ replies: EMPTY_REPLIES, ackReplySeq: this.highestReplyAck });
+    if (!this.bufferedReplies.has(reply.reply_seq) && this.bufferedReplies.size >= this.limits.maxReplyWindow) {
+      frameError("reply_window_full");
     }
+    this.bufferedReplies.set(reply.reply_seq, reply);
+    return this.deliverBufferedReplies();
+  }
+
+  private deliverBufferedReplies(): { readonly replies: readonly SupervisorReply[]; readonly ackReplySeq: number } {
     const delivered: SupervisorReply[] = [];
-    let current: SupervisorReply | undefined = reply;
+    let current = this.bufferedReplies.get(this.nextExpectedReplySeq);
     while (current !== undefined) {
       let accepted = true;
       try {
@@ -1507,14 +1560,14 @@ export class SupervisorChannel {
       } catch {
         accepted = false;
       }
-      // 传输帧可以确认已接收，但未成功注入的 reply 不推进 reply_seq，
-      // 不回 reply ACK；它会在同一根会话的下一次重连中重新发送。
+      // 注入失败时保留当前 reply；传输 ACK 仍可推进，但 reply ACK 必须等待
+      // 当前或 reload 后的新父会话真正接纳正文。
       if (!accepted) break;
+      this.bufferedReplies.delete(current.reply_seq);
       delivered.push(current);
       this.highestReplyAck = current.reply_seq;
       this.nextExpectedReplySeq += 1;
       current = this.bufferedReplies.get(this.nextExpectedReplySeq);
-      if (current !== undefined) this.bufferedReplies.delete(this.nextExpectedReplySeq);
     }
     return Object.freeze({ replies: Object.freeze(delivered), ackReplySeq: this.highestReplyAck });
   }

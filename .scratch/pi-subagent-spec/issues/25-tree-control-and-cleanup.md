@@ -26,3 +26,7 @@ Status: resolved
 - 2026-08-06：第二轮双轴复审结果为 Spec 0 项发现；Standards 发现 1 项运行时职责发散判断项，已通过抽取 reload 交接协调模块修复并重新完成全量门禁。静态核查未发现调试标记、旧跨控制器注册表、伪回复命令、树控制兼容别名或生产伪 child 端点；系统临时目录无 `pi-subagent-local-*`、测试日志、调试缓存或 loader 中间产物残留。真实 Windows + Pi + 模型 + Job Object 组合继续由人工验证，未将其记录为自动测试通过。
 
 - 2026-08-07：根据真实会话尾部的递归终止失败记录补齐回归：单节点监督器把“物理资源已确认、整树权威尚待提交”与真实 `termination_incomplete` 分离，`AgentController` 随后按固定屏障批量确认父节点及后代，避免父等子、外层又等监督器成功的循环依赖。同步修复 shutdown 与 in-flight spawn 的登记竞态，关闭开始后拒绝新创建并等待已接纳创建进入可回收集合。另按 Pi 真实 `session_shutdown(reload) -> oldRunner.invalidate() -> 新扩展加载` 顺序修正跨实例 reload：有界 transfer 同时发布到进程级共享 lease 注册表，不再依赖会被 invalidate 自动撤销的旧 EventBus 订阅；测试显式模拟旧 API 失效、递归 root/child 交接和 watchdog 清理。
+
+- 2026-08-07：补齐 reload 交接的两个生命周期空窗。父监督通道现在保留已经接收但因旧 Pi API 失效而未注入的连续回复，不推进 `reply_seq` 或发送 reply ACK；新实例在 reload `session_start` 绑定新 API 后经既有监督器重试，成功注入后才累计确认。旧实例的 watchdog 只覆盖尚无新 factory 接管的阶段；宿主门禁开始时显式持有 outgoing lease，门禁失败立即按根关闭语义清树，成功实例在全部公开面与生命周期处理器注册后才认领控制器，已认领状态不再沿用固定 5 秒期限。回归覆盖交接窗口回复、ACK 清空、后续回复顺序、慢 factory 超过原期限、门禁失败清理及迟到 reload start。
+
+- 2026-08-07：真实 Pi package 旅程暴露启动期监督 ACK 被 `ManagedRpcNode` 的 `ready` 门槛拒绝：bridge 的 start 响应仍在等待 child `session_start`，而 child 已发送 hello 并等待父端 `hello_ack`，最终形成 30 秒 `spawn_timeout`。修复后只有监督帧可在 bridge 已绑定的 `starting` 阶段通过，prompt、steering、abort 和状态查询仍保持 ready-only；新增确定性回归覆盖 bridge start 未完成时的监督帧应答。

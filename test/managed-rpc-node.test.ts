@@ -1,13 +1,17 @@
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { BridgeSupervisorEndpoint } from "./helpers/bridge-supervisor-endpoint.ts";
 import {
   FakeManagedRpcNode,
   MANAGED_RPC_BRIDGE_PROTOCOL,
+  MANAGED_RPC_SUPERVISOR_MAX_ENCODED_FRAME_BYTES,
+  MANAGED_RPC_SUPERVISOR_MAX_FRAME_BYTES,
   ManagedRpcBridgeClient,
   ManagedRpcNode,
   createManagedRpcNodeLaunchSpec,
+  resolveManagedRpcBridgeScriptPath,
   type ManagedRpcBridge,
   type ManagedRpcBridgeFactory,
   type ManagedRpcNodeStartContext,
@@ -36,22 +40,34 @@ import {
 
 const TREE = Object.freeze({ kind: "tree" });
 
-test("受管节点只为源码 bridge 启用 TypeScript stripping", () => {
+test("编译后的受管节点优先解析同目录 bridge，源码节点仍解析 dist bridge", () => {
+  const compiledModuleUrl = "file:///D:/package/dist/src/managed-rpc-node.js";
+  const colocatedCompiled = fileURLToPath(new URL("./rpc-bridge-process.js", compiledModuleUrl));
+  assert.equal(
+    resolveManagedRpcBridgeScriptPath(compiledModuleUrl, (path) => path === colocatedCompiled),
+    colocatedCompiled,
+  );
+
+  const sourceModuleUrl = "file:///D:/package/src/managed-rpc-node.ts";
+  const sourceCompiled = fileURLToPath(new URL("../dist/src/rpc-bridge-process.js", sourceModuleUrl));
+  assert.equal(
+    resolveManagedRpcBridgeScriptPath(sourceModuleUrl, (path) => path === sourceCompiled),
+    sourceCompiled,
+  );
+});
+
+test("受管节点只为源码 bridge 启用 TypeScript stripping，配置不进入命令行", () => {
   const compiled = createManagedRpcNodeLaunchSpec({
     bridgeScriptPath: "C:/pi-subagents-wj/dist/src/rpc-bridge-process.js",
   });
-  assert.deepEqual(compiled.args?.slice(0, 2), [
-    "C:/pi-subagents-wj/dist/src/rpc-bridge-process.js",
-    "--config",
-  ]);
+  assert.deepEqual(compiled.args, ["C:/pi-subagents-wj/dist/src/rpc-bridge-process.js"]);
 
   const source = createManagedRpcNodeLaunchSpec({
     bridgeScriptPath: "C:/pi-subagents-wj/src/rpc-bridge-process.ts",
   });
-  assert.deepEqual(source.args?.slice(0, 3), [
+  assert.deepEqual(source.args, [
     "--experimental-strip-types",
     "C:/pi-subagents-wj/src/rpc-bridge-process.ts",
-    "--config",
   ]);
 });
 
@@ -65,6 +81,7 @@ function transport(): ManagedProcessTransport {
 
 class RecordingBridge implements ManagedRpcBridge {
   readonly operations: string[] = [];
+  readonly supervisorFrames: Uint8Array[] = [];
   private readonly eventListeners = new Set<(event: unknown) => void>();
   private readonly faultListeners = new Set<(fault: "eof" | "protocol_fault" | "process_exit") => void>();
 
@@ -103,7 +120,9 @@ class RecordingBridge implements ManagedRpcBridge {
     return () => this.faultListeners.delete(listener);
   }
 
-  async sendSupervisorFrame(): Promise<void> {}
+  async sendSupervisorFrame(frame: Uint8Array): Promise<void> {
+    this.supervisorFrames.push(new Uint8Array(frame));
+  }
 
   onSupervisorFrame(): () => void {
     return () => {};
@@ -161,6 +180,33 @@ class RecordingAdapter implements ProcessTreeAdapter {
   }
 }
 
+class DelayedStartBridge extends RecordingBridge {
+  readonly startEntered: Promise<void>;
+  private signalStartEntered!: () => void;
+  private readonly startGate: Promise<void>;
+  private completeStartGate!: () => void;
+
+  constructor() {
+    super();
+    this.startEntered = new Promise<void>((resolve) => {
+      this.signalStartEntered = resolve;
+    });
+    this.startGate = new Promise<void>((resolve) => {
+      this.completeStartGate = resolve;
+    });
+  }
+
+  override async start(): Promise<void> {
+    this.operations.push("bridge:start");
+    this.signalStartEntered();
+    await this.startGate;
+  }
+
+  completeStart(): void {
+    this.completeStartGate();
+  }
+}
+
 class DelayedLaunchAdapter extends RecordingAdapter {
   readonly launchStarted: Promise<void>;
   private signalLaunchStarted!: () => void;
@@ -195,14 +241,17 @@ test("ManagedRpcNode 以单一启动事务绑定 launch 返回的树和桥接，
   const adapter = new RecordingAdapter();
   let bridge: RecordingBridge | undefined;
   let bridgeCredential: string | undefined;
+  let bridgeRpcOptions: Readonly<Record<string, unknown>> | undefined;
   const bridgeFactory: ManagedRpcBridgeFactory = (_transport, options) => {
     bridgeCredential = options?.credential;
+    bridgeRpcOptions = options?.rpcOptions;
     bridge = new RecordingBridge();
     return bridge;
   };
   const node = new ManagedRpcNode({
     processTreeAdapter: adapter,
     launch: { command: "bridge.exe", args: ["--managed"] },
+    rpcOptions: { args: ["--no-session"], templatePrompt: { mode: "append", body: "不进入命令行" } },
     bridgeFactory,
   });
   const observed: unknown[] = [];
@@ -212,6 +261,10 @@ test("ManagedRpcNode 以单一启动事务绑定 launch 返回的树和桥接，
   const credential = adapter.launchSpec?.env?.PI_SUBAGENT_MANAGED_RPC_CREDENTIAL;
   assert.equal(typeof credential, "string");
   assert.equal(credential?.length, 43);
+  assert.deepEqual(bridgeRpcOptions, {
+    args: ["--no-session"],
+    templatePrompt: { mode: "append", body: "不进入命令行" },
+  });
   bridge?.emitEvent({ type: "agent_settled" });
   assert.deepEqual(observed, [{ type: "agent_settled" }]);
   await node.prompt("hello");
@@ -235,6 +288,25 @@ test("ManagedRpcNode 以单一启动事务绑定 launch 返回的树和桥接，
     "bridge:release",
   ]);
   assert.equal(bridgeCredential, credential);
+});
+
+test("ManagedRpcNode 在 bridge 启动握手完成前允许监督帧双向应答", async () => {
+  const adapter = new RecordingAdapter();
+  const bridge = new DelayedStartBridge();
+  const node = new ManagedRpcNode({
+    processTreeAdapter: adapter,
+    launch: { command: "bridge.exe" },
+    bridgeFactory: () => bridge,
+  });
+
+  const startup = node.start();
+  await bridge.startEntered;
+  await node.sendSupervisorFrame(new Uint8Array([1, 2, 3]));
+  assert.deepEqual(bridge.supervisorFrames, [new Uint8Array([1, 2, 3])]);
+
+  bridge.completeStart();
+  await startup;
+  await node.release();
 });
 
 test("ManagedRpcNode 启动超时期间不伪造资源确认，并在迟到 launch 后完成挂起回滚", async () => {
@@ -339,6 +411,67 @@ test("ManagedRpcBridgeClient 使用固定版本与长度边界传递高层命令
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.deepEqual(faults, ["eof"]);
   assert.deepEqual(requests.map((request) => request.command), ["start", "prompt", "get_state"]);
+  await client.release();
+});
+
+test("桥接客户端分片传递全部合法的最大图片消息", async () => {
+  const parentInput = new PassThrough();
+  const parentOutput = new PassThrough();
+  const client = new ManagedRpcBridgeClient({
+    stdin: parentInput,
+    stdout: parentOutput,
+    stderr: new PassThrough(),
+  });
+  const chunks: Array<Record<string, unknown>> = [];
+  let buffered = new Uint8Array(0);
+  parentInput.on("data", (chunk: Uint8Array) => {
+    const combined = new Uint8Array(buffered.byteLength + chunk.byteLength);
+    combined.set(buffered);
+    combined.set(chunk, buffered.byteLength);
+    buffered = combined;
+    while (buffered.byteLength >= 4) {
+      const length = new DataView(buffered.buffer, buffered.byteOffset, 4).getUint32(0, false);
+      if (buffered.byteLength < length + 4) return;
+      const frame = JSON.parse(new TextDecoder().decode(buffered.subarray(4, length + 4))) as Record<string, unknown>;
+      buffered = buffered.subarray(length + 4);
+      if (frame.kind === "command_chunk") {
+        chunks.push(frame);
+        if (frame.chunk_index === (frame.chunk_count as number) - 1) {
+          parentOutput.write(encodeFrame({
+            protocol: MANAGED_RPC_BRIDGE_PROTOCOL,
+            kind: "response",
+            id: frame.id,
+            ok: true,
+          }));
+        }
+      } else {
+        parentOutput.write(encodeFrame({
+          protocol: MANAGED_RPC_BRIDGE_PROTOCOL,
+          kind: "response",
+          id: frame.id,
+          ok: true,
+        }));
+      }
+    }
+  });
+
+  await client.start();
+  const imageData = Buffer.alloc(24 * 1024, 0x31).toString("base64");
+  await client.prompt("包含全部最大图片的任务", Array.from({ length: 8 }, () => ({
+    type: "image" as const,
+    data: imageData,
+    mimeType: "image/png",
+  })));
+
+  assert.ok(chunks.length > 1);
+  const payloadBytes = Buffer.concat(chunks.map((frame) => Buffer.from(String(frame.chunk), "base64url")));
+  const payload = JSON.parse(payloadBytes.toString("utf8")) as {
+    message: string;
+    images: Array<{ data: string; mimeType: string }>;
+  };
+  assert.equal(payload.message, "包含全部最大图片的任务");
+  assert.equal(payload.images.length, 8);
+  assert.equal(payload.images.every((image) => image.data === imageData && image.mimeType === "image/png"), true);
   await client.release();
 });
 
@@ -515,7 +648,7 @@ test("桥接客户端在唯一读写流上复用有界监督帧并传递启动�
   await client.release();
 });
 
-test("桥接监督隧道为 Base64URL 膨胀预留外层帧空间", async () => {
+test("桥接监督隧道把完整监督帧分片为可容纳的 Base64URL 外层帧", async () => {
   const parentInput = new PassThrough();
   const client = new ManagedRpcBridgeClient({
     stdin: parentInput,
@@ -525,18 +658,29 @@ test("桥接监督隧道为 Base64URL 膨胀预留外层帧空间", async () => 
   const written: Uint8Array[] = [];
   parentInput.on("data", (chunk: Uint8Array) => written.push(new Uint8Array(chunk)));
 
-  const tunnelLimit = 46 * 1024;
-  await client.sendSupervisorFrame(new Uint8Array(tunnelLimit));
+  const fullFrame = new Uint8Array(MANAGED_RPC_SUPERVISOR_MAX_FRAME_BYTES + 1);
+  for (let index = 0; index < fullFrame.byteLength; index += 1) fullFrame[index] = index % 251;
+  await client.sendSupervisorFrame(fullFrame);
   await assert.rejects(
-    () => client.sendSupervisorFrame(new Uint8Array(tunnelLimit + 1)),
+    () => client.sendSupervisorFrame(new Uint8Array(MANAGED_RPC_SUPERVISOR_MAX_ENCODED_FRAME_BYTES + 1)),
     /监督帧无效/,
   );
 
-  assert.equal(written.length, 1);
-  const outer = written[0]!;
-  const bodyLength = new DataView(outer.buffer, outer.byteOffset, 4).getUint32(0, false);
-  assert.ok(bodyLength <= 64 * 1024);
-  assert.equal(outer.byteLength, bodyLength + 4);
+  assert.equal(written.length, 2);
+  const chunks = written.map((outer) => {
+    const bodyLength = new DataView(outer.buffer, outer.byteOffset, 4).getUint32(0, false);
+    assert.ok(bodyLength <= 64 * 1024);
+    assert.equal(outer.byteLength, bodyLength + 4);
+    const parsed = JSON.parse(new TextDecoder().decode(outer.subarray(4))) as { frame: string };
+    return new Uint8Array(Buffer.from(parsed.frame, "base64url"));
+  });
+  const reassembled = new Uint8Array(fullFrame.byteLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    reassembled.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  assert.deepEqual(reassembled, fullFrame);
   await client.release();
 });
 
@@ -616,6 +760,75 @@ class LinkedManagedNode extends FakeManagedRpcNode {
     this.endpoint?.publishReply(reply);
   }
 }
+
+class FragmentingLinkedManagedNode extends LinkedManagedNode {
+  override emitSupervisorFrame(frame: Uint8Array): void {
+    for (let offset = 0; offset < frame.byteLength; offset += MANAGED_RPC_SUPERVISOR_MAX_FRAME_BYTES) {
+      super.emitSupervisorFrame(frame.subarray(
+        offset,
+        Math.min(frame.byteLength, offset + MANAGED_RPC_SUPERVISOR_MAX_FRAME_BYTES),
+      ));
+    }
+  }
+}
+
+test("受管监督通道重组分片后的最大 final 图片回复", async () => {
+  const childId = "abababab-abab-4bab-8bab-abababababab";
+  const credential = "supervisor-credential-0123456789012345";
+  const node = new FragmentingLinkedManagedNode();
+  const delivered: Array<{ text: string; imageCount: number }> = [];
+  const channel = new ManagedRpcSupervisorChannel({
+    node,
+    rootId: "root-large-final",
+    localAgentId: null,
+    peerAgentId: childId,
+    parentAgentId: null,
+    depth: 1,
+    credential,
+    requestIdRegistry: new SupervisorRequestIdRegistry(),
+    onReply: (reply) => {
+      delivered.push({ text: reply.text, imageCount: reply.images?.length ?? 0 });
+      return true;
+    },
+  });
+  const signal = new AbortController().signal;
+  await channel.bind(signal);
+  await node.start(signal, {
+    supervisor: {
+      root_id: "root-large-final",
+      local_agent_id: childId,
+      peer_agent_id: "",
+      parent_agent_id: null,
+      depth: 1,
+      credential,
+      initial_snapshot: [{
+        agent_id: childId,
+        parent_agent_id: null,
+        template_id: "researcher",
+        name: "图片 final",
+        depth: 1,
+        state: "starting",
+        pending_message_count: 0,
+        revision: 1,
+        observed_at: "2026-08-06T00:00:00.000Z",
+      }],
+      initial_subtree_revision: 1,
+    },
+  });
+  await channel.waitForReady(signal);
+
+  const imageData = Buffer.alloc(24 * 1024, 0x7f).toString("base64");
+  await node.publishReply({
+    kind: "final",
+    text: "最大图片 final",
+    images: Array.from({ length: 8 }, () => ({ type: "image" as const, data: imageData, mimeType: "image/png" })),
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(delivered, [{ text: "最大图片 final", imageCount: 8 }]);
+  await channel.release();
+  await node.release();
+});
 
 test("RpcSupervisor 通过真正 child 端点完成双握手和回复 ACK", async () => {
   const id = "99999999-9999-4999-8999-999999999999";
