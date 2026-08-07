@@ -118,7 +118,7 @@ interface PendingWaiter {
   readonly timer: ReturnType<typeof setTimeout>;
 }
 
-export type WaitAgentOutcome = "settled" | "terminal" | "timeout";
+export type WaitAgentOutcome = "reply" | "settled" | "terminal" | "timeout";
 
 export interface WaitAgentData {
   readonly agent_id: string;
@@ -179,6 +179,7 @@ export class AgentController {
   /** start 抛出前无法取得公开身份的节点仍需保留内部回收能力。 */
   private readonly unassignedSupervisors = new Map<AgentSupervisor, () => void>();
   private readonly waiters = new Map<string, Set<PendingWaiter>>();
+  private readonly pendingReplyNotifications = new Map<string, number>();
   private readonly messageIds = new Set<string>();
   private unsubscribeTreeChange: (() => void) | undefined;
   private readonly confirmedWithoutOwnership = new Set<string>();
@@ -337,6 +338,8 @@ export class AgentController {
     const target = await this.admittedDirectChild(input.agent_id, "wait_agent");
     if (!target.ok) return target;
     const timeout = input.timeout_ms ?? this.waitTimeoutMs;
+    const pendingReply = this.takeReplyNotification(input.agent_id, target.data);
+    if (pendingReply !== undefined) return Object.freeze({ ok: true, data: pendingReply });
     const immediate = this.waitOutcome(input.agent_id, target.data);
     if (immediate !== undefined) return Object.freeze({ ok: true, data: immediate });
 
@@ -360,10 +363,29 @@ export class AgentController {
       // 原子检查、登记、再次检查，避免事件恰好落在登记边界丢失。
       const latest = this.tree.getStatus(input.agent_id);
       if (latest.ok) {
-        const outcome = this.waitOutcome(input.agent_id, latest.data);
+        const outcome = this.takeReplyNotification(input.agent_id, latest.data)
+          ?? this.waitOutcome(input.agent_id, latest.data);
         if (outcome !== undefined) this.finishWaiter(input.agent_id, waiter, Object.freeze({ ok: true, data: outcome }));
       }
     });
+  }
+
+  /** 父端 reply inbox 在工作中消息被 Pi 会话接纳后调用。 */
+  notifyAgentReply(agentId: unknown): boolean {
+    if (!isCanonicalUuid(agentId) || !this.agents.has(agentId)) return false;
+    const status = this.tree.getStatus(agentId);
+    if (!status.ok || status.data.state === "failed" || status.data.state === "terminating" || status.data.state === "terminated") {
+      return false;
+    }
+    const set = this.waiters.get(agentId);
+    if (set !== undefined && set.size > 0) {
+      const result = Object.freeze({ ok: true as const, data: makeWaitData(status.data, "reply") });
+      for (const waiter of [...set]) this.finishWaiter(agentId, waiter, result);
+      return true;
+    }
+    const pending = this.pendingReplyNotifications.get(agentId) ?? 0;
+    this.pendingReplyNotifications.set(agentId, Math.min(32, pending + 1));
+    return true;
   }
 
   async interruptAgent(agentId: unknown): Promise<ControlResult<InterruptAgentData>> {
@@ -523,6 +545,7 @@ export class AgentController {
     if (current !== expected) return;
     current.unsubscribe();
     this.agents.delete(agentId);
+    this.pendingReplyNotifications.delete(agentId);
   }
 
   getAgentStatus(agentId: unknown): ControlResult<AgentSnapshot> {
@@ -625,6 +648,7 @@ export class AgentController {
       }
     }
     this.waiters.clear();
+    this.pendingReplyNotifications.clear();
     for (const entry of this.agents.values()) entry.unsubscribe();
     this.agents.clear();
     for (const unsubscribe of this.unassignedSupervisors.values()) unsubscribe();
@@ -718,6 +742,9 @@ export class AgentController {
         // 父会话注入失败只影响上行观察者，不破坏节点等待和生命周期。
       }
     }
+    if (event.kind === "reply" && event.reply.kind === "message" && agentId !== undefined) {
+      this.notifyAgentReply(agentId);
+    }
     if (agentId !== undefined && event.kind === "activity") {
       this.tree.updateActivity(agentId, {
         category: event.activity.category,
@@ -795,6 +822,7 @@ export class AgentController {
     if (entry === undefined) return;
     entry.unsubscribe();
     this.agents.delete(agentId);
+    this.pendingReplyNotifications.delete(agentId);
   }
 
   private resolveAllReadyWaiters(): void {
@@ -826,6 +854,14 @@ export class AgentController {
     if (status.state === "idle") return makeWaitData(status, "settled");
     if (status.state === "failed" || status.state === "terminated") return makeWaitData(status, "terminal");
     return undefined;
+  }
+
+  private takeReplyNotification(agentId: string, status: AgentSnapshot): WaitAgentData | undefined {
+    const pending = this.pendingReplyNotifications.get(agentId) ?? 0;
+    if (pending <= 0) return undefined;
+    if (pending === 1) this.pendingReplyNotifications.delete(agentId);
+    else this.pendingReplyNotifications.set(agentId, pending - 1);
+    return makeWaitData(status, "reply");
   }
 
   private allocateMessageId(): string {

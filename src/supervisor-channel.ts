@@ -97,11 +97,22 @@ export interface SupervisorReplyImage {
   readonly mimeType: string;
 }
 
+export type SupervisorReplyKind = "message" | "final";
+
 export interface SupervisorReply {
   readonly reply_seq: number;
+  readonly kind: SupervisorReplyKind;
   readonly text: string;
   readonly images?: readonly SupervisorReplyImage[];
 }
+
+/**
+ * 公开发送入口仍兼容包内旧替身省略 kind 的调用；线上帧始终由
+ * `parseReply()` 补齐并严格携带 kind。旧调用按最终回复处理。
+ */
+export type SupervisorReplyInput = Omit<SupervisorReply, "reply_seq" | "kind"> & {
+  readonly kind?: SupervisorReplyKind;
+};
 
 /** 监督控制正文只允许可复制、可深冻结的纯 JSON 值。 */
 export type SupervisorJsonValue =
@@ -213,6 +224,8 @@ export interface SupervisorReceiveAccepted {
   readonly tree_revision: number;
   readonly outbound: readonly SupervisorFrame[];
   readonly replies: readonly SupervisorReply[];
+  /** child 端本次收到的累计 reply ACK；仅用于传输适配器完成本地等待。 */
+  readonly reply_ack?: number;
   /** 仅供本地监督器递交给 TreeController 的脱敏生命周期事实。 */
   readonly event?: SupervisorEvent;
   /** 本次接收原子替换的完整快照；调用方可直接交给树控制器。 */
@@ -877,6 +890,7 @@ function parseSnapshot(
 
 function parseReply(payload: Record<string, unknown>, limits: SupervisorChannelLimits): SupervisorReply {
   if (!Number.isSafeInteger(payload.reply_seq) || (payload.reply_seq as number) < 1) frameError("reply_invalid");
+  if (payload.kind !== "message" && payload.kind !== "final") frameError("reply_invalid");
   if (!validBoundedString(payload.text, limits)) frameError("reply_invalid");
   if (payload.images !== undefined && !Array.isArray(payload.images)) frameError("reply_invalid");
   const images = payload.images as unknown[] | undefined;
@@ -896,11 +910,15 @@ function parseReply(payload: Record<string, unknown>, limits: SupervisorChannelL
     ) frameError("reply_invalid");
     parsedImages.push(Object.freeze({ type: "image", data: candidate.data, mimeType: candidate.mimeType }));
   }
-  if (Object.keys(payload).some((key) => key !== "reply_seq" && key !== "text" && key !== "images")) {
+  if (payload.kind === "message" && (payload.text as string).trim().length === 0 && parsedImages.length === 0) {
+    frameError("reply_invalid");
+  }
+  if (Object.keys(payload).some((key) => key !== "reply_seq" && key !== "kind" && key !== "text" && key !== "images")) {
     frameError("reply_invalid");
   }
   return Object.freeze({
     reply_seq: payload.reply_seq as number,
+    kind: payload.kind as SupervisorReplyKind,
     text: payload.text as string,
     ...(parsedImages.length === 0 ? {} : { images: Object.freeze(parsedImages) }),
   });
@@ -1056,18 +1074,24 @@ export class SupervisorChannel {
     return frame;
   }
 
-  /** child 仅能上行普通对话回复，不能夹带工具参数、结果或任意事件。 */
-  publishReply(reply: Omit<SupervisorReply, "reply_seq"> | SupervisorReply): SupervisorFrame {
+  /** child 仅能上行分类对话回复，不能夹带工具参数、结果或任意事件。 */
+  publishReply(reply: SupervisorReplyInput | SupervisorReply): SupervisorFrame {
     if (this.role !== "child" || this.terminationBarrier || this.state !== "ready") {
       throw new SupervisorProtocolError("closed");
     }
-    if (this.outboundReplies.size >= this.limits.maxReplyWindow) {
-      throw new SupervisorProtocolError("reply_window_full");
-    }
     const candidate = reply as Record<string, unknown>;
     const replySeq = candidate.reply_seq === undefined ? this.nextReplySeq : candidate.reply_seq;
+    const kind = candidate.kind === undefined ? "final" : candidate.kind;
+    const messageWindow = Math.max(0, this.limits.maxReplyWindow - 1);
+    if (kind === "message" && this.outboundReplies.size >= messageWindow) {
+      throw new SupervisorProtocolError("reply_window_full");
+    }
+    if (kind === "final" && this.outboundReplies.size >= this.limits.maxReplyWindow) {
+      throw new SupervisorProtocolError("reply_window_full");
+    }
     const parsed = parseReply({
       ...candidate,
+      kind,
       reply_seq: replySeq,
     }, this.limits);
     if (parsed.reply_seq !== this.nextReplySeq) throw new SupervisorProtocolError("reply_invalid");
@@ -1309,6 +1333,7 @@ export class SupervisorChannel {
     }
     let applied = false;
     let replies: readonly SupervisorReply[] = EMPTY_REPLIES;
+    let replyAck: number | undefined;
     let event: SupervisorEvent | undefined;
     let controlRequest: SupervisorControlRequest | undefined;
     let controlResponse: SupervisorControlResponse | undefined;
@@ -1345,7 +1370,11 @@ export class SupervisorChannel {
         controlResponse = parseControlResponse(frame.payload, this.limits);
         break;
       case "ack":
-        outbound.push(...this.applyAck(frame));
+        {
+          const result = this.applyAck(frame);
+          outbound.push(...result.outbound);
+          replyAck = result.replyAck;
+        }
         break;
       case "event":
         event = this.applyEvent(frame);
@@ -1367,6 +1396,7 @@ export class SupervisorChannel {
       tree_revision: this.treeRevision,
       outbound: Object.freeze(outbound),
       replies,
+      ...(replyAck === undefined ? {} : { reply_ack: replyAck }),
       ...(event === undefined ? {} : { event }),
       ...(acceptedSnapshot === undefined ? {} : { snapshot: acceptedSnapshot }),
       ...(controlRequest === undefined ? {} : { control_request: controlRequest }),
@@ -1489,7 +1519,10 @@ export class SupervisorChannel {
     return Object.freeze({ replies: Object.freeze(delivered), ackReplySeq: this.highestReplyAck });
   }
 
-  private applyAck(frame: InternalFrame): readonly SupervisorFrame[] {
+  private applyAck(frame: InternalFrame): {
+    readonly outbound: readonly SupervisorFrame[];
+    readonly replyAck?: number;
+  } {
     const payload = frame.payload;
     const kind = payload.kind;
     if (kind === "transport") {
@@ -1505,9 +1538,9 @@ export class SupervisorChannel {
       ) {
         this.awaitingInitialSnapshotAckSeq = undefined;
         this.state = "ready";
-        return this.replayUnacknowledgedReplies();
+        return Object.freeze({ outbound: this.replayUnacknowledgedReplies() });
       }
-      return EMPTY_FRAMES;
+      return Object.freeze({ outbound: EMPTY_FRAMES });
     }
     if (kind !== "reply" || !Number.isSafeInteger(payload.reply_seq) || (payload.reply_seq as number) < 0) {
       frameError("invalid_frame");
@@ -1519,7 +1552,7 @@ export class SupervisorChannel {
     for (const replySeq of this.outboundReplies.keys()) {
       if (replySeq <= acknowledged) this.outboundReplies.delete(replySeq);
     }
-    return EMPTY_FRAMES;
+    return Object.freeze({ outbound: EMPTY_FRAMES, replyAck: acknowledged });
   }
 
   private applyEvent(frame: InternalFrame): SupervisorEvent {
@@ -1746,7 +1779,7 @@ export class FakeSupervisorChannel extends SupervisorChannel {
     return frame;
   }
 
-  sendReply(reply: Omit<SupervisorReply, "reply_seq"> | SupervisorReply): SupervisorFrame {
+  sendReply(reply: SupervisorReplyInput | SupervisorReply): SupervisorFrame {
     const frame = this.publishReply(reply);
     this.send(frame);
     return frame;

@@ -50,6 +50,14 @@ function subtreeSnapshot(nodes: readonly AgentSnapshot[], revision = 1): ScopedA
   });
 }
 
+test("常驻 Agents widget 在没有直接子代理时不显示", () => {
+  const snapshot = subtreeSnapshot([
+    node({ agent_id: PARENT_ID, parent_agent_id: null, template_id: "parent", name: "当前会话" }),
+  ]);
+
+  assert.deepEqual(renderAgentsWidget(snapshot, 120), []);
+});
+
 test("常驻 Agents widget 只按稳定字段顺序显示作用域直接子代理并安全截断", () => {
   const snapshot = subtreeSnapshot([
     node({ agent_id: PARENT_ID, parent_agent_id: null, template_id: "parent", name: "当前会话" }),

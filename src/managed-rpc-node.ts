@@ -21,6 +21,8 @@ export interface ManagedRpcImage {
 }
 
 export interface ManagedRpcReply {
+  /** 旧包内替身省略时按 final 处理；生产监督帧始终明确携带分类。 */
+  readonly kind?: "message" | "final";
   readonly text: string;
   readonly images?: readonly ManagedRpcImage[];
 }

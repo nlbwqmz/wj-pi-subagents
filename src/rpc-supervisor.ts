@@ -7,6 +7,7 @@ import type {
   SupervisorControlResponse,
   SupervisorEvent,
   SupervisorReply,
+  SupervisorReplyInput,
   SupervisorSnapshot,
 } from "./supervisor-channel.ts";
 import type {
@@ -300,7 +301,12 @@ export interface RpcSupervisorChannel {
   bind(signal: AbortSignal): Promise<void>;
   waitForReady(signal: AbortSignal): Promise<void>;
   isReady(): boolean;
-  publishReply(reply: Omit<SupervisorReply, "reply_seq">): Promise<void>;
+  publishReply(reply: SupervisorReplyInput | SupervisorReply): Promise<void>;
+  /** child final fence 使用；父端实现可拒绝该方向。 */
+  publishReplyAndWaitForAck?(
+    reply: SupervisorReplyInput | SupervisorReply,
+    signal?: AbortSignal,
+  ): Promise<void>;
   establishTerminationBarrier(): void;
   requestClose(signal: AbortSignal): Promise<void>;
   waitForClose(deadline: number | Date): Promise<RpcSupervisorChannelCloseState>;

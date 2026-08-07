@@ -326,6 +326,83 @@ test("普通回复按 reply_seq 有序注入并以累计 ACK 去重，窗口有�
   });
 });
 
+test("工作中 message 为 final 预留窗口槽位，二者按同一 reply_seq 顺序提交", () => {
+  const replies: Array<{ kind: string; text: string }> = [];
+  const pair = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+    limits: { maxReplyWindow: 3 },
+    onReply: (reply) => {
+      replies.push({ kind: reply.kind, text: reply.text });
+      return true;
+    },
+  });
+  handshake(pair);
+
+  const first = pair.child.publishReply({ kind: "message", text: "阶段一" });
+  const second = pair.child.publishReply({ kind: "message", text: "阶段二" });
+  assert.throws(
+    () => pair.child.publishReply({ kind: "message", text: "不得占用 final 槽位" }),
+    (error: unknown) => error instanceof SupervisorProtocolError && error.code === "reply_window_full",
+  );
+  const final = pair.child.publishReply({ kind: "final", text: "" });
+  assert.throws(
+    () => pair.child.publishReply({ kind: "final", text: "窗口已满" }),
+    (error: unknown) => error instanceof SupervisorProtocolError && error.code === "reply_window_full",
+  );
+
+  const results = [
+    pair.parent.receive(first),
+    pair.parent.receive(second),
+    pair.parent.receive(final),
+  ];
+  assert.deepEqual(replies, [
+    { kind: "message", text: "阶段一" },
+    { kind: "message", text: "阶段二" },
+    { kind: "final", text: "" },
+  ]);
+
+  const outbound = results.flatMap((result) => result.kind === "accepted" ? [...result.outbound] : []);
+  const replyAckResults = outbound.map((frame) => pair.child.receive(frame));
+  assert.deepEqual(
+    replyAckResults.flatMap((result) =>
+      result.kind === "accepted" && result.reply_ack !== undefined ? [result.reply_ack] : []),
+    [1, 2, 3],
+  );
+  const finalReplyAck = [...outbound].reverse().find((frame) => frame.payload.kind === "reply");
+  assert.ok(finalReplyAck);
+  assert.equal(pair.child.receive(finalReplyAck).kind, "duplicate");
+  assert.equal(pair.child.getPublicState().pending_reply_count, 0);
+});
+
+test("原始 reply 帧必须显式携带 kind，message 正文不能为空", () => {
+  const missingKind = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+  });
+  handshake(missingKind);
+  const valid = missingKind.child.publishReply({ kind: "final", text: "最终结果" });
+  const { kind: _replyKind, ...payloadWithoutKind } = valid.payload;
+  const invalid = { ...valid, payload: payloadWithoutKind } as SupervisorFrame;
+  assert.deepEqual(missingKind.parent.receive(invalid), {
+    kind: "protocol_fault",
+    error: "reply_invalid",
+  });
+
+  const emptyMessage = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+  });
+  handshake(emptyMessage);
+  assert.throws(
+    () => emptyMessage.child.publishReply({ kind: "message", text: "   " }),
+    (error: unknown) => error instanceof SupervisorProtocolError && error.code === "reply_invalid",
+  );
+});
+
 test("回复注入未成功时不发送 reply ACK，也不把通道裁决为协议故障", () => {
   const pair = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,

@@ -152,6 +152,52 @@ test("直接父子旅程闭合 spawn、prompt、steering、wait 和协作式 int
   }
 });
 
+test("工作中 reply 通知立即唤醒 wait_agent 且不改变子代理生命周期", async () => {
+  const id = "43434343-4343-4434-8434-434343434343";
+  const tree = makeTree(id);
+  let node: FakeManagedRpcNode | undefined;
+  const controller = new AgentController({
+    tree,
+    allowUnvalidatedTemplates: true,
+    createSupervisor: ({ actor, reservation }) => {
+      node = new FakeManagedRpcNode();
+      return new RpcSupervisor({
+        controller: tree,
+        actor,
+        reservation,
+        managedNode: node,
+        channel: new ReadyChannel(),
+        startupTimeoutMs: 100,
+        gracefulShutdownMs: 10,
+      });
+    },
+  });
+  const spawned = await controller.spawnAgent({ template_id: "researcher", name: "回复代理" });
+  assert.equal(spawned.ok, true);
+  if (!spawned.ok) return;
+  assert.equal((await controller.sendMessage({ agent_id: id, message: "开始" })).ok, true);
+  const waiting = controller.waitAgent({ agent_id: id });
+  assert.equal(controller.notifyAgentReply(id), true);
+  const result = await waiting;
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.data.outcome, "reply");
+    assert.equal(result.data.state, "working");
+  }
+  const status = controller.getAgentStatus(id);
+  assert.equal(status.ok && status.data.state, "working");
+
+  assert.equal(controller.notifyAgentReply(id), true);
+  const queued = await controller.waitAgent({ agent_id: id });
+  assert.equal(queued.ok, true);
+  if (queued.ok) {
+    assert.equal(queued.data.outcome, "reply");
+    assert.equal(queued.data.state, "working");
+  }
+  node?.emitEvent({ type: "agent_settled" });
+  await controller.shutdown();
+});
+
 test("已确认工具活动只以固定类别和计数进入控制器安全树快照", async () => {
   const id = "45454545-4545-4545-8545-454545454545";
   const tree = makeTree(id);

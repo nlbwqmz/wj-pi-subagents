@@ -24,14 +24,14 @@
 
 ## 它能做什么
 
-安装扩展后，Pi 会获得八个代理管理工具和一个 `/agent` 命令。你仍然可以像平常一样用自然语言给 Pi 下达任务；根代理会在适合时调用这些工具。
+安装扩展后，根 Pi 会话会获得八个代理管理工具和一个 `/agent` 命令；每个子代理还会获得只向直接父会话汇报的 `reply_to_parent` 工具。你仍然可以像平常一样用自然语言给 Pi 下达任务；代理会在适合时调用这些工具。
 
 - 每个子代理运行在独立的临时 Pi RPC 进程中，有自己的上下文和身份。
 - 同一个子代理可以连续接收多轮任务，适合需要保留上下文的长期分工。
 - 不同节点可以并行工作；同一个节点上的控制命令按顺序处理。
 - 子代理可以继续创建自己的子代理，形成受深度和名额限制的树。
 - 父代理只能控制自己的直接子代理，不能越级操纵更深层后代。
-- 子代理回复只交付给直接父代理，并触发父代理继续处理。
+- 子代理只有主动调用 `reply_to_parent` 时才会上报工作中进度；处理完全 settled 后，运行时再向直接父代理自动提交一次最终答复。
 - 会话关闭时，扩展会递归清理受监督的子进程树。
 
 子代理不会复制父会话的对话历史。整棵树共享根会话启动时确定的工作目录、项目信任结果、环境快照和配额配置；具体工具、模型、thinking 和系统提示由代理模板决定。
@@ -47,7 +47,7 @@
 | macOS / Linux | 已实现 process group/session 适配器，但尚未完成独立原生验收 |
 | 模型 | Pi 当前会话必须已选定可用模型；模板指定的模型和 thinking 必须处于当前可用范围 |
 
-扩展启动时会先检查 Node、Pi、平台适配器、Pi API 和运行依赖。任一条件不满足时，扩展会整体保持未激活：八个工具、`/agent` 和代理 widget 都不会注册；交互界面会尽量显示一次 `host_capability_unavailable` 警告，普通 Pi 会话仍可继续使用。
+扩展启动时会先检查 Node、Pi、平台适配器、Pi API 和运行依赖。任一条件不满足时，扩展会整体保持未激活：代理工具、`/agent` 和代理 widget 都不会注册；交互界面会尽量显示一次 `host_capability_unavailable` 警告，普通 Pi 会话仍可继续使用。
 
 ## 安装
 
@@ -201,10 +201,11 @@ systemPromptMode: append
 1. 根代理调用 `get_agent_templates` 查看当前有效模板，并原样复制返回的 `template_id`。
 2. 根代理调用 `spawn_agent`，创建后得到唯一 `agent_id`。
 3. 根代理调用 `send_message` 发送第一项任务。
-4. 子代理的回复自动回到直接父代理。
-5. 根代理可调用 `wait_agent` 等待节点空闲或进入终态。
-6. 后续仍可向同一 `agent_id` 发送任务，以复用其上下文。
-7. 不再需要时调用 `terminate_agent`，递归回收该节点和所有后代。
+4. 子代理需要汇报进度、提问或给出阶段性发现时，调用 `reply_to_parent`；该调用不会结束当前工作。
+5. 子代理完全 settled 后，运行时自动把最终答复提交给直接父代理。
+6. 根代理可调用 `wait_agent` 等待工作中回复、节点空闲或终态。
+7. 后续仍可向同一 `agent_id` 发送任务，以复用其上下文。
+8. 不再需要时调用 `terminate_agent`，递归回收该节点和所有后代。
 
 `spawn_agent` 只负责创建节点，不接受首条任务。若模型只创建了代理却没有开始工作，可以明确提醒它“继续向刚创建的代理调用 `send_message`”。
 
@@ -249,7 +250,7 @@ thinking: medium
 
 Markdown 正文可以为空。未列出的 frontmatter 字段会被静默忽略；尤其是 `name`、`env`、`skills`、`extensions` 和 `promptTemplates` 不会产生模板级覆盖。
 
-`description` 只是模板展示元数据，不会自动注入提示词。`get_agent_templates` 会列出当前发现且格式有效的模板，并返回 `template_id`、可选 `description` 和模板声明的业务 `tools`。八个代理管理工具不能手动写进模板 `tools`，也不会出现在返回项的 `tools` 中；扩展会根据深度和祖先权限自动追加或移除完整管理工具集合。
+`description` 只是模板展示元数据，不会自动注入提示词。`get_agent_templates` 会列出当前发现且格式有效的模板，并返回 `template_id`、可选 `description` 和模板声明的业务 `tools`。八个代理管理工具与 `reply_to_parent` 都不能手动写进模板 `tools`，也不会出现在返回项的 `tools` 中；扩展会根据深度和祖先权限自动追加或移除完整管理工具集合，并为所有子代理单独保留 `reply_to_parent`。
 
 模板出现在目录中不表示当前父会话一定能创建它：模型、thinking 和管理能力仍会在 `spawn_agent` 时预检；模板 `tools` 是子代理的初始业务工具请求，不要求是父会话当前活动工具的子集。目录为空时 `get_agent_templates` 直接返回 `[]`，此时不能调用 `spawn_agent`。
 
@@ -288,11 +289,11 @@ Markdown 正文可以为空。未列出的 frontmatter 字段会被静默忽略�
 - 节点为 `working` 或 `interrupting` 时，消息作为 steering 加入当前处理；
 - 节点为 `failed`、`terminating` 或 `terminated` 时，消息会被拒绝。
 
-工具成功只表示消息已被子 Pi 接受，不表示任务已经完成。子代理的普通 assistant 回复会自动显示在直接父会话，并触发父代理继续处理；`wait_agent` 只负责观察状态，不会重复取回回复。
+工具成功只表示消息已被子 Pi 接受，不表示任务已经完成。子代理的普通 assistant 过程输出不会自动上行：工作中汇报必须显式调用 `reply_to_parent`，最终答复则由运行时在 `agent_settled` 时自动提交。回复正文直接进入父会话；`wait_agent` 只观察回复通知和生命周期，不会在工具结果中重复复制正文。
 
 ### 等待、打断与终止
 
-- `wait_agent`：等待节点 settled、进入稳定终态或超时。超时只结束这次等待，不打断节点。
+- `wait_agent`：等待工作中回复、节点 settled、进入稳定终态或超时。工作中回复只结束本次等待，不会让节点停止；超时也不打断节点。
 - `interrupt_agent`：协作式中断当前处理，保留节点、上下文和后代。它不会自动升级为终止。
 - `terminate_agent`：永久递归终止目标和全部后代，并同步等待资源回收确认。目标必须是调用者的直接子代理。
 
@@ -300,7 +301,7 @@ Markdown 正文可以为空。未列出的 frontmatter 字段会被静默忽略�
 
 ### 递归委派与控制范围
 
-默认 `maxDepth=2`：根会话深度为 0，可以创建深度 1 的 A；A 可以创建深度 2 的 A-1；A-1 是叶节点。只有 `depth < maxDepth` 且祖先没有设置 `subagents: disabled` 的节点才会看到完整的八工具集合。
+默认 `maxDepth=2`：根会话深度为 0，可以创建深度 1 的 A；A 可以创建深度 2 的 A-1；A-1 是叶节点。只有 `depth < maxDepth` 且祖先没有设置 `subagents: disabled` 的节点才会看到完整的八工具集合；叶节点仍会看到 `reply_to_parent`，因为它不属于子代理管理能力。
 
 每个父代理只能向自己的直接子代理发送消息、等待、中断、终止或查询状态。根代理可以只读查看整棵树；普通子代理只能只读查看自己的子树。展示名称只是给人看的标签，寻址始终使用 UUID 格式的 `agent_id`。
 
@@ -394,7 +395,7 @@ Markdown 正文可以为空。未列出的 frontmatter 字段会被静默忽略�
 ]
 ```
 
-这个工具是其他管理工具成功外壳的明确例外：模型可见正文就是数组，不套 `{ "ok": true, "data": ... }`。每项只包含区分大小写的 `template_id`、可选 `description` 和始终存在的业务 `tools`；没有描述时省略该字段，合法空工具模板返回 `tools: []`。`tools` 不包含八个子代理管理工具，结果也不会公开模板正文、来源、模型、thinking、路径或无效模板诊断。
+这个工具是其他管理工具成功外壳的明确例外：模型可见正文就是数组，不套 `{ "ok": true, "data": ... }`。每项只包含区分大小写的 `template_id`、可选 `description` 和始终存在的业务 `tools`；没有描述时省略该字段，合法空工具模板返回 `tools: []`。`tools` 不包含八个子代理管理工具或 `reply_to_parent`，结果也不会公开模板正文、来源、模型、thinking、路径或无效模板诊断。
 
 数组只说明模板格式有效，不代表当前父会话的模型、thinking 和管理能力预检一定通过。模板 `tools` 不执行父会话活动工具子集校验。返回 `[]` 时不能调用 `spawn_agent`；返回非空数组后，也应以 `spawn_agent` 的实际结果为准。
 
@@ -442,6 +443,44 @@ Markdown 正文可以为空。未列出的 frontmatter 字段会被静默忽略�
 
 若返回 `message_delivery_failed`，交付状态可能无法确认。不要盲目自动重发；先查询节点状态并结合任务是否已有回复判断，以免重复执行。
 
+### `reply_to_parent`
+
+该工具只存在于子代理会话，用于向创建自己的直接父会话发送工作中回复。目标身份已经由监督通道绑定，因此不接受 `agent_id` 或任意目标参数：
+
+```json
+{
+  "message": "正在核对第二个实现分支，完成后继续汇总。"
+}
+```
+
+`message` 必须非空且不超过 16 KiB UTF-8；工具不接受图片、回复类别、序号或“完成”开关。适合发送进度、问题和阶段性发现。成功结果中的 `accepted: true` 表示直接父会话已经接纳并确认该消息，但子代理仍处于当前处理，应继续完成原任务。
+
+不要用 `reply_to_parent` 模拟最终结果。子代理完全 settled 时，运行时会自动发送一次最终答复；根会话没有该工具，叶节点和 `subagents: disabled` 的子代理仍然有该工具。
+
+### 父会话看到的回复
+
+工作中回复以模型可见信封进入直接父会话：
+
+```text
+Message Type: AGENT_MESSAGE
+Sender: 550e8400-e29b-41d4-a716-446655440000
+Payload:
+正在核对第二个实现分支，完成后继续汇总。
+```
+
+它不会自行启动一个新的父代理 turn；如果父代理正在调用 `wait_agent`，这条回复会让等待立即以 `outcome: "reply"` 返回，而子代理继续工作。没有活动等待时，消息仍保留在父会话中，供父代理后续处理。
+
+最终答复由运行时在子代理 `agent_settled` 时自动提交：
+
+```text
+Message Type: FINAL_ANSWER
+Sender: 550e8400-e29b-41d4-a716-446655440000
+Payload:
+已完成核对，结论如下……
+```
+
+最终答复会触发父代理继续处理。运行时只选择最后一条安全完成的 assistant 内容；思考块、工具前说明、工具调用、工具参数和工具结果不会被当作最终答复。若本轮没有安全正文，运行时仍会发送一个不显示内容的空 final 确认屏障，并在父端确认后才允许 settled 状态继续传播。
+
 ### `wait_agent`
 
 等待一个直接子代理：
@@ -455,6 +494,7 @@ Markdown 正文可以为空。未列出的 frontmatter 字段会被静默忽略�
 
 `timeout_ms` 可省略，合法范围为 10,000 到 600,000 毫秒。返回的 `outcome` 为：
 
+- `reply`：直接子代理发来一条工作中回复；返回快照通常仍是 `working` 或 `interrupting`，子代理会继续当前处理；
 - `settled`：观察到了正常 settled 边界，或调用时节点已经空闲；
 - `terminal`：节点已经或随后进入 `failed` / `terminated`；
 - `timeout`：本次观察到期，节点继续保持原有工作。
@@ -548,6 +588,8 @@ Markdown 正文可以为空。未列出的 frontmatter 字段会被静默忽略�
 
 `pending_message_count` 表示已经受理、但尚未开始实际处理的父消息数量，不包含当前活动 prompt。因此 `working` 节点的 pending 可以是 0。
 
+一次处理中的 assistant `message_end` 只用于更新本地最终候选，不会直接发送给父会话。`agent_settled` 是唯一自动 final 边界：运行时先提交并等待父端确认最终答复或空 final 屏障，然后父控制器才会继续观察该节点回到 `idle`。重复 settled 不会生成第二条最终答复。
+
 ## 安全与资源边界
 
 ### 扩展拥有宿主用户权限
@@ -611,7 +653,7 @@ pi list
 
 - `tools` 必须是字符串，例如 `tools: read, grep`，不能写成 YAML 数组；
 - 空工具集只能写成双引号 `tools: ""`；
-- 不要把 `get_agent_templates`、`spawn_agent` 等八个管理工具放进 `tools`；
+- 不要把 `get_agent_templates`、`spawn_agent` 等八个管理工具或 `reply_to_parent` 放进 `tools`；它们由运行时按角色管理；
 - `model` 必须含 provider 和 model，例如 `openai/gpt-example`；
 - thinking、`subagents`、`contextFiles` 和 `systemPromptMode` 必须使用文档列出的精确值；
 - 无效的同名项目模板会遮蔽有效用户模板，不能靠用户模板自动回退。

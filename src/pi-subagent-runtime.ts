@@ -10,9 +10,12 @@ import {
 } from "./agent-supervisor-factory.ts";
 import {
   AGENT_TOOL_NAMES,
+  CHILD_REPLY_TOOL_NAME,
   registerAgentTools,
+  registerReplyToParentTool,
   type AgentToolRegistrationApi,
 } from "./agent-tools.ts";
+import { ChildReplyCoordinator } from "./child-reply-coordinator.ts";
 import type {
   AvailableHostCapabilities,
   ExtensionApiSurface,
@@ -42,7 +45,11 @@ import {
 } from "./local-supervisor-transport.ts";
 import { StreamSupervisorChannel } from "./stream-supervisor-channel.ts";
 import { SubtreePublisher } from "./subtree-publisher.ts";
-import { normalizeAssistantMessageEnd } from "./rpc-bridge-event.ts";
+import {
+  ParentReplyInbox,
+  PI_SUBAGENT_FINAL_TYPE,
+  PI_SUBAGENT_MESSAGE_TYPE,
+} from "./parent-reply-inbox.ts";
 import {
   RuntimeReloadCoordinator,
   readRuntimeReloadEventBus,
@@ -73,7 +80,9 @@ import {
   type AgentTreeUiContext,
 } from "./agent-tree-ui.ts";
 
-export const PI_SUBAGENT_REPLY_MESSAGE_TYPE = "pi-subagent-reply" as const;
+/** @deprecated 使用区分 message/final 的两个 customType。 */
+export const PI_SUBAGENT_REPLY_MESSAGE_TYPE = PI_SUBAGENT_FINAL_TYPE;
+export { PI_SUBAGENT_FINAL_TYPE, PI_SUBAGENT_MESSAGE_TYPE };
 
 interface RuntimeExtensionApi extends AgentToolRegistrationApi {
   on(event: string, handler: (event: unknown, context: unknown) => unknown): void;
@@ -175,6 +184,8 @@ interface ActiveRuntime {
   readonly authority: TreeAuthorityPort;
   readonly rootAuthority?: RootTreeAuthority;
   readonly upstream?: ChildUpstreamControl;
+  readonly replyCoordinator?: ChildReplyCoordinator;
+  readonly replyInbox: ParentReplyInbox;
   readonly bindings: RuntimeBindings;
   createSupervisor: AgentSupervisorFactory;
   handoffPending?: boolean;
@@ -202,11 +213,16 @@ interface RuntimeTransfer {
   readonly authority: TreeAuthorityPort;
   readonly rootAuthority?: RootTreeAuthority;
   readonly upstream?: ChildUpstreamControl;
+  readonly replyCoordinator?: ChildReplyCoordinator;
+  readonly replyInbox: ParentReplyInbox;
   readonly bindings: RuntimeBindings;
   readonly createSupervisor: AgentSupervisorFactory;
 }
 
-const MANAGEMENT_TOOL_NAMES = new Set<string>(AGENT_TOOL_NAMES);
+const SYSTEM_TOOL_NAMES = new Set<string>([
+  ...AGENT_TOOL_NAMES,
+  CHILD_REPLY_TOOL_NAME,
+]);
 
 function asRuntimeApi(api: ExtensionApiSurface): RuntimeExtensionApi {
   return api as RuntimeExtensionApi;
@@ -235,6 +251,13 @@ function isRuntimeTransfer(value: unknown): value is RuntimeTransfer {
       && isRecord(value.upstream.channel)
       && isRecord(value.upstream.client)
       && isRecord(value.upstream.publisher)
+    ))
+    && isRecord(value.replyInbox)
+    && typeof value.replyInbox.accept === "function"
+    && (!value.isChild || (
+      isRecord(value.replyCoordinator)
+      && typeof value.replyCoordinator.replyToParent === "function"
+      && typeof value.replyCoordinator.settle === "function"
     ))
     && typeof value.createSupervisor === "function";
 }
@@ -416,7 +439,7 @@ function knownBusinessTools(api: RuntimeExtensionApi): ReadonlySet<string> {
     return names;
   }
   for (const tool of tools) {
-    if (!isRecord(tool) || typeof tool.name !== "string" || MANAGEMENT_TOOL_NAMES.has(tool.name)) continue;
+    if (!isRecord(tool) || typeof tool.name !== "string" || SYSTEM_TOOL_NAMES.has(tool.name)) continue;
     names.add(tool.name);
   }
   return names;
@@ -431,17 +454,25 @@ function activeBusinessTools(api: RuntimeExtensionApi): readonly string[] {
   }
   if (!Array.isArray(tools)) return Object.freeze([]);
   return Object.freeze(tools.filter(
-    (name): name is string => typeof name === "string" && !MANAGEMENT_TOOL_NAMES.has(name),
+    (name): name is string => typeof name === "string" && !SYSTEM_TOOL_NAMES.has(name),
   ));
 }
 
-function applyManagementToolVisibility(api: RuntimeExtensionApi, enabled: boolean): void {
+function applyAgentToolVisibility(
+  api: RuntimeExtensionApi,
+  managementEnabled: boolean,
+  replyEnabled: boolean,
+): void {
   if (typeof api.setActiveTools !== "function") return;
   try {
     const business = activeBusinessTools(api);
-    api.setActiveTools(enabled
-      ? Object.freeze([...new Set([...business, ...AGENT_TOOL_NAMES])])
-      : business);
+    const system = [
+      ...(replyEnabled ? [CHILD_REPLY_TOOL_NAME] : []),
+      ...(managementEnabled ? AGENT_TOOL_NAMES : []),
+    ];
+    api.setActiveTools(system.length === 0
+      ? business
+      : Object.freeze([...new Set([...business, ...system])]));
   } catch {
     // 工具可见性失败不能提升服务端授权；控制器仍会重复裁决。
   }
@@ -503,55 +534,6 @@ function validateTemplateAgainstContext(
   return Object.freeze({ ok: true, data: Object.freeze({}) });
 }
 
-function deliverReply(
-  api: RuntimeExtensionApi,
-  agentId: string,
-  reply: ManagedReplyShape,
-): boolean {
-  const content: Array<Record<string, string>> = [];
-  if (reply.text.length > 0) content.push({ type: "text", text: reply.text });
-  for (const image of reply.images ?? []) {
-    content.push({ type: "image", data: image.data, mimeType: image.mimeType });
-  }
-  if (content.length === 0) return false;
-  try {
-    api.sendMessage({
-      customType: PI_SUBAGENT_REPLY_MESSAGE_TYPE,
-      content,
-      display: true,
-      details: { agent_id: agentId },
-    }, { triggerTurn: true, deliverAs: "steer" });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-interface ManagedReplyShape {
-  readonly text: string;
-  readonly images?: readonly {
-    readonly type: "image";
-    readonly data: string;
-    readonly mimeType: string;
-  }[];
-}
-
-function readSupervisorReply(event: unknown): ManagedReplyShape | undefined {
-  const normalized = normalizeAssistantMessageEnd(event);
-  if (normalized.kind !== "event" || normalized.event.type !== "message_end") return undefined;
-  const text: string[] = [];
-  const images: NonNullable<ManagedReplyShape["images"]>[number][] = [];
-  for (const item of normalized.event.message.content) {
-    if (item.type === "text") text.push(item.text);
-    else images.push(Object.freeze({ ...item }));
-  }
-  if (text.length === 0 && images.length === 0) return undefined;
-  return Object.freeze({
-    text: text.join(""),
-    ...(images.length === 0 ? {} : { images: Object.freeze(images) }),
-  });
-}
-
 export function createPiSubagentRuntimeActivator(
   options: PiSubagentRuntimeOptions = {},
 ): PiSubagentRuntimeActivator {
@@ -561,6 +543,7 @@ export function createPiSubagentRuntimeActivator(
     let active: ActiveRuntime | undefined;
     let lifecycle: Promise<void> = Promise.resolve();
     let runtimeUi: { readonly runtime: ActiveRuntime; readonly binding: AgentTreeUiBinding } | undefined;
+    const bootstrapAtActivation = readChildRuntimeBootstrap(options.environment);
 
     const disposeRuntimeUi = (current?: ActiveRuntime): void => {
       const registered = runtimeUi;
@@ -605,6 +588,14 @@ export function createPiSubagentRuntimeActivator(
         : active?.controller as AgentController;
     });
 
+    if (bootstrapAtActivation.kind === "child") {
+      registerReplyToParentTool(api, async (toolContext) => {
+        if (active !== undefined) active.bindings.context = readContext(toolContext);
+        if (active?.handoffPending === true) return undefined;
+        return active?.replyCoordinator;
+      });
+    }
+
     api.registerCommand("agent", {
       description: "查看当前会话作用域内的只读代理树",
       handler: async (_args, rawContext) => {
@@ -620,13 +611,25 @@ export function createPiSubagentRuntimeActivator(
       },
     });
 
+    api.on("agent_start", () => {
+      const current = active;
+      if (current === undefined || !current.isChild || current.handoffPending === true) return;
+      current.replyCoordinator?.observeAgentStart();
+    });
+
     api.on("message_end", (event) => {
       const current = active;
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
-      const reply = readSupervisorReply(event);
-      if (reply === undefined || current.upstream === undefined) return;
-      return current.upstream.channel.publishReply(reply).catch(() => {
-        // 监督通道故障由其父端统一裁决；消息正文不得进入扩展错误或日志。
+      current.replyCoordinator?.observeAssistantMessageEnd(event);
+    });
+
+    api.on("agent_settled", (event) => {
+      const current = active;
+      if (current === undefined || !current.isChild || current.handoffPending === true) return;
+      const coordinator = current.replyCoordinator;
+      if (coordinator === undefined) return;
+      return coordinator.settle().catch(() => {
+        // 协调器已通知监督通道故障；这里吞掉异常，避免 Pi uncaughtException。
       });
     });
 
@@ -644,6 +647,8 @@ export function createPiSubagentRuntimeActivator(
         authority: transfer.authority,
         ...(transfer.rootAuthority === undefined ? {} : { rootAuthority: transfer.rootAuthority }),
         ...(transfer.upstream === undefined ? {} : { upstream: transfer.upstream }),
+        ...(transfer.replyCoordinator === undefined ? {} : { replyCoordinator: transfer.replyCoordinator }),
+        replyInbox: transfer.replyInbox,
         bindings: transfer.bindings,
         createSupervisor: transfer.createSupervisor,
       };
@@ -713,7 +718,6 @@ export function createPiSubagentRuntimeActivator(
       await closeChildControl(current, releaseUpstream);
       return true;
     };
-    const bootstrapAtActivation = readChildRuntimeBootstrap(options.environment);
     const activationIdentity = reloadIdentity(
       bootstrapAtActivation.kind === "child" ? bootstrapAtActivation.bootstrap : undefined,
     );
@@ -739,6 +743,8 @@ export function createPiSubagentRuntimeActivator(
         authority: current.authority,
         ...(current.rootAuthority === undefined ? {} : { rootAuthority: current.rootAuthority }),
         ...(current.upstream === undefined ? {} : { upstream: current.upstream }),
+        ...(current.replyCoordinator === undefined ? {} : { replyCoordinator: current.replyCoordinator }),
+        replyInbox: current.replyInbox,
         bindings: current.bindings,
         createSupervisor: current.createSupervisor,
       }),
@@ -768,7 +774,7 @@ export function createPiSubagentRuntimeActivator(
         active.bindings.api = api;
         active.bindings.context = context;
         publishReloadSnapshot(active, context);
-        applyManagementToolVisibility(api, active.managementEnabled);
+        applyAgentToolVisibility(api, active.managementEnabled, active.isChild);
         bindRuntimeUi(active, context);
         return;
       }
@@ -794,7 +800,7 @@ export function createPiSubagentRuntimeActivator(
           }
           reloadCoordinator.commitIncoming(incoming);
           active = current;
-          applyManagementToolVisibility(api, current.managementEnabled);
+          applyAgentToolVisibility(api, current.managementEnabled, current.isChild);
           bindRuntimeUi(current, context);
           try {
             options.onController?.(current.controller);
@@ -924,6 +930,27 @@ export function createPiSubagentRuntimeActivator(
         }, channel);
         upstream = Object.freeze({ channel, client, publisher });
       }
+      const replyInbox = new ParentReplyInbox({
+        readApi: () => {
+          const current = stateReference;
+          if (current === undefined) throw new Error("父会话尚未就绪");
+          return current.bindings.api;
+        },
+        notifyMessage: (agentId) => {
+          const current = stateReference;
+          if (current === undefined) return;
+          current.controller.notifyAgentReply(agentId);
+        },
+      });
+      const replyCoordinator = upstream === undefined
+        ? undefined
+        : new ChildReplyCoordinator({
+          port: upstream.channel,
+          onFinalFailure: () => {
+            upstream.channel.failProtocol();
+            void upstream.channel.release().catch(() => {});
+          },
+        });
       const state: ActiveRuntime = {
         controller: undefined as unknown as AgentController,
         templates,
@@ -935,6 +962,8 @@ export function createPiSubagentRuntimeActivator(
         authority,
         ...(rootAuthority === undefined ? {} : { rootAuthority }),
         ...(upstream === undefined ? {} : { upstream }),
+        ...(replyCoordinator === undefined ? {} : { replyCoordinator }),
+        replyInbox,
         bindings: { api, context },
         createSupervisor: undefined as unknown as AgentSupervisorFactory,
       };
@@ -952,7 +981,7 @@ export function createPiSubagentRuntimeActivator(
         activeTools: () => activeBusinessTools(state.bindings.api),
         currentModel: () => currentModelReference(state.bindings.context),
         currentThinking: () => currentThinking(state.bindings.context),
-        deliverReply: (agentId, reply) => deliverReply(state.bindings.api, agentId, reply),
+        deliverReply: (agentId, reply) => state.replyInbox.accept(agentId, reply),
         requestIdRegistry,
         bindControlServer: (_agentId, channel) => {
           const server = new SupervisorControlServer(channel, controlHandler);
@@ -998,7 +1027,7 @@ export function createPiSubagentRuntimeActivator(
           rootId,
         }));
       }
-      applyManagementToolVisibility(api, state.managementEnabled);
+      applyAgentToolVisibility(api, state.managementEnabled, state.isChild);
       bindRuntimeUi(state, context);
       try {
         options.onController?.(controller);
@@ -1016,7 +1045,7 @@ export function createPiSubagentRuntimeActivator(
       const reason = isRecord(event) ? event.reason : undefined;
       if (reason === "reload" && reloadCoordinator.beginHandoff(current)) {
         disposeRuntimeUi(current);
-        applyManagementToolVisibility(api, false);
+        applyAgentToolVisibility(api, false, false);
         return;
       }
       reloadCoordinator.cancelHandoff(current);

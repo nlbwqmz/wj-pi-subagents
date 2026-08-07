@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AGENT_TOOL_NAMES } from "./agent-tools.ts";
+import { AGENT_TOOL_NAMES, CHILD_REPLY_TOOL_NAME } from "./agent-tools.ts";
 import type {
   AgentSupervisorFactory,
   AgentSupervisorFactoryInput,
@@ -47,6 +47,7 @@ export interface AgentSupervisorFactoryOptions {
   readonly currentModel?: string | (() => string | undefined);
   readonly currentThinking?: string | (() => string | undefined);
   readonly managementToolNames?: readonly string[];
+  readonly childReplyToolNames?: readonly string[];
   /** 只有宿主消息已同步进入父会话上下文时才返回 true，随后协议才会 ACK。 */
   readonly deliverReply?: (agentId: string, reply: ManagedRpcReply) => boolean;
   /** 为每条直接子监督通道绑定根裁决或逐跳转发服务。 */
@@ -91,6 +92,7 @@ export function createAgentSupervisorFactory(
         extensionPath: options.childExtensionPath ?? defaultChildExtensionPath(),
         ...(childPiPaths.cliPath === undefined ? {} : { cliPath: childPiPaths.cliPath }),
         ...(childPiPaths.modulePath === undefined ? {} : { piModulePath: childPiPaths.modulePath }),
+        childReplyTools: options.childReplyToolNames ?? [CHILD_REPLY_TOOL_NAME],
         managementTools: childManagementEnabled(options, input, template)
           ? (options.managementToolNames ?? AGENT_TOOL_NAMES)
           : [],
@@ -119,6 +121,7 @@ export function createAgentSupervisorFactory(
             if (options.deliverReply === undefined) return false;
             try {
               return options.deliverReply(context.agent_id, {
+                kind: reply.kind,
                 text: reply.text,
                 ...(reply.images === undefined
                   ? {}
@@ -195,6 +198,7 @@ export function buildManagedRpcOptions(
   options: {
     readonly currentModel?: AgentSupervisorFactoryOptions["currentModel"];
     readonly currentThinking?: AgentSupervisorFactoryOptions["currentThinking"];
+    readonly childReplyTools?: readonly string[];
     readonly managementTools?: readonly string[];
     readonly extensionPath?: string;
     readonly cliPath?: string;
@@ -213,7 +217,11 @@ export function buildManagedRpcOptions(
   if (template.body.trim() !== "") {
     args.push(template.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", template.body);
   }
-  const tools = [...new Set([...template.tools, ...(options.managementTools ?? [])])];
+  const tools = [...new Set([
+    ...template.tools,
+    ...(options.childReplyTools ?? []),
+    ...(options.managementTools ?? []),
+  ])];
   // 空字符串仍是显式 allowlist；省略 --tools 会错误启用 Pi 默认工具。
   args.push("--tools", tools.join(","));
   const selectedModel = template.model ?? resolveCurrent(options.currentModel);

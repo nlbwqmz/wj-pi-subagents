@@ -5,7 +5,10 @@ import {
   StreamSupervisorChannel,
   type SupervisorByteTransport,
 } from "../src/stream-supervisor-channel.ts";
-import { SupervisorRequestIdRegistry } from "../src/supervisor-channel.ts";
+import {
+  SupervisorRequestIdRegistry,
+  type SupervisorReply,
+} from "../src/supervisor-channel.ts";
 import type { AgentSnapshot } from "../src/tree-controller.ts";
 
 const CHILD_ID = "550e8400-e29b-41d4-a716-446655440000";
@@ -26,7 +29,7 @@ function snapshot(): AgentSnapshot {
   });
 }
 
-function channelPair(onReply?: (reply: { readonly text: string }) => boolean): {
+function channelPair(onReply?: (reply: SupervisorReply) => boolean): {
   readonly parent: StreamSupervisorChannel;
   readonly child: StreamSupervisorChannel;
   readonly parentToChild: PassThrough;
@@ -139,6 +142,63 @@ test("回复与生命周期事件通过安全回调传递，观察者异常不�
   assert.equal(pair.child.getPublicState().pending_reply_count, 0);
   await pair.parent.release();
   await pair.child.release();
+});
+
+test("child reply 发布等待父端累计 ACK，message 与空 final fence 共用序号域", async () => {
+  const received: Array<{ kind: string; text: string }> = [];
+  const pair = channelPair((reply) => {
+    received.push({ kind: reply.kind, text: reply.text });
+    return true;
+  });
+  await pair.child.bind(new AbortController().signal);
+  await pair.parent.waitForReady(new AbortController().signal);
+  await pair.child.waitForReady(new AbortController().signal);
+
+  const message = pair.child.publishReplyAndWaitForAck({ kind: "message", text: "进度" });
+  await settleIo();
+  await message;
+  const final = pair.child.publishReplyAndWaitForAck({ kind: "final", text: "" });
+  await settleIo();
+  await final;
+  assert.deepEqual(received, [
+    { kind: "message", text: "进度" },
+    { kind: "final", text: "" },
+  ]);
+  await pair.parent.release();
+  await pair.child.release();
+});
+
+test("reply ACK 等待在协议故障和通道释放时确定失败且不产生未处理拒绝", async () => {
+  const faulted = channelPair(() => false);
+  await faulted.child.bind(new AbortController().signal);
+  await faulted.parent.waitForReady(new AbortController().signal);
+  await faulted.child.waitForReady(new AbortController().signal);
+
+  const waitingForFault = faulted.child.publishReplyAndWaitForAck({
+    kind: "message",
+    text: "等待确认",
+  });
+  await settleIo();
+  assert.equal(faulted.child.getPublicState().pending_reply_count, 1);
+  faulted.child.failProtocol();
+  await assert.rejects(waitingForFault, /监督回复未获确认/);
+  assert.equal(faulted.child.getPublicState().state, "faulted");
+  await faulted.parent.release();
+  await faulted.child.release();
+
+  const released = channelPair(() => false);
+  await released.child.bind(new AbortController().signal);
+  await released.parent.waitForReady(new AbortController().signal);
+  await released.child.waitForReady(new AbortController().signal);
+
+  const waitingForRelease = released.child.publishReplyAndWaitForAck({
+    kind: "final",
+    text: "最终结果",
+  });
+  await settleIo();
+  await released.child.release();
+  await assert.rejects(waitingForRelease, /监督回复未获确认/);
+  await released.parent.release();
 });
 
 test("协议损坏和 EOF 只通知一次稳定故障，并支持可取消 ready 等待", async () => {

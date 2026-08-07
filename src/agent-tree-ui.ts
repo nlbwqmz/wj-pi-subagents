@@ -404,6 +404,7 @@ export function renderAgentsWidget(
   const rows = snapshot.nodes
     .filter((node) => node.parent_agent_id === parentAgentId && node.state !== "terminated")
     .map((node) => truncateToDisplayWidth(`  ${formatAgentFacts(node)}`, width));
+  if (rows.length === 0) return Object.freeze([]);
   return Object.freeze([truncateToDisplayWidth("Agents", width), ...rows]);
 }
 

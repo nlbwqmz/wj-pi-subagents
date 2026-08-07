@@ -4,7 +4,11 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import type { AgentController } from "../src/agent-controller.ts";
-import { AGENT_TOOL_NAMES, SubagentToolError } from "../src/agent-tools.ts";
+import {
+  AGENT_TOOL_NAMES,
+  CHILD_REPLY_TOOL_NAME,
+  SubagentToolError,
+} from "../src/agent-tools.ts";
 import {
   FakeManagedRpcNode,
   type ManagedRpcNodeStartContext,
@@ -526,13 +530,16 @@ test("生产运行时闭合直接父子的创建、消息、回复、等待、�
 
   assert.deepEqual(api.sentMessages, [{
     message: {
-      customType: "pi-subagent-reply",
+      customType: "pi-subagent-final",
       content: [
-        { type: "text", text: "直接回复" },
+        {
+          type: "text",
+          text: `Message Type: FINAL_ANSWER\nSender: ${AGENT_ID}\nPayload:\n直接回复`,
+        },
         { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
       ],
       display: true,
-      details: { agent_id: AGENT_ID },
+      details: { agent_id: AGENT_ID, kind: "final" },
     },
     options: { triggerTurn: true, deliverAs: "steer" },
   }]);
@@ -594,7 +601,7 @@ test("运行时以单数 agent 命令交付只读 TUI，并在会话关闭时清
   const widget = (firstWidget?.content as (
     widgetTui: { requestRender(): void },
   ) => { render(width: number): string[] })(tui);
-  assert.deepEqual(widget.render(80), ["Agents"]);
+  assert.deepEqual(widget.render(80), []);
 
   await execute(api, "spawn_agent", { template_id: "researcher", name: "TUI 子代理" }, context);
   assert.deepEqual(widget.render(80), [
@@ -831,28 +838,75 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   };
   assert.deepEqual(childTemplates.details, rootTemplates.details);
 
+  await childApi.emit("agent_start", { type: "agent_start" }, childContext);
   await childApi.emit("message_end", {
     type: "message_end",
     message: {
       role: "assistant",
+      stopReason: "toolUse",
       content: [
         { type: "thinking", thinking: "SECRET_CHILD_THINKING" },
-        { type: "text", text: "真正 child 直接回复" },
+        { type: "text", text: "过程文本不应上行" },
         { type: "toolCall", id: "SECRET_CALL", name: "read", arguments: { secret: true } },
       ],
     },
   }, childContext);
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(rootApi.sentMessages.length, 0);
+
+  const progressReply = await execute(childApi, CHILD_REPLY_TOOL_NAME, {
+    message: "正在继续工作",
+  }, childContext) as { details?: Record<string, unknown> };
+  assert.equal(progressReply.details?.accepted, true);
   assert.deepEqual(rootApi.sentMessages, [{
     message: {
-      customType: "pi-subagent-reply",
-      content: [{ type: "text", text: "真正 child 直接回复" }],
+      customType: "pi-subagent-message",
+      content: [{
+        type: "text",
+        text: `Message Type: AGENT_MESSAGE\nSender: ${parentId}\nPayload:\n正在继续工作`,
+      }],
       display: true,
-      details: { agent_id: parentId },
+      details: { agent_id: parentId, kind: "message" },
     },
-    options: { triggerTurn: true, deliverAs: "steer" },
+    options: { triggerTurn: false, deliverAs: "steer" },
   }]);
+
+  await childApi.emit("message_end", {
+    type: "message_end",
+    message: {
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "thinking", thinking: "SECRET_CHILD_THINKING" }, { type: "text", text: "真正 child 最终回复" }],
+    },
+  }, childContext);
+  await childApi.emit("agent_settled", { type: "agent_settled" }, childContext);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(rootApi.sentMessages, [
+    {
+      message: {
+        customType: "pi-subagent-message",
+        content: [{
+          type: "text",
+          text: `Message Type: AGENT_MESSAGE\nSender: ${parentId}\nPayload:\n正在继续工作`,
+        }],
+        display: true,
+        details: { agent_id: parentId, kind: "message" },
+      },
+      options: { triggerTurn: false, deliverAs: "steer" },
+    },
+    {
+      message: {
+        customType: "pi-subagent-final",
+        content: [{
+          type: "text",
+          text: `Message Type: FINAL_ANSWER\nSender: ${parentId}\nPayload:\n真正 child 最终回复`,
+        }],
+        display: true,
+        details: { agent_id: parentId, kind: "final" },
+      },
+      options: { triggerTurn: true, deliverAs: "steer" },
+    },
+  ]);
   assert.doesNotMatch(JSON.stringify(rootApi.sentMessages), /SECRET_CHILD_THINKING|SECRET_CALL/);
 
   const grandchildSpawn = execute(childApi, "spawn_agent", {
@@ -876,27 +930,36 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   const childActiveTools = childApi.activeToolHistory.at(-1) ?? [];
   const leafActiveTools = leafApi.activeToolHistory.at(-1) ?? [];
   assert.equal(AGENT_TOOL_NAMES.every((name) => childActiveTools.includes(name)), true);
+  assert.equal(childActiveTools.includes(CHILD_REPLY_TOOL_NAME), true);
   assert.equal(AGENT_TOOL_NAMES.some((name) => leafActiveTools.includes(name)), false);
+  assert.equal(leafActiveTools.includes(CHILD_REPLY_TOOL_NAME), true);
 
+  const leafContext = extensionContext(cwd);
+  await leafApi.emit("agent_start", { type: "agent_start" }, leafContext);
   await leafApi.emit("message_end", {
     type: "message_end",
     message: {
       role: "assistant",
+      stopReason: "stop",
       content: [{ type: "text", text: "叶节点只回复直接父会话" }],
     },
-  }, extensionContext(cwd));
+  }, leafContext);
+  await leafApi.emit("agent_settled", { type: "agent_settled" }, leafContext);
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.deepEqual(childApi.sentMessages, [{
     message: {
-      customType: "pi-subagent-reply",
-      content: [{ type: "text", text: "叶节点只回复直接父会话" }],
+      customType: "pi-subagent-final",
+      content: [{
+        type: "text",
+        text: `Message Type: FINAL_ANSWER\nSender: ${grandchildId}\nPayload:\n叶节点只回复直接父会话`,
+      }],
       display: true,
-      details: { agent_id: grandchildId },
+      details: { agent_id: grandchildId, kind: "final" },
     },
     options: { triggerTurn: true, deliverAs: "steer" },
   }]);
-  assert.equal(rootApi.sentMessages.length, 1);
+  assert.equal(rootApi.sentMessages.length, 2);
 
   await new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -1131,15 +1194,32 @@ test("根与 child 跨实例 reload 保留同一监督连接，并让既有 chil
     { template_id: "reviewer", tools: [] },
   ]);
 
+  await newChildApi.emit("agent_start", { type: "agent_start" }, context);
   await newChildApi.emit("message_end", {
     type: "message_end",
-    message: { role: "assistant", content: [{ type: "text", text: "双方 reload 后回复" }] },
+    message: {
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: "双方 reload 后回复" }],
+    },
   }, context);
+  await newChildApi.emit("agent_settled", { type: "agent_settled" }, context);
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(oldRootApi.sentMessages.length, 0);
   assert.equal(newRootApi.sentMessages.length, 1);
-  assert.equal((newRootApi.sentMessages[0]?.message as { details?: { agent_id?: string } }).details?.agent_id, parentId);
+  assert.deepEqual(newRootApi.sentMessages[0], {
+    message: {
+      customType: "pi-subagent-final",
+      content: [{
+        type: "text",
+        text: `Message Type: FINAL_ANSWER\nSender: ${parentId}\nPayload:\n双方 reload 后回复`,
+      }],
+      display: true,
+      details: { agent_id: parentId, kind: "final" },
+    },
+    options: { triggerTurn: true, deliverAs: "steer" },
+  });
 
   const grandchildSpawn = execute(newChildApi, "spawn_agent", {
     template_id: "reviewer",

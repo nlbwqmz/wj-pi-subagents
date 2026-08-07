@@ -5,6 +5,7 @@ import {
   type SupervisorEvent,
   type SupervisorFrame,
   type SupervisorReply,
+  type SupervisorReplyInput,
   type SupervisorSnapshot,
 } from "../../src/supervisor-channel.ts";
 import {
@@ -78,7 +79,7 @@ export class BridgeSupervisorEndpoint {
     }
   }
 
-  publishReply(reply: Omit<SupervisorReply, "reply_seq">): void {
+  publishReply(reply: SupervisorReplyInput | SupervisorReply): void {
     this.send(this.protocol.publishReply(reply));
   }
 

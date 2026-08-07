@@ -79,7 +79,7 @@ npm 是未来规范发布渠道，正式版本使用 SemVer；`v<version>` git t
 
 ### 2.3 宿主兼容门禁
 
-**REQ-005**：扩展激活必须是全有或全无事务。在注册八个管理工具、`/agent`、widget、监督器或业务生命周期处理器之前，必须确认：
+**REQ-005**：扩展激活必须是全有或全无事务。在注册八个管理工具、子代理专用 `reply_to_parent`、`/agent`、widget、监督器或业务生命周期处理器之前，必须确认：
 
 1. Node 版本满足 `>=22.19.0`；
 2. Pi 版本满足 `>=0.83.0`；
@@ -217,6 +217,7 @@ thinking: medium
 
 - 子代理不复制父会话渲染后的系统提示或对话历史；
 - `append` 将模板正文追加到项目与角色提示层；`replace` 只替换该层；两者都不能移除安全、所有权、直接父子通信、工具和树控制契约；
+- 每个子代理始终保留只向直接父会话发送工作中回复的运行时契约；模板正文、模板 `tools` 和 `subagents: disabled` 均不能移除、替换或扩大其目标；
 - `contextFiles` 只控制固定 `cwd` 祖先链的 `AGENTS.md`/`CLAUDE.md`，每个模板独立决定；父节点禁用不阻止子模板重新启用；
 - skills、extensions 和 slash prompt templates 不由模板限制，按固定 `cwd`、统一 project trust、用户资源目录和 Pi 正常发现机制加载；
 - prompt template 不自动展开为首条任务；模板也没有 `env` 覆盖。
@@ -225,7 +226,7 @@ thinking: medium
 
 **REQ-017**：成功的根 `/reload` 必须原子更新模板发现快照和 Pi 动态业务资源，只影响未来创建；既有节点的模板正文、初始工具请求、模型选择、提示、生命周期和上下文不得回溯改变。运行期业务工具或资源变化不重新执行模板能力预检，不降级、终止或重建节点。
 
-树控制面是例外：reload 后必须按保存的身份、直接父关系、祖先 `subagents` 关闭状态和 `maxDepth` 重新施加八个管理工具的完整可见性。成功 reload 通过控制器交接保留代理树；根和后代的 `get_agent_templates` 必须通过根权威读取 reload 后的同一最新目录，不得继续使用子运行时的旧快照。若新扩展实例未通过宿主兼容门禁，旧控制器必须按终止语义清理全部子代理，不保留旧工具、widget、端点或孤儿进程，也不自动回退旧实例。
+树控制面是例外：reload 后必须按保存的身份、直接父关系、祖先 `subagents` 关闭状态和 `maxDepth` 重新施加八个管理工具的完整可见性，并为所有子运行时重新施加 `reply_to_parent`。成功 reload 通过控制器交接保留代理树与回复协调状态；根和后代的 `get_agent_templates` 必须通过根权威读取 reload 后的同一最新目录，不得继续使用子运行时的旧快照。若新扩展实例未通过宿主兼容门禁，旧控制器必须按终止语义清理全部子代理，不保留旧工具、widget、端点或孤儿进程，也不自动回退旧实例。
 
 ## 5. 能力、深度和资源配额
 
@@ -240,6 +241,8 @@ thinking: medium
 3. 当前节点 `depth < maxDepth`。
 
 任一条件不满足时整组隐藏，后代不能重新开启。服务端仍必须重复校验直接父权限和深度；绕过工具发现的模板目录查询返回 `template_capability_unavailable`，创建请求返回 `max_depth_reached` 或相应授权错误。
+
+`reply_to_parent` 不属于八个管理工具。每个子代理无论是否达到 `maxDepth`、是否继承管理能力、模板是否设置 `subagents: disabled`，都必须保留该工具；根会话不得注册它。
 
 ### 5.2 名额占用与释放
 
@@ -315,11 +318,11 @@ Pi `get_state` 只可用于启动同步、事件缺口后的异常重同步和�
 
 ### 6.4 共通工具契约
 
-**REQ-024**：公开工具固定为：
+**REQ-024**：子代理管理工具固定为：
 
 `get_agent_templates`、`spawn_agent`、`send_message`、`wait_agent`、`interrupt_agent`、`terminate_agent`、`get_agent_status`、`get_agent_tree`。
 
-不提供多模式 `subagent` 工具，也不提供 `report_progress` 或 `send_parent_message`。所有定向工具使用根会话内唯一、终止后不复用的 UUID `agent_id`；控制器新分配的值使用随机 UUID v4，所有传输文本必须符合 RFC 9562 canonical 小写格式（`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`），不带 `agent_` 前缀。展示名称不能寻址，也不能从标识推断树结构。任何 `agent_id` 参数若不是 canonical UUID 文本，必须返回 `invalid_argument`；格式正确但不在当前根注册表中的值返回 `agent_not_found`。
+不提供多模式 `subagent` 工具。子运行时额外注册单一 `reply_to_parent`，但它不属于管理工具、不接受目标身份，也不能用于越级或任意目标消息。所有管理定向工具使用根会话内唯一、终止后不复用的 UUID `agent_id`；控制器新分配的值使用随机 UUID v4，所有传输文本必须符合 RFC 9562 canonical 小写格式（`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`），不带 `agent_` 前缀。展示名称不能寻址，也不能从标识推断树结构。任何 `agent_id` 参数若不是 canonical UUID 文本，必须返回 `invalid_argument`；格式正确但不在当前根注册表中的值返回 `agent_not_found`。
 
 除 `get_agent_templates` 的直接数组结果外，成功结果统一为：
 
@@ -363,7 +366,7 @@ Pi `get_state` 只可用于启动同步、事件缺口后的异常重同步和�
 ]
 ```
 
-每项字段闭集为区分大小写的 `template_id`、可选 `description` 和始终存在的 `tools`。没有描述时省略 `description`；合法空工具模板返回 `tools: []`。`tools` 只包含模板声明并已规范化的业务工具，不得混入八个管理工具。结果不得包含模板正文、来源、model、thinking、`subagents`、`contextFiles`、路径、诊断或其他运行配置；无效候选与来源诊断不得枚举。失败仍使用本节统一错误契约。
+每项字段闭集为区分大小写的 `template_id`、可选 `description` 和始终存在的 `tools`。没有描述时省略 `description`；合法空工具模板返回 `tools: []`。`tools` 只包含模板声明并已规范化的业务工具，不得混入八个管理工具或 `reply_to_parent`。结果不得包含模板正文、来源、model、thinking、`subagents`、`contextFiles`、路径、诊断或其他运行配置；无效候选与来源诊断不得枚举。失败仍使用本节统一错误契约。
 
 数组只表示根权威当前发现且格式有效的模板，不执行调用者当前模型、thinking 或管理权限的完整创建预检。`tools` 是子代理的初始业务工具请求，不要求是父会话当前活动工具的子集；非空项仍可能在 `spawn_agent` 返回 `template_capability_unavailable`。根 `/reload` 后，根和所有后代查询必须立即读取根权威发布的同一最新目录。
 
@@ -422,7 +425,23 @@ Pi `get_state` 只可用于启动同步、事件缺口后的异常重同步和�
 
 能证明未接受时返回 `message_delivery_failed` 并减 pending；接受状态未知时也返回该码，但不得自动重发，内部未决交付由后续队列/settle/故障事实消解。已返回 accepted 的调用不得因后续模型、工具或进程失败而被改写。
 
-普通 assistant 回复经直接父子上行协议注入直接父会话；不允许越级。父会话模型自行决定是否继续交互。
+父会话向下发送的任务/steering 与子代理向上回复是两条独立语义；`send_message` 的成功、pending 变化或 settle 不得被误当成已经收到回复。
+
+### 6.6.1 `reply_to_parent`
+
+**REQ-055**：每个子运行时必须注册 `reply_to_parent`，根运行时不得注册。输入字段闭集只允许非空 `message`：
+
+```json
+{ "message": "正在核对实现，完成后继续当前任务。" }
+```
+
+正文不得超过监督通道字符串上限。工具不接受 `agent_id`、目标路径、图片、回复类别、触发参数、序号或完成标记；目标由已认证的直接父子监督关系唯一绑定。它用于进度、问题和阶段性发现，成功只表示直接父会话已经接纳并 ACK：
+
+```json
+{ "ok": true, "data": { "accepted": true } }
+```
+
+成功不会停止、settle、中断或另起当前子代理处理；模型必须继续原任务。最终答复由运行时自动提交，模型不得用本工具模拟 final。监督通道或父会话无法确认接纳时返回 `message_delivery_failed`，不得泄露正文或底层传输错误。
 
 ### 6.7 `wait_agent`
 
@@ -445,11 +464,12 @@ Pi `get_state` 只可用于启动同步、事件缺口后的异常重同步和�
 
 `outcome` 只有：
 
+- `reply`：等待中收到直接子代理工作中回复，或调用前已有尚未消费的回复通知；返回快照不改变生命周期，通常仍为 `working`/`interrupting`；
 - `settled`：调用时已 `idle`，`starting` 后进入 `idle`，或 `working`/`interrupting` 收到 `agent_settled`；
 - `terminal`：调用时已经或等待中进入 `failed`/`terminated`；`failed` 必须附 `data.error`；
 - `timeout`：观察期限先到；`terminating` 在资源未确认时只能继续等或超时。
 
-结束原因与返回快照分开线性化，因此可以出现 `settled + working` 或 `terminal + terminating`。超时与事件先提交者决定唯一 outcome；超时绝不中断、终止或升级节点，也不重复返回 assistant 回复。
+结束原因与返回快照分开线性化，因此可以出现 `reply + working`、`settled + working` 或 `terminal + terminating`。超时、工作中回复通知与生命周期事件由先提交者决定唯一 outcome；超时绝不中断、终止或升级节点。回复正文已经作为独立父会话消息注入，`wait_agent` 结果不得重复携带正文。
 
 ### 6.8 `interrupt_agent`
 
@@ -549,8 +569,8 @@ Pi `get_state` 只可用于启动同步、事件缺口后的异常重同步和�
 
 **REQ-033**：每条直接父子关系必须有两个相互隔离的平面：
 
-1. **Pi 任务通道**：监督器独占子进程 RPC stdin/stdout；承载 prompt/steer、abort、Pi 状态事件和普通 assistant 输出。
-2. **父子监督通道**：独立本地双向可靠字节流；只承载握手、生命周期、完整子树快照、回复确认、重同步和关闭通知。
+1. **Pi 任务通道**：监督器独占子进程 RPC stdin/stdout；承载 prompt/steer、abort、Pi 状态事件和原始 assistant 生命周期输出。
+2. **父子监督通道**：独立本地双向可靠字节流；只承载握手、生命周期、完整子树快照、分类回复及确认、逐跳控制请求/响应、重同步和关闭通知。
 
 Unix 使用本地 Unix socket，Windows 使用命名管道。上层必须用带长度边界的 UTF-8 JSON 帧，不能依赖换行、模型文本、Pi 日志或 `entry_appended` 分帧。控制帧不得成为模型工具、prompt、会话条目或模型上下文。
 
@@ -559,7 +579,7 @@ Unix 使用本地 Unix socket，Windows 使用命名管道。上层必须用带�
 ```json
 {
   "protocol": "pi-subagent/1",
-  "kind": "hello|hello_ack|event|snapshot_request|snapshot|reply|ack|close",
+  "kind": "hello|hello_ack|event|snapshot_request|snapshot|reply|control_request|control_response|ack|close",
   "stream_id": "stream_...",
   "sender_agent_id": "550e8400-e29b-41d4-a716-446655440000",
   "target_agent_id": "550e8400-e29b-41d4-a716-446655440001",
@@ -593,15 +613,31 @@ Unix 使用本地 Unix socket，Windows 使用命名管道。上层必须用带�
 
 重同步期间可保留最后安全快照供只读 UI，但不得把它当成最新健康事实。请求超期、身份不符、快照非法或 EOF 时，节点按终止屏障进入 `failed` 或继续 `terminating`；缓存后代不能静默消失，必须进入防孤儿清理。
 
-### 7.4 普通回复
+### 7.4 分类回复与最终提交屏障
 
-**REQ-036**：监督器必须把普通 assistant 输出组装成只向直接父控制器上行的 `reply`，携带独立单调 `reply_seq` 和 Pi `ImageContent`。逐 token、工具参数和工具结果不得作为树事件转发。
+**REQ-036**：直接父子监督 `reply` 必须携带独立单调 `reply_seq`、必填 `kind: "message" | "final"`、有界文本和可选 Pi `ImageContent`。原始帧缺少或使用未知 `kind` 属于协议故障；`message` 正文与图片不能同时为空，`final` 可以为空并作为 completion fence。
 
-父控制器按 `reply_seq` 顺序注入普通会话输入，注入成功后累计 ACK；重复回复不得再次注入。未连续确认回复只保留有界窗口。同一活动根会话内有限重同步先恢复握手和快照，再从最近未确认回复继续；不承诺跨根崩溃恢复或去重。消息 ID、reply seq、帧 seq 和 tree revision 属于不同命名空间，不得复用或互相推断。
+子运行时只能通过两条入口发布 reply：
+
+1. `reply_to_parent` 显式发布 `kind:"message"`。它与当前处理串行确认，但不会结束处理；
+2. `agent_settled` 发布且每轮至多发布一次 `kind:"final"`。`message_end` 只更新本地最终候选，绝不直接上行；只有 `stopReason` 为 `stop`/`length`、不含工具调用且正文/图片通过安全边界的最后一条 assistant 完成消息可成为候选，否则 final 使用空 fence。
+
+显式 message 与自动 final 必须通过同一发布队列和 `reply_seq` 域顺序发送。发送端必须等待 final 的 reply ACK；只有父端已经接纳最终正文或空 fence 后，Pi 才能继续发布对应 `agent_settled` 生命周期事实。确认失败必须关闭/故障监督通道，不能让父端先观察到健康 `idle`。工作中 message 最多占用 `maxReplyWindow - 1` 个未确认槽位，始终为 final 预留一个槽位。
+
+父控制器按 `reply_seq` 顺序接纳并累计 ACK；重复回复不得再次注入。模型可见正文必须自包含来源和类别：
+
+```text
+Message Type: AGENT_MESSAGE|FINAL_ANSWER
+Sender: <agent_id>
+Payload:
+<正文>
+```
+
+`message` 注入使用非自动 turn 语义，同时通知 `wait_agent` 返回 `outcome:"reply"`；`final` 注入触发父会话继续处理。空 final 只 ACK，不创建空会话消息。思考块、工具前说明、工具调用、工具参数、工具结果、错误和中止消息不得进入任何 reply。未连续确认回复只保留有界窗口；有限重同步先恢复握手和快照，再从最近未确认回复继续。消息 ID、reply seq、帧 seq 和 tree revision 属于不同命名空间，不得复用或互相推断。
 
 ### 7.5 有界状态与安全
 
-**REQ-037**：控制器只能保留每个直接子代理的最新完整快照、每个流的序号水位、一个有界待确认快照/回复窗口和当前快照请求；不得保存无限事件日志。状态快照可合并，普通回复不得静默合并。窗口满时可以暂停非必要快照并请求重同步，但不得改变公开配额或等待语义。
+**REQ-037**：控制器只能保留每个直接子代理的最新完整快照、每个流的序号水位、一个有界待确认快照/回复窗口、当前快照请求和有界待消费工作中回复通知；不得保存无限事件日志。状态快照可合并，分类回复不得静默合并。窗口满时可以暂停非必要快照并请求重同步，但不得挤占 final 预留槽位、改变公开配额或等待语义。
 
 监督端点只绑定本机 IPC，并使用不可猜测一次性凭据。帧长度、字符串、节点列表和回复载荷必须有代码级固定上限；越界关闭通道并按协议故障处理。凭据、端点、流 ID、序号水位和原始错误不得出现在工具、UI 或模型上下文。
 
@@ -641,7 +677,7 @@ Unix 使用本地 Unix socket，Windows 使用命名管道。上层必须用带�
 
 终止屏障优先级最高：取消尚未写入的普通命令，抢占未完成中断清理，拒绝新 prompt/创建/普通控制，并用状态代际丢弃迟到响应。并发终止合并到同一流程。
 
-监督器必须将 Pi 原始事件归一化：prompt 接受、`agent_settled`、安全工具活动、reply、EOF/协议故障。`agent_end`、abort 响应和局部完成只作诊断，不得错误 settle 或确认资源。
+监督器必须将 Pi 原始事件归一化：prompt 接受、`agent_settled`、安全工具活动、分类 reply、EOF/协议故障。assistant `message_end` 只允许在子运行时更新最终候选，不能直接跨越监督边界；`agent_end`、abort 响应和局部完成只作诊断，不得错误 settle、提交 final 或确认资源。
 
 ### 8.4 终止与资源确认
 
@@ -756,7 +792,7 @@ Windows 执行两个锁定宿主组合：
 **REQ-049**：实现必须提供以下五层自动化测试，且不依赖外部模型网络、API key 或人工交互：
 
 1. **纯逻辑测试**：状态机、配额、配置、模板、树合并、seq/ACK/重同步、脱敏；使用 fake 和可控单调时钟覆盖竞态。
-2. **Pi 契约测试**：加载真实扩展入口和 Pi `RpcClient`，验证八工具 schema、`get_agent_templates` 直接数组例外、其余成功外壳、错误外壳、事件映射、reload 与 UI-only 边界。
+2. **Pi 契约测试**：加载真实扩展入口和 Pi `RpcClient`，验证八个管理工具与子运行时 `reply_to_parent` 的角色可见性/schema、`get_agent_templates` 直接数组例外、其余成功外壳、错误外壳、事件映射、reload 与 UI-only 边界。
 3. **原生进程集成测试**：启动真实 `pi --mode rpc --no-session`，使用确定性本地假模型/提供者，验证创建、steering、中断、故障和整树回收。
 4. **TUI 交互测试**：验证直接子代理 widget、`/agent` 遮罩、滚动/展开/关闭、稳定尺寸和 UI-only 通知。
 5. **本地 package 测试**：验证本地包目录或本地构建包的 manifest、生产依赖、临时加载和隔离的本地持久安装形态。
@@ -770,9 +806,9 @@ Windows 执行两个锁定宿主组合：
 **REQ-050**：以下旅程必须在 Windows 乘两个宿主组合的两个 job 中全部执行；macOS/Linux 只保留代码、类型、纯逻辑和 fake 测试，不在本里程碑执行原生旅程：
 
 1. 加载扩展并发现合法模板，根先通过 `get_agent_templates` 获得安全目录、精确复制 `template_id` 再创建 A；只有双握手后才以 `idle` 成功。
-2. 向空闲 A 发送任务，接收直接回复并等待 settled；再次发送可观察同一节点上下文延续。
+2. 向空闲 A 发送任务；A 显式发送工作中回复后继续处理，父端 `wait_agent` 以 `reply + working` 返回；A settled 时再自动收到唯一最终答复，随后复用同一节点可观察上下文延续。
 3. A 工作时再次发送，验证 steering 被接受而不是独立后续任务。
-4. A 查询到与根权威一致的模板目录并创建 A-1 到默认深度 2；A-1 不可见八个管理工具，绕过发现查询返回 `template_capability_unavailable`，绕过发现创建仍返回 `max_depth_reached`。
+4. A 查询到与根权威一致的模板目录并创建 A-1 到默认深度 2；A-1 不可见八个管理工具但仍可见 `reply_to_parent`，绕过发现查询返回 `template_capability_unavailable`，绕过发现创建仍返回 `max_depth_reached`。
 5. 根能只读看整树但不能越级控制 A-1；A 只能看自身子树并直接控制 A-1；revision、pending 和父关系一致。
 6. 创建兄弟节点并行处理，验证不同节点并行、同节点命令串行。
 7. 中断工作节点，等 `agent_settled` 回 idle 后再次复用。
@@ -787,8 +823,9 @@ Windows 执行两个锁定宿主组合：
 - 参数错误（包括 `get_agent_templates` 多余参数和非 canonical UUID 的 `agent_id`）、格式正确但未注册的 UUID、非直接子代理、模板不存在/无效/能力不足、深度/直接/全树配额耗尽；
 - 配置不可读、坏 JSON、非法值、未知字段 UI-only 默认回退，以及非法显式根参数拒绝启动；
 - 启动超时/提前退出、RPC 断开、消息接受状态未知、中断-settle 竞态、屏障后迟到事件、部分级联失败、中间父故障和根关闭；
-- 重复帧、断序、旧 revision、旧/非法 stream、损坏快照、ACK 丢失、reset 快照和回复去重；
-- 模板目录为空时直接返回 `[]`，无效候选和来源诊断不枚举，非空项字段闭合且不泄露运行配置，模板业务 `tools` 不混入八个管理工具；
+- 重复帧、断序、旧 revision、旧/非法 stream、损坏快照、ACK 丢失、reset 快照和回复去重；reply 缺失/非法 `kind`、空 message、message/final 混排、final 槽位预留、空 final fence、ACK 等待失败与通道关闭；
+- assistant 思考、工具前说明、工具调用、参数、结果、错误和中止内容不能泄漏到父会话；重复 settled 不得重复 final；
+- 模板目录为空时直接返回 `[]`，无效候选和来源诊断不枚举，非空项字段闭合且不泄露运行配置，模板业务 `tools` 不混入八个管理工具或 `reply_to_parent`；
 - 未信任项目资源不加载、模板不能扩权、叶节点不能绕过管理能力和深度、根不能越级控制；
 - cwd 外路径仍按 Pi 正常工具能力处理，证明扩展没有误实现 cwd 沙箱；
 - 以秘密 canary 注入 prompt、路径、环境、工具参数/结果、连接凭据和堆栈，证明 widget、`/agent`、状态/树、错误、UI 通知、监督帧和 UI-only 诊断不泄露，也不进入模型上下文；
@@ -830,17 +867,17 @@ Windows 执行两个锁定宿主组合：
 | `AC-007` | 模板 schema | 空正文、逗号 tools 规范化、枚举、model/thinking、未知字段静默忽略 |
 | `AC-008` | 覆盖、诊断和模板 reload | 无效项目遮蔽用户；诊断 UI-only；根与后代查询 reload 后同一新目录；新快照只影响未来创建 |
 | `AC-009` | 创建能力与上下文继承 | 工具缺一即拒绝；精确模型/thinking；prompt mode、contextFiles、资源继承 |
-| `AC-010` | 深度、管理工具和配额 | 默认两级；八工具整体隐藏；祖先 disabled 衰减；查询/创建服务端复核；直接/全树原子预留和回收释放 |
+| `AC-010` | 深度、管理工具和配额 | 默认两级；八工具整体隐藏但 child 回复工具保留；祖先 disabled 衰减；查询/创建服务端复核；直接/全树原子预留和回收释放 |
 | `AC-011` | 七态、pending、revision | 所有合法/非法转换、迟到事件守卫、计数与修订单调 |
 | `AC-012` | 创建成功与失败回滚 | 创建生成 canonical UUID v4；双握手后 idle；启动错误/超时；清理完整与不完整两条返回路径 |
-| `AC-013` | 任务、steering 与回复 | 空闲 prompt、工作 steer、交付未知不重发、直接回复顺序和 ACK |
-| `AC-014` | 等待竞态 | 原子登记、多等待者、settled/terminal/timeout 及并发返回组合 |
+| `AC-013` | 任务、steering 与回复 | 空闲 prompt、工作 steer、交付未知不重发、显式工作中回复、自动唯一 final、模型可见信封和 ACK |
+| `AC-014` | 等待竞态 | 原子登记、多等待者、reply/settled/terminal/timeout 及并发返回组合 |
 | `AC-015` | 协作式中断 | abort 不等于 settle、不清 steering、不释放名额、中断后可复用 |
 | `AC-016` | 终止与部分级联 | 屏障、后代优先、强制回收、幂等合并、partial failure |
 | `AC-017` | 状态和树查询 | 直接状态权限、根/子树裁剪、原子 tree revision、安全字段 |
 | `AC-018` | 公开错误码闭集 | 非法 UUID 与未注册 UUID 分流；每个错误码、retryable 和无副作用；无额外阶段错误码 |
 | `AC-019` | 监督握手和快照 | 身份/版本/凭据、初始快照、subtree replacement、原子根修订 |
-| `AC-020` | seq、ACK、重同步和有界状态 | duplicate/gap/reset/new stream/reply dedupe/窗口边界 |
+| `AC-020` | seq、ACK、重同步和有界状态 | duplicate/gap/reset/new stream、message/final 同序、reply dedupe、final 槽位与 ACK 失败边界 |
 | `AC-021` | 监督器启动和命令顺序 | 先挂接 OS 树、双通道就绪、单写者、终止优先、迟到丢弃 |
 | `AC-022` | Windows 原生进程树回收 | Windows Job Object、资源确认和孙进程整树回收；Unix 原生部分延期 |
 | `AC-023` | 父故障、根关闭与 reload 失败 | 防孤儿、内部期限、无自动重启、失败 reload 清树 |
@@ -884,5 +921,6 @@ Windows 执行两个锁定宿主组合：
 | `REQ-052` | 09、10 | `AC-027` |
 | `REQ-053` | 06、10 | `AC-030` |
 | `REQ-054` | 10 | `AC-031` |
+| `REQ-055` | 11、21 | `AC-013`、`AC-014`、`AC-020`、`AC-026` |
 
 本文没有性能测试或发布执行要求，registry 凭据等发布运营信息属于外部输入。当前运行期产品决策已冻结，平台验收范围则明确分为 Windows 开发里程碑和后续独立的 macOS/Linux 原生验证计划。实现代理应按 REQ 和 AC 直接拆分生产代码与测试；对不改变公开行为的类名、文件布局、内部期限数值、帧/字符串安全上限和日志后端，可以在实现中选择并用测试固定。

@@ -16,6 +16,7 @@ import {
   type SupervisorEvent,
   type SupervisorFrame,
   type SupervisorReply,
+  type SupervisorReplyInput,
   type SupervisorSnapshot,
 } from "./supervisor-channel.ts";
 import {
@@ -120,7 +121,14 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
     return this.protocol.getPublicState().state === "ready";
   }
 
-  async publishReply(_reply: Omit<SupervisorReply, "reply_seq">): Promise<void> {
+  async publishReply(_reply: SupervisorReplyInput | SupervisorReply): Promise<void> {
+    throw new Error("父端监督通道不能发布代理回复");
+  }
+
+  async publishReplyAndWaitForAck(
+    _reply: SupervisorReplyInput | SupervisorReply,
+    _signal?: AbortSignal,
+  ): Promise<void> {
     throw new Error("父端监督通道不能发布代理回复");
   }
 
