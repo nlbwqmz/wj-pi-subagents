@@ -16,6 +16,7 @@ import type {
 
 const FIRST_ID = "10000000-0000-4000-8000-000000000001";
 const SECOND_ID = "10000000-0000-4000-8000-000000000002";
+const THIRD_ID = "10000000-0000-4000-8000-000000000003";
 
 function template(
   templateId = "worker",
@@ -93,6 +94,71 @@ test("根权威以模板修订闭合解析与预留事务", async () => {
   assert.equal(grant.template_revision, 2);
   assert.equal(grant.management_enabled, true);
   assert.equal(expectSuccess(tree.getQuotaSnapshot()).active_tree_agents, 1);
+});
+
+test("根权威只发布安全模板数组并在 reload 后立即返回空目录", async () => {
+  const tree = new TreeController({
+    config: { maxDepth: 2, maxChildrenPerAgent: 2, maxAgentsPerTree: 2, waitTimeoutMs: 10_000 },
+    idFactory: () => FIRST_ID,
+  });
+  const described = Object.freeze({
+    ...template("Explore"),
+    description: "只读探索",
+    tools: Object.freeze(["read", "grep"]),
+  });
+  const emptyTools = Object.freeze({
+    ...template("empty-tools"),
+    tools: Object.freeze([] as string[]),
+  });
+  const authority = new RootTreeAuthority({
+    tree,
+    templateSnapshot: snapshot(described, emptyTools),
+  });
+
+  const listed = expectSuccess(await authority.listTemplates(ROOT_TREE_ACTOR));
+  assert.deepEqual(listed, [
+    { template_id: "Explore", description: "只读探索", tools: ["read", "grep"] },
+    { template_id: "empty-tools", tools: [] },
+  ]);
+  assert.equal(Object.isFrozen(listed), true);
+  assert.equal(Object.isFrozen(listed[0]), true);
+  assert.equal(Object.isFrozen(listed[0]?.tools), true);
+  assert.doesNotMatch(JSON.stringify(listed), /source|body|model|thinking|contextFiles|subagents/);
+
+  authority.updateTemplateSnapshot(snapshot());
+  assert.deepEqual(expectSuccess(await authority.listTemplates(ROOT_TREE_ACTOR)), []);
+});
+
+test("根权威拒绝管理能力已关闭的节点绕过工具隐藏查询模板", async () => {
+  const ids = [FIRST_ID, SECOND_ID, THIRD_ID];
+  const tree = new TreeController({
+    config: { maxDepth: 2, maxChildrenPerAgent: 3, maxAgentsPerTree: 3, waitTimeoutMs: 10_000 },
+    idFactory: () => ids.shift() ?? THIRD_ID,
+  });
+  const authority = new RootTreeAuthority({ tree, templateSnapshot: snapshot(template()) });
+  const reserveReady = (
+    actor: typeof ROOT_TREE_ACTOR | { readonly kind: "agent"; readonly agent_id: string },
+    name: string,
+    subagents: TemplateDefinition["subagents"] = "inherit",
+  ) => {
+    const reserved = expectSuccess(tree.reserveStartingChild(actor, {
+      templateId: "worker",
+      name,
+      subagents,
+    }));
+    expectSuccess(tree.applyLifecycleEvent(reserved.node.agent_id, {
+      type: "startup_ready",
+      expected_generation: reserved.lifecycle_generation,
+    }));
+    return Object.freeze({ kind: "agent" as const, agent_id: reserved.node.agent_id });
+  };
+
+  const disabled = reserveReady(ROOT_TREE_ACTOR, "模板关闭管理能力", "disabled");
+  const parent = reserveReady(ROOT_TREE_ACTOR, "可递归父代理");
+  const depthLeaf = reserveReady(parent, "深度叶节点");
+
+  expectFailure(await authority.listTemplates(disabled), "template_capability_unavailable");
+  expectFailure(await authority.listTemplates(depthLeaf), "template_capability_unavailable");
 });
 
 test("两个父并发争抢最后一个全树名额时根权威只签发一个 grant", async () => {

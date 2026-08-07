@@ -741,6 +741,11 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   await rootApi.emit("session_start", { type: "session_start", reason: "startup" }, rootContext);
   assert.ok(rootController);
 
+  const rootTemplates = await execute(rootApi, "get_agent_templates", {}, rootContext) as {
+    details?: Array<{ template_id: string; tools: string[] }>;
+  };
+  assert.deepEqual(rootTemplates.details, [{ template_id: "researcher", tools: [] }]);
+
   const parentSpawn = execute(rootApi, "spawn_agent", {
     template_id: "researcher",
     name: "递归父代理",
@@ -771,6 +776,10 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   assert.ok(childController);
   assert.deepEqual(childController.actor, { kind: "agent", agent_id: parentId });
   assert.equal(childController.getAgentTree().ok, true);
+  const childTemplates = await execute(childApi, "get_agent_templates", {}, childContext) as {
+    details?: Array<{ template_id: string; tools: string[] }>;
+  };
+  assert.deepEqual(childTemplates.details, rootTemplates.details);
 
   await childApi.emit("message_end", {
     type: "message_end",
@@ -814,8 +823,10 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   const grandchildId = String(spawnedGrandchild.details?.agent_id);
   assert.equal(grandchildId, "cccccccc-cccc-4ccc-8ccc-cccccccccccc");
   assert.equal(grandchildBootstrap.environment?.PI_SUBAGENT_MANAGEMENT_ENABLED, "false");
-  assert.equal(childApi.activeToolHistory.at(-1)?.includes("spawn_agent"), true);
-  assert.equal(leafApi.activeToolHistory.at(-1)?.includes("spawn_agent"), false);
+  const childActiveTools = childApi.activeToolHistory.at(-1) ?? [];
+  const leafActiveTools = leafApi.activeToolHistory.at(-1) ?? [];
+  assert.equal(AGENT_TOOL_NAMES.every((name) => childActiveTools.includes(name)), true);
+  assert.equal(AGENT_TOOL_NAMES.some((name) => leafActiveTools.includes(name)), false);
 
   await leafApi.emit("message_end", {
     type: "message_end",
@@ -1061,6 +1072,14 @@ test("根与 child 跨实例 reload 保留同一监督连接，并让既有 chil
   await newRootApi.emit("session_start", { type: "session_start", reason: "reload" }, context);
   assert.equal(transportAdapter.listenCalls, 1);
   assert.equal(transportAdapter.connectCalls, 1);
+
+  const reloadedTemplates = await execute(newChildApi, "get_agent_templates", {}, context) as {
+    details?: Array<{ template_id: string; tools: string[] }>;
+  };
+  assert.deepEqual(reloadedTemplates.details, [
+    { template_id: "researcher", tools: [] },
+    { template_id: "reviewer", tools: [] },
+  ]);
 
   await newChildApi.emit("message_end", {
     type: "message_end",

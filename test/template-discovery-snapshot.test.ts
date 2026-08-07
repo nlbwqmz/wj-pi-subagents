@@ -4,6 +4,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   discoverTemplateSnapshot,
+  listAgentTemplates,
   TemplateSnapshotController,
   type TemplateDirectoryEntry,
   type TemplateDiscoveryFileSystem,
@@ -76,6 +77,16 @@ test("发现用户直属合法模板并以文件名发布稳定 template_id", ()
   }]);
   assert.deepEqual(snapshot.invalidCandidates, []);
   assert.deepEqual(snapshot.sourceDiagnostics, []);
+  const listed = listAgentTemplates(snapshot);
+  assert.deepEqual(listed, [{
+    template_id: "researcher",
+    description: "核对资料",
+    tools: ["read", "grep"],
+  }]);
+  assert.equal(Object.isFrozen(listed), true);
+  assert.equal(Object.isFrozen(listed[0]), true);
+  assert.equal(Object.isFrozen(listed[0]?.tools), true);
+  assert.doesNotMatch(JSON.stringify(listed), /source|body|model|thinking|contextFiles|subagents/);
 });
 
 test("严格解析完整 frontmatter，保留正文并静默忽略未知字段", () => {

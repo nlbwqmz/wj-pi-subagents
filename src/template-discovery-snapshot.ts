@@ -42,6 +42,13 @@ export interface TemplateDefinition {
   readonly body: string;
 }
 
+/** 模型可见的有效模板目录条目；不暴露正文、来源、模型或其他运行配置。 */
+export interface AgentTemplateListItem {
+  readonly template_id: string;
+  readonly description?: string;
+  readonly tools: readonly string[];
+}
+
 export type TemplateCandidateDiagnosticReason =
   | "file_unreadable"
   | "invalid_utf8"
@@ -163,6 +170,17 @@ function createTemplateDefinition(template: TemplateDefinition): TemplateDefinit
     writable: false,
   });
   return freezeRecord(value);
+}
+
+/** 从已校验快照生成安全目录，调用方无需再次理解模板过滤规则。 */
+export function listAgentTemplates(
+  snapshot: TemplateDiscoverySnapshot,
+): readonly AgentTemplateListItem[] {
+  return Object.freeze(snapshot.templates.map((template) => freezeRecord({
+    template_id: template.templateId,
+    ...(template.description === undefined ? {} : { description: template.description }),
+    tools: Object.freeze([...template.tools]),
+  })));
 }
 
 function compareText(left: string, right: string): number {

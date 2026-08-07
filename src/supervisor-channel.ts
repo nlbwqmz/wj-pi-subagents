@@ -114,6 +114,7 @@ export type SupervisorJsonValue =
 
 /** 子树控制请求允许进入父级路由器的内部操作闭集。 */
 export const SUPERVISOR_CONTROL_OPERATIONS = Object.freeze([
+  "list_templates",
   "resolve_template",
   "reserve_child",
   "admit_control",

@@ -11,6 +11,7 @@ export type AgentToolControllerProvider = (
 ) => AgentController | Promise<AgentController>;
 
 export const AGENT_TOOL_NAMES = Object.freeze([
+  "get_agent_templates",
   "spawn_agent",
   "send_message",
   "wait_agent",
@@ -50,6 +51,7 @@ export class SubagentToolError extends Error {
 
 interface JsonSchema {
   readonly type: string;
+  readonly description?: string;
   readonly properties?: Readonly<Record<string, JsonSchema>>;
   readonly required?: readonly string[];
   readonly additionalProperties?: boolean;
@@ -79,10 +81,20 @@ const imageSchema: JsonSchema = Object.freeze({
 });
 
 const schemas: Readonly<Record<AgentToolName, JsonSchema>> = Object.freeze({
+  get_agent_templates: Object.freeze({
+    type: "object",
+    properties: Object.freeze({}),
+    additionalProperties: false,
+  }),
   spawn_agent: Object.freeze({
     type: "object",
     properties: Object.freeze({
-      template_id: Object.freeze({ type: "string", minLength: 1, maxLength: 256 }),
+      template_id: Object.freeze({
+        type: "string",
+        description: "先调用 get_agent_templates，再原样复制其当前返回项的 template_id，两者必须完全一致；区分大小写，不得猜测、改写或使用 description 代替。",
+        minLength: 1,
+        maxLength: 256,
+      }),
       name: Object.freeze({ type: "string", minLength: 1, maxLength: 256 }),
     }),
     required: Object.freeze(["template_id", "name"]),
@@ -133,7 +145,8 @@ const schemas: Readonly<Record<AgentToolName, JsonSchema>> = Object.freeze({
 });
 
 const descriptions: Readonly<Record<AgentToolName, string>> = Object.freeze({
-  spawn_agent: "创建一个直接子代理并等待它完成启动握手。",
+  get_agent_templates: "列出当前发现且格式有效的子代理模板，直接返回 JSON 数组。每项包含 template_id、可选 description 和模板声明的业务 tools；返回 [] 表示当前没有有效模板，此时不能调用 spawn_agent。非空模板仍须通过 spawn_agent 的工具、模型、thinking 和管理能力预检，可能返回 template_capability_unavailable。",
+  spawn_agent: "使用有效模板创建一个直接子代理并等待它完成启动握手。调用前先调用 get_agent_templates；template_id 必须与其当前返回项的 template_id 完全一致并区分大小写，不得猜测、改写或使用 description 代替。若 get_agent_templates 返回 []，则不能调用 spawn_agent。创建成功后使用 send_message 发送首项任务。",
   send_message: "向直接子代理发送任务消息或当前处理的 steering。",
   wait_agent: "等待直接子代理 settled 或进入终态。",
   interrupt_agent: "协作式中断直接子代理当前处理，保留节点和上下文。",
@@ -143,10 +156,10 @@ const descriptions: Readonly<Record<AgentToolName, string>> = Object.freeze({
 });
 
 /** 返回给 Pi 的固定工具结果；details 只包含控制器安全数据。 */
-function toolResult<T>(result: ControlResult<T>): unknown {
+function toolResult<T>(result: ControlResult<T>, dataOnly = false): unknown {
   if (!result.ok) throw new SubagentToolError(result.error);
   return {
-    content: [{ type: "text", text: JSON.stringify(result) }],
+    content: [{ type: "text", text: JSON.stringify(dataOnly ? result.data : result) }],
     details: result.data,
   };
 }
@@ -168,6 +181,7 @@ function executeTool(
   name: AgentToolName,
   provider: AgentToolControllerProvider,
   execute: (controller: AgentController, params: unknown) => Promise<ControlResult<unknown>>,
+  dataOnly = false,
 ): Record<string, unknown> {
   return {
     name,
@@ -181,17 +195,21 @@ function executeTool(
       _signal: AbortSignal | undefined,
       _onUpdate: unknown,
       context: unknown,
-    ) => toolResult(await execute(await controllerFor(provider, context), params)),
+    ) => toolResult(await execute(await controllerFor(provider, context), params), dataOnly),
   };
 }
 
-/** 注册完整、不可拆分的七工具集合；返回已注册名称供宿主测试和诊断使用。 */
+/** 注册完整、不可拆分的八工具集合；返回已注册名称供宿主测试和诊断使用。 */
 export function registerAgentTools(
   api: AgentToolRegistrationApi,
   provider: AgentToolControllerProvider,
 ): readonly AgentToolName[] {
   if (typeof api.registerTool !== "function") throw new TypeError("宿主缺少 registerTool");
   const tools: readonly Record<string, unknown>[] = [
+    executeTool("get_agent_templates", provider, async (controller, params) => {
+      if (!isEmptyObject(params)) return controlFailure("invalid_argument");
+      return controller.getAgentTemplates();
+    }, true),
     executeTool("spawn_agent", provider, async (controller, params) => controller.spawnAgent(params)),
     executeTool("send_message", provider, async (controller, params) => controller.sendMessage(params)),
     executeTool("wait_agent", provider, async (controller, params) => controller.waitAgent(params)),

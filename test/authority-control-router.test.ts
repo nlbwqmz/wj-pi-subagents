@@ -131,6 +131,13 @@ test("远程端口经请求相关器调用根权威并保留完整模板语义",
   const remote = new RemoteTreeAuthorityPort(A_ID, client);
   const actor = Object.freeze({ kind: "agent" as const, agent_id: A_ID });
 
+  const templates = expectSuccess(await remote.listTemplates(actor));
+  assert.deepEqual(templates, [{
+    template_id: "worker",
+    description: "受控模板",
+    tools: ["read"],
+  }]);
+  assert.doesNotMatch(JSON.stringify(templates), /source|body|model|thinking|context_files|subagents/);
   const resolved = expectSuccess(await remote.resolveTemplate(actor, "worker"));
   assert.equal(resolved.template.systemPromptMode, "replace");
   assert.equal(resolved.template.contextFiles, "disabled");
@@ -227,6 +234,11 @@ test("中间父只扩展 route，深层创建仍由同一个根权威分配身�
   const deepClient = new SupervisorControlClient(childLinks.child, 1_000);
   const remote = new RemoteTreeAuthorityPort(B_ID, deepClient);
   const actor = Object.freeze({ kind: "agent" as const, agent_id: B_ID });
+  assert.deepEqual(expectSuccess(await remote.listTemplates(actor)), [{
+    template_id: "worker",
+    description: "受控模板",
+    tools: ["read"],
+  }]);
   const resolved = expectSuccess(await remote.resolveTemplate(actor, "worker"));
   const c = expectSuccess(await remote.reserveChild(actor, {
     template_id: "worker",
@@ -242,6 +254,28 @@ test("中间父只扩展 route，深层创建仍由同一个根权威分配身�
   forwarder.close();
   upstream.close();
   rootServer.close();
+});
+
+test("远程模板目录解析拒绝额外配置字段", async () => {
+  const links = linkPair();
+  const server = new SupervisorControlServer(links.parent, async (request) => Object.freeze({
+    operation_id: request.operation_id,
+    ok: true as const,
+    data: Object.freeze([Object.freeze({
+      template_id: "worker",
+      tools: Object.freeze(["read"]),
+      body: "不得进入模型可见目录",
+    })]),
+  }));
+  const client = new SupervisorControlClient(links.child, 1_000);
+  const remote = new RemoteTreeAuthorityPort(A_ID, client);
+  const result = await remote.listTemplates(Object.freeze({ kind: "agent" as const, agent_id: A_ID }));
+
+  assert.equal(result.ok, false);
+  if (result.ok) throw new Error("预期拒绝越界模板目录");
+  assert.equal(result.error.code, "internal_error");
+  client.close();
+  server.close();
 });
 
 test("同一 operation_id 使用不同正文时父端固定为协议故障", async () => {

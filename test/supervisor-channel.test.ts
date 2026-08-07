@@ -408,6 +408,31 @@ test("内部控制请求与响应沿现有序号和 ACK 合法往返", () => {
   assert.deepEqual(acceptedResponse.outbound.map((frame) => frame.kind), ["ack"]);
 });
 
+test("模板目录查询作为只读控制操作合法往返", () => {
+  const pair = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+  });
+  handshake(pair);
+  const request = pair.child.publishControlRequest({
+    operation_id: "operation_templates_1",
+    operation: "list_templates",
+    route: [CHILD_ID],
+    body: {},
+  });
+  pair.child.send(request);
+  const accepted = pair.child.deliverNext();
+  assert.equal(accepted?.kind, "accepted");
+  if (accepted?.kind !== "accepted") return;
+  assert.deepEqual(accepted.control_request, {
+    operation_id: "operation_templates_1",
+    operation: "list_templates",
+    route: [CHILD_ID],
+    body: {},
+  });
+});
+
 test("控制请求拒绝空 route、非规范身份和跨分支伪造", () => {
   const pair = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,

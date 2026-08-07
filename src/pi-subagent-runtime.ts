@@ -214,6 +214,7 @@ function isRuntimeTransfer(value: unknown): value is RuntimeTransfer {
   if (!isRecord(value) || !isRecord(value.bindings)) return false;
   return isRecord(value.controller)
     && typeof value.controller.shutdown === "function"
+    && typeof value.controller.getAgentTemplates === "function"
     && typeof value.controller.updateTemplateSnapshot === "function"
     && isRecord(value.templates)
     && typeof value.templates.reload === "function"
@@ -224,6 +225,7 @@ function isRuntimeTransfer(value: unknown): value is RuntimeTransfer {
     && typeof value.isChild === "boolean"
     && typeof value.managementEnabled === "boolean"
     && isRecord(value.authority)
+    && typeof value.authority.listTemplates === "function"
     && typeof value.authority.resolveTemplate === "function"
     && (value.rootAuthority === undefined || isRecord(value.rootAuthority))
     && (value.upstream === undefined || (

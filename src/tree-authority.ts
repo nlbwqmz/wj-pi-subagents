@@ -10,9 +10,11 @@ import {
   type TreeController,
 } from "./tree-controller.ts";
 import type {
+  AgentTemplateListItem,
   TemplateDefinition,
   TemplateDiscoverySnapshot,
 } from "./template-discovery-snapshot.ts";
+import { listAgentTemplates } from "./template-discovery-snapshot.ts";
 
 /** 根权威返回的模板副本；正文只允许在受认证的创建控制请求中传输。 */
 export interface ResolvedTemplateGrant {
@@ -57,6 +59,9 @@ export interface ControlAdmission {
  * 则把同一调用沿受认证的直接父子监督链逐跳转发。
  */
 export interface TreeAuthorityPort {
+  listTemplates(
+    actor: TreeActor,
+  ): Promise<ControlResult<readonly AgentTemplateListItem[]>>;
   resolveTemplate(
     actor: TreeActor,
     templateId: string,
@@ -119,6 +124,15 @@ export class RootTreeAuthority implements TreeAuthorityPort {
 
   getTemplateRevision(): number {
     return this.templateRevision;
+  }
+
+  async listTemplates(
+    actor: TreeActor,
+  ): Promise<ControlResult<readonly AgentTemplateListItem[]>> {
+    const capability = this.tree.getManagementCapability(actor);
+    if (!capability.ok) return capability;
+    if (!capability.data.enabled) return controlFailure("template_capability_unavailable");
+    return success(listAgentTemplates(this.templateSnapshot));
   }
 
   async resolveTemplate(

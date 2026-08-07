@@ -11,7 +11,12 @@ import {
   type TreeActor,
   type TreeController,
 } from "./tree-controller.ts";
-import type { TemplateDefinition, TemplateDiscoverySnapshot } from "./template-discovery-snapshot.ts";
+import {
+  listAgentTemplates,
+  type AgentTemplateListItem,
+  type TemplateDefinition,
+  type TemplateDiscoverySnapshot,
+} from "./template-discovery-snapshot.ts";
 import type {
   AuthorityControlAction,
   SpawnGrant,
@@ -538,6 +543,16 @@ export class AgentController {
 
   getAgentTree(): ControlResult<ScopedAgentTreeSnapshot> {
     return this.tree.getTreeSnapshotFor(this.actor);
+  }
+
+  async getAgentTemplates(): Promise<ControlResult<readonly AgentTemplateListItem[]>> {
+    if (this.authority !== undefined) return this.authority.listTemplates(this.actor);
+    return Object.freeze({
+      ok: true,
+      data: this.templateSnapshot === undefined
+        ? Object.freeze([] as AgentTemplateListItem[])
+        : listAgentTemplates(this.templateSnapshot),
+    });
   }
 
   /** 根 reload 原子替换未来创建使用的目录，不回溯改变既有节点。 */

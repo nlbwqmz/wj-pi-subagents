@@ -79,7 +79,7 @@ npm 是未来规范发布渠道，正式版本使用 SemVer；`v<version>` git t
 
 ### 2.3 宿主兼容门禁
 
-**REQ-005**：扩展激活必须是全有或全无事务。在注册七个管理工具、`/agent`、widget、监督器或业务生命周期处理器之前，必须确认：
+**REQ-005**：扩展激活必须是全有或全无事务。在注册八个管理工具、`/agent`、widget、监督器或业务生命周期处理器之前，必须确认：
 
 1. Node 版本满足 `>=22.19.0`；
 2. Pi 版本满足 `>=0.83.0`；
@@ -159,7 +159,7 @@ Node 版本低到宿主 Pi 本身无法启动时，由 Node/Pi 既有启动路�
 | 字段 | 类型与默认值 | 规范语义 |
 | --- | --- | --- |
 | `tools` | 必填 YAML 字符串 | `""` 是唯一合法空工具集；非空值按逗号拆分、裁剪、丢弃空项、按首次顺序去重；规范化后为空无效 |
-| `description` | 可选字符串 | 裁剪后只作父代理展示元数据；空值等同无描述 |
+| `description` | 可选字符串 | 裁剪后只作父代理展示元数据，可由 `get_agent_templates` 返回；空值等同无描述 |
 | `subagents` | `inherit` 或 `disabled`，默认 `inherit` | `disabled` 对当前节点及所有后代关闭整组管理工具 |
 | `contextFiles` | `enabled` 或 `disabled`，默认 `enabled` | 只控制固定 `cwd` 祖先链的 `AGENTS.md`/`CLAUDE.md` |
 | `systemPromptMode` | `append` 或 `replace`，默认 `append` | 决定正文追加或替换项目与角色提示层 |
@@ -192,7 +192,7 @@ thinking: medium
 
 **REQ-014**：项目和用户候选具有相同 `template_id` 时，项目候选整体覆盖用户候选，不合并字段或正文。覆盖在有效性判断之前决定：无效项目候选仍遮蔽有效用户候选，显式创建返回 `template_invalid`；有效项目候选不因被遮蔽用户候选无效而失效。
 
-根必须独立读取和校验所有可信来源候选，包括最终被遮蔽者。有效候选进入有效模板目录；无效候选进入只含逻辑来源、文件名和安全短原因的诊断索引；来源无法枚举形成无 `template_id` 的来源诊断。
+根必须独立读取和校验所有可信来源候选，包括最终被遮蔽者。有效候选进入有效模板目录并成为 `get_agent_templates` 的唯一数据来源；无效候选进入只含逻辑来源、文件名和安全短原因的诊断索引；来源无法枚举形成无 `template_id` 的来源诊断。无效候选和来源诊断不得进入模型可见模板数组。
 
 没有选中候选时 `spawn_agent` 返回 `template_not_found`；选中候选无效时返回 `template_invalid`；无法归类的控制器故障才返回 `internal_error`。诊断不得保存或展示正文、绝对路径、环境、OS 异常或堆栈。
 
@@ -225,7 +225,7 @@ thinking: medium
 
 **REQ-017**：成功的根 `/reload` 必须原子更新模板发现快照和 Pi 动态业务资源，只影响未来创建；既有节点的模板正文、初始工具请求、模型选择、提示、生命周期和上下文不得回溯改变。运行期业务工具或资源变化不重新执行模板能力预检，不降级、终止或重建节点。
 
-树控制面是例外：reload 后必须按保存的身份、直接父关系、祖先 `subagents` 关闭状态和 `maxDepth` 重新施加七个管理工具的完整可见性。成功 reload 通过控制器交接保留代理树；若新扩展实例未通过宿主兼容门禁，旧控制器必须按终止语义清理全部子代理，不保留旧工具、widget、端点或孤儿进程，也不自动回退旧实例。
+树控制面是例外：reload 后必须按保存的身份、直接父关系、祖先 `subagents` 关闭状态和 `maxDepth` 重新施加八个管理工具的完整可见性。成功 reload 通过控制器交接保留代理树；根和后代的 `get_agent_templates` 必须通过根权威读取 reload 后的同一最新目录，不得继续使用子运行时的旧快照。若新扩展实例未通过宿主兼容门禁，旧控制器必须按终止语义清理全部子代理，不保留旧工具、widget、端点或孤儿进程，也不自动回退旧实例。
 
 ## 5. 能力、深度和资源配额
 
@@ -233,13 +233,13 @@ thinking: medium
 
 **REQ-018**：根深度固定为 `0`，每经过一条父子边深度加一。有效 `maxDepth` 是可创建的最大子代理层级。默认 `maxDepth=2` 时，根可创建 A（深度 1），A 可创建 A-1（深度 2），A-1 是叶节点。
 
-七个管理工具是不可拆分的“子代理管理能力”。一个节点只有同时满足以下条件才获得整组工具：
+八个管理工具是不可拆分的“子代理管理能力”。一个节点只有同时满足以下条件才获得整组工具：
 
 1. 直接父会话仍有该能力；
 2. 所有祖先模板均未以 `subagents: disabled` 关闭它；
 3. 当前节点 `depth < maxDepth`。
 
-任一条件不满足时整组隐藏，后代不能重新开启。服务端仍必须重复校验直接父权限和深度；绕过工具发现的创建请求返回 `max_depth_reached` 或相应授权错误。
+任一条件不满足时整组隐藏，后代不能重新开启。服务端仍必须重复校验直接父权限和深度；绕过工具发现的模板目录查询返回 `template_capability_unavailable`，创建请求返回 `max_depth_reached` 或相应授权错误。
 
 ### 5.2 名额占用与释放
 
@@ -317,11 +317,11 @@ Pi `get_state` 只可用于启动同步、事件缺口后的异常重同步和�
 
 **REQ-024**：公开工具固定为：
 
-`spawn_agent`、`send_message`、`wait_agent`、`interrupt_agent`、`terminate_agent`、`get_agent_status`、`get_agent_tree`。
+`get_agent_templates`、`spawn_agent`、`send_message`、`wait_agent`、`interrupt_agent`、`terminate_agent`、`get_agent_status`、`get_agent_tree`。
 
 不提供多模式 `subagent` 工具，也不提供 `report_progress` 或 `send_parent_message`。所有定向工具使用根会话内唯一、终止后不复用的 UUID `agent_id`；控制器新分配的值使用随机 UUID v4，所有传输文本必须符合 RFC 9562 canonical 小写格式（`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`），不带 `agent_` 前缀。展示名称不能寻址，也不能从标识推断树结构。任何 `agent_id` 参数若不是 canonical UUID 文本，必须返回 `invalid_argument`；格式正确但不在当前根注册表中的值返回 `agent_not_found`。
 
-成功结果统一为：
+除 `get_agent_templates` 的直接数组结果外，成功结果统一为：
 
 ```json
 { "ok": true, "data": {} }
@@ -343,6 +343,30 @@ Pi `get_state` 只可用于启动同步、事件缺口后的异常重同步和�
 
 调用方只依赖 `code` 和 `retryable`；`message` 和 `details` 结构不稳定，但不得泄露正文、绝对路径、环境、凭据、端点、进程句柄或堆栈。
 
+### 6.4.1 `get_agent_templates`
+
+输入只允许空对象 `{}`。成功正文直接是 JSON 数组，不套用 `{ "ok": true, "data": ... }` 外壳。没有格式有效模板时返回：
+
+```json
+[]
+```
+
+非空结果示例：
+
+```json
+[
+  {
+    "template_id": "Explore",
+    "description": "Fast codebase exploration agent (read-only)",
+    "tools": ["read", "bash", "grep", "find", "ls"]
+  }
+]
+```
+
+每项字段闭集为区分大小写的 `template_id`、可选 `description` 和始终存在的 `tools`。没有描述时省略 `description`；合法空工具模板返回 `tools: []`。`tools` 只包含模板声明并已规范化的业务工具，不得混入八个管理工具。结果不得包含模板正文、来源、model、thinking、`subagents`、`contextFiles`、路径、诊断或其他运行配置；无效候选与来源诊断不得枚举。失败仍使用本节统一错误契约。
+
+数组只表示根权威当前发现且格式有效的模板，不执行调用者当前业务工具、模型、thinking 或管理权限的完整创建预检。非空项仍可能在 `spawn_agent` 返回 `template_capability_unavailable`。根 `/reload` 后，根和所有后代查询必须立即读取根权威发布的同一最新目录。
+
 ### 6.5 `spawn_agent`
 
 **REQ-025**：输入只允许必填 `template_id` 和 `name`：
@@ -352,6 +376,8 @@ Pi `get_state` 只可用于启动同步、事件缺口后的异常重同步和�
 ```
 
 不得携带首条任务，也不得覆盖 cwd、环境、模型、thinking、工具、扩展、技能、提示、信任、深度或配额。首条任务必须另行调用 `send_message`。
+
+模型调用前必须先调用 `get_agent_templates`，并原样复制当前返回项的 `template_id`。标识区分大小写，不得猜测、裁剪、改写、做 Unicode 归一化或使用 `description` 代替。若目录返回 `[]`，不得调用 `spawn_agent`；非空目录不替代本次创建预检。
 
 创建顺序为：静态模板/能力预检，原子预留与登记，进程树监督绑定，子进程启动，父子监督握手与首个快照，无副作用 Pi RPC 请求/响应，最后进入 `idle`。成功最小结果：
 
@@ -730,7 +756,7 @@ Windows 执行两个锁定宿主组合：
 **REQ-049**：实现必须提供以下五层自动化测试，且不依赖外部模型网络、API key 或人工交互：
 
 1. **纯逻辑测试**：状态机、配额、配置、模板、树合并、seq/ACK/重同步、脱敏；使用 fake 和可控单调时钟覆盖竞态。
-2. **Pi 契约测试**：加载真实扩展入口和 Pi `RpcClient`，验证七工具 schema、错误外壳、事件映射、reload 与 UI-only 边界。
+2. **Pi 契约测试**：加载真实扩展入口和 Pi `RpcClient`，验证八工具 schema、`get_agent_templates` 直接数组例外、其余成功外壳、错误外壳、事件映射、reload 与 UI-only 边界。
 3. **原生进程集成测试**：启动真实 `pi --mode rpc --no-session`，使用确定性本地假模型/提供者，验证创建、steering、中断、故障和整树回收。
 4. **TUI 交互测试**：验证直接子代理 widget、`/agent` 遮罩、滚动/展开/关闭、稳定尺寸和 UI-only 通知。
 5. **本地 package 测试**：验证本地包目录或本地构建包的 manifest、生产依赖、临时加载和隔离的本地持久安装形态。
@@ -743,26 +769,27 @@ Windows 执行两个锁定宿主组合：
 
 **REQ-050**：以下旅程必须在 Windows 乘两个宿主组合的两个 job 中全部执行；macOS/Linux 只保留代码、类型、纯逻辑和 fake 测试，不在本里程碑执行原生旅程：
 
-1. 加载扩展并发现合法模板，根创建 A；只有双握手后才以 `idle` 成功。
+1. 加载扩展并发现合法模板，根先通过 `get_agent_templates` 获得安全目录、精确复制 `template_id` 再创建 A；只有双握手后才以 `idle` 成功。
 2. 向空闲 A 发送任务，接收直接回复并等待 settled；再次发送可观察同一节点上下文延续。
 3. A 工作时再次发送，验证 steering 被接受而不是独立后续任务。
-4. A 创建 A-1 到默认深度 2；A-1 不可见管理工具，绕过发现创建仍返回 `max_depth_reached`。
+4. A 查询到与根权威一致的模板目录并创建 A-1 到默认深度 2；A-1 不可见八个管理工具，绕过发现查询返回 `template_capability_unavailable`，绕过发现创建仍返回 `max_depth_reached`。
 5. 根能只读看整树但不能越级控制 A-1；A 只能看自身子树并直接控制 A-1；revision、pending 和父关系一致。
 6. 创建兄弟节点并行处理，验证不同节点并行、同节点命令串行。
 7. 中断工作节点，等 `agent_settled` 回 idle 后再次复用。
 8. 终止 A，验证 A-1 后代优先、整树资源确认、幂等终止和两类名额释放。
-9. 成功根 `/reload` 后，新模板快照只影响未来创建，既有节点和 UI 状态保持一致。
+9. 成功根 `/reload` 后，根和 A 的模板查询立即看到同一新目录；新模板快照只影响未来创建，既有节点和 UI 状态保持一致。
 
 ### 10.4 负向、安全与资源正确性
 
 **REQ-051**：负向矩阵至少必须覆盖：
 
 - 公开闭集中每个工具错误码至少一个场景，核对 `retryable`、安全 details 和无副作用；
-- 参数错误（包括非 canonical UUID 的 `agent_id`）、格式正确但未注册的 UUID、非直接子代理、模板不存在/无效/能力不足、深度/直接/全树配额耗尽；
+- 参数错误（包括 `get_agent_templates` 多余参数和非 canonical UUID 的 `agent_id`）、格式正确但未注册的 UUID、非直接子代理、模板不存在/无效/能力不足、深度/直接/全树配额耗尽；
 - 配置不可读、坏 JSON、非法值、未知字段 UI-only 默认回退，以及非法显式根参数拒绝启动；
 - 启动超时/提前退出、RPC 断开、消息接受状态未知、中断-settle 竞态、屏障后迟到事件、部分级联失败、中间父故障和根关闭；
 - 重复帧、断序、旧 revision、旧/非法 stream、损坏快照、ACK 丢失、reset 快照和回复去重；
-- 未信任项目资源不加载、模板不能扩权、叶节点不能绕过深度、根不能越级控制；
+- 模板目录为空时直接返回 `[]`，无效候选和来源诊断不枚举，非空项字段闭合且不泄露运行配置，模板业务 `tools` 不混入八个管理工具；
+- 未信任项目资源不加载、模板不能扩权、叶节点不能绕过管理能力和深度、根不能越级控制；
 - cwd 外路径仍按 Pi 正常工具能力处理，证明扩展没有误实现 cwd 沙箱；
 - 以秘密 canary 注入 prompt、路径、环境、工具参数/结果、连接凭据和堆栈，证明 widget、`/agent`、状态/树、错误、UI 通知、监督帧和 UI-only 诊断不泄露，也不进入模型上下文；
 - Windows 真实验证显式终止、根关闭和 reload 激活失败后没有存活的被监督后代；macOS/Linux 对应原生场景记为延期，不得以 skip 或 mock 标记为已通过。
@@ -799,11 +826,11 @@ Windows 执行两个锁定宿主组合：
 | `AC-003` | 原子宿主兼容门禁 | 版本/API/平台缺失时零公开面、UI-only 诊断、宿主继续运行 |
 | `AC-004` | 配置优先级 | 根参数、可信项目、用户、默认按字段解析且根值固定 |
 | `AC-005` | 配置错误诊断 | 文件/JSON/值错误用默认且不下退；未知字段忽略；非法根参数拒绝 |
-| `AC-006` | 模板发现与身份 | 双来源直属 Markdown、project trust、文件名 ID、符号链接和来源故障 |
+| `AC-006` | 模板发现与身份 | 双来源直属 Markdown、project trust、文件名 ID、符号链接、来源故障和安全模板目录数组 |
 | `AC-007` | 模板 schema | 空正文、逗号 tools 规范化、枚举、model/thinking、未知字段静默忽略 |
-| `AC-008` | 覆盖、诊断和模板 reload | 无效项目遮蔽用户；诊断 UI-only；新快照只影响未来创建 |
+| `AC-008` | 覆盖、诊断和模板 reload | 无效项目遮蔽用户；诊断 UI-only；根与后代查询 reload 后同一新目录；新快照只影响未来创建 |
 | `AC-009` | 创建能力与上下文继承 | 工具缺一即拒绝；精确模型/thinking；prompt mode、contextFiles、资源继承 |
-| `AC-010` | 深度、管理工具和配额 | 默认两级；祖先 disabled 衰减；直接/全树原子预留和回收释放 |
+| `AC-010` | 深度、管理工具和配额 | 默认两级；八工具整体隐藏；祖先 disabled 衰减；查询/创建服务端复核；直接/全树原子预留和回收释放 |
 | `AC-011` | 七态、pending、revision | 所有合法/非法转换、迟到事件守卫、计数与修订单调 |
 | `AC-012` | 创建成功与失败回滚 | 创建生成 canonical UUID v4；双握手后 idle；启动错误/超时；清理完整与不完整两条返回路径 |
 | `AC-013` | 任务、steering 与回复 | 空闲 prompt、工作 steer、交付未知不重发、直接回复顺序和 ACK |

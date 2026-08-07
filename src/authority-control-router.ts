@@ -19,6 +19,7 @@ import type {
   TreeAuthorityPort,
 } from "./tree-authority.ts";
 import type {
+  AgentTemplateListItem,
   TemplateDefinition,
   TemplateThinkingLevel,
 } from "./template-discovery-snapshot.ts";
@@ -227,6 +228,16 @@ export function createRootAuthorityControlHandler(
     if (!isCanonicalUuid(actorId)) return failureResponse(request.operation_id, "invalid_argument");
     const actor = Object.freeze({ kind: "agent" as const, agent_id: actorId });
     switch (request.operation) {
+      case "list_templates": {
+        if (exactRecord(request.body, []) === undefined) {
+          return failureResponse(request.operation_id, "invalid_argument");
+        }
+        return resultResponse(
+          request.operation_id,
+          await authority.listTemplates(actor),
+          templateListToJson,
+        );
+      }
       case "resolve_template": {
         const body = exactRecord(request.body, ["template_id"]);
         if (body === undefined || typeof body.template_id !== "string") {
@@ -285,6 +296,11 @@ export class RemoteTreeAuthorityPort implements TreeAuthorityPort {
     if (!isCanonicalUuid(localAgentId)) throw new TypeError("本地代理标识无效");
     this.localAgentId = localAgentId;
     this.client = client;
+  }
+
+  async listTemplates(actor: TreeActor): Promise<ControlResult<readonly AgentTemplateListItem[]>> {
+    if (!this.sameActor(actor)) return controlFailure("agent_unavailable");
+    return this.call("list_templates", {}, parseTemplateList);
   }
 
   async resolveTemplate(actor: TreeActor, templateId: string): Promise<ControlResult<ResolvedTemplateGrant>> {
@@ -372,6 +388,14 @@ function resultResponse<T>(
     : Object.freeze({ operation_id: operationId, ok: false, error: result.error });
 }
 
+function templateListToJson(value: readonly AgentTemplateListItem[]): SupervisorJsonValue {
+  return Object.freeze(value.map((item) => Object.freeze({
+    template_id: item.template_id,
+    ...(item.description === undefined ? {} : { description: item.description }),
+    tools: Object.freeze([...item.tools]),
+  })));
+}
+
 function resolvedTemplateToJson(value: ResolvedTemplateGrant): SupervisorJsonValue {
   return Object.freeze({
     template: templateToJson(value.template),
@@ -443,6 +467,29 @@ function parseResolvedTemplateGrant(value: SupervisorJsonValue): ResolvedTemplat
     template: parsedTemplate,
     template_revision: record.template_revision as number,
   });
+}
+
+function parseTemplateList(value: SupervisorJsonValue): readonly AgentTemplateListItem[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const templates: AgentTemplateListItem[] = [];
+  for (const item of value) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) return undefined;
+    const record = item as Record<string, unknown>;
+    const allowed = ["template_id", "description", "tools"];
+    if (
+      Object.keys(record).some((key) => !allowed.includes(key))
+      || typeof record.template_id !== "string"
+      || (record.description !== undefined && typeof record.description !== "string")
+      || !Array.isArray(record.tools)
+      || record.tools.some((tool) => typeof tool !== "string")
+    ) return undefined;
+    templates.push(Object.freeze({
+      template_id: record.template_id,
+      ...(record.description === undefined ? {} : { description: record.description as string }),
+      tools: Object.freeze([...(record.tools as string[])]),
+    }));
+  }
+  return Object.freeze(templates);
 }
 
 function parseTemplate(value: unknown): TemplateDefinition | undefined {
