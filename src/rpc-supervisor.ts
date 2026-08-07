@@ -409,6 +409,14 @@ export type RpcSupervisorInterruptResult =
     };
 
 export type RpcSupervisorTerminationResult =
+  /** 监督器物理资源已确认，但树屏障尚待外层权威提交。 */
+  | {
+      readonly ok: true;
+      readonly agent_id: string;
+      readonly state: "terminating";
+      readonly cleanup: "confirmed";
+      readonly tree_confirmation: "pending";
+    }
   | {
       readonly ok: true;
       readonly agent_id: string;
@@ -534,6 +542,7 @@ export class RpcSupervisor {
   private nodeHandleReleased = false;
   private channelHandleReleased = false;
   private forcedTerminationUsed = false;
+  private treeConfirmationPending = false;
 
   constructor(options: RpcSupervisorOptions) {
     if (!validDuration(options.startupTimeoutMs) || !validDuration(options.gracefulShutdownMs)) {
@@ -1111,11 +1120,20 @@ export class RpcSupervisor {
   private async runTermination(): Promise<RpcSupervisorTerminationResult> {
     const cleanup = await this.cleanupResources(true, true);
     if (cleanup === "confirmed" && this.agentId !== undefined) {
+      if (this.treeConfirmationPending) {
+        return Object.freeze({
+          ok: true,
+          agent_id: this.agentId,
+          state: "terminating" as const,
+          cleanup: "confirmed" as const,
+          tree_confirmation: "pending" as const,
+        });
+      }
       return Object.freeze({
         ok: true,
         agent_id: this.agentId,
-        state: "terminated",
-        cleanup: "confirmed",
+        state: "terminated" as const,
+        cleanup: "confirmed" as const,
       });
     }
     return Object.freeze({
@@ -1244,8 +1262,8 @@ export class RpcSupervisor {
     }
     const confirmation = this.applyLifecycle({ type: "resources_confirmed" });
     if (confirmation.node.state !== "terminated") {
-      this.applyLifecycle({ type: "termination_incomplete" });
-      return "incomplete";
+      // 物理资源已经确认；固定屏障的整树提交由外层权威完成。
+      this.treeConfirmationPending = true;
     }
     this.phase = "terminated";
     this.unsubscribeDependencies();

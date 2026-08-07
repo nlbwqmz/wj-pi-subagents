@@ -24,3 +24,5 @@ Status: resolved
 - 2026-08-06：最终验证为 `npm run typecheck` 通过；`npm test` 共 200 项，195 通过、0 失败、5 项因当前平台为 Windows 而跳过的 Unix 原生测试；`git diff --check` 通过。纯逻辑、内存 fake 和监督协议测试覆盖树权威、能力衰减、快照裁剪、递归终止、故障及 reload。生产 bridge 成功旅程使用不会访问网络或模型的 fake `RpcClient`，但实际运行生产 bridge、Windows 本地 IPC、父/子监督协议、回复 ACK 与端点清理；它是 fake/协议集成，不是实际 Pi 或模型旅程。本机 5 项 Windows Job Object 原生测试实际运行通过，验证启动前归属、失败回滚、孙进程整树回收、优雅超时升级与未确认资源语义；这仍不等同于真实 Pi、真实模型和 Job Object 的完整组合旅程。
 
 - 2026-08-06：第二轮双轴复审结果为 Spec 0 项发现；Standards 发现 1 项运行时职责发散判断项，已通过抽取 reload 交接协调模块修复并重新完成全量门禁。静态核查未发现调试标记、旧跨控制器注册表、伪回复命令、树控制兼容别名或生产伪 child 端点；系统临时目录无 `pi-subagent-local-*`、测试日志、调试缓存或 loader 中间产物残留。真实 Windows + Pi + 模型 + Job Object 组合继续由人工验证，未将其记录为自动测试通过。
+
+- 2026-08-07：根据真实会话尾部的递归终止失败记录补齐回归：单节点监督器把“物理资源已确认、整树权威尚待提交”与真实 `termination_incomplete` 分离，`AgentController` 随后按固定屏障批量确认父节点及后代，避免父等子、外层又等监督器成功的循环依赖。同步修复 shutdown 与 in-flight spawn 的登记竞态，关闭开始后拒绝新创建并等待已接纳创建进入可回收集合。另按 Pi 真实 `session_shutdown(reload) -> oldRunner.invalidate() -> 新扩展加载` 顺序修正跨实例 reload：有界 transfer 同时发布到进程级共享 lease 注册表，不再依赖会被 invalidate 自动撤销的旧 EventBus 订阅；测试显式模拟旧 API 失效、递归 root/child 交接和 watchdog 清理。

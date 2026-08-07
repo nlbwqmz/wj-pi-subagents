@@ -968,7 +968,7 @@ test("终止屏障取消未写命令、抢占活动 RPC、合并并发终止并�
   if (status.ok) assert.equal(status.data.state, "terminated");
 });
 
-test("直接后代尚未终止时不把本节点资源确认误报为终止成功", async () => {
+test("终止目标物理资源确认后等待外层批量提交固定屏障", async () => {
   const tree = createController();
   const managedNode = new TestManagedRpcNode(new FakeRpcClient(), new FakeProcessTreeAdapter());
   const supervisor = new RpcSupervisor({
@@ -986,41 +986,30 @@ test("直接后代尚未终止时不把本节点资源确认误报为终止成�
     { templateId: "researcher", name: "后代" },
   );
   assert.equal(child.ok, true);
-
-  assert.deepEqual(await supervisor.terminate(), {
-    ok: false,
-    agent_id: FIRST_AGENT_ID,
-    code: "termination_incomplete",
-    state: "terminating",
-    cleanup: "incomplete",
-  });
-  let parentStatus = tree.getStatus(FIRST_AGENT_ID);
-  assert.equal(parentStatus.ok, true);
-  if (parentStatus.ok) assert.equal(parentStatus.data.state, "terminating");
-
-  if (!child.ok) throw new Error("测试后代预留失败");
-  const childFailed = tree.applyLifecycleEvent(child.data.node.agent_id, {
-    type: "startup_failed",
-    error_code: "spawn_failed",
-    expected_generation: child.data.lifecycle_generation,
-  });
-  assert.equal(childFailed.ok, true);
-  if (!childFailed.ok) throw new Error("测试后代启动失败事件未生效");
-  const childTerminated = tree.applyLifecycleEvent(child.data.node.agent_id, {
-    type: "resources_confirmed",
-    expected_generation: childFailed.data.lifecycle_generation,
-  });
-  assert.equal(childTerminated.ok, true);
+  const barrier = tree.beginTerminationBarrier(ROOT_TREE_ACTOR, FIRST_AGENT_ID);
+  assert.equal(barrier.ok, true);
 
   assert.deepEqual(await supervisor.terminate(), {
     ok: true,
     agent_id: FIRST_AGENT_ID,
-    state: "terminated",
+    state: "terminating",
     cleanup: "confirmed",
+    tree_confirmation: "pending",
   });
-  parentStatus = tree.getStatus(FIRST_AGENT_ID);
+  const parentStatus = tree.getStatus(FIRST_AGENT_ID);
   assert.equal(parentStatus.ok, true);
-  if (parentStatus.ok) assert.equal(parentStatus.data.state, "terminated");
+  if (parentStatus.ok) assert.equal(parentStatus.data.state, "terminating");
+  if (!child.ok) throw new Error("测试后代预留失败");
+  const childStatus = tree.getStatus(child.data.node.agent_id);
+  assert.equal(childStatus.ok, true);
+  if (childStatus.ok) assert.equal(childStatus.data.state, "terminating");
+
+  const confirmed = tree.confirmTerminationBarrierResources(FIRST_AGENT_ID);
+  assert.equal(confirmed.ok, true);
+  if (confirmed.ok) assert.equal(confirmed.data.node.state, "terminated");
+  const confirmedChild = tree.getStatus(child.data.node.agent_id);
+  assert.equal(confirmedChild.ok, true);
+  if (confirmedChild.ok) assert.equal(confirmedChild.data.state, "terminated");
 });
 
 test("关闭请求不返回时仍在内部期限后强制回收并结束等待", async () => {

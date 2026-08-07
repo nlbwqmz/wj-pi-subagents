@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 
 const RELOAD_LEASE_REQUEST_CHANNEL = "pi-subagent/runtime/reload/request/v1";
+const SHARED_RELOAD_LEASE_REGISTRY = Symbol.for("pi-subagents-wj/runtime-reload-leases/v1");
+const SHARED_RELOAD_LEASE_REGISTRY_VERSION = 1;
 const DEFAULT_RELOAD_LEASE_TIMEOUT_MS = 5_000;
 
 export interface RuntimeReloadEventBus {
@@ -49,6 +51,17 @@ interface PendingRuntimeReloadLease<TRuntime, TTransfer> {
   readonly runtime: TRuntime;
   readonly transfer: TTransfer;
   timer: ReturnType<typeof setTimeout> | undefined;
+  sharedLeaseId: string | undefined;
+}
+
+interface SharedRuntimeReloadLease {
+  readonly identity: RuntimeReloadIdentity;
+  claim(identity: RuntimeReloadIdentity, accept: (transfer: unknown) => boolean): boolean;
+}
+
+interface SharedRuntimeReloadLeaseRegistry {
+  readonly version: typeof SHARED_RELOAD_LEASE_REGISTRY_VERSION;
+  readonly leases: Map<string, SharedRuntimeReloadLease>;
 }
 
 interface MutableIncomingRuntimeReloadLease<TRuntime> extends IncomingRuntimeReloadLease<TRuntime> {
@@ -58,8 +71,9 @@ interface MutableIncomingRuntimeReloadLease<TRuntime> extends IncomingRuntimeRel
 }
 
 /**
- * 在真正隔离的扩展模块实例之间交接同一运行时。协调器只拥有 lease 状态和
- * EventBus 订阅；代理树、监督通道及清理裁决仍由调用方提供的运行时操作负责。
+ * 在真正隔离的扩展模块实例之间交接同一运行时。EventBus 提供同一 runner
+ * 内的快路径，进程级共享 lease 覆盖旧 runner invalidate 后的跨实例认领；
+ * 代理树、监督通道及清理裁决仍由调用方提供的运行时操作负责。
  */
 export class RuntimeReloadCoordinator<TRuntime, TTransfer> {
   private readonly options: RuntimeReloadCoordinatorOptions<TRuntime, TTransfer>;
@@ -74,7 +88,8 @@ export class RuntimeReloadCoordinator<TRuntime, TTransfer> {
     this.eventBus = options.eventBus;
     this.timeoutMs = validateRuntimeReloadLeaseTimeout(options.timeoutMs);
     if (this.eventBus === undefined) return;
-    this.requestIncoming(options.activationIdentity);
+    this.claimSharedIncoming(options.activationIdentity);
+    if (this.incoming === undefined) this.requestIncoming(options.activationIdentity);
     this.subscribe();
   }
 
@@ -87,10 +102,13 @@ export class RuntimeReloadCoordinator<TRuntime, TTransfer> {
       runtime,
       transfer: this.options.createTransfer(runtime),
       timer: undefined,
+      sharedLeaseId: undefined,
     };
+    this.outgoing = lease;
+    this.publishSharedOutgoing(lease);
     const timer = setTimeout(() => {
       if (this.outgoing !== lease || this.options.getActive() !== runtime) return;
-      this.outgoing = undefined;
+      this.clearOutgoing(lease);
       this.options.setHandoffPending(runtime, false);
       void this.options.cleanup(runtime).then((complete) => {
         if (!complete) return;
@@ -103,7 +121,6 @@ export class RuntimeReloadCoordinator<TRuntime, TTransfer> {
     }, this.timeoutMs);
     timer.unref?.();
     lease.timer = timer;
-    this.outgoing = lease;
     return true;
   }
 
@@ -178,6 +195,64 @@ export class RuntimeReloadCoordinator<TRuntime, TTransfer> {
     this.options.release(runtime);
   }
 
+  private claimSharedIncoming(identity: RuntimeReloadIdentity): void {
+    const registry = sharedReloadLeaseRegistry();
+    const candidates = [...registry.leases.entries()].filter(([, lease]) =>
+      sameIdentity(lease.identity, identity));
+    if (candidates.length !== 1) return;
+    const [leaseId, lease] = candidates[0]!;
+    if (lease.claim(identity, (transfer) => this.acceptIncoming(transfer, identity))) {
+      registry.leases.delete(leaseId);
+    }
+  }
+
+  private acceptIncoming(value: unknown, identity: RuntimeReloadIdentity): boolean {
+    if (this.incoming !== undefined || !this.options.isTransfer(value)) return false;
+    if (!sameIdentity(this.options.identityOfTransfer(value), identity)) return false;
+    let runtime: TRuntime;
+    try {
+      runtime = this.options.restoreTransfer(value);
+    } catch {
+      return false;
+    }
+    const lease: MutableIncomingRuntimeReloadLease<TRuntime> = {
+      runtime,
+      timer: undefined,
+      cleanup: undefined,
+      expired: false,
+    };
+    const timer = setTimeout(() => {
+      if (this.incoming !== lease || this.options.getActive() === runtime) return;
+      void this.cleanupIncoming(lease);
+    }, this.timeoutMs);
+    timer.unref?.();
+    lease.timer = timer;
+    this.incoming = lease;
+    return true;
+  }
+
+  private publishSharedOutgoing(lease: PendingRuntimeReloadLease<TRuntime, TTransfer>): void {
+    const leaseId = randomUUID();
+    lease.sharedLeaseId = leaseId;
+    const identity = Object.freeze({ ...this.options.identityOfRuntime(lease.runtime) });
+    sharedReloadLeaseRegistry().leases.set(leaseId, Object.freeze({
+      identity,
+      claim: (
+        candidate: RuntimeReloadIdentity,
+        accept: (transfer: unknown) => boolean,
+      ): boolean => {
+        const active = this.options.getActive();
+        if (this.outgoing !== lease || active !== lease.runtime) return false;
+        if (!sameIdentity(identity, candidate) || !accept(lease.transfer)) return false;
+        this.clearOutgoing(lease);
+        this.options.setActive(undefined);
+        this.options.relinquish(lease.runtime);
+        this.unsubscribe();
+        return true;
+      },
+    }));
+  }
+
   private requestIncoming(identity: RuntimeReloadIdentity): void {
     const eventBus = this.eventBus;
     if (eventBus === undefined) return;
@@ -186,25 +261,7 @@ export class RuntimeReloadCoordinator<TRuntime, TTransfer> {
       kind: "pi-subagent-reload-lease-request" as const,
       requestId: randomUUID(),
       identity: Object.freeze({ ...identity }),
-      claim: (value: unknown): boolean => {
-        if (!accepting || this.incoming !== undefined || !this.options.isTransfer(value)) return false;
-        if (!sameIdentity(this.options.identityOfTransfer(value), identity)) return false;
-        const runtime = this.options.restoreTransfer(value);
-        const lease: MutableIncomingRuntimeReloadLease<TRuntime> = {
-          runtime,
-          timer: undefined,
-          cleanup: undefined,
-          expired: false,
-        };
-        const timer = setTimeout(() => {
-          if (this.incoming !== lease || this.options.getActive() === runtime) return;
-          void this.cleanupIncoming(lease);
-        }, this.timeoutMs);
-        timer.unref?.();
-        lease.timer = timer;
-        this.incoming = lease;
-        return true;
-      },
+      claim: (value: unknown): boolean => accepting && this.acceptIncoming(value, identity),
     });
     try {
       eventBus.emit(RELOAD_LEASE_REQUEST_CHANNEL, request);
@@ -239,6 +296,10 @@ export class RuntimeReloadCoordinator<TRuntime, TTransfer> {
   private clearOutgoing(lease: PendingRuntimeReloadLease<TRuntime, TTransfer>): void {
     if (lease.timer !== undefined) clearTimeout(lease.timer);
     lease.timer = undefined;
+    if (lease.sharedLeaseId !== undefined) {
+      sharedReloadLeaseRegistry().leases.delete(lease.sharedLeaseId);
+      lease.sharedLeaseId = undefined;
+    }
     if (this.outgoing === lease) this.outgoing = undefined;
   }
 
@@ -251,6 +312,28 @@ export class RuntimeReloadCoordinator<TRuntime, TTransfer> {
       // EventBus 退订失败不能恢复已经交接或完成清理的运行时所有权。
     }
   }
+}
+
+interface GlobalSymbolStore {
+  [key: symbol]: unknown;
+}
+
+function sharedReloadLeaseRegistry(): SharedRuntimeReloadLeaseRegistry {
+  const store = globalThis as unknown as GlobalSymbolStore;
+  const current = store[SHARED_RELOAD_LEASE_REGISTRY];
+  if (
+    isRecord(current)
+    && current.version === SHARED_RELOAD_LEASE_REGISTRY_VERSION
+    && current.leases instanceof Map
+  ) {
+    return current as unknown as SharedRuntimeReloadLeaseRegistry;
+  }
+  const created: SharedRuntimeReloadLeaseRegistry = Object.freeze({
+    version: SHARED_RELOAD_LEASE_REGISTRY_VERSION,
+    leases: new Map<string, SharedRuntimeReloadLease>(),
+  });
+  store[SHARED_RELOAD_LEASE_REGISTRY] = created;
+  return created;
 }
 
 export function readRuntimeReloadEventBus(candidate: unknown): RuntimeReloadEventBus | undefined {

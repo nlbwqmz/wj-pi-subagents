@@ -185,7 +185,9 @@ export class AgentController {
   private readonly confirmedWithoutOwnership = new Set<string>();
   private readonly terminationFlows = new Map<string, Promise<ControlResult<TerminateAgentData>>>();
   private readonly orphanCleanupFlows = new Map<string, Promise<void>>();
+  private readonly spawnFlows = new Set<Promise<void>>();
   private shutdownFlow: Promise<boolean> | undefined;
+  private shutdownRequested = false;
   private disposed = false;
 
   constructor(options: AgentControllerOptions) {
@@ -203,6 +205,19 @@ export class AgentController {
   }
 
   async spawnAgent(input: SpawnAgentInput | unknown): Promise<ControlResult<SpawnAgentData>> {
+    if (this.shutdownRequested || this.disposed) return controlFailure("agent_unavailable");
+    let finish!: () => void;
+    const tracked = new Promise<void>((resolve) => { finish = resolve; });
+    this.spawnFlows.add(tracked);
+    try {
+      return await this.performSpawnAgent(input);
+    } finally {
+      finish();
+      this.spawnFlows.delete(tracked);
+    }
+  }
+
+  private async performSpawnAgent(input: SpawnAgentInput | unknown): Promise<ControlResult<SpawnAgentData>> {
     if (!isSpawnInput(input)) return controlFailure("invalid_argument");
     let template: TemplateDefinition | undefined;
     let templateRevision: number | undefined;
@@ -510,6 +525,11 @@ export class AgentController {
   private confirmTreeResources(agentId: string): boolean {
     const status = this.tree.getStatus(agentId);
     if (!status.ok || status.data.state === "terminated") return false;
+    const barrier = this.tree.getTerminationBarrier(agentId);
+    if (barrier.ok && barrier.data.agent_id === agentId) {
+      const confirmation = this.tree.confirmTerminationBarrierResources(agentId);
+      return confirmation.ok && confirmation.data.node.state === "terminated";
+    }
     const generation = this.tree.getLifecycleGeneration(agentId);
     if (!generation.ok) return false;
     const result = this.tree.applyLifecycleEvent(agentId, {
@@ -590,6 +610,7 @@ export class AgentController {
 
   private async beginShutdown(parentBarrierEstablished: boolean): Promise<boolean> {
     if (this.disposed) return true;
+    this.shutdownRequested = true;
     const existing = this.shutdownFlow;
     if (existing !== undefined) return existing;
     const flow = this.performShutdown(parentBarrierEstablished);
@@ -602,6 +623,7 @@ export class AgentController {
   }
 
   private async performShutdown(parentBarrierEstablished: boolean): Promise<boolean> {
+    await Promise.allSettled([...this.spawnFlows]);
     const assignedIds = [...this.agents.keys()];
     const unassigned = [...this.unassignedSupervisors.entries()];
     await Promise.allSettled(assignedIds.map((agentId) => parentBarrierEstablished
@@ -639,6 +661,7 @@ export class AgentController {
 
   dispose(): void {
     if (this.disposed) return;
+    this.shutdownRequested = true;
     this.disposed = true;
     this.unsubscribeTreeChange?.();
     this.unsubscribeTreeChange = undefined;

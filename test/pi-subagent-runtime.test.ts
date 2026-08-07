@@ -224,10 +224,26 @@ class FakeExtensionApi {
   readonly sentMessages: Array<{ message: unknown; options: unknown }> = [];
   readonly activeToolHistory: string[][] = [];
   activeTools = ["read", "grep"];
-  readonly events: FakeEventBus;
+  readonly events: Pick<FakeEventBus, "emit" | "on">;
+  private readonly eventUnsubscribers = new Set<() => void>();
 
-  constructor(events = new FakeEventBus()) {
-    this.events = events;
+  constructor(eventBus = new FakeEventBus()) {
+    this.events = {
+      emit: (channel, value) => eventBus.emit(channel, value),
+      on: (channel, handler) => {
+        const unsubscribe = eventBus.on(channel, handler);
+        const tracked = (): void => {
+          if (!this.eventUnsubscribers.delete(tracked)) return;
+          unsubscribe();
+        };
+        this.eventUnsubscribers.add(tracked);
+        return tracked;
+      },
+    };
+  }
+
+  invalidate(): void {
+    for (const unsubscribe of [...this.eventUnsubscribers]) unsubscribe();
   }
 
   on(event: string, handler: (event: unknown, context: unknown) => unknown): void {
@@ -966,14 +982,32 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   const rootTree = rootController.getAgentTree();
   assert.equal(rootTree.ok, true);
   if (rootTree.ok) {
-    assert.deepEqual(rootTree.data.nodes.map((node) => [node.agent_id, node.depth, node.parent_agent_id]), [
-      [parentId, 1, null],
-      [grandchildId, 2, parentId],
+    assert.deepEqual(rootTree.data.nodes.map((node) => [
+      node.agent_id,
+      node.depth,
+      node.parent_agent_id,
+      node.state,
+    ]), [
+      [parentId, 1, null, "idle"],
+      [grandchildId, 2, parentId, "idle"],
     ]);
   }
   const childTree = childController.getAgentTree();
   assert.equal(childTree.ok, true);
   if (childTree.ok) assert.deepEqual(childTree.data.nodes.map((node) => node.agent_id), [parentId, grandchildId]);
+
+  const terminated = await execute(rootApi, "terminate_agent", {
+    agent_id: parentId,
+  }, rootContext) as { details?: Record<string, unknown> };
+  assert.deepEqual(terminated.details, {
+    agent_id: parentId,
+    state: "terminated",
+    changed: true,
+    forced: false,
+    terminated_count: 2,
+  });
+  assert.equal(parentNode.operations().includes("release"), true);
+  assert.equal(grandchildNode.operations().includes("release"), true);
 
   await rootApi.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, rootContext);
   await childApi.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, childContext);
@@ -1041,6 +1075,7 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
   assert.equal(firstId, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
 
   await oldApi.emit("session_shutdown", { type: "session_shutdown", reason: "reload" }, oldContext);
+  oldApi.invalidate();
   assert.equal(oldUi.widgetCalls.at(-1)?.content, undefined);
   assert.deepEqual(
     firstNode.operations().filter((operation) => [
@@ -1120,6 +1155,7 @@ test("根与 child 跨实例 reload 保留同一监督连接，并让既有 chil
   const leafApi = new FakeExtensionApi();
   const parentNode = new RuntimeBridgeNode(transportAdapter);
   const grandchildNode = new RuntimeBridgeNode(transportAdapter);
+  let newRootController: AgentController | undefined;
   const allocatedIds = [
     "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
     "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
@@ -1168,6 +1204,7 @@ test("根与 child 跨实例 reload 保留同一监督连接，并让既有 chil
   assert.equal(transportAdapter.connectCalls, 1);
 
   await oldChildApi.emit("session_shutdown", { type: "session_shutdown", reason: "reload" }, context);
+  oldChildApi.invalidate();
   const newChildActivate = newChildModule.createPiSubagentRuntimeActivator({
     environment: parentBootstrap.environment,
     localSupervisorTransportAdapter: transportAdapter,
@@ -1178,8 +1215,10 @@ test("根与 child 跨实例 reload 保留同一监督连接，并让既有 chil
   assert.equal(transportAdapter.connectCalls, 1);
 
   await oldRootApi.emit("session_shutdown", { type: "session_shutdown", reason: "reload" }, context);
+  oldRootApi.invalidate();
   const newRootActivate = newRootModule.createPiSubagentRuntimeActivator({
     templateFileSystem: templateFileSystem(cwd, undefined, ["researcher", "reviewer"]),
+    onController: (controller: AgentController) => { newRootController = controller; },
   });
   await newRootActivate(newRootApi as never, capabilities);
   await newRootApi.emit("session_start", { type: "session_start", reason: "reload" }, context);
@@ -1256,6 +1295,9 @@ test("根与 child 跨实例 reload 保留同一监督连接，并让既有 chil
   assert.equal(grandchildNode.operations().includes("force_terminate"), false);
   assert.equal(parentNode.operations().includes("release"), true);
   assert.equal(grandchildNode.operations().includes("release"), true);
+  const closedTree = newRootController?.getAgentTree();
+  assert.equal(closedTree?.ok, true);
+  if (closedTree?.ok) assert.deepEqual(closedTree.data.nodes, []);
   await newChildApi.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
   await leafApi.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
 });
@@ -1288,6 +1330,7 @@ test("reload lease 未被新实例提交时在有界期限后清理旧树", asyn
   await api.emit("session_start", { type: "session_start", reason: "startup" }, context);
   await execute(api, "spawn_agent", { template_id: "researcher", name: "等待租约" }, context);
   await api.emit("session_shutdown", { type: "session_shutdown", reason: "reload" }, context);
+  api.invalidate();
   assert.equal(node.operations().includes("release"), false);
   await new Promise<void>((resolve) => setTimeout(resolve, 80));
   assert.equal(node.operations().includes("release"), true);
@@ -1333,6 +1376,7 @@ test("新实例认领 lease 后未启动会超时清理，并拒绝迟到的 rel
   await oldApi.emit("session_start", { type: "session_start", reason: "startup" }, context);
   await execute(oldApi, "spawn_agent", { template_id: "researcher", name: "等待新实例启动" }, context);
   await oldApi.emit("session_shutdown", { type: "session_shutdown", reason: "reload" }, context);
+  oldApi.invalidate();
 
   const newActivate = newRuntimeModule.createPiSubagentRuntimeActivator({
     reloadLeaseTimeoutMs: 20,

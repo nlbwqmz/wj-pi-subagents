@@ -288,6 +288,64 @@ test("生产控制器没有模板快照时拒绝创建，不绕过模板发现",
   assert.equal(created, 0);
 });
 
+test("shutdown 等待正在启动的创建事务并回收随后登记的监督器", async () => {
+  const id = "67676767-6767-4767-8767-676767676767";
+  const tree = makeTree(id);
+  let releaseStart!: () => void;
+  const startGate = new Promise<void>((resolve) => { releaseStart = resolve; });
+  let reportStarted!: () => void;
+  const startEntered = new Promise<void>((resolve) => { reportStarted = resolve; });
+  const supervisor = new ControlledSupervisor(
+    async () => {
+      const reserved = tree.reserveStartingChild(ROOT_TREE_ACTOR, {
+        templateId: "researcher",
+        name: "并发关闭",
+      });
+      assert.equal(reserved.ok, true);
+      if (!reserved.ok) throw new Error("测试预留失败");
+      const ready = tree.applyLifecycleEvent(id, {
+        type: "startup_ready",
+        expected_generation: reserved.data.lifecycle_generation,
+      });
+      assert.equal(ready.ok, true);
+      reportStarted();
+      await startGate;
+      return { ok: true, agent_id: id, state: "idle" };
+    },
+    async () => ({
+      ok: true,
+      agent_id: id,
+      state: "terminated",
+      cleanup: "confirmed",
+    }),
+  );
+  const controller = new AgentController({
+    tree,
+    allowUnvalidatedTemplates: true,
+    createSupervisor: () => supervisor,
+  });
+
+  const spawning = controller.spawnAgent({ template_id: "researcher", name: "并发关闭" });
+  await startEntered;
+  const shuttingDown = controller.shutdown();
+  const lateSpawn = await controller.spawnAgent({ template_id: "researcher", name: "关闭后创建" });
+  assert.equal(lateSpawn.ok, false);
+  if (!lateSpawn.ok) assert.equal(lateSpawn.error.code, "agent_unavailable");
+  let shutdownSettled = false;
+  void shuttingDown.then(() => { shutdownSettled = true; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(shutdownSettled, false);
+
+  releaseStart();
+  const spawned = await spawning;
+  assert.equal(spawned.ok, true);
+  assert.equal(await shuttingDown, true);
+  assert.equal(supervisor.terminationCalls, 1);
+  const status = tree.getStatus(id);
+  assert.equal(status.ok, true);
+  if (status.ok) assert.equal(status.data.state, "terminated");
+});
+
 test("监督器 start 抛错后尝试回收，并按回收结果区分内部错误与清理不完整", async () => {
   const confirmedId = "77777777-7777-4777-8777-777777777777";
   const confirmed = new ControlledSupervisor(
