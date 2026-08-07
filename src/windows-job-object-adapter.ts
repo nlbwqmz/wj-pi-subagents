@@ -353,7 +353,9 @@ export class WindowsJobObjectAdapter implements ProcessTreeAdapter {
   async release(tree: ProcessTreeHandle): Promise<void> {
     const state = this.readState(tree);
     if (state.handleReleased) return;
-    if (!state.helperEnded && state.resources !== "released") {
+    // 即使资源已确认释放，也必须显式通知 helper 退出。helper 会保留事件管道，
+    // 直到该命令到达，避免最终 released 事件与管道 EOF 竞争。
+    if (!state.helperEnded) {
       try {
         await this.sendCommand(state, "release");
       } catch {

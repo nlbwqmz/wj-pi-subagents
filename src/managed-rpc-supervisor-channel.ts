@@ -86,6 +86,9 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
         MANAGED_RPC_SUPERVISOR_MAX_BODY_BYTES,
       ),
     });
+    // 启动阶段可能先收到传输故障，再进入 waitForReady；预先消费内部拒绝，
+    // 同时保留原 Promise 的拒绝结果供稍后 waitForReady 观察。
+    void this.ready.promise.catch(() => {});
     if (options.onSnapshot !== undefined) this.snapshots.add(options.onSnapshot);
     this.unsubscribeFrame = this.node.onSupervisorFrame((frame) => this.receive(frame));
     this.unsubscribeTransport = this.node.onTransportFault((fault) => {

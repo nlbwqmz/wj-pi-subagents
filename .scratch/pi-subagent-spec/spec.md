@@ -204,12 +204,12 @@ thinking: medium
 
 1. 精确解析当前模板发现快照；
 2. 校验已知 schema 和工具名；
-3. 确认直接父会话当前有效业务工具集完整包含模板 `tools`；
+3. 将模板 `tools` 作为子代理初始业务工具请求，不与直接父会话当前活动工具做子集校验；
 4. 精确解析显式或捕获的 provider/model，并校验当前模型目录、根策略和静态认证可用性；
 5. 校验 thinking 枚举及当前已知模型支持范围；
 6. 校验有效子代理管理能力、深度和名额。
 
-结构或格式问题返回 `template_invalid`。模板合法但工具、模型、认证、thinking 或父授权静态不可满足时返回不可重试的 `template_capability_unavailable`，不得静默削减工具、夹紧 thinking、构造 custom model、预留名额、登记节点或启动进程。
+结构、格式或未知工具名问题返回 `template_invalid`。模板合法但模型、认证、thinking 或父授权静态不可满足时返回不可重试的 `template_capability_unavailable`，不得静默削减工具、夹紧 thinking、构造 custom model、预留名额、登记节点或启动进程。
 
 预检不得通过真实模型请求证明最终可用性，也不计算环境、提示、技能、扩展、上下文文件或工具注册表哈希。创建成功只要求监督通道和 Pi RPC 都可通信，不保证运行期资源永不变化。
 
@@ -365,7 +365,7 @@ Pi `get_state` 只可用于启动同步、事件缺口后的异常重同步和�
 
 每项字段闭集为区分大小写的 `template_id`、可选 `description` 和始终存在的 `tools`。没有描述时省略 `description`；合法空工具模板返回 `tools: []`。`tools` 只包含模板声明并已规范化的业务工具，不得混入八个管理工具。结果不得包含模板正文、来源、model、thinking、`subagents`、`contextFiles`、路径、诊断或其他运行配置；无效候选与来源诊断不得枚举。失败仍使用本节统一错误契约。
 
-数组只表示根权威当前发现且格式有效的模板，不执行调用者当前业务工具、模型、thinking 或管理权限的完整创建预检。非空项仍可能在 `spawn_agent` 返回 `template_capability_unavailable`。根 `/reload` 后，根和所有后代查询必须立即读取根权威发布的同一最新目录。
+数组只表示根权威当前发现且格式有效的模板，不执行调用者当前模型、thinking 或管理权限的完整创建预检。`tools` 是子代理的初始业务工具请求，不要求是父会话当前活动工具的子集；非空项仍可能在 `spawn_agent` 返回 `template_capability_unavailable`。根 `/reload` 后，根和所有后代查询必须立即读取根权威发布的同一最新目录。
 
 ### 6.5 `spawn_agent`
 
@@ -377,7 +377,7 @@ Pi `get_state` 只可用于启动同步、事件缺口后的异常重同步和�
 
 不得携带首条任务，也不得覆盖 cwd、环境、模型、thinking、工具、扩展、技能、提示、信任、深度或配额。首条任务必须另行调用 `send_message`。
 
-模型调用前必须先调用 `get_agent_templates`，并原样复制当前返回项的 `template_id`。标识区分大小写，不得猜测、裁剪、改写、做 Unicode 归一化或使用 `description` 代替。若目录返回 `[]`，不得调用 `spawn_agent`；非空目录不替代本次创建预检。
+模型调用前必须先调用 `get_agent_templates`，并原样复制当前返回项的 `template_id`。标识区分大小写，不得猜测、裁剪、改写、做 Unicode 归一化或使用 `description` 代替。模板 `tools` 不要求是父会话活动工具的子集；若目录返回 `[]`，不得调用 `spawn_agent`；非空目录不替代本次创建预检。
 
 创建顺序为：静态模板/能力预检，原子预留与登记，进程树监督绑定，子进程启动，父子监督握手与首个快照，无副作用 Pi RPC 请求/响应，最后进入 `idle`。成功最小结果：
 
@@ -530,7 +530,7 @@ Pi `get_state` 只可用于启动同步、事件缺口后的异常重同步和�
 | `not_direct_child` | 节点存在但不是调用者直接子代理 | 不可重试 |
 | `template_not_found` | 当前可信来源没有选中候选 | 不可重试 |
 | `template_invalid` | 选中模板存在但格式或已知字段无效 | 修正模板后再调用 |
-| `template_capability_unavailable` | 模板合法但父授权、工具、模型或 thinking 静态不满足 | 更换模板或父配置后再调用 |
+| `template_capability_unavailable` | 模板合法但父授权、模型或 thinking 静态不满足 | 更换模板或父配置后再调用 |
 | `max_depth_reached` | 调用者达到深度上限 | 不可重试 |
 | `max_children_reached` | 直接子代理名额已满 | 完成直接子代理回收后可重试 |
 | `max_tree_agents_reached` | 全树名额已满 | 任一节点完成回收后可重试 |

@@ -6,7 +6,8 @@
  * 转发给父监督器。
  */
 import { randomBytes } from "node:crypto";
-import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   MANAGED_RPC_BRIDGE_CREDENTIAL_ENV,
   MANAGED_RPC_BRIDGE_MAX_FRAME_BYTES,
@@ -357,17 +358,30 @@ function normalizeImages(value: unknown): ManagedImage[] | undefined {
 async function ensureClient(): Promise<BridgeClient> {
   if (client !== undefined) return client;
   const options = isRecord(config.rpc) ? config.rpc : {};
-  const { RpcClient } = await import("@earendil-works/pi-coding-agent");
-  const cliPath = typeof options.cliPath === "string" && options.cliPath.length > 0
+  const configuredCliPath = typeof options.cliPath === "string" && options.cliPath.length > 0
     ? options.cliPath
-    : defaultPiCliPath();
+    : undefined;
+  const cliPath = configuredCliPath ?? defaultPiCliPath();
+  const configuredModulePath = typeof options.piModulePath === "string" && options.piModulePath.length > 0
+    ? options.piModulePath
+    : undefined;
+  const moduleSpecifier = configuredModulePath === undefined
+    ? (configuredCliPath === undefined || cliPath === undefined
+      ? undefined
+      : pathToFileURL(join(dirname(cliPath), "index.js")).href)
+    : toModuleSpecifier(configuredModulePath);
+  const piModule = moduleSpecifier === undefined
+    ? await import("@earendil-works/pi-coding-agent")
+    : await import(moduleSpecifier);
+  const { RpcClient } = piModule;
+  const { piModulePath: _piModulePath, ...clientRpcOptions } = options;
   const configuredEnvironment = isRecord(options.env)
     ? Object.fromEntries(Object.entries(options.env).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ))
     : {};
   const clientOptions = {
-    ...options,
+    ...clientRpcOptions,
     ...(cliPath === undefined ? {} : { cliPath }),
     env: {
       ...configuredEnvironment,
@@ -384,6 +398,11 @@ async function ensureClient(): Promise<BridgeClient> {
     if (normalized.kind === "event") emitEvent(normalized.event);
   });
   return client;
+}
+
+function toModuleSpecifier(value: string): string {
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(value)) return value;
+  return pathToFileURL(value).href;
 }
 
 function defaultPiCliPath(): string | undefined {

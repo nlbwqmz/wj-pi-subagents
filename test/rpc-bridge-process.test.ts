@@ -148,6 +148,50 @@ test("生产桥接配合 fake RpcClient 完成真实本地监督握手、回复 
   await bridge.release();
 });
 
+test("桥接可从配置的 Pi 模块路径加载 RpcClient", async (context) => {
+  const script = fileURLToPath(new URL("../src/rpc-bridge-process.ts", import.meta.url));
+  const loader = new URL("./helpers/reject-bare-pi-module-loader.mjs", import.meta.url).href;
+  const piModulePath = new URL("./helpers/minimal-pi-rpc-client.mjs", import.meta.url).href;
+  const config = Buffer.from(JSON.stringify({
+    rpc: { piModulePath },
+  }), "utf8").toString("base64url");
+  const bridgeCredential = "bridge-credential-01234567890123456789";
+  const child = spawn(process.execPath, [
+    "--experimental-strip-types",
+    "--experimental-loader",
+    loader,
+    script,
+    "--config",
+    config,
+  ], {
+    env: {
+      ...process.env,
+      [MANAGED_RPC_BRIDGE_CREDENTIAL_ENV]: bridgeCredential,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  const stderr: Uint8Array[] = [];
+  child.stderr.on("data", (chunk: Uint8Array) => stderr.push(new Uint8Array(chunk)));
+  const bridge = new ManagedRpcBridgeClient({
+    stdin: child.stdin,
+    stdout: child.stdout,
+    stderr: child.stderr,
+  }, { credential: bridgeCredential });
+  context.after(async () => {
+    await bridge.release();
+    if (!child.killed && child.exitCode === null) child.kill();
+  });
+
+  await bridge.start();
+  const closeObservation = once(child, "close") as Promise<[number | null, NodeJS.Signals | null]>;
+  await bridge.requestClose(new AbortController().signal);
+  const [code, signal] = await closeObservation;
+  assert.equal(code, 0, Buffer.concat(stderr).toString("utf8"));
+  assert.equal(signal, null);
+  await bridge.release();
+});
+
 async function runBridge(input: Uint8Array): Promise<{
   readonly code: number | null;
   readonly signal: NodeJS.Signals | null;

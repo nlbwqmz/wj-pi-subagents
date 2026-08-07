@@ -80,7 +80,7 @@ const ERROR_METADATA: Readonly<Record<PublicErrorCode, Readonly<{
   not_direct_child: Object.freeze({ message: "目标不是直接子代理", retryable: false }),
   template_not_found: Object.freeze({ message: "未找到代理模板", retryable: false }),
   template_invalid: Object.freeze({ message: "代理模板无效", retryable: false }),
-  template_capability_unavailable: Object.freeze({ message: "代理管理能力不可用", retryable: false }),
+  template_capability_unavailable: Object.freeze({ message: "模板所需能力不可用", retryable: false }),
   max_depth_reached: Object.freeze({ message: "已达到最大代理深度", retryable: false }),
   max_children_reached: Object.freeze({ message: "直接子代理名额已满", retryable: true }),
   max_tree_agents_reached: Object.freeze({ message: "代理树名额已满", retryable: true }),

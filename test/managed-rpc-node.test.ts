@@ -7,6 +7,7 @@ import {
   MANAGED_RPC_BRIDGE_PROTOCOL,
   ManagedRpcBridgeClient,
   ManagedRpcNode,
+  createManagedRpcNodeLaunchSpec,
   type ManagedRpcBridge,
   type ManagedRpcBridgeFactory,
   type ManagedRpcNodeStartContext,
@@ -34,6 +35,25 @@ import {
 } from "../src/supervisor-channel.ts";
 
 const TREE = Object.freeze({ kind: "tree" });
+
+test("受管节点只为源码 bridge 启用 TypeScript stripping", () => {
+  const compiled = createManagedRpcNodeLaunchSpec({
+    bridgeScriptPath: "C:/pi-subagent/dist/src/rpc-bridge-process.js",
+  });
+  assert.deepEqual(compiled.args?.slice(0, 2), [
+    "C:/pi-subagent/dist/src/rpc-bridge-process.js",
+    "--config",
+  ]);
+
+  const source = createManagedRpcNodeLaunchSpec({
+    bridgeScriptPath: "C:/pi-subagent/src/rpc-bridge-process.ts",
+  });
+  assert.deepEqual(source.args?.slice(0, 3), [
+    "--experimental-strip-types",
+    "C:/pi-subagent/src/rpc-bridge-process.ts",
+    "--config",
+  ]);
+});
 
 function transport(): ManagedProcessTransport {
   return Object.freeze({
@@ -658,6 +678,38 @@ test("RpcSupervisor 通过真正 child 端点完成双握手和回复 ACK", asyn
   assert.equal(events.some((event) => (
     typeof event === "object" && event !== null && (event as { kind?: unknown }).kind === "reply"
   )), false);
+});
+
+test("监督通道在 waitForReady 尚未开始时遇到 EOF 不产生未处理拒绝", async () => {
+  const node = new FakeManagedRpcNode();
+  const channel = new ManagedRpcSupervisorChannel({
+    node,
+    rootId: "root-test",
+    localAgentId: null,
+    peerAgentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    parentAgentId: null,
+    depth: 1,
+    credential: "supervisor-credential-0123456789012345",
+    requestIdRegistry: new SupervisorRequestIdRegistry(),
+  });
+  const unhandled: unknown[] = [];
+  const onUnhandledRejection = (reason: unknown): void => {
+    unhandled.push(reason);
+  };
+  process.on("unhandledRejection", onUnhandledRejection);
+  try {
+    await channel.bind(new AbortController().signal);
+    node.emitTransportFault("eof");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandled, []);
+    await assert.rejects(
+      channel.waitForReady(new AbortController().signal),
+      /监督通道不可用/,
+    );
+  } finally {
+    process.off("unhandledRejection", onUnhandledRejection);
+    await channel.release();
+  }
 });
 
 function encodeFrame(value: unknown): Uint8Array {

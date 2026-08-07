@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AGENT_TOOL_NAMES } from "./agent-tools.ts";
 import type {
@@ -33,6 +34,10 @@ export interface AgentSupervisorFactoryOptions {
   readonly templateSnapshot: TemplateDiscoverySnapshot;
   readonly rootId?: string;
   readonly bridgeScriptPath?: string;
+  /** 子 Pi CLI 入口；未提供时从宿主正在运行的 cli.js 推导。 */
+  readonly childPiCliPath?: string;
+  /** 子 Pi 模块入口；未提供时从 childPiCliPath 的同目录 index.js 推导。 */
+  readonly childPiModulePath?: string;
   /** 子 Pi 必须显式加载本扩展；未填写时使用包内标准入口。 */
   readonly childExtensionPath?: string;
   readonly startupTimeoutMs?: number;
@@ -71,6 +76,7 @@ export function createAgentSupervisorFactory(
   const startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_RPC_STARTUP_TIMEOUT_MS;
   const gracefulShutdownMs = options.gracefulShutdownMs ?? DEFAULT_RPC_GRACEFUL_SHUTDOWN_MS;
   const requestIdRegistry = options.requestIdRegistry ?? new SupervisorRequestIdRegistry();
+  const childPiPaths = resolveChildPiPaths(options);
 
   const factory = ((input: AgentSupervisorFactoryInput): RpcSupervisor => {
     const template = input.template ?? resolveTemplate(templateSnapshot, input.reservation.templateId);
@@ -83,6 +89,8 @@ export function createAgentSupervisorFactory(
         currentModel: options.currentModel,
         currentThinking: options.currentThinking,
         extensionPath: options.childExtensionPath ?? defaultChildExtensionPath(),
+        ...(childPiPaths.cliPath === undefined ? {} : { cliPath: childPiPaths.cliPath }),
+        ...(childPiPaths.modulePath === undefined ? {} : { piModulePath: childPiPaths.modulePath }),
         managementTools: childManagementEnabled(options, input, template)
           ? (options.managementToolNames ?? AGENT_TOOL_NAMES)
           : [],
@@ -189,11 +197,15 @@ export function buildManagedRpcOptions(
     readonly currentThinking?: AgentSupervisorFactoryOptions["currentThinking"];
     readonly managementTools?: readonly string[];
     readonly extensionPath?: string;
+    readonly cliPath?: string;
+    readonly piModulePath?: string;
   } = {},
 ): Readonly<Record<string, unknown>> {
   const args: string[] = ["--no-session"];
   if (options.extensionPath !== undefined) {
-    args.push("--no-extensions", "-e", options.extensionPath);
+    // 保留显式加载本扩展，同时允许 Pi 按根会话 settings 发现 provider 等扩展。
+    // 子 Pi 若关闭扩展发现，将无法解析根会话使用的动态 provider。
+    args.push("-e", options.extensionPath);
   }
   if (template.contextFiles === "disabled") args.push("--no-context-files");
   const thinking = template.thinking ?? resolveCurrent(options.currentThinking);
@@ -207,10 +219,48 @@ export function buildManagedRpcOptions(
   const selectedModel = template.model ?? resolveCurrent(options.currentModel);
   const [provider, model] = splitModel(selectedModel);
   return Object.freeze({
+    ...(options.cliPath === undefined ? {} : { cliPath: options.cliPath }),
+    ...(options.piModulePath === undefined ? {} : { piModulePath: options.piModulePath }),
     ...(provider === undefined ? {} : { provider }),
     ...(model === undefined ? {} : { model }),
     args: Object.freeze(args),
   });
+}
+
+interface ChildPiPaths {
+  readonly cliPath?: string;
+  readonly modulePath?: string;
+}
+
+/**
+ * RpcClient 在子进程中运行，不能依赖 pi-subagent 包目录中的 peer 依赖解析。
+ * Pi CLI 的 argv[1] 是可靠的宿主入口；仅识别 cli.js，避免测试 runner 等路径
+ * 被误判为 Pi CLI。
+ */
+function resolveChildPiPaths(
+  options: Pick<AgentSupervisorFactoryOptions, "childPiCliPath" | "childPiModulePath">,
+): ChildPiPaths {
+  const configuredCliPath = normalizePath(options.childPiCliPath);
+  const configuredModulePath = normalizePath(options.childPiModulePath);
+  const inferredCliPath = configuredCliPath === undefined ? inferHostPiCliPath() : undefined;
+  const cliPath = configuredCliPath ?? inferredCliPath;
+  const modulePath = configuredModulePath
+    ?? (cliPath === undefined ? undefined : join(dirname(cliPath), "index.js"));
+  return Object.freeze({
+    ...(cliPath === undefined ? {} : { cliPath }),
+    ...(modulePath === undefined ? {} : { modulePath }),
+  });
+}
+
+function inferHostPiCliPath(): string | undefined {
+  const entry = process.argv[1];
+  if (typeof entry !== "string" || basename(entry).toLowerCase() !== "cli.js") return undefined;
+  return resolvePath(entry);
+}
+
+function normalizePath(value: string | undefined): string | undefined {
+  if (value === undefined || value.length === 0) return undefined;
+  return resolvePath(value);
 }
 
 function defaultChildExtensionPath(): string {

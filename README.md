@@ -177,7 +177,7 @@ systemPromptMode: append
 这里没有填写 `model` 和 `thinking`，所以创建时会继承直接父会话当时的精确模型与 thinking 等级。
 
 > [!NOTE]
-> `read` 必须是当前 Pi 实际注册且父会话当前启用的工具。增加 `grep`、`find` 或其他工具前，也要确认它们在父会话中处于启用状态。
+> `read` 必须是当前 Pi 实际注册的工具。模板业务工具不要求在父会话当前处于活动状态，子 Pi 会按模板声明的初始工具集启动。
 
 ### 第二步：启动或重载
 
@@ -251,18 +251,18 @@ Markdown 正文可以为空。未列出的 frontmatter 字段会被静默忽略�
 
 `description` 只是模板展示元数据，不会自动注入提示词。`get_agent_templates` 会列出当前发现且格式有效的模板，并返回 `template_id`、可选 `description` 和模板声明的业务 `tools`。八个代理管理工具不能手动写进模板 `tools`，也不会出现在返回项的 `tools` 中；扩展会根据深度和祖先权限自动追加或移除完整管理工具集合。
 
-模板出现在目录中不表示当前父会话一定能创建它：业务工具、模型、thinking 和管理能力仍会在 `spawn_agent` 时预检。目录为空时 `get_agent_templates` 直接返回 `[]`，此时不能调用 `spawn_agent`。
+模板出现在目录中不表示当前父会话一定能创建它：模型、thinking 和管理能力仍会在 `spawn_agent` 时预检；模板 `tools` 是子代理的初始业务工具请求，不要求是父会话当前活动工具的子集。目录为空时 `get_agent_templates` 直接返回 `[]`，此时不能调用 `spawn_agent`。
 
 创建时还会做能力预检：
 
-- 模板中的每个业务工具必须已经由 Pi 注册，并且当前在直接父会话中启用。
+- 模板中的每个业务工具必须已经由 Pi 注册；它不要求当前在直接父会话中启用，子 Pi 会按模板请求自己的初始工具集。
 - 显式模型必须存在于 Pi 模型目录并处于当前模型范围内。
 - 模板或继承到的 thinking 必须受所选模型支持。
-- 模板不能扩张父会话已有的工具、信任或子代理管理权限。
+- 模板不能扩张父会话的信任或子代理管理权限；业务工具不执行父会话活动工具子集校验。
 
-模板格式错误会得到 `template_invalid`；模板合法但当前工具、模型或 thinking 无法满足时会得到 `template_capability_unavailable`。
+模板格式错误或列出未注册工具会得到 `template_invalid`；模板合法但当前模型、thinking 或管理能力无法满足时会得到 `template_capability_unavailable`。
 
-当前子 Pi 以 `--no-extensions` 启动，并只显式加载 Pi Subagent 自身。模板优先使用 Pi 内置业务工具；不要依赖只由父会话其他第三方扩展注册的工具。
+当前子 Pi 会显式加载 Pi Subagent 自身，并沿用根会话的 Pi 扩展发现配置，因此根会话注册的动态 provider（例如自定义 provider）也能在子 Pi 中解析。模板仍应优先使用 Pi 内置业务工具；依赖其他扩展注册的业务工具时，必须确认这些扩展在子 Pi 的同一 cwd/settings 下可发现。
 
 ### 模板与父会话的继承关系
 
@@ -396,11 +396,11 @@ Markdown 正文可以为空。未列出的 frontmatter 字段会被静默忽略�
 
 这个工具是其他管理工具成功外壳的明确例外：模型可见正文就是数组，不套 `{ "ok": true, "data": ... }`。每项只包含区分大小写的 `template_id`、可选 `description` 和始终存在的业务 `tools`；没有描述时省略该字段，合法空工具模板返回 `tools: []`。`tools` 不包含八个子代理管理工具，结果也不会公开模板正文、来源、模型、thinking、路径或无效模板诊断。
 
-数组只说明模板格式有效，不代表当前父会话的工具、模型、thinking 和管理能力预检一定通过。返回 `[]` 时不能调用 `spawn_agent`；返回非空数组后，也应以 `spawn_agent` 的实际结果为准。
+数组只说明模板格式有效，不代表当前父会话的模型、thinking 和管理能力预检一定通过。模板 `tools` 不执行父会话活动工具子集校验。返回 `[]` 时不能调用 `spawn_agent`；返回非空数组后，也应以 `spawn_agent` 的实际结果为准。
 
 ### `spawn_agent`
 
-创建一个直接子代理，并等待它完成进程、监督通道和 Pi RPC 的启动握手。调用前必须先调用 `get_agent_templates`，再从当前返回项中原样复制 `template_id`。标识区分大小写，不得猜测、改写或使用 `description` 代替；若目录返回 `[]`，不能调用本工具。
+创建一个直接子代理，并等待它完成进程、监督通道和 Pi RPC 的启动握手。调用前必须先调用 `get_agent_templates`，再从当前返回项中原样复制 `template_id`。标识区分大小写，不得猜测、改写或使用 `description` 代替；模板 `tools` 是子代理的初始业务工具请求，不要求是父会话活动工具的子集。若目录返回 `[]`，不能调用本工具。
 
 输入只包含模板标识和展示名称：
 
@@ -411,7 +411,7 @@ Markdown 正文可以为空。未列出的 frontmatter 字段会被静默忽略�
 }
 ```
 
-成功时节点已处于 `idle`，结果包含新分配的 `agent_id`、名称、模板、深度和状态。名称与模板标识的 UTF-8 长度都不能超过 256 字节。它不能同时携带任务、模型、工具、cwd 或配额；第一项任务必须另行调用 `send_message`。即使模板出现在查询结果中，本次创建仍可能因当前能力预检返回 `template_capability_unavailable`。
+成功时节点已处于 `idle`，结果包含新分配的 `agent_id`、名称、模板、深度和状态。名称与模板标识的 UTF-8 长度都不能超过 256 字节。它不能同时携带任务、模型、工具、cwd 或配额；第一项任务必须另行调用 `send_message`。即使模板出现在查询结果中，本次创建仍可能因模型、thinking 或管理能力预检失败而返回 `template_capability_unavailable`。
 
 ### `send_message`
 
@@ -516,7 +516,7 @@ Markdown 正文可以为空。未列出的 frontmatter 字段会被静默忽略�
 | `not_direct_child` | 目标存在，但不是调用者的直接子代理 | 让它的直接父代理执行控制 |
 | `template_not_found` | 没有选中对应模板 | 检查目录、文件名、trust 并 `/reload` |
 | `template_invalid` | 选中的模板候选格式无效 | 修复 UTF-8、frontmatter 或字段 |
-| `template_capability_unavailable` | 模板要求的工具、模型、thinking 或管理能力不可用 | 调整模板或父会话能力 |
+| `template_capability_unavailable` | 模板要求的模型、thinking 或管理能力不可用 | 调整模板或父会话能力 |
 | `max_depth_reached` | 达到最大深度 | 提高新会话配置，或从更浅节点创建 |
 | `max_children_reached` | 直接子代理名额已满 | 终止不用的直接子代理后重试 |
 | `max_tree_agents_reached` | 全树名额已满 | 回收任一不用的分支后重试 |
@@ -527,6 +527,8 @@ Markdown 正文可以为空。未列出的 frontmatter 字段会被静默忽略�
 | `internal_error` | 控制器遇到已脱敏的内部故障 | 查看 UI 状态，保存可复现步骤 |
 
 错误结果只公开稳定 `code`、安全说明、`retryable` 和空详情；不会把底层路径、凭据、句柄或堆栈交给模型。
+
+如果刚更新了本地 package 或重新生成了 smoke tarball，请退出并重新启动根 Pi 会话。已经运行的会话不会自动替换扩展代码；安装包中的受管 bridge 会使用随包编译的入口，并从宿主 Pi CLI 解析 `RpcClient`，因此不需要在子 Pi 中关闭扩展发现。
 
 ## 生命周期
 
@@ -562,7 +564,7 @@ Pi package 是在本机进程内执行的代码，这个扩展及其子 Pi 进�
 
 ### 模板不能扩权
 
-项目模板只有在 Pi 已信任该项目时才会读取。模板只能从直接父会话当前启用的业务工具中取子集；它不能改变 project trust、环境、cwd 或配额，也不能突破祖先的 `subagents: disabled` 和 `maxDepth`。
+项目模板只有在 Pi 已信任该项目时才会读取。模板可以声明已注册的业务工具，不要求从直接父会话当前活动工具中取子集；它不能改变 project trust、环境、cwd 或配额，也不能突破祖先的 `subagents: disabled` 和 `maxDepth`。
 
 ### 进程树回收
 
@@ -620,12 +622,11 @@ TUI warning 只显示逻辑来源、直属文件名和固定原因，不显示�
 
 模板本身合法，但当前父会话无法满足它：
 
-- 先确认模板列出的业务工具既已注册又处于启用状态；
 - 确认显式模型仍存在，并处于 Pi 当前 scoped models 范围；
 - 确认模型支持指定或继承到的 thinking；
 - 如果问题来自递归创建，检查深度和祖先是否关闭了子代理能力。
 
-必要时在父会话切换模型或工具，修改模板，然后执行根 `/reload` 再创建新节点。已有节点不会随模板变化重建。
+业务工具不要求向父会话活动工具向下缩减；若模板列出未注册的工具名，则会在模板发现阶段得到 `template_invalid`。已有节点不会随模板变化重建。
 
 ### 配置看起来没有生效
 
@@ -657,7 +658,7 @@ npm run check
 
 ### 打包后安装到 Pi 测试
 
-以下命令以扩展仓库 `D:\code\pi-subagent-wj`、测试项目 `D:\code\your-project` 和当前版本 `0.1.0` 为例。请把测试项目路径替换成你的实际路径；版本变化后，也要替换 tarball 文件名中的版本号。Pi 不会直接解压本地 `.tgz`，因此需要先用 npm 将 tarball 安装成目录。
+以下命令以扩展仓库 `D:\code\pi-subagent-wj` 和测试项目 `D:\code\your-project` 为例。请把测试项目路径替换成你的实际路径。Smoke 打包命令会读取当前包名和版本，生成 tarball，并将其安装到 `.scratch\package-smoke`；版本变化后不需要修改命令。
 
 1. 进入扩展源码目录：
 
@@ -677,25 +678,19 @@ npm run check
    npm run check
    ```
 
-4. 生成 tarball：
+4. 生成 tarball 并安装到隔离测试目录：
 
    ```powershell
-   npm pack
+   npm run pack:smoke
    ```
 
-5. 将 tarball 安装到隔离测试目录：
-
-   ```powershell
-   npm install --prefix "D:\code\pi-subagent-wj\.scratch\package-smoke" --omit=dev --legacy-peer-deps --package-lock=false --no-save "D:\code\pi-subagent-wj\pi-subagent-0.1.0.tgz"
-   ```
-
-6. 进入需要测试的项目：
+5. 进入需要测试的项目：
 
    ```powershell
    Set-Location "D:\code\your-project"
    ```
 
-7. 把隔离目录中的 package 安装到当前 Pi 项目：
+6. 把隔离目录中的 package 安装到当前 Pi 项目：
 
    ```powershell
    pi install "D:\code\pi-subagent-wj\.scratch\package-smoke\node_modules\pi-subagent" -l
@@ -707,19 +702,19 @@ npm run check
    pi install "D:\code\pi-subagent-wj\.scratch\package-smoke\node_modules\pi-subagent" -l --approve
    ```
 
-8. 确认 package 已登记：
+7. 确认 package 已登记：
 
    ```powershell
    pi list
    ```
 
-9. 启动 Pi：
+8. 启动 Pi：
 
    ```powershell
    pi
    ```
 
-10. 进入 Pi 后打开代理树，确认扩展已经加载：
+9. 进入 Pi 后打开代理树，确认扩展已经加载：
 
     ```text
     /agent
@@ -749,12 +744,6 @@ npm run check
 
    ```powershell
    Remove-Item -LiteralPath "D:\code\pi-subagent-wj\.scratch\package-smoke" -Recurse -Force
-   ```
-
-5. 删除生成的 tarball：
-
-   ```powershell
-   Remove-Item -LiteralPath "D:\code\pi-subagent-wj\pi-subagent-0.1.0.tgz" -Force
    ```
 
 项目的实现规格与决策背景位于：

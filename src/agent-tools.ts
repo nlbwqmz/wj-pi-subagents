@@ -145,8 +145,8 @@ const schemas: Readonly<Record<AgentToolName, JsonSchema>> = Object.freeze({
 });
 
 const descriptions: Readonly<Record<AgentToolName, string>> = Object.freeze({
-  get_agent_templates: "列出当前发现且格式有效的子代理模板，直接返回 JSON 数组。每项包含 template_id、可选 description 和模板声明的业务 tools；返回 [] 表示当前没有有效模板，此时不能调用 spawn_agent。非空模板仍须通过 spawn_agent 的工具、模型、thinking 和管理能力预检，可能返回 template_capability_unavailable。",
-  spawn_agent: "使用有效模板创建一个直接子代理并等待它完成启动握手。调用前先调用 get_agent_templates；template_id 必须与其当前返回项的 template_id 完全一致并区分大小写，不得猜测、改写或使用 description 代替。若 get_agent_templates 返回 []，则不能调用 spawn_agent。创建成功后使用 send_message 发送首项任务。",
+  get_agent_templates: "列出当前发现且格式有效的子代理模板，直接返回 JSON 数组。每项包含 template_id、可选 description 和模板声明的子代理初始业务 tools；tools 不要求向父会话当前活动工具向下缩减。返回 [] 表示当前没有有效模板，此时不能调用 spawn_agent。非空模板仍须通过 spawn_agent 的模板格式、工具注册、模型、thinking 和管理能力预检。",
+  spawn_agent: "使用有效模板创建一个直接子代理并等待它完成启动握手。调用前先调用 get_agent_templates；template_id 必须从当前返回数组中原样复制、区分大小写，不得猜测、裁剪、改写或用 description 代替。模板 tools 是子代理的初始业务工具请求，不要求是父会话活动工具的子集。若 get_agent_templates 返回 []，则不能调用 spawn_agent。创建成功后使用 send_message 发送首项任务。",
   send_message: "向直接子代理发送任务消息或当前处理的 steering。",
   wait_agent: "等待直接子代理 settled 或进入终态。",
   interrupt_agent: "协作式中断直接子代理当前处理，保留节点和上下文。",

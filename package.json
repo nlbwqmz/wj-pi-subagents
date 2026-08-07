@@ -4,7 +4,7 @@
   "description": "Pi 子代理扩展包",
   "type": "module",
   "keywords": ["pi-package"],
-  "files": ["extensions", "src"],
+  "files": ["dist", "extensions", "src"],
   "engines": {
     "node": ">=22.19.0"
   },
@@ -21,6 +21,9 @@
     "typescript": "5.9.3"
   },
   "scripts": {
+    "build:bridge": "tsc -p tsconfig.bridge.json",
+    "pack:smoke": "node scripts/package-smoke.mjs",
+    "prepack": "npm run build:bridge",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "check": "npm run typecheck && npm test"

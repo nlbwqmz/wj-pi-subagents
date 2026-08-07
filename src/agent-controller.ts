@@ -91,6 +91,7 @@ export interface AgentControllerOptions {
   readonly templateSnapshot?: TemplateDiscoverySnapshot;
   /** 仅旧 fake 测试可显式开启；生产装配必须传入发现快照。 */
   readonly allowUnvalidatedTemplates?: boolean;
+  /** 已保留以兼容旧装配；模板业务工具不再与父会话活动工具做子集校验。 */
   readonly activeTools?: () => readonly string[];
   readonly validateTemplate?: (
     template: TemplateDefinition,
@@ -170,7 +171,6 @@ export class AgentController {
   private readonly createSupervisor: AgentSupervisorFactory;
   private templateSnapshot: TemplateDiscoverySnapshot | undefined;
   private readonly allowUnvalidatedTemplates: boolean;
-  private readonly activeTools: (() => readonly string[]) | undefined;
   private readonly validateTemplate: AgentControllerOptions["validateTemplate"];
   private readonly waitTimeoutMs: number;
   private readonly onReply: AgentControllerOptions["onReply"];
@@ -193,7 +193,6 @@ export class AgentController {
     this.createSupervisor = options.createSupervisor;
     this.templateSnapshot = options.templateSnapshot;
     this.allowUnvalidatedTemplates = options.allowUnvalidatedTemplates === true;
-    this.activeTools = options.activeTools;
     this.validateTemplate = options.validateTemplate;
     this.waitTimeoutMs = options.waitTimeoutMs ?? WAIT_AGENT_DEFAULT_TIMEOUT_MS;
     this.onReply = options.onReply;
@@ -215,16 +214,6 @@ export class AgentController {
       const preflight = this.preflightTemplate(input.template_id);
       if (!preflight.ok) return preflight;
       template = preflight.data;
-    }
-    if (this.activeTools !== undefined && template !== undefined) {
-      let available: Set<string>;
-      try {
-        available = new Set(this.activeTools());
-      } catch {
-        return controlFailure("template_capability_unavailable");
-      }
-      const missing = template.tools.filter((tool) => !available.has(tool));
-      if (missing.length > 0) return controlFailure("template_capability_unavailable");
     }
     if (template !== undefined && this.validateTemplate !== undefined) {
       try {

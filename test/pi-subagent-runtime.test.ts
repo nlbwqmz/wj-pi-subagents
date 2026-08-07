@@ -243,10 +243,15 @@ class FakeExtensionApi {
   getActiveTools(): string[] { return [...this.activeTools, ...this.tools.keys()]; }
   getAllTools(): Array<{ name: string }> {
     return [
-      { name: "read" },
-      { name: "grep" },
-      ...[...this.tools.keys()].map((name) => ({ name })),
-    ];
+      "read",
+      "bash",
+      "edit",
+      "write",
+      "grep",
+      "find",
+      "ls",
+      ...this.tools.keys(),
+    ].map((name) => ({ name }));
   }
   setActiveTools(tools: readonly string[]): void {
     this.activeTools = [...tools];
@@ -265,6 +270,7 @@ function templateFileSystem(
   cwd: string,
   thinking?: string,
   templateIds: readonly string[] = ["researcher"],
+  templateTools = "",
 ): TemplateDiscoveryFileSystem {
   const userDirectory = join(homedir(), ".pi", "agent", "agents");
   const projectDirectory = join(cwd, ".pi", "agents");
@@ -283,9 +289,10 @@ function templateFileSystem(
     },
     readFile(path) {
       if (!files.has(path)) throw new Error("意外文件");
+      const toolsFrontmatter = templateTools.length === 0 ? 'tools: ""' : `tools: ${templateTools}`;
       return Buffer.from([
         "---",
-        'tools: ""',
+        toolsFrontmatter,
         ...(thinking === undefined ? [] : [`thinking: ${thinking}`]),
         "subagents: inherit",
         "contextFiles: disabled",
@@ -699,6 +706,49 @@ test("预检遵循 Pi thinking 支持集合并拒绝被模型显式禁用的 off
     },
   );
   assert.equal(nodeCreations, 0);
+  await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
+});
+
+test("根会话 max 场景允许模板请求父活动工具之外的已注册业务工具", async () => {
+  const cwd = "C:\\workspace\\active-tool-preflight";
+  const api = new FakeExtensionApi();
+  api.activeTools = ["read"];
+  let nodeCreations = 0;
+  let createdTools: readonly string[] | undefined;
+  const activate = createPiSubagentRuntimeActivator({
+    rootIdFactory: () => "root-active-tool-preflight",
+    agentIdFactory: () => AGENT_ID,
+    templateFileSystem: templateFileSystem(
+      cwd,
+      undefined,
+      ["Explore"],
+      "edit",
+    ),
+    nodeFactory: (template) => {
+      nodeCreations += 1;
+      createdTools = template.tools;
+      return new RuntimeLinkedNode();
+    },
+  });
+  await activate(api as never, {
+    ok: true,
+    nodeVersion: process.versions.node,
+    piVersion: "0.83.0",
+    platform: "win32",
+    processTreeAdapter: {} as never,
+  });
+
+  const context = extensionContext(cwd);
+  context.thinkingLevel = "max";
+  await api.emit("session_start", { type: "session_start", reason: "startup" }, context);
+
+  const spawned = await execute(api, "spawn_agent", { template_id: "Explore", name: "允许启动" }, context) as {
+    details?: { template_id?: string; state?: string };
+  };
+  assert.equal(spawned.details?.template_id, "Explore");
+  assert.equal(spawned.details?.state, "idle");
+  assert.deepEqual(createdTools, ["edit"]);
+  assert.equal(nodeCreations, 1);
   await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
 });
 

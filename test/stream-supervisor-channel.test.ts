@@ -164,6 +164,29 @@ test("协议损坏和 EOF 只通知一次稳定故障，并支持可取消 ready
   await pair.child.release();
 });
 
+test("流式监督通道在 waitForReady 尚未开始时故障不产生未处理拒绝", async () => {
+  const pair = channelPair();
+  const unhandled: unknown[] = [];
+  const onUnhandledRejection = (reason: unknown): void => {
+    unhandled.push(reason);
+  };
+  process.on("unhandledRejection", onUnhandledRejection);
+  try {
+    await pair.parent.bind(new AbortController().signal);
+    pair.parent.failProtocol();
+    await settleIo();
+    assert.deepEqual(unhandled, []);
+    await assert.rejects(
+      pair.parent.waitForReady(new AbortController().signal),
+      /监督通道不可用/,
+    );
+  } finally {
+    process.off("unhandledRejection", onUnhandledRejection);
+    await pair.parent.release();
+    await pair.child.release();
+  }
+});
+
 test("终止屏障发送 close 后拒绝迟到帧，写入失败不会毒化后续队列", async () => {
   const pair = channelPair();
   await pair.child.bind(new AbortController().signal);

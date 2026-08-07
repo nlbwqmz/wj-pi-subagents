@@ -13,6 +13,7 @@ test("package manifest 只暴露一个显式 Pi 扩展入口", () => {
     private?: boolean;
     files?: string[];
     engines?: { node?: string };
+    scripts?: { "pack:smoke"?: string };
     peerDependencies?: Record<string, string>;
     dependencies?: Record<string, string>;
     pi?: Record<string, unknown>;
@@ -20,8 +21,9 @@ test("package manifest 只暴露一个显式 Pi 扩展入口", () => {
   };
 
   assert.equal(manifest.private, undefined);
-  assert.deepEqual(manifest.files, ["extensions", "src"]);
+  assert.deepEqual(manifest.files, ["dist", "extensions", "src"]);
   assert.equal(manifest.engines?.node, REQUIRED_NODE_RANGE);
+  assert.equal(manifest.scripts?.["pack:smoke"], "node scripts/package-smoke.mjs");
   assert.equal(manifest.peerDependencies?.["@earendil-works/pi-coding-agent"], "*");
   assert.ok(manifest.dependencies?.semver, "生产安装必须能够解析 semver");
   assert.deepEqual(manifest.pi, {

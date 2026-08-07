@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import type { Readable, Writable } from "node:stream";
@@ -112,14 +113,29 @@ export function createManagedRpcNodeLaunchSpec(
   options: Pick<ManagedRpcNodeAssemblyOptions, "cwd" | "env" | "rpcOptions" | "bridgeScriptPath">,
 ): ManagedRpcNodeLaunchOptions {
   const scriptPath = options.bridgeScriptPath
-    ?? fileURLToPath(new URL("./rpc-bridge-process.ts", import.meta.url));
+    ?? defaultBridgeScriptPath();
   const config = Buffer.from(JSON.stringify({ rpc: options.rpcOptions ?? {} }), "utf8").toString("base64url");
   return Object.freeze({
     command: process.execPath,
-    args: Object.freeze(["--experimental-strip-types", scriptPath, "--config", config]),
+    args: Object.freeze([
+      ...(scriptPath.endsWith(".ts") ? ["--experimental-strip-types"] : []),
+      scriptPath,
+      "--config",
+      config,
+    ]),
     ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
     ...(options.env === undefined ? {} : { env: Object.freeze({ ...options.env }) }),
   });
+}
+
+/**
+ * Node 原生 type stripping 不允许执行 node_modules 内的 .ts 文件。发布包提供
+ * 编译 bridge 时优先运行它；源码目录未构建时仍保留本地开发的 .ts 回退路径。
+ */
+function defaultBridgeScriptPath(): string {
+  const compiled = fileURLToPath(new URL("../dist/src/rpc-bridge-process.js", import.meta.url));
+  if (existsSync(compiled)) return compiled;
+  return fileURLToPath(new URL("./rpc-bridge-process.ts", import.meta.url));
 }
 
 /** 生产装配便捷入口；返回值仍是单一 `ManagedRpcNode` 深模块。 */

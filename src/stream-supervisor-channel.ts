@@ -89,6 +89,9 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     this.initialSnapshot = Object.freeze([...(options.initialSnapshot ?? [])]);
     this.initialSubtreeRevision = options.initialSubtreeRevision;
     this.onCloseRequested = options.onCloseRequested;
+    // child 可能在父端等待握手前先收到 EOF；不能让内部 ready 拒绝升级为
+    // 未处理拒绝，但 waitForReady 仍需观察原始失败。
+    void this.ready.promise.catch(() => {});
     if (options.onEvent !== undefined) this.eventListeners.add(options.onEvent);
     if (options.onSnapshot !== undefined) this.snapshotListeners.add(options.onSnapshot);
     this.transport.stdout.on("data", (chunk: Uint8Array | string) => {

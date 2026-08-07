@@ -148,6 +148,8 @@ export interface PiSubagentRuntimeOptions {
   readonly rootArguments?: unknown;
   readonly templateFileSystem?: TemplateDiscoveryFileSystem;
   readonly bridgeScriptPath?: string;
+  readonly childPiCliPath?: string;
+  readonly childPiModulePath?: string;
   readonly nodeFactory?: AgentSupervisorFactoryOptions["nodeFactory"];
   /** 测试可替换本地 IPC；生产固定使用命名管道或 Unix socket。 */
   readonly localSupervisorTransportAdapter?: LocalSupervisorTransportAdapter;
@@ -957,6 +959,8 @@ export function createPiSubagentRuntimeActivator(
           return () => server.close();
         },
         ...(options.bridgeScriptPath === undefined ? {} : { bridgeScriptPath: options.bridgeScriptPath }),
+        ...(options.childPiCliPath === undefined ? {} : { childPiCliPath: options.childPiCliPath }),
+        ...(options.childPiModulePath === undefined ? {} : { childPiModulePath: options.childPiModulePath }),
         ...(options.nodeFactory === undefined ? {} : { nodeFactory: options.nodeFactory }),
       });
       const controller = new AgentController({

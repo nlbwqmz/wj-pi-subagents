@@ -418,6 +418,8 @@ public static class PiSubagentWindowsJobHelper
             while (!state.Finished.WaitOne(0))
             {
                 string line = state.Reader.ReadLine();
+                // 控制管道 EOF 只会发生在父端已退出或显式释放之后。关闭 Job
+                // 让 KILL_ON_JOB_CLOSE 回收残留成员，避免 helper 自身滞留。
                 if (line == null) return;
                 string[] parts = line.Split(' ');
                 if (parts.Length != 3 || parts[0] != "command") continue;
@@ -443,6 +445,11 @@ public static class PiSubagentWindowsJobHelper
         catch
         {
             state.Send("error control_unavailable");
+        }
+        finally
+        {
+            CloseJob(state);
+            state.Finished.Set();
         }
     }
 
@@ -504,8 +511,8 @@ public static class PiSubagentWindowsJobHelper
             }
             if (resources == "released")
             {
-                CloseJob(state);
-                state.Finished.Set();
+                // 最终资源事实必须在父端显式 release 前保持可查询。若此处立刻
+                // 退出，命名管道 EOF 可能先于最后一条 resources released 被父端处理。
                 return;
             }
             if (resources == "unknown") return;
