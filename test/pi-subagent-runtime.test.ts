@@ -675,8 +675,11 @@ test("运行时以单数 agent 命令交付只读 TUI，并在会话关闭时清
   const command = api.commands.get("agent");
   assert.ok(command);
   const opened = command.handler("", context) as Promise<void>;
-  assert.deepEqual(ui.overlayOptions, { overlay: true });
-  assert.match(ui.overlay?.render(80).join("\n") ?? "", /Agent tree · revision/);
+  assert.deepEqual(ui.overlayOptions, {
+    overlay: true,
+    overlayOptions: { width: 96, anchor: "center", margin: 1 },
+  });
+  assert.match(ui.overlay?.render(80).join("\n") ?? "", /AGENT TREE\s+REV/);
   ui.overlay?.handleInput?.("\x1b");
   await opened;
 

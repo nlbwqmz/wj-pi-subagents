@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { stripVTControlCharacters } from "node:util";
 import {
   AgentTreeFailureNotifier,
   AgentTreePanelModel,
   bindAgentTreeUi,
+  displayWidth,
+  renderAgentTreePanelSurface,
   renderAgentsWidget,
 } from "../src/agent-tree-ui.ts";
 import type {
@@ -22,6 +25,20 @@ const FAILED_ID = "71000000-0000-4000-8000-000000000008";
 const INCOMPLETE_ID = "71000000-0000-4000-8000-000000000009";
 const FINISHED_FAILED_ID = "71000000-0000-4000-8000-000000000012";
 const FINISHED_INCOMPLETE_ID = "71000000-0000-4000-8000-000000000013";
+
+const PANEL_THEME = Object.freeze({
+  fg(color: string, text: string): string {
+    const code = color === "borderAccent" ? 51 : color === "accent" ? 45 : color === "error" ? 196 : 252;
+    return `\x1b[38;5;${code}m${text}\x1b[39m`;
+  },
+  bg(color: string, text: string): string {
+    const code = color === "selectedBg" ? 60 : 236;
+    return `\x1b[48;5;${code}m${text}\x1b[49m`;
+  },
+  bold(text: string): string {
+    return `\x1b[1m${text}\x1b[22m`;
+  },
+});
 
 function node(overrides: Partial<AgentSnapshot> & Pick<AgentSnapshot, "agent_id" | "parent_agent_id">): AgentSnapshot {
   const { agent_id, parent_agent_id, ...rest } = overrides;
@@ -240,6 +257,32 @@ test("代理树面板默认展开直接子代理、折叠深层分支并优先�
   assert.match(model.render(120).join("\n"), /failed-done · 故障后终止 · failed/);
   assert.match(model.render(120).join("\n"), /cleanup-done · 重试后终止 · incomplete/);
   assert.doesNotMatch(model.render(120).join("\n"), /broken · 故障后代|cleanup · 待清理后代/);
+});
+
+test("代理树遮罩面板使用完整主题表面并让选中行独立高亮", () => {
+  const snapshot = subtreeSnapshot([
+    node({ agent_id: PARENT_ID, parent_agent_id: null, template_id: "parent", name: "当前会话" }),
+    node({ agent_id: CHILD_ID, parent_agent_id: PARENT_ID, template_id: "worker", name: "直接子代理" }),
+  ], 4);
+  const lines = renderAgentTreePanelSurface(new AgentTreePanelModel(snapshot), 72, PANEL_THEME);
+  const plainLines = lines.map((line) => stripVTControlCharacters(line));
+
+  assert.equal(lines.length, 18);
+  for (const line of plainLines) assert.equal(displayWidth(line), 72);
+  assert.equal(plainLines[0], `┏${"━".repeat(70)}┓`);
+  assert.match(plainLines[1]!, /┃ AGENT TREE\s+REV 4 ┃/);
+  assert.match(lines[3]!, /\x1b\[48;5;60m/);
+  assert.match(lines[4]!, /\x1b\[48;5;236m/);
+  assert.equal(plainLines.at(-1), `┗${"━".repeat(70)}┛`);
+
+  for (const width of [1, 2, 5, 6, 20]) {
+    const narrowLines = renderAgentTreePanelSurface(new AgentTreePanelModel(snapshot), width, PANEL_THEME);
+    assert.equal(
+      narrowLines.every((line) => displayWidth(stripVTControlCharacters(line)) === width),
+      true,
+      `面板在 ${width} 列下必须保持稳定行宽`,
+    );
+  }
 });
 
 test("代理树面板支持上下滚动、左右展开折叠和 Esc 关闭", () => {
@@ -633,11 +676,14 @@ test("UI 绑定通过 widget、overlay 和 notify 跟随树修订并完整清理
         keybindings: unknown,
         done: (result: T) => void,
       ) => TestComponent | Promise<TestComponent>,
-      options?: { readonly overlay?: boolean },
+      options?: {
+        readonly overlay?: boolean;
+        readonly overlayOptions?: unknown;
+      },
     ): Promise<T> {
       overlayOptions = options;
       return new Promise<T>((resolve) => {
-        overlayComponent = factory(tui, {}, {}, resolve) as typeof overlayComponent;
+        overlayComponent = factory(tui, PANEL_THEME, {}, resolve) as typeof overlayComponent;
       });
     },
     notify(message: string, type?: "info" | "warning" | "error"): void {
@@ -662,8 +708,14 @@ test("UI 绑定通过 widget、overlay 和 notify 跟随树修订并完整清理
     "  worker · 直接子代理 · idle · 1m 00s",
   ]);
   const opened = binding.openPanel({ hasUI: true, mode: "tui", ui });
-  assert.deepEqual(overlayOptions, { overlay: true });
-  assert.match(overlayComponent?.render(80).join("\n") ?? "", /Agent tree · revision 1/);
+  assert.deepEqual(overlayOptions, {
+    overlay: true,
+    overlayOptions: { width: 96, anchor: "center", margin: 1 },
+  });
+  const initialPanel = overlayComponent?.render(80) ?? [];
+  assert.match(initialPanel.map((line) => stripVTControlCharacters(line)).join("\n"), /AGENT TREE\s+REV 1/);
+  assert.equal(initialPanel.every((line) => displayWidth(stripVTControlCharacters(line)) === 80), true);
+  assert.match(initialPanel[0] ?? "", /\x1b\[48;5;236m/);
 
   current = subtreeSnapshot(current.nodes.map((item) => item.agent_id === CHILD_ID
     ? node({
@@ -680,7 +732,10 @@ test("UI 绑定通过 widget、overlay 和 notify 跟随树修订并完整清理
     : item), 2);
   for (const listener of listeners) listener();
   assert.equal(renders >= 2, true);
-  assert.match(overlayComponent?.render(80).join("\n") ?? "", /revision 2/);
+  assert.match(
+    (overlayComponent?.render(80) ?? []).map((line) => stripVTControlCharacters(line)).join("\n"),
+    /REV 2/,
+  );
   assert.deepEqual(notifications, [
     { message: "代理故障：worker ×1；internal_error ×1", type: "warning" },
   ]);
@@ -712,10 +767,13 @@ test("首次树读取失败时 agent 面板仍显示固定安全错误并可关�
         handleInput?(data: string): void;
         invalidate(): void;
       },
-      _options?: { readonly overlay?: boolean },
+      _options?: {
+        readonly overlay?: boolean;
+        readonly overlayOptions?: unknown;
+      },
     ): Promise<T> {
       return new Promise<T>((resolve) => {
-        overlayComponent = factory(tui, {}, {}, resolve);
+        overlayComponent = factory(tui, PANEL_THEME, {}, resolve);
       });
     },
   };
@@ -733,12 +791,13 @@ test("首次树读取失败时 agent 面板仍显示固定安全错误并可关�
   }, { hasUI: true, mode: "tui", ui });
 
   const opened = binding.openPanel();
-  assert.deepEqual(overlayComponent?.render(80), [
-    "Agent tree",
-    "代理树暂时不可用",
-    "Esc close",
-  ]);
-  assert.doesNotMatch(overlayComponent?.render(80).join("\n") ?? "", /private|secret-canary/i);
+  const rendered = overlayComponent?.render(80) ?? [];
+  const plainRendered = rendered.map((line) => stripVTControlCharacters(line));
+  assert.equal(rendered.length, 18);
+  assert.equal(plainRendered.every((line) => displayWidth(line) === 80), true);
+  assert.match(plainRendered.join("\n"), /AGENT TREE/);
+  assert.match(plainRendered.join("\n"), /代理树暂时不可用/);
+  assert.doesNotMatch(plainRendered.join("\n"), /private|secret-canary/i);
   overlayComponent?.handleInput?.("\x1b");
   await opened;
   binding.dispose();

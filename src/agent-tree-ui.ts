@@ -19,6 +19,21 @@ export interface AgentTreePanelOptions {
   readonly viewport_height?: number;
 }
 
+interface AgentTreeCustomOptions {
+  readonly overlay?: boolean;
+  readonly overlayOptions?: {
+    readonly width?: number | `${number}%`;
+    readonly anchor?: "center";
+    readonly margin?: number;
+  };
+}
+
+interface AgentTreePanelTheme {
+  fg?(color: string, text: string): string;
+  bg?(color: string, text: string): string;
+  bold?(text: string): string;
+}
+
 interface PanelRow {
   readonly key: string;
   readonly text: string;
@@ -75,7 +90,7 @@ interface AgentTreeUiSurface {
       keybindings: unknown,
       done: (result: T) => void,
     ) => AgentTreeComponent | Promise<AgentTreeComponent>,
-    options?: { readonly overlay?: boolean },
+    options?: AgentTreeCustomOptions,
   ): Promise<T>;
   notify?(message: string, type?: "info" | AgentTreeNotificationType): void;
 }
@@ -93,6 +108,12 @@ export interface AgentTreeUiBinding {
 
 const AGENTS_WIDGET_KEY = "pi-subagent-agents";
 const ELAPSED_REFRESH_INTERVAL_MS = 1_000;
+const DEFAULT_PANEL_VIEWPORT_HEIGHT = 12;
+const AGENT_TREE_OVERLAY_OPTIONS = Object.freeze({
+  width: 96,
+  anchor: "center" as const,
+  margin: 1,
+});
 
 export type AgentTreePanelInputOutcome = "changed" | "ignored" | "close";
 export type AgentTreePanelUpdateOutcome = "changed" | "ignored" | "close" | "error";
@@ -301,7 +322,7 @@ export function bindAgentTreeUi(
       if (panelPromise !== undefined) return panelPromise;
       let invocation: Promise<void>;
       try {
-        invocation = custom.call(overrideContext.ui, (tui, _theme, _keybindings, done) => {
+        invocation = custom.call(overrideContext.ui, (tui, theme, _keybindings, done) => {
           let closed = false;
           const finish = (): void => {
             if (closed) return;
@@ -317,12 +338,11 @@ export function bindAgentTreeUi(
           activePanel = panel;
           return {
             render: (width) => {
-              if (panel.model === undefined) return errorPanelLines(width);
               try {
-                return [...panel.model.render(width)];
+                return [...renderAgentTreePanelSurface(panel.model, width, theme)];
               } catch {
-                panel.model.markError();
-                return [...panel.model.render(width)];
+                panel.model?.markError();
+                return [...renderAgentTreePanelSurface(panel.model, width, undefined)];
               }
             },
             handleInput: (data) => {
@@ -340,7 +360,10 @@ export function bindAgentTreeUi(
               if (activePanel === panel) activePanel = undefined;
             },
           };
-        }, { overlay: true }) as Promise<void>;
+        }, {
+          overlay: true,
+          overlayOptions: AGENT_TREE_OVERLAY_OPTIONS,
+        }) as Promise<void>;
       } catch {
         return Promise.resolve();
       }
@@ -509,6 +532,10 @@ export class AgentTreePanelModel {
     if (data === "\x1b[C" || data === "l") return this.expandSelected(selected.key);
     if (data === "\x1b[D" || data === "h") return this.collapseSelected(selected.key);
     return "ignored";
+  }
+
+  getViewportHeight(): number {
+    return this.viewportHeight;
   }
 
   getPublicState(): AgentTreePanelPublicState {
@@ -696,6 +723,164 @@ export class AgentTreePanelModel {
   }
 }
 
+type AgentTreePanelLineStyle = "header" | "body" | "selected" | "error" | "footer";
+
+/** 将纯树投影包装成完整主题表面，避免 overlay 内部继续透出底层会话内容。 */
+export function renderAgentTreePanelSurface(
+  model: AgentTreePanelModel | undefined,
+  width: number,
+  theme: unknown,
+): readonly string[] {
+  const panelWidth = Number.isSafeInteger(width) && width > 0 ? width : 0;
+  if (panelWidth === 0) return Object.freeze([]);
+  const framed = panelWidth >= 6;
+  const contentWidth = framed ? panelWidth - 4 : panelWidth;
+  const semanticLines = model === undefined
+    ? errorPanelLines(contentWidth)
+    : [...model.render(contentWidth)];
+  const state = model?.getPublicState();
+  const isError = model === undefined || state?.status === "error";
+  const bodyHeight = model?.getViewportHeight() ?? DEFAULT_PANEL_VIEWPORT_HEIGHT;
+  const body = semanticLines.slice(1, -1).slice(0, bodyHeight);
+  while (body.length < bodyHeight) body.push("");
+  const header = formatPanelHeader(isError ? undefined : state?.tree_revision, contentWidth);
+  const footer = semanticLines.at(-1) ?? "";
+
+  if (!framed) {
+    return Object.freeze([
+      renderNarrowPanelLine(header, panelWidth, "header", theme),
+      ...body.map((line) => renderNarrowPanelLine(
+        line,
+        panelWidth,
+        isError && line.length > 0 ? "error" : line.startsWith("› ") ? "selected" : "body",
+        theme,
+      )),
+      renderNarrowPanelLine(footer, panelWidth, "footer", theme),
+    ]);
+  }
+
+  return Object.freeze([
+    renderPanelRule(panelWidth, "top", theme),
+    renderFramedPanelLine(header, contentWidth, "header", theme),
+    renderPanelRule(panelWidth, "divider", theme),
+    ...body.map((line) => renderFramedPanelLine(
+      line,
+      contentWidth,
+      isError && line.length > 0 ? "error" : line.startsWith("› ") ? "selected" : "body",
+      theme,
+    )),
+    renderPanelRule(panelWidth, "divider", theme),
+    renderFramedPanelLine(footer, contentWidth, "footer", theme),
+    renderPanelRule(panelWidth, "bottom", theme),
+  ]);
+}
+
+function formatPanelHeader(revision: number | undefined, width: number): string {
+  const title = "AGENT TREE";
+  const revisionLabel = revision === undefined ? "" : `REV ${revision}`;
+  if (revisionLabel.length === 0) return truncateToDisplayWidth(title, width);
+  const required = displayWidth(title) + displayWidth(revisionLabel) + 1;
+  if (required > width) return truncateToDisplayWidth(`${title} · ${revisionLabel}`, width);
+  return `${title}${" ".repeat(width - displayWidth(title) - displayWidth(revisionLabel))}${revisionLabel}`;
+}
+
+function renderPanelRule(
+  width: number,
+  position: "top" | "divider" | "bottom",
+  theme: unknown,
+): string {
+  const [left, fill, right] = position === "top"
+    ? ["┏", "━", "┓"]
+    : position === "bottom"
+      ? ["┗", "━", "┛"]
+      : ["┣", "━", "┫"];
+  const color = position === "divider" ? "border" : "borderAccent";
+  const rule = `${left}${fill.repeat(Math.max(0, width - 2))}${right}`;
+  return themeBg(theme, "customMessageBg", themeFg(theme, color, rule));
+}
+
+function renderFramedPanelLine(
+  value: string,
+  contentWidth: number,
+  style: AgentTreePanelLineStyle,
+  theme: unknown,
+): string {
+  const padded = padToDisplayWidth(value, contentWidth);
+  const borderColor = style === "header" || style === "selected" ? "borderAccent" : "border";
+  const line = `${themeFg(theme, borderColor, "┃")} ${stylePanelText(padded, style, theme)} ${themeFg(theme, borderColor, "┃")}`;
+  return themeBg(theme, style === "selected" ? "selectedBg" : "customMessageBg", line);
+}
+
+function renderNarrowPanelLine(
+  value: string,
+  width: number,
+  style: AgentTreePanelLineStyle,
+  theme: unknown,
+): string {
+  const padded = padToDisplayWidth(value, width);
+  return themeBg(
+    theme,
+    style === "selected" ? "selectedBg" : "customMessageBg",
+    stylePanelText(padded, style, theme),
+  );
+}
+
+function stylePanelText(value: string, style: AgentTreePanelLineStyle, theme: unknown): string {
+  switch (style) {
+    case "header":
+      return themeFg(theme, "accent", themeBold(theme, value));
+    case "selected":
+      return themeFg(theme, "text", themeBold(theme, value));
+    case "error":
+      return themeFg(theme, "error", value);
+    case "footer":
+      return themeFg(theme, "dim", value);
+    case "body":
+      return themeFg(theme, "customMessageText", value);
+  }
+}
+
+function padToDisplayWidth(value: string, width: number): string {
+  const truncated = truncateToDisplayWidth(value, width);
+  return `${truncated}${" ".repeat(Math.max(0, width - displayWidth(truncated)))}`;
+}
+
+function themeFg(theme: unknown, color: string, text: string): string {
+  if (typeof theme !== "object" || theme === null) return text;
+  const candidate = theme as AgentTreePanelTheme;
+  if (typeof candidate.fg !== "function") return text;
+  try {
+    const styled = candidate.fg.call(candidate, color, text);
+    return typeof styled === "string" ? styled : text;
+  } catch {
+    return text;
+  }
+}
+
+function themeBg(theme: unknown, color: string, text: string): string {
+  if (typeof theme !== "object" || theme === null) return text;
+  const candidate = theme as AgentTreePanelTheme;
+  if (typeof candidate.bg !== "function") return text;
+  try {
+    const styled = candidate.bg.call(candidate, color, text);
+    return typeof styled === "string" ? styled : text;
+  } catch {
+    return text;
+  }
+}
+
+function themeBold(theme: unknown, text: string): string {
+  if (typeof theme !== "object" || theme === null) return text;
+  const candidate = theme as AgentTreePanelTheme;
+  if (typeof candidate.bold !== "function") return text;
+  try {
+    const styled = candidate.bold.call(candidate, text);
+    return typeof styled === "string" ? styled : text;
+  } catch {
+    return text;
+  }
+}
+
 function formatAgentFacts(node: AgentSnapshot): string {
   const facts = [safeUiFact(node.template_id), safeUiFact(node.name), node.state];
   if (node.activity !== undefined) {
@@ -734,7 +919,7 @@ function stablePrioritySort(
 }
 
 function validViewportHeight(value: number | undefined): number {
-  return Number.isSafeInteger(value) && (value ?? 0) > 0 ? value! : 18;
+  return Number.isSafeInteger(value) && (value ?? 0) > 0 ? value! : DEFAULT_PANEL_VIEWPORT_HEIGHT;
 }
 
 function countBy<T>(items: readonly T[], keyOf: (item: T) => string): ReadonlyMap<string, number> {
