@@ -302,7 +302,7 @@ export interface RpcSupervisorChannel {
   waitForReady(signal: AbortSignal): Promise<void>;
   isReady(): boolean;
   publishReply(reply: SupervisorReplyInput | SupervisorReply): Promise<void>;
-  /** child final fence 使用；父端实现可拒绝该方向。 */
+  /** child final ACK 使用；父端实现可拒绝该方向。 */
   publishReplyAndWaitForAck?(
     reply: SupervisorReplyInput | SupervisorReply,
     signal?: AbortSignal,

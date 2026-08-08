@@ -30,21 +30,30 @@ export interface ChildReplyPort {
 
 export interface ChildReplyCoordinatorOptions {
   readonly port: ChildReplyPort;
-  /** 最终 fence 无法确认时通知运行时关闭监督通道，避免 Pi 误报 idle。 */
+  /** 最终答复无法确认时通知运行时关闭监督通道，避免 Pi 误报 idle。 */
   readonly onFinalFailure?: () => void;
 }
 
 type Publication = () => Promise<void>;
+type RunFinalState = "normal" | "failed" | "interrupted";
+
+const MISSING_FINAL_REPLY_NOTICE =
+  "子代理本轮未产生可用的最终回复。如有必要，可以尝试继续与该子代理沟通。";
+const FAILED_WITH_PARTIAL_NOTICE =
+  "子代理本轮未能正常完成，以下为已保留的部分内容。如有必要，可以尝试继续与该子代理沟通。";
+const INTERRUPTED_NOTICE =
+  "子代理本轮处理已中断。如有必要，可以尝试继续与该子代理沟通。";
 
 /**
  * 将 Pi 生命周期事件和父端回复语义集中在一个小而有状态的模块中。
- * message_end 从不直接上行，只有显式工具和 settled fence 能进入端口。
+ * message_end 从不直接上行，只有显式工具和 settled final 能进入端口。
  */
 export class ChildReplyCoordinator {
   private readonly port: ChildReplyPort;
   private readonly onFinalFailure: (() => void) | undefined;
   private publicationTail: Promise<void> = Promise.resolve();
   private candidate: FinalCandidate | undefined;
+  private finalState: RunFinalState = "normal";
   private runActive = false;
   private finalSubmitted = false;
   private finalFailureNotified = false;
@@ -60,6 +69,7 @@ export class ChildReplyCoordinator {
     this.finalSubmitted = false;
     this.finalFailureNotified = false;
     this.candidate = undefined;
+    this.finalState = "normal";
   }
 
   /** 只在本地更新候选；非 assistant 消息不会影响上一条合法候选。 */
@@ -68,24 +78,27 @@ export class ChildReplyCoordinator {
     if (parsed.kind === "ignored") return;
     this.runActive = true;
     if (parsed.kind !== "event" || parsed.event.type !== "message_end") {
-      this.candidate = undefined;
+      this.finalState = "failed";
       return;
     }
     const raw = isRecord(event) && isRecord(event.message) ? event.message : undefined;
     const stopReason = raw?.stopReason;
-    if (stopReason !== "stop" && stopReason !== "length") {
-      this.candidate = undefined;
+    if (stopReason === "error") {
+      this.finalState = "failed";
       return;
     }
-    if (Array.isArray(raw?.content) && raw.content.some((item) => isRecord(item) && item.type === "toolCall")) {
-      this.candidate = undefined;
+    if (stopReason === "aborted") {
+      this.finalState = "interrupted";
       return;
     }
+    this.finalState = "normal";
+    if (stopReason !== "stop" && stopReason !== "length") return;
+    if (Array.isArray(raw?.content) && raw.content.some((item) => isRecord(item) && item.type === "toolCall")) return;
 
     const text = parsed.event.message.content
       .filter((item): item is { readonly type: "text"; readonly text: string } => item.type === "text")
       .map((item) => item.text)
-      .join("");
+      .join("\n");
     const images = parsed.event.message.content
       .filter((item): item is SupervisorReplyImage => item.type === "image")
       .map((item) => Object.freeze({ ...item }));
@@ -94,10 +107,7 @@ export class ChildReplyCoordinator {
       && images.length === 0
       || utf8Length(text) > SUPERVISOR_CHANNEL_LIMITS.maxStringBytes
       || images.length > SUPERVISOR_CHANNEL_LIMITS.maxImagesPerReply
-    ) {
-      this.candidate = undefined;
-      return;
-    }
+    ) return;
     this.candidate = Object.freeze({
       text,
       ...(images.length === 0 ? {} : { images: Object.freeze(images) }),
@@ -127,16 +137,29 @@ export class ChildReplyCoordinator {
     return Object.freeze({ ok: true, data: Object.freeze({ accepted: true as const }) });
   }
 
-  /** settled 是唯一 final 提交入口；没有正文也发送空 fence。 */
+  /** settled 是唯一 final 提交入口；没有正文时发送说明性结果。 */
   async settle(): Promise<void> {
     if (!this.runActive || this.finalSubmitted) return;
     this.finalSubmitted = true;
     this.runActive = false;
     const candidate = this.candidate;
+    const failedWithPartial = this.finalState === "failed" && candidate !== undefined;
+    const partialText = failedWithPartial && candidate.text.trim().length > 0
+      ? `\n\n${candidate.text}`
+      : "";
+    const failedText = `${FAILED_WITH_PARTIAL_NOTICE}${partialText}`;
+    const text = this.finalState === "interrupted"
+      ? INTERRUPTED_NOTICE
+      : failedWithPartial
+        ? utf8Length(failedText) <= SUPERVISOR_CHANNEL_LIMITS.maxStringBytes
+          ? failedText
+          : FAILED_WITH_PARTIAL_NOTICE
+        : candidate?.text ?? MISSING_FINAL_REPLY_NOTICE;
+    const includeCandidateImages = this.finalState !== "interrupted" && candidate?.images !== undefined;
     const reply: SupervisorReplyInput = {
       kind: "final",
-      text: candidate?.text ?? "",
-      ...(candidate?.images === undefined ? {} : { images: candidate.images }),
+      text,
+      ...(includeCandidateImages ? { images: candidate.images } : {}),
     };
     try {
       await this.enqueue(() => this.port.publishReplyAndWaitForAck(reply));

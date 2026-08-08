@@ -143,7 +143,7 @@ test("回复与生命周期事件通过安全回调传递，观察者异常不�
   await pair.child.release();
 });
 
-test("child reply 发布等待父端累计 ACK，message 与空 final fence 共用序号域", async () => {
+test("child reply 发布等待父端累计 ACK，message 与非空 final 共用序号域", async () => {
   const received: Array<{ kind: string; text: string }> = [];
   const pair = channelPair((reply) => {
     received.push({ kind: reply.kind, text: reply.text });
@@ -156,12 +156,12 @@ test("child reply 发布等待父端累计 ACK，message 与空 final fence 共�
   const message = pair.child.publishReplyAndWaitForAck({ kind: "message", text: "进度" });
   await settleIo();
   await message;
-  const final = pair.child.publishReplyAndWaitForAck({ kind: "final", text: "" });
+  const final = pair.child.publishReplyAndWaitForAck({ kind: "final", text: "完成" });
   await settleIo();
   await final;
   assert.deepEqual(received, [
     { kind: "message", text: "进度" },
-    { kind: "final", text: "" },
+    { kind: "final", text: "完成" },
   ]);
   await pair.parent.release();
   await pair.child.release();

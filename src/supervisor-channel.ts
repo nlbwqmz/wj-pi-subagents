@@ -947,7 +947,7 @@ function parseReply(payload: Record<string, unknown>, limits: SupervisorChannelL
     ) frameError("reply_invalid");
     parsedImages.push(Object.freeze({ type: "image", data: candidate.data, mimeType: candidate.mimeType }));
   }
-  if (payload.kind === "message" && (payload.text as string).trim().length === 0 && parsedImages.length === 0) {
+  if ((payload.text as string).trim().length === 0 && parsedImages.length === 0) {
     frameError("reply_invalid");
   }
   if (Object.keys(payload).some((key) => key !== "reply_seq" && key !== "kind" && key !== "text" && key !== "images")) {

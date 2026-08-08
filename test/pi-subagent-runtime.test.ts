@@ -224,11 +224,16 @@ interface RegisteredCommand {
 type RegisteredMessageRenderer = (
   message: unknown,
   options: { readonly expanded?: boolean; readonly outputPad?: number },
-  theme: { fg(color: string, text: string): string; bold(text: string): string },
+  theme: {
+    fg(color: string, text: string): string;
+    bg(color: string, text: string): string;
+    bold(text: string): string;
+  },
 ) => { render(width: number): string[]; invalidate(): void };
 
 const MESSAGE_RENDER_THEME = Object.freeze({
   fg: (_color: string, text: string): string => text,
+  bg: (_color: string, text: string): string => text,
   bold: (text: string): string => text,
 });
 
@@ -592,7 +597,7 @@ test("生产运行时闭合直接父子的创建、消息、回复、等待、�
     MESSAGE_RENDER_THEME,
   ).render(120).join("\n");
   assert.match(finalDisplay, new RegExp(`Sender: 运行时子代理 · ${AGENT_ID}`));
-  assert.match(finalDisplay, /Payload:\n直接回复/);
+  assert.match(finalDisplay, /Payload:[^\r\n]*\r?\n[^\r\n]*直接回复/);
   assert.match(finalDisplay, /图片 1 · image\/png ×1/);
   assert.doesNotMatch(finalDisplay, /aGVsbG8=/);
 

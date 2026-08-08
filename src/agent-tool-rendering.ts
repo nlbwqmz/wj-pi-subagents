@@ -27,7 +27,8 @@ const INTERNAL_ERROR_REASON = "控制器内部错误";
 
 export interface AgentToolRenderTheme {
   fg(
-    color: "toolTitle" | "success" | "error" | "warning" | "muted" | "dim",
+    color: "toolTitle" | "success" | "error" | "warning" | "muted" | "dim"
+      | "accent" | "customMessageText" | "customMessageLabel",
     text: string,
   ): string;
   bold(text: string): string;
@@ -82,6 +83,12 @@ export interface SafeTextComponentOptions {
   readonly maxLines?: number;
   readonly overflowText?: string;
   readonly outputPad?: number;
+  /** 可选消息卡片的对称横向留白。 */
+  readonly paddingX?: number;
+  /** 可选消息卡片的上下留白。 */
+  readonly paddingY?: number;
+  /** 对整行（包括留白）应用主题背景。 */
+  readonly background?: (text: string) => string;
 }
 
 /**
@@ -115,9 +122,29 @@ export class SafeTextComponent implements AgentToolRenderComponent {
 
   render(width: number): string[] {
     const availableWidth = validWidth(width);
+    const background = this.options.background;
     const outputPad = validPadding(this.options.outputPad, availableWidth);
-    const contentWidth = Math.max(1, availableWidth - outputPad);
+    const horizontalPadding = background === undefined
+      ? 0
+      : validPadding(
+        this.options.paddingX,
+        Math.floor(Math.max(0, availableWidth - outputPad) / 2),
+      );
+    const contentWidth = Math.max(1, availableWidth - outputPad - horizontalPadding * 2);
     const rendered: string[] = [];
+
+    const renderLine = (line: SafeRenderLine, text: string): string => {
+      const styled = line.bold === true ? this.theme.bold(text) : text;
+      const leftPad = " ".repeat(outputPad + horizontalPadding);
+      if (background === undefined) {
+        return this.theme.fg(line.color, `${leftPad}${styled}`);
+      }
+      const rightPad = " ".repeat(Math.max(
+        0,
+        availableWidth - outputPad - horizontalPadding - displayWidth(text),
+      ));
+      return background(this.theme.fg(line.color, `${leftPad}${styled}${rightPad}`));
+    };
 
     for (const line of this.lines) {
       const prefix = sanitizeInline(line.prefix ?? "");
@@ -137,23 +164,29 @@ export class SafeTextComponent implements AgentToolRenderComponent {
       }
       for (const part of wrapped) {
         const text = truncateToDisplayWidth(`${prefix}${part}`, contentWidth);
-        const styled = line.bold === true ? this.theme.bold(text) : text;
-        const padded = `${" ".repeat(outputPad)}${styled}`;
-        rendered.push(this.theme.fg(line.color, padded));
+        rendered.push(renderLine(line, text));
       }
     }
 
     if (this.options.maxLines !== undefined && rendered.length > this.options.maxLines) {
       const keep = Math.max(0, this.options.maxLines - 1);
+      rendered.splice(
+        keep,
+        rendered.length - keep,
+        renderLine({ text: "", color: "dim" }, truncateToDisplayWidth(
+          this.options.overflowText ?? "…",
+          contentWidth,
+        )),
+      );
+    }
+
+    if (background !== undefined) {
+      const paddingY = validVerticalPadding(this.options.paddingY);
+      const blank = background(" ".repeat(availableWidth));
       return [
-        ...rendered.slice(0, keep),
-        this.theme.fg(
-          "dim",
-          `${" ".repeat(outputPad)}${truncateToDisplayWidth(
-            this.options.overflowText ?? "…",
-            contentWidth,
-          )}`,
-        ),
+        ...Array.from({ length: paddingY }, () => blank),
+        ...rendered,
+        ...Array.from({ length: paddingY }, () => blank),
       ];
     }
     return rendered;
@@ -803,6 +836,11 @@ function validWidth(width: number): number {
 function validPadding(value: number | undefined, width: number): number {
   if (!Number.isSafeInteger(value) || value === undefined || value <= 0) return 0;
   return Math.min(value, Math.max(0, width - 1));
+}
+
+function validVerticalPadding(value: number | undefined): number {
+  if (!Number.isSafeInteger(value) || value === undefined || value <= 0) return 0;
+  return Math.min(value, 16);
 }
 
 function wrapToDisplayWidth(value: string, width: number): string[] {

@@ -378,7 +378,7 @@ test("工作中 message 为 final 预留窗口槽位，二者按同一 reply_seq
     () => pair.child.publishReply({ kind: "message", text: "不得占用 final 槽位" }),
     (error: unknown) => error instanceof SupervisorProtocolError && error.code === "reply_window_full",
   );
-  const final = pair.child.publishReply({ kind: "final", text: "" });
+  const final = pair.child.publishReply({ kind: "final", text: "最终结果" });
   assert.throws(
     () => pair.child.publishReply({ kind: "final", text: "窗口已满" }),
     (error: unknown) => error instanceof SupervisorProtocolError && error.code === "reply_window_full",
@@ -392,7 +392,7 @@ test("工作中 message 为 final 预留窗口槽位，二者按同一 reply_seq
   assert.deepEqual(replies, [
     { kind: "message", text: "阶段一" },
     { kind: "message", text: "阶段二" },
-    { kind: "final", text: "" },
+    { kind: "final", text: "最终结果" },
   ]);
 
   const outbound = results.flatMap((result) => result.kind === "accepted" ? [...result.outbound] : []);
@@ -408,7 +408,7 @@ test("工作中 message 为 final 预留窗口槽位，二者按同一 reply_seq
   assert.equal(pair.child.getPublicState().pending_reply_count, 0);
 });
 
-test("原始 reply 帧必须显式携带 kind，message 正文不能为空", () => {
+test("原始 reply 帧必须显式携带 kind，message/final 内容不能为空，图片 final 仍合法", () => {
   const missingKind = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,
     childAgentId: CHILD_ID,
@@ -423,6 +423,22 @@ test("原始 reply 帧必须显式携带 kind，message 正文不能为空", () 
     error: "reply_invalid",
   });
 
+  const emptyIncomingFinal = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+  });
+  handshake(emptyIncomingFinal);
+  const validIncomingFinal = emptyIncomingFinal.child.publishReply({ kind: "final", text: "最终结果" });
+  const forgedEmptyFinal = {
+    ...validIncomingFinal,
+    payload: { ...validIncomingFinal.payload, text: "" },
+  } as SupervisorFrame;
+  assert.deepEqual(emptyIncomingFinal.parent.receive(forgedEmptyFinal), {
+    kind: "protocol_fault",
+    error: "reply_invalid",
+  });
+
   const emptyMessage = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,
     childAgentId: CHILD_ID,
@@ -433,6 +449,17 @@ test("原始 reply 帧必须显式携带 kind，message 正文不能为空", () 
     () => emptyMessage.child.publishReply({ kind: "message", text: "   " }),
     (error: unknown) => error instanceof SupervisorProtocolError && error.code === "reply_invalid",
   );
+  assert.throws(
+    () => emptyMessage.child.publishReply({ kind: "final", text: "" }),
+    (error: unknown) => error instanceof SupervisorProtocolError && error.code === "reply_invalid",
+  );
+  const imageOnlyFinal = emptyMessage.child.publishReply({
+    kind: "final",
+    text: "",
+    images: [{ type: "image", data: "YWJj", mimeType: "image/png" }],
+  });
+  assert.equal(imageOnlyFinal.payload.kind, "final");
+  assert.equal(imageOnlyFinal.payload.text, "");
   assert.throws(
     () => emptyMessage.child.publishReply({
       kind: "final",

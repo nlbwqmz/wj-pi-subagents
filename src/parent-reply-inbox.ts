@@ -27,10 +27,14 @@ export interface ParentReplyMessageRenderOptions {
   readonly outputPad?: number;
 }
 
+export interface ParentReplyMessageTheme extends AgentToolRenderTheme {
+  bg(color: "customMessageBg", text: string): string;
+}
+
 export type ParentReplyMessageRenderer = (
   message: unknown,
   options: ParentReplyMessageRenderOptions,
-  theme: AgentToolRenderTheme,
+  theme: ParentReplyMessageTheme,
 ) => AgentToolRenderComponent;
 
 export interface ParentReplyMessageRendererApi {
@@ -44,7 +48,7 @@ export interface ParentReplyMessageRendererOptions {
 
 /**
  * 父端 reply 接纳点。只有 Pi 会话已同步接受 custom message 后才返回 true，
- * 监督通道据此发送累计 ACK；空 final 只作为 completion fence 被确认。
+ * 监督通道据此发送累计 ACK；正文与图片同时为空的回复会被拒绝。
  */
 export class ParentReplyInbox {
   private readonly readApi: () => ParentConversationApi;
@@ -61,8 +65,7 @@ export class ParentReplyInbox {
     const kind = reply.kind ?? "final";
     const images = reply.images ?? [];
     const hasText = reply.text.trim().length > 0;
-    if (kind === "message" && !hasText && images.length === 0) return false;
-    if (kind === "final" && !hasText && images.length === 0) return true;
+    if (!hasText && images.length === 0) return false;
 
     const content: Array<Record<string, string>> = [{
       type: "text",
@@ -157,12 +160,21 @@ function createParentReplyMessageRenderer(
         ? agentId
         : `${senderName} · ${agentId}`;
     const lines: SafeRenderLine[] = [
-      { text: `Message Type: ${messageType}`, color: "muted", bold: true },
-      { text: `Sender: ${sender}`, color: "dim" },
-      { text: "Payload:", color: "muted", bold: true },
+      {
+        text: `Message Type: ${messageType}`,
+        color: kind === "message" ? "customMessageLabel" : "success",
+        bold: true,
+      },
+      { text: `Sender: ${sender}`, color: "muted" },
+      { text: "", color: "customMessageText" },
+      {
+        text: "Payload:",
+        color: kind === "message" ? "customMessageLabel" : "success",
+        bold: true,
+      },
       {
         text: payload,
-        color: "dim",
+        color: "customMessageText",
         multiline: true,
         ...(renderOptions.expanded === true ? {} : {
           maxLines: 8,
@@ -173,7 +185,9 @@ function createParentReplyMessageRenderer(
     const imageSummary = formatSafeImageSummary(content);
     if (imageSummary !== undefined) lines.push({ text: imageSummary, color: "muted" });
     return createSafeTextComponent(lines, theme, {}, {
-      ...(renderOptions.outputPad === undefined ? {} : { outputPad: renderOptions.outputPad }),
+      paddingX: renderOptions.outputPad ?? 1,
+      paddingY: 1,
+      background: (text) => theme.bg("customMessageBg", text),
     });
   };
 }

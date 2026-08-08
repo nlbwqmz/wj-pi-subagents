@@ -613,14 +613,14 @@ Unix 使用本地 Unix socket，Windows 使用命名管道。上层必须用带�
 
 ### 7.4 分类回复与最终提交屏障
 
-**REQ-036**：直接父子监督 `reply` 必须携带独立单调 `reply_seq`、必填 `kind: "message" | "final"`、有界文本和可选 Pi `ImageContent`。原始帧缺少或使用未知 `kind` 属于协议故障；`message` 正文与图片不能同时为空，`final` 可以为空并作为 completion fence。
+**REQ-036**：直接父子监督 `reply` 必须携带独立单调 `reply_seq`、必填 `kind: "message" | "final"`、有界文本和可选 Pi `ImageContent`。原始帧缺少或使用未知 `kind` 属于协议故障；`message` 与 `final` 的正文和图片都不能同时为空。
 
 子运行时只能通过两条入口发布 reply：
 
 1. `reply_to_parent` 显式发布 `kind:"message"`。它与当前处理串行确认，但不会结束处理；
-2. `agent_settled` 发布且每轮至多发布一次 `kind:"final"`。`message_end` 只更新本地最终候选，绝不直接上行；只有 `stopReason` 为 `stop`/`length`、不含工具调用且正文/图片通过安全边界的最后一条 assistant 完成消息可成为候选，否则 final 使用空 fence。
+2. `agent_settled` 发布且每轮至多发布一次 `kind:"final"`。`message_end` 只更新本地最终候选，绝不直接上行；运行时在本轮保留最近一条通过安全边界的 assistant 正文，后续工具调用或空消息不会清除已有候选。若最后一轮出错、被中断或本轮没有可用正文，final 使用简短说明，不透传原始错误或中止消息。
 
-显式 message 与自动 final 必须通过同一发布队列和 `reply_seq` 域顺序发送。发送端必须等待 final 的 reply ACK；只有父端已经接纳最终正文或空 fence 后，Pi 才能继续发布对应 `agent_settled` 生命周期事实。确认失败必须关闭/故障监督通道，不能让父端先观察到健康 `idle`。工作中 message 最多占用 `maxReplyWindow - 1` 个未确认槽位，始终为 final 预留一个槽位。
+显式 message 与自动 final 必须通过同一发布队列和 `reply_seq` 域顺序发送。发送端必须等待 final 的 reply ACK；只有父端已经接纳最终正文或说明性结果后，Pi 才能继续发布对应 `agent_settled` 生命周期事实。确认失败必须关闭/故障监督通道，不能让父端先观察到健康 `idle`。工作中 message 最多占用 `maxReplyWindow - 1` 个未确认槽位，始终为 final 预留一个槽位。
 
 父控制器按 `reply_seq` 顺序接纳并累计 ACK；重复回复不得再次注入。模型可见正文必须自包含来源和类别：
 
@@ -631,7 +631,7 @@ Payload:
 <正文>
 ```
 
-`message` 注入使用非自动 turn 语义，同时通知 `wait_agent` 返回 `outcome:"reply"`；`final` 注入触发父会话继续处理。空 final 只 ACK，不创建空会话消息。思考块、工具前说明、工具调用、工具参数、工具结果、错误和中止消息不得进入任何 reply。未连续确认回复只保留有界窗口；有限重同步先恢复握手和快照，再从最近未确认回复继续。消息 ID、reply seq、帧 seq 和 tree revision 属于不同命名空间，不得复用或互相推断。
+`message` 注入使用非自动 turn 语义，同时通知 `wait_agent` 返回 `outcome:"reply"`；`final` 注入触发父会话继续处理。正文和图片同时为空的 reply 属于协议故障，不得接纳或 ACK。原始思考块、工具前说明、工具调用、工具参数、工具结果、错误和中止消息不得进入任何 reply。未连续确认回复只保留有界窗口；有限重同步先恢复握手和快照，再从最近未确认回复继续。消息 ID、reply seq、帧 seq 和 tree revision 属于不同命名空间，不得复用或互相推断。
 
 ### 7.5 有界状态与安全
 
@@ -823,7 +823,7 @@ Windows 执行两个锁定宿主组合：
 - 参数错误（包括 `get_agent_templates` 多余参数和非 canonical UUID 的 `agent_id`）、格式正确但未注册的 UUID、非直接子代理、模板不存在/无效/能力不足、深度/直接/全树配额耗尽；
 - 配置不可读、坏 JSON、非法值、未知字段 UI-only 默认回退，以及非法显式根参数拒绝启动；
 - 启动超时/提前退出、RPC 断开、消息接受状态未知、中断-settle 竞态、屏障后迟到事件、部分级联失败、中间父故障和根关闭；
-- 重复帧、断序、旧 revision、旧/非法 stream、损坏快照、ACK 丢失、reset 快照和回复去重；reply 缺失/非法 `kind`、空 message、message/final 混排、final 槽位预留、空 final fence、ACK 等待失败与通道关闭；
+- 重复帧、断序、旧 revision、旧/非法 stream、损坏快照、ACK 丢失、reset 快照和回复去重；reply 缺失/非法 `kind`、空 message/final 拒绝、message/final 混排、final 槽位预留、ACK 等待失败与通道关闭；
 - assistant 思考、工具前说明、工具调用、参数、结果、错误和中止内容不能泄漏到父会话；重复 settled 不得重复 final；
 - 模板目录为空时直接返回 `[]`，无效候选和来源诊断不枚举，非空项字段闭合且不泄露运行配置，模板业务 `tools` 不混入八个管理工具或 `reply_to_parent`；
 - 未信任项目资源不加载、模板不能扩权、叶节点不能绕过管理能力和深度、根不能越级控制；
