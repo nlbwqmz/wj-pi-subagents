@@ -221,10 +221,22 @@ interface RegisteredCommand {
   readonly handler: (args: string, context: unknown) => unknown;
 }
 
+type RegisteredMessageRenderer = (
+  message: unknown,
+  options: { readonly expanded?: boolean; readonly outputPad?: number },
+  theme: { fg(color: string, text: string): string; bold(text: string): string },
+) => { render(width: number): string[]; invalidate(): void };
+
+const MESSAGE_RENDER_THEME = Object.freeze({
+  fg: (_color: string, text: string): string => text,
+  bold: (text: string): string => text,
+});
+
 class FakeExtensionApi {
   readonly handlers = new Map<string, Array<(event: unknown, context: unknown) => unknown>>();
   readonly tools = new Map<string, RegisteredTool>();
   readonly commands = new Map<string, RegisteredCommand>();
+  readonly messageRenderers = new Map<string, RegisteredMessageRenderer>();
   readonly sentMessages: Array<{ message: unknown; options: unknown }> = [];
   readonly activeToolHistory: string[][] = [];
   activeTools = ["read", "grep"];
@@ -261,6 +273,10 @@ class FakeExtensionApi {
   registerTool(tool: unknown): void {
     const candidate = tool as RegisteredTool;
     this.tools.set(candidate.name, candidate);
+  }
+
+  registerMessageRenderer(customType: string, renderer: RegisteredMessageRenderer): void {
+    this.messageRenderers.set(customType, renderer);
   }
 
   registerCommand(name: string, command: RegisteredCommand): void {
@@ -523,6 +539,7 @@ test("生产运行时闭合直接父子的创建、消息、回复、等待、�
   });
 
   assert.deepEqual([...api.tools.keys()], [...AGENT_TOOL_NAMES]);
+  assert.deepEqual([...api.messageRenderers.keys()], ["pi-subagent-message", "pi-subagent-final"]);
   assert.equal(api.handlers.get("session_start")?.length, 1);
   assert.equal(api.handlers.get("session_shutdown")?.length, 1);
 
@@ -562,10 +579,22 @@ test("生产运行时闭合直接父子的创建、消息、回复、等待、�
         { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
       ],
       display: true,
-      details: { agent_id: AGENT_ID, kind: "final" },
+      details: { agent_id: AGENT_ID, kind: "final", sender_name: "运行时子代理" },
     },
     options: { triggerTurn: true, deliverAs: "steer" },
   }]);
+
+  const finalRenderer = api.messageRenderers.get("pi-subagent-final");
+  assert.ok(finalRenderer);
+  const finalDisplay = finalRenderer(
+    api.sentMessages[0]!.message,
+    { expanded: true, outputPad: 0 },
+    MESSAGE_RENDER_THEME,
+  ).render(120).join("\n");
+  assert.match(finalDisplay, new RegExp(`Sender: 运行时子代理 · ${AGENT_ID}`));
+  assert.match(finalDisplay, /Payload:\n直接回复/);
+  assert.match(finalDisplay, /图片 1 · image\/png ×1/);
+  assert.doesNotMatch(finalDisplay, /aGVsbG8=/);
 
   node.emitEvent({ type: "agent_settled" });
   const waited = await execute(api, "wait_agent", { agent_id: AGENT_ID }, context) as {
@@ -588,6 +617,13 @@ test("生产运行时闭合直接父子的创建、消息、回复、等待、�
 
   await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
   assert.equal(node.operations().includes("release"), true, node.operations().join(","));
+  const terminatedDisplay = finalRenderer(
+    api.sentMessages[0]!.message,
+    { expanded: true, outputPad: 0 },
+    MESSAGE_RENDER_THEME,
+  ).render(120).join("\n");
+  assert.match(terminatedDisplay, new RegExp(`Sender: ${AGENT_ID}`));
+  assert.doesNotMatch(terminatedDisplay, /运行时子代理/);
 });
 
 test("运行时以单数 agent 命令交付只读 TUI，并在会话关闭时清理 UI", async () => {
@@ -888,10 +924,18 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
         text: `Message Type: AGENT_MESSAGE\nSender: ${parentId}\nPayload:\n正在继续工作`,
       }],
       display: true,
-      details: { agent_id: parentId, kind: "message" },
+      details: { agent_id: parentId, kind: "message", sender_name: "递归父代理" },
     },
     options: { triggerTurn: false, deliverAs: "steer" },
   }]);
+
+  const progressRenderer = rootApi.messageRenderers.get("pi-subagent-message");
+  assert.ok(progressRenderer);
+  assert.match(
+    progressRenderer(rootApi.sentMessages[0]!.message, { expanded: true, outputPad: 0 }, MESSAGE_RENDER_THEME)
+      .render(120).join("\n"),
+    new RegExp(`Sender: 递归父代理 · ${parentId}`),
+  );
 
   await childApi.emit("message_end", {
     type: "message_end",
@@ -913,7 +957,7 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
           text: `Message Type: AGENT_MESSAGE\nSender: ${parentId}\nPayload:\n正在继续工作`,
         }],
         display: true,
-        details: { agent_id: parentId, kind: "message" },
+        details: { agent_id: parentId, kind: "message", sender_name: "递归父代理" },
       },
       options: { triggerTurn: false, deliverAs: "steer" },
     },
@@ -925,11 +969,18 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
           text: `Message Type: FINAL_ANSWER\nSender: ${parentId}\nPayload:\n真正 child 最终回复`,
         }],
         display: true,
-        details: { agent_id: parentId, kind: "final" },
+        details: { agent_id: parentId, kind: "final", sender_name: "递归父代理" },
       },
       options: { triggerTurn: true, deliverAs: "steer" },
     },
   ]);
+  const recursiveFinalRenderer = rootApi.messageRenderers.get("pi-subagent-final");
+  assert.ok(recursiveFinalRenderer);
+  assert.match(
+    recursiveFinalRenderer(rootApi.sentMessages[1]!.message, { expanded: true, outputPad: 0 }, MESSAGE_RENDER_THEME)
+      .render(120).join("\n"),
+    new RegExp(`Sender: 递归父代理 · ${parentId}`),
+  );
   assert.doesNotMatch(JSON.stringify(rootApi.sentMessages), /SECRET_CHILD_THINKING|SECRET_CALL/);
 
   const grandchildSpawn = execute(childApi, "spawn_agent", {
@@ -978,7 +1029,7 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
         text: `Message Type: FINAL_ANSWER\nSender: ${grandchildId}\nPayload:\n叶节点只回复直接父会话`,
       }],
       display: true,
-      details: { agent_id: grandchildId, kind: "final" },
+      details: { agent_id: grandchildId, kind: "final", sender_name: "递归孙代理" },
     },
     options: { triggerTurn: true, deliverAs: "steer" },
   }]);
@@ -1129,6 +1180,13 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
     },
     options: { triggerTurn: true, deliverAs: "steer" },
   });
+  const reloadedFinalRenderer = newApi.messageRenderers.get("pi-subagent-final");
+  assert.ok(reloadedFinalRenderer);
+  assert.match(
+    reloadedFinalRenderer(newApi.sentMessages[0]!.message, { expanded: true, outputPad: 0 }, MESSAGE_RENDER_THEME)
+      .render(120).join("\n"),
+    new RegExp(`Sender: 交接前节点 · ${firstId}`),
+  );
   assert.deepEqual(
     firstNode.operations().filter((operation) => [
       "graceful_close",
@@ -1288,6 +1346,13 @@ test("根与 child 跨实例 reload 保留同一监督连接，并让既有 chil
     },
     options: { triggerTurn: true, deliverAs: "steer" },
   });
+  const recursiveReloadRenderer = newRootApi.messageRenderers.get("pi-subagent-final");
+  assert.ok(recursiveReloadRenderer);
+  assert.match(
+    recursiveReloadRenderer(newRootApi.sentMessages[0]!.message, { expanded: true, outputPad: 0 }, MESSAGE_RENDER_THEME)
+      .render(120).join("\n"),
+    new RegExp(`Sender: 跨 reload 父代理 · ${parentId}`),
+  );
 
   const grandchildSpawn = execute(newChildApi, "spawn_agent", {
     template_id: "reviewer",

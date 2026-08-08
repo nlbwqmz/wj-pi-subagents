@@ -21,6 +21,7 @@ import {
 const readyApi = (): ExtensionApiSurface => ({
   on: () => {},
   registerTool: () => {},
+  registerMessageRenderer: () => {},
   registerCommand: () => {},
   getActiveTools: () => [],
   getAllTools: () => [],
@@ -181,6 +182,29 @@ test("缺失必需宿主 API 时拒绝激活", async () => {
     assert.equal(result.diagnostic.reason, "host_api_unavailable");
     assert.deepEqual(result.diagnostic.missingApi, ["registerCommand"]);
   }
+});
+
+test("缺失消息 renderer 注册能力时拒绝整套扩展激活", async () => {
+  const api = readyApi();
+  delete api.registerMessageRenderer;
+  const result = await checkHostCapabilities({
+    extensionApi: api,
+    ...readyOverrides(),
+  });
+
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.diagnostic.reason, "host_api_unavailable");
+    assert.deepEqual(result.diagnostic.missingApi, ["registerMessageRenderer"]);
+  }
+
+  let activated = false;
+  const extension = createPiSubagentExtension({
+    probe: readyOverrides(),
+    activate: () => { activated = true; },
+  });
+  await extension(api);
+  assert.equal(activated, false);
 });
 
 test("RpcClient 缺失监督方法时拒绝激活", async () => {

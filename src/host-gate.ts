@@ -40,6 +40,7 @@ export type SupportedPlatform = (typeof SUPPORTED_PLATFORMS)[number];
 export interface ExtensionApiSurface {
   on?: unknown;
   registerTool?: unknown;
+  registerMessageRenderer?: unknown;
   registerCommand?: unknown;
   getActiveTools?: unknown;
   getAllTools?: unknown;
@@ -164,6 +165,7 @@ function readPiVersion(module: unknown): string {
 const REQUIRED_EXTENSION_API_METHODS = [
   "on",
   "registerTool",
+  "registerMessageRenderer",
   "registerCommand",
   "getActiveTools",
   "getAllTools",

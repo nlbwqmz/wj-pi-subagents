@@ -49,6 +49,8 @@ import {
   ParentReplyInbox,
   PI_SUBAGENT_FINAL_TYPE,
   PI_SUBAGENT_MESSAGE_TYPE,
+  registerParentReplyMessageRenderers,
+  type ParentReplyMessageRenderer,
 } from "./parent-reply-inbox.ts";
 import {
   RuntimeReloadCoordinator,
@@ -90,6 +92,7 @@ interface RuntimeExtensionApi extends AgentToolRegistrationApi {
     readonly description: string;
     readonly handler: (args: string, context: unknown) => unknown;
   }): void;
+  registerMessageRenderer(customType: string, renderer: ParentReplyMessageRenderer): void;
   getActiveTools(): string[];
   getAllTools(): unknown[];
   setActiveTools?(tools: readonly string[]): void;
@@ -534,6 +537,24 @@ function validateTemplateAgainstContext(
   return Object.freeze({ ok: true, data: Object.freeze({}) });
 }
 
+function readDirectChildDisplayName(
+  runtime: ActiveRuntime | undefined,
+  agentId: string,
+  includeTerminated: boolean,
+): string | undefined {
+  if (runtime === undefined || runtime.handoffPending === true || !isCanonicalUuid(agentId)) return undefined;
+  try {
+    const status = runtime.controller.getAgentStatus(agentId);
+    if (!status.ok || status.data.agent_id !== agentId) return undefined;
+    if (!includeTerminated && (status.data.state === "terminating" || status.data.state === "terminated")) {
+      return undefined;
+    }
+    return status.data.name.length > 0 ? status.data.name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function createPiSubagentRuntimeActivator(
   options: PiSubagentRuntimeOptions = {},
 ): PiSubagentRuntimeActivator {
@@ -581,11 +602,19 @@ export function createPiSubagentRuntimeActivator(
       current.tree.clearTerminatedRecords();
     };
 
+    registerParentReplyMessageRenderers(api, {
+      resolveSenderName: (agentId) => readDirectChildDisplayName(active, agentId, false),
+    });
     registerAgentTools(api, async (toolContext) => {
       if (active !== undefined) active.bindings.context = readContext(toolContext);
       return active?.handoffPending === true
         ? undefined as unknown as AgentController
         : active?.controller as AgentController;
+    }, {
+      resolveAgentName: (agentId) => readDirectChildDisplayName(active, agentId, true),
+      readWaitTimeoutMs: () => active?.handoffPending === true
+        ? undefined
+        : active?.rootRuntime.config.waitTimeoutMs,
     });
 
     if (bootstrapAtActivation.kind === "child") {
@@ -907,6 +936,7 @@ export function createPiSubagentRuntimeActivator(
           if (current === undefined) return;
           current.controller.notifyAgentReply(agentId);
         },
+        readSenderName: (agentId) => readDirectChildDisplayName(stateReference, agentId, false),
       });
       const replyCoordinator = upstream === undefined
         ? undefined
