@@ -71,7 +71,7 @@ test("管理工具系统提示要求直接父会话等待已接纳任务并在�
     registrations.find((tool) => tool.name === name)?.promptGuidelines;
 
   assert.deepEqual(readGuidelines("send_message"), [
-    "send_message 返回 accepted: true 后，该父子消息继续由目标子代理处理。直接父会话使用 wait_agent 等待，或只处理明确拆分且无资源冲突的工作；在子代理给出最终答复或进入终态前，不在父会话实施或再次委派同一任务。",
+    "send_message 返回 accepted: true 后，该任务继续由目标直接子代理负责。直接父会话使用 wait_agent 等待，或只处理明确拆分、无数据依赖且无共享写资源的工作；在子代理给出最终答复或进入终态前，不在父会话实施或再次委派同一任务。若返回 message_delivery_failed，交付状态可能无法确认，不要盲目重发，先查询状态并结合已有回复判断。",
   ]);
   assert.deepEqual(readGuidelines("wait_agent"), [
     "wait_agent 返回 outcome: reply 时，子代理仍在处理；直接父会话继续等待或使用 send_message 引导同一子代理。wait_agent 返回 outcome: timeout 只结束本次等待，不改变子代理生命周期，也不把任务交回直接父会话。",
@@ -83,6 +83,14 @@ test("管理工具系统提示要求直接父会话等待已接纳任务并在�
     if (name === "send_message" || name === "wait_agent" || name === "interrupt_agent") continue;
     assert.equal(readGuidelines(name), undefined, `${name} 不应重复携带委派规则`);
   }
+
+  const readDescription = (name: string): string =>
+    String(registrations.find((tool) => tool.name === name)?.description ?? "");
+  assert.match(readDescription("send_message"), /accepted: true/);
+  assert.match(readDescription("send_message"), /message_delivery_failed/);
+  assert.match(readDescription("wait_agent"), /timeout/);
+  assert.match(readDescription("interrupt_agent"), /wait_agent/);
+  assert.match(readDescription("terminate_agent"), /永久/);
 });
 
 test("模板查询与创建通过注册渲染接口提供语义化调用和结果", async () => {

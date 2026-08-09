@@ -160,24 +160,24 @@ const schemas: Readonly<Record<AgentToolName, JsonSchema>> = Object.freeze({
 const descriptions: Readonly<Record<AgentToolName, string>> = Object.freeze({
   get_agent_templates: "列出当前发现且格式有效的子代理模板，直接返回 JSON 数组。每项包含 template_id、可选 description 和模板声明的子代理初始业务 tools；tools 不要求向父会话当前活动工具向下缩减。返回 [] 表示当前没有有效模板，此时不能调用 spawn_agent。非空模板仍须通过 spawn_agent 的模板格式、工具注册、模型、thinking 和管理能力预检。",
   spawn_agent: "使用有效模板创建一个直接子代理并等待它完成启动握手。调用前先调用 get_agent_templates；template_id 必须从当前返回数组中原样复制、区分大小写，不得猜测、裁剪、改写或用 description 代替。模板 tools 是子代理的初始业务工具请求，不要求是父会话活动工具的子集。若 get_agent_templates 返回 []，则不能调用 spawn_agent。创建成功后使用 send_message 发送首项任务。",
-  send_message: "向直接子代理发送任务消息或当前处理的 steering。",
-  wait_agent: "等待直接子代理发来工作中回复、完全 settled 或进入终态。收到工作中回复时返回 outcome: reply，子代理会继续当前处理。",
-  interrupt_agent: "协作式中断直接子代理当前处理，保留节点和上下文。",
-  terminate_agent: "终止直接子代理及其已登记子树并确认资源回收。",
+  send_message: "向直接子代理发送任务消息或当前处理的 steering。返回 accepted: true 只表示消息已被接受，不表示任务完成；若返回 message_delivery_failed，交付状态可能无法确认，不要盲目重发。",
+  wait_agent: "等待直接子代理发来工作中回复、完全 settled 或进入终态。收到 outcome: reply 时子代理会继续处理；outcome: timeout 只结束本次等待，不改变节点生命周期。",
+  interrupt_agent: "协作式中断直接子代理当前处理，保留节点和上下文；调用成功后仍需使用 wait_agent 确认处理真正结束。",
+  terminate_agent: "永久终止直接子代理及其已登记子树并确认资源回收；只有确定不再复用该分支时使用。",
   get_agent_status: "读取直接子代理最近确认的安全状态快照。",
   get_agent_tree: "读取当前调用者作用域内的安全代理树快照。",
 });
 
+export const PARENT_COORDINATION_GUIDELINES = Object.freeze({
+  sendMessage: "send_message 返回 accepted: true 后，该任务继续由目标直接子代理负责。直接父会话使用 wait_agent 等待，或只处理明确拆分、无数据依赖且无共享写资源的工作；在子代理给出最终答复或进入终态前，不在父会话实施或再次委派同一任务。若返回 message_delivery_failed，交付状态可能无法确认，不要盲目重发，先查询状态并结合已有回复判断。",
+  waitAgent: "wait_agent 返回 outcome: reply 时，子代理仍在处理；直接父会话继续等待或使用 send_message 引导同一子代理。wait_agent 返回 outcome: timeout 只结束本次等待，不改变子代理生命周期，也不把任务交回直接父会话。",
+  interruptAgent: "直接父会话需要接管已下发任务时，先使用 interrupt_agent，再使用 wait_agent 确认子代理已结束当前处理；确认后再实施相同任务或修改相同资源。",
+});
+
 const promptGuidelines: Readonly<Partial<Record<AgentToolName, readonly string[]>>> = Object.freeze({
-  send_message: Object.freeze([
-    "send_message 返回 accepted: true 后，该父子消息继续由目标子代理处理。直接父会话使用 wait_agent 等待，或只处理明确拆分且无资源冲突的工作；在子代理给出最终答复或进入终态前，不在父会话实施或再次委派同一任务。",
-  ]),
-  wait_agent: Object.freeze([
-    "wait_agent 返回 outcome: reply 时，子代理仍在处理；直接父会话继续等待或使用 send_message 引导同一子代理。wait_agent 返回 outcome: timeout 只结束本次等待，不改变子代理生命周期，也不把任务交回直接父会话。",
-  ]),
-  interrupt_agent: Object.freeze([
-    "直接父会话需要接管已下发任务时，先使用 interrupt_agent，再使用 wait_agent 确认子代理已结束当前处理；确认后再实施相同任务或修改相同资源。",
-  ]),
+  send_message: Object.freeze([PARENT_COORDINATION_GUIDELINES.sendMessage]),
+  wait_agent: Object.freeze([PARENT_COORDINATION_GUIDELINES.waitAgent]),
+  interrupt_agent: Object.freeze([PARENT_COORDINATION_GUIDELINES.interruptAgent]),
 });
 
 const childReplySchema: JsonSchema = Object.freeze({

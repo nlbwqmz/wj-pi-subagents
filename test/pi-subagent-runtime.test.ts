@@ -7,6 +7,7 @@ import type { AgentController } from "../src/agent-controller.ts";
 import {
   AGENT_TOOL_NAMES,
   CHILD_REPLY_TOOL_NAME,
+  PARENT_COORDINATION_GUIDELINES,
   SubagentToolError,
 } from "../src/agent-tools.ts";
 import {
@@ -866,7 +867,29 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   assert.ok(rootController);
   const rootPromptHandler = rootApi.handlers.get("before_agent_start")?.[0];
   assert.ok(rootPromptHandler);
+  const parentCoordinationGuidance = [
+    "父子任务协作要求：",
+    `- ${PARENT_COORDINATION_GUIDELINES.sendMessage}`,
+    `- ${PARENT_COORDINATION_GUIDELINES.waitAgent}`,
+    `- ${PARENT_COORDINATION_GUIDELINES.interruptAgent}`,
+  ].join("\n");
+  const childFinalReplyGuidance = [
+    "子代理最终答复要求：",
+    "- 每次处理结束前，必须输出一条非空且可用的最终答复。",
+    "- 如果产物已经写入文件，仍要说明完成内容、关键结果和产物路径。",
+    "- 不要以工具调用、工具结果或空白 assistant 消息结束处理。",
+    "- 如果没有可用结果，请简短说明原因。",
+  ].join("\n");
   assert.equal(await rootPromptHandler({ systemPrompt: "根会话提示" }, rootContext), undefined);
+  const rootCustomPromptResult = await rootPromptHandler({
+    systemPrompt: "自定义根会话提示",
+    systemPromptOptions: { customPrompt: "自定义根会话提示" },
+  }, rootContext) as { readonly systemPrompt?: unknown };
+  assert.equal(rootCustomPromptResult.systemPrompt, [
+    "自定义根会话提示",
+    "",
+    parentCoordinationGuidance,
+  ].join("\n"));
 
   const rootTemplates = await execute(rootApi, "get_agent_templates", {}, rootContext) as {
     details?: Array<{ template_id: string; tools: string[] }>;
@@ -905,11 +928,18 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   assert.equal(childPromptResult.systemPrompt, [
     "模板与项目提示",
     "",
-    "子代理最终答复要求：",
-    "- 每次处理结束前，必须输出一条非空且可用的最终答复。",
-    "- 如果产物已经写入文件，仍要说明完成内容、关键结果和产物路径。",
-    "- 不要以工具调用、工具结果或空白 assistant 消息结束处理。",
-    "- 如果没有可用结果，请简短说明原因。",
+    childFinalReplyGuidance,
+  ].join("\n"));
+  const childCustomPromptResult = await childPromptHandler({
+    systemPrompt: "自定义模板与项目提示",
+    systemPromptOptions: { customPrompt: "自定义模板与项目提示" },
+  }, childContext) as { readonly systemPrompt?: unknown };
+  assert.equal(childCustomPromptResult.systemPrompt, [
+    "自定义模板与项目提示",
+    "",
+    parentCoordinationGuidance,
+    "",
+    childFinalReplyGuidance,
   ].join("\n"));
   const spawnedParent = await parentSpawn;
   const parentId = String(spawnedParent.details?.agent_id);
@@ -1021,7 +1051,19 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
     templateFileSystem: templateFileSystem(cwd),
   });
   await leafActivate(leafApi as never, hostCapabilities);
-  await leafApi.emit("session_start", { type: "session_start", reason: "startup" }, extensionContext(cwd));
+  const leafContext = extensionContext(cwd);
+  await leafApi.emit("session_start", { type: "session_start", reason: "startup" }, leafContext);
+  const leafPromptHandler = leafApi.handlers.get("before_agent_start")?.[0];
+  assert.ok(leafPromptHandler);
+  const leafCustomPromptResult = await leafPromptHandler({
+    systemPrompt: "叶节点自定义提示",
+    systemPromptOptions: { customPrompt: "叶节点自定义提示" },
+  }, leafContext) as { readonly systemPrompt?: unknown };
+  assert.equal(leafCustomPromptResult.systemPrompt, [
+    "叶节点自定义提示",
+    "",
+    childFinalReplyGuidance,
+  ].join("\n"));
   const spawnedGrandchild = await grandchildSpawn;
   const grandchildId = String(spawnedGrandchild.details?.agent_id);
   assert.equal(grandchildId, "cccccccc-cccc-4ccc-8ccc-cccccccccccc");
@@ -1033,7 +1075,6 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   assert.equal(AGENT_TOOL_NAMES.some((name) => leafActiveTools.includes(name)), false);
   assert.equal(leafActiveTools.includes(CHILD_REPLY_TOOL_NAME), true);
 
-  const leafContext = extensionContext(cwd);
   await leafApi.emit("agent_start", { type: "agent_start" }, leafContext);
   await leafApi.emit("message_end", {
     type: "message_end",

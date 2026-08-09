@@ -11,6 +11,7 @@ import {
 import {
   AGENT_TOOL_NAMES,
   CHILD_REPLY_TOOL_NAME,
+  PARENT_COORDINATION_GUIDELINES,
   registerAgentTools,
   registerReplyToParentTool,
   type AgentToolRegistrationApi,
@@ -227,6 +228,13 @@ const SYSTEM_TOOL_NAMES = new Set<string>([
   CHILD_REPLY_TOOL_NAME,
 ]);
 
+const PARENT_COORDINATION_GUIDANCE = [
+  "父子任务协作要求：",
+  `- ${PARENT_COORDINATION_GUIDELINES.sendMessage}`,
+  `- ${PARENT_COORDINATION_GUIDELINES.waitAgent}`,
+  `- ${PARENT_COORDINATION_GUIDELINES.interruptAgent}`,
+].join("\n");
+
 const CHILD_FINAL_REPLY_GUIDANCE = [
   "子代理最终答复要求：",
   "- 每次处理结束前，必须输出一条非空且可用的最终答复。",
@@ -275,6 +283,13 @@ function isRuntimeTransfer(value: unknown): value is RuntimeTransfer {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Pi 的 customPrompt 分支不会合入工具 promptGuidelines，需在运行时恢复父角色协议。 */
+function hasCustomSystemPrompt(event: unknown): boolean {
+  if (!isRecord(event) || !isRecord(event.systemPromptOptions)) return false;
+  const customPrompt = event.systemPromptOptions.customPrompt;
+  return typeof customPrompt === "string" && customPrompt.length > 0;
 }
 
 function reloadIdentity(bootstrap: ChildRuntimeBootstrap | undefined): RuntimeReloadIdentity {
@@ -650,10 +665,16 @@ export function createPiSubagentRuntimeActivator(
 
     api.on("before_agent_start", (event) => {
       const current = active;
-      if (current === undefined || !current.isChild || current.handoffPending === true) return;
+      if (current === undefined || current.handoffPending === true) return;
       if (!isRecord(event) || typeof event.systemPrompt !== "string") return;
+      const guidance: string[] = [];
+      if (current.managementEnabled && hasCustomSystemPrompt(event)) {
+        guidance.push(PARENT_COORDINATION_GUIDANCE);
+      }
+      if (current.isChild) guidance.push(CHILD_FINAL_REPLY_GUIDANCE);
+      if (guidance.length === 0) return;
       return {
-        systemPrompt: `${event.systemPrompt}\n\n${CHILD_FINAL_REPLY_GUIDANCE}`,
+        systemPrompt: `${event.systemPrompt}\n\n${guidance.join("\n\n")}`,
       };
     });
 
