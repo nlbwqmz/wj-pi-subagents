@@ -227,6 +227,14 @@ const SYSTEM_TOOL_NAMES = new Set<string>([
   CHILD_REPLY_TOOL_NAME,
 ]);
 
+const CHILD_FINAL_REPLY_GUIDANCE = [
+  "子代理最终答复要求：",
+  "- 每次处理结束前，必须输出一条非空且可用的最终答复。",
+  "- 如果产物已经写入文件，仍要说明完成内容、关键结果和产物路径。",
+  "- 不要以工具调用、工具结果或空白 assistant 消息结束处理。",
+  "- 如果没有可用结果，请简短说明原因。",
+].join("\n");
+
 function asRuntimeApi(api: ExtensionApiSurface): RuntimeExtensionApi {
   return api as RuntimeExtensionApi;
 }
@@ -638,6 +646,15 @@ export function createPiSubagentRuntimeActivator(
         }
         await runtimeUi?.binding.openPanel(context);
       },
+    });
+
+    api.on("before_agent_start", (event) => {
+      const current = active;
+      if (current === undefined || !current.isChild || current.handoffPending === true) return;
+      if (!isRecord(event) || typeof event.systemPrompt !== "string") return;
+      return {
+        systemPrompt: `${event.systemPrompt}\n\n${CHILD_FINAL_REPLY_GUIDANCE}`,
+      };
     });
 
     api.on("agent_start", () => {

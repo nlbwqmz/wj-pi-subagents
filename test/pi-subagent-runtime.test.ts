@@ -864,6 +864,9 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   await rootActivate(rootApi as never, hostCapabilities);
   await rootApi.emit("session_start", { type: "session_start", reason: "startup" }, rootContext);
   assert.ok(rootController);
+  const rootPromptHandler = rootApi.handlers.get("before_agent_start")?.[0];
+  assert.ok(rootPromptHandler);
+  assert.equal(await rootPromptHandler({ systemPrompt: "根会话提示" }, rootContext), undefined);
 
   const rootTemplates = await execute(rootApi, "get_agent_templates", {}, rootContext) as {
     details?: Array<{ template_id: string; tools: string[] }>;
@@ -894,6 +897,20 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   await childActivate(childApi as never, hostCapabilities);
   const childContext = extensionContext(cwd);
   await childApi.emit("session_start", { type: "session_start", reason: "startup" }, childContext);
+  const childPromptHandler = childApi.handlers.get("before_agent_start")?.[0];
+  assert.ok(childPromptHandler);
+  const childPromptResult = await childPromptHandler({ systemPrompt: "模板与项目提示" }, childContext) as {
+    readonly systemPrompt?: unknown;
+  };
+  assert.equal(childPromptResult.systemPrompt, [
+    "模板与项目提示",
+    "",
+    "子代理最终答复要求：",
+    "- 每次处理结束前，必须输出一条非空且可用的最终答复。",
+    "- 如果产物已经写入文件，仍要说明完成内容、关键结果和产物路径。",
+    "- 不要以工具调用、工具结果或空白 assistant 消息结束处理。",
+    "- 如果没有可用结果，请简短说明原因。",
+  ].join("\n"));
   const spawnedParent = await parentSpawn;
   const parentId = String(spawnedParent.details?.agent_id);
   assert.equal(parentId, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");

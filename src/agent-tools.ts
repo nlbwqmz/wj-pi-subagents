@@ -168,6 +168,18 @@ const descriptions: Readonly<Record<AgentToolName, string>> = Object.freeze({
   get_agent_tree: "读取当前调用者作用域内的安全代理树快照。",
 });
 
+const promptGuidelines: Readonly<Partial<Record<AgentToolName, readonly string[]>>> = Object.freeze({
+  send_message: Object.freeze([
+    "send_message 返回 accepted: true 后，该父子消息继续由目标子代理处理。直接父会话使用 wait_agent 等待，或只处理明确拆分且无资源冲突的工作；在子代理给出最终答复或进入终态前，不在父会话实施或再次委派同一任务。",
+  ]),
+  wait_agent: Object.freeze([
+    "wait_agent 返回 outcome: reply 时，子代理仍在处理；直接父会话继续等待或使用 send_message 引导同一子代理。wait_agent 返回 outcome: timeout 只结束本次等待，不改变子代理生命周期，也不把任务交回直接父会话。",
+  ]),
+  interrupt_agent: Object.freeze([
+    "直接父会话需要接管已下发任务时，先使用 interrupt_agent，再使用 wait_agent 确认子代理已结束当前处理；确认后再实施相同任务或修改相同资源。",
+  ]),
+});
+
 const childReplySchema: JsonSchema = Object.freeze({
   type: "object",
   properties: Object.freeze({
@@ -214,10 +226,12 @@ function executeTool(
   dataOnly = false,
   lookups: AgentToolRenderLookups = {},
 ): Record<string, unknown> {
+  const guidelines = promptGuidelines[name];
   return {
     name,
     label: name,
     description: descriptions[name],
+    ...(guidelines === undefined ? {} : { promptGuidelines: guidelines }),
     parameters: schemas[name],
     executionMode: "sequential",
     renderCall: (

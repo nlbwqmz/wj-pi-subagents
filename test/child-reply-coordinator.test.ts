@@ -268,7 +268,7 @@ test("没有安全最终候选时发送说明性 final，确认失败只通知�
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.deepEqual(port.replies, [{
     kind: "final",
-    text: "子代理本轮未产生可用的最终回复。如有必要，可以尝试继续与该子代理沟通。",
+    text: "子代理本轮已结束，但未产生可用的最终答复。若仍需结果，请在该子代理进入 idle 后，使用 send_message 向同一 agent_id 追问一次：“请仅总结上一轮已完成的工作并给出最终答复，不要重新执行任务；若没有可用结果，请说明原因。”若再次没有最终答复，请停止追问并报告无可用结果。",
   }]);
   port.acknowledgeAll();
   await settled;
