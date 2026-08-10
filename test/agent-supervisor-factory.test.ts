@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import {
+  CHILD_REPLY_SCHEMA,
+  CHILD_REPLY_VERSION,
+  type ChildFinalEnvelope,
+} from "../src/child-reply-envelope.ts";
 import { createAgentSupervisorFactory, buildManagedRpcOptions } from "../src/agent-supervisor-factory.ts";
 import { BridgeSupervisorEndpoint } from "./helpers/bridge-supervisor-endpoint.ts";
 import {
@@ -15,6 +20,20 @@ import type {
 import { ROOT_TREE_ACTOR, TreeController } from "../src/tree-controller.ts";
 
 const AGENT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const TURN_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+function finalReply(text: string): ChildFinalEnvelope {
+  return {
+    schema: CHILD_REPLY_SCHEMA,
+    version: CHILD_REPLY_VERSION,
+    kind: "final",
+    agent_id: AGENT_ID,
+    turn_id: TURN_ID,
+    run_state: "settled",
+    output_state: "present",
+    text,
+  };
+}
 
 class LinkedFactoryNode extends FakeManagedRpcNode {
   private startContext: ManagedRpcNodeStartContext | undefined;
@@ -91,7 +110,7 @@ function factoryHarness(deliverReply?: (agentId: string, reply: ManagedRpcReply)
     rootArguments: { maxDepth: 2 },
     controllerMetadata: {
       rootId: "root-factory",
-      protocolVersion: "pi-subagent/2",
+      protocolVersion: "pi-subagent/3",
     },
   });
   const options = {
@@ -220,7 +239,7 @@ test("身份预留后才建立监督上下文并追加最终子代理环境", as
   assert.equal(context.environment?.PI_SUBAGENT_AGENT_ID, AGENT_ID);
   assert.equal(context.environment?.PI_SUBAGENT_DEPTH, "1");
   assert.equal(context.environment?.PI_SUBAGENT_MAX_DEPTH, "2");
-  assert.equal(context.environment?.PI_SUBAGENT_PROTOCOL_VERSION, "pi-subagent/2");
+  assert.equal(context.environment?.PI_SUBAGENT_PROTOCOL_VERSION, "pi-subagent/3");
   await supervisor.terminate();
 });
 
@@ -233,7 +252,7 @@ test("没有安全回复投递器时父端不发送 ACK", async () => {
   });
   assert.equal((await supervisor.start()).ok, true);
 
-  await node.publishReply({ text: "未投递回复" });
+  await node.publishReply(finalReply("未投递回复"));
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -244,7 +263,7 @@ test("没有安全回复投递器时父端不发送 ACK", async () => {
 test("安全回复投递成功后才通过监督通道确认", async () => {
   const delivered: Array<{ agentId: string; text: string }> = [];
   const { node, createSupervisor } = factoryHarness((agentId, reply) => {
-    delivered.push({ agentId, text: reply.text });
+    delivered.push({ agentId, text: reply.text ?? "" });
     return true;
   });
   const supervisor = createSupervisor({
@@ -254,7 +273,7 @@ test("安全回复投递成功后才通过监督通道确认", async () => {
   });
   assert.equal((await supervisor.start()).ok, true);
 
-  await node.publishReply({ text: "已投递回复" });
+  await node.publishReply(finalReply("已投递回复"));
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
 

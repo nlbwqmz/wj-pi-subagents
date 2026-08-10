@@ -5,6 +5,14 @@ import { PassThrough } from "node:stream";
 import test from "node:test";
 import type { AgentController } from "../src/agent-controller.ts";
 import {
+  CHILD_REPLY_SCHEMA,
+  CHILD_REPLY_VERSION,
+  parseChildReplyEnvelope,
+  type ChildFinalEnvelope,
+  type ChildReplyEnvelope,
+  type ChildReplyImage,
+} from "../src/child-reply-envelope.ts";
+import {
   AGENT_TOOL_NAMES,
   CHILD_REPLY_TOOL_NAME,
   PARENT_COORDINATION_GUIDELINES,
@@ -38,6 +46,43 @@ import {
 import type { TemplateDiscoveryFileSystem } from "../src/template-discovery-snapshot.ts";
 
 const AGENT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const DESCENDANT_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const TURN_1 = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+const TURN_2 = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+
+function finalReply(
+  agentId: string,
+  text: string,
+  images?: readonly ChildReplyImage[],
+  turnId = TURN_1,
+): ChildFinalEnvelope {
+  return {
+    schema: CHILD_REPLY_SCHEMA,
+    version: CHILD_REPLY_VERSION,
+    kind: "final",
+    agent_id: agentId,
+    turn_id: turnId,
+    run_state: "settled",
+    output_state: "present",
+    text,
+    ...(images === undefined ? {} : { images }),
+  };
+}
+
+function readSentReply(entry: { readonly message: unknown }): ChildReplyEnvelope {
+  const content = (entry.message as { content?: Array<{ type?: string; text?: string }> }).content;
+  const text = content?.find((item) => item.type === "text")?.text;
+  if (typeof text !== "string") throw new Error("父会话消息缺少结构化文本");
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw new Error("父会话消息不是 JSON");
+  }
+  const envelope = parseChildReplyEnvelope(value);
+  if (envelope === undefined) throw new Error("父会话消息不是合法 reply envelope");
+  return envelope;
+}
 
 class RuntimeLinkedNode extends FakeManagedRpcNode {
   private channel: StreamSupervisorChannel | undefined;
@@ -104,6 +149,7 @@ class RuntimeBridgeNode extends FakeManagedRpcNode {
   private readonly adapter: LocalSupervisorTransportAdapter;
   private listener: LocalSupervisorTransportListener | undefined;
   private transport: SupervisorByteTransport | undefined;
+  private streaming = false;
   startContext: ManagedRpcNodeStartContext | undefined;
 
   constructor(adapter: LocalSupervisorTransportAdapter) {
@@ -152,6 +198,15 @@ class RuntimeBridgeNode extends FakeManagedRpcNode {
         else reject(error);
       });
     });
+  }
+
+  override async getState(): Promise<unknown> {
+    await super.getState();
+    return { isStreaming: this.streaming, pendingMessageCount: 0 };
+  }
+
+  setStreaming(value: boolean): void {
+    this.streaming = value;
   }
 
   override async requestGracefulClose(): Promise<void> {
@@ -246,6 +301,7 @@ class FakeExtensionApi {
   readonly sentMessages: Array<{ message: unknown; options: unknown }> = [];
   readonly activeToolHistory: string[][] = [];
   activeTools = ["read", "grep"];
+  sendMessageBlocked = false;
   readonly events: Pick<FakeEventBus, "emit" | "on">;
   private readonly eventUnsubscribers = new Set<() => void>();
   private valid = true;
@@ -306,7 +362,7 @@ class FakeExtensionApi {
     this.activeToolHistory.push([...tools]);
   }
   sendMessage(message: unknown, options: unknown): void {
-    if (!this.valid) throw new Error("扩展 API 已失效");
+    if (!this.valid || this.sendMessageBlocked) throw new Error("扩展 API 已失效");
     this.sentMessages.push({ message, options });
   }
   exec(): void {}
@@ -517,6 +573,163 @@ test("child bootstrap 严格要求完整临时监督字段并区分根直接子�
   );
 });
 
+test("final ACK 失败从 runtime handler 向 Pi 冒泡", async () => {
+  const cwd = "C:\\workspace\\final-ack-failure";
+  const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
+  const localCredential = `local_${"l".repeat(32)}`;
+  const supervisorCredential = `supervisor_${"s".repeat(32)}`;
+  const listener = await transportAdapter.listen({
+    agentId: AGENT_ID,
+    credential: localCredential,
+  });
+  const api = new FakeExtensionApi();
+  let controller: AgentController | undefined;
+  const activate = createPiSubagentRuntimeActivator({
+    environment: childBootstrapEnvironment({
+      [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorEndpoint]: listener.endpoint,
+      [RUNTIME_EPHEMERAL_ENV_KEYS.localSupervisorCredential]: localCredential,
+      [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorCredential]: supervisorCredential,
+    }),
+    agentIdFactory: () => DESCENDANT_ID,
+    localSupervisorTransportAdapter: transportAdapter,
+    templateFileSystem: templateFileSystem(cwd),
+    onController: (value) => { controller = value; },
+  });
+  await activate(api as never, {
+    ok: true,
+    nodeVersion: process.versions.node,
+    piVersion: "0.83.0",
+    platform: "win32",
+    processTreeAdapter: {} as never,
+  });
+  const context = extensionContext(cwd);
+  const sessionStart = api.emit("session_start", { type: "session_start", reason: "startup" }, context);
+  const transport = await listener.waitForConnection();
+  const parentChannel = new StreamSupervisorChannel({
+    role: "parent",
+    rootId: "root-bootstrap",
+    localAgentId: null,
+    peerAgentId: AGENT_ID,
+    parentAgentId: null,
+    depth: 1,
+    credential: supervisorCredential,
+    requestIdRegistry: new SupervisorRequestIdRegistry(),
+    transport,
+    onReply: () => false,
+  });
+  const bindingAbort = new AbortController();
+  await parentChannel.bind(bindingAbort.signal);
+  await Promise.all([parentChannel.waitForReady(bindingAbort.signal), sessionStart]);
+  assert.ok(controller);
+
+  await api.emit("agent_start", { type: "agent_start" }, context);
+  await api.emit("agent_end", { type: "agent_end" }, context);
+  const settling = api.emit("agent_settled", { type: "agent_settled" }, context);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  await listener.close();
+  await assert.rejects(settling, /子代理最终回复未获父会话确认/);
+  await parentChannel.release();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(api.sentMessages.length, 0);
+
+  assert.equal(await controller.shutdown(), true);
+  api.invalidate();
+  await listener.close();
+});
+
+test("前置 settled handler 延迟期间启动的新轮不会被旧 settle 提前提交 final", async () => {
+  const cwd = "C:\\workspace\\preceding-settle-overlap";
+  const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
+  const localCredential = `local_${"l".repeat(32)}`;
+  const supervisorCredential = `supervisor_${"s".repeat(32)}`;
+  const listener = await transportAdapter.listen({
+    agentId: AGENT_ID,
+    credential: localCredential,
+  });
+  const api = new FakeExtensionApi();
+  let precedingDelay: Promise<void> | undefined;
+  let releasePreceding!: () => void;
+  api.on("agent_settled", () => precedingDelay);
+  const activate = createPiSubagentRuntimeActivator({
+    environment: childBootstrapEnvironment({
+      [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorEndpoint]: listener.endpoint,
+      [RUNTIME_EPHEMERAL_ENV_KEYS.localSupervisorCredential]: localCredential,
+      [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorCredential]: supervisorCredential,
+    }),
+    agentIdFactory: () => DESCENDANT_ID,
+    localSupervisorTransportAdapter: transportAdapter,
+    templateFileSystem: templateFileSystem(cwd),
+  });
+  await activate(api as never, {
+    ok: true,
+    nodeVersion: process.versions.node,
+    piVersion: "0.83.0",
+    platform: "win32",
+    processTreeAdapter: {} as never,
+  });
+  const context = extensionContext(cwd);
+  let idle = true;
+  context.isIdle = () => idle;
+  const sessionStart = api.emit("session_start", { type: "session_start", reason: "startup" }, context);
+  const transport = await listener.waitForConnection();
+  const delivered: ChildReplyEnvelope[] = [];
+  const parentChannel = new StreamSupervisorChannel({
+    role: "parent",
+    rootId: "root-bootstrap",
+    localAgentId: null,
+    peerAgentId: AGENT_ID,
+    parentAgentId: null,
+    depth: 1,
+    credential: supervisorCredential,
+    requestIdRegistry: new SupervisorRequestIdRegistry(),
+    transport,
+    onReply: (reply) => {
+      delivered.push(reply.envelope);
+      return true;
+    },
+  });
+  const bindingAbort = new AbortController();
+  await parentChannel.bind(bindingAbort.signal);
+  await Promise.all([parentChannel.waitForReady(bindingAbort.signal), sessionStart]);
+
+  await api.emit("agent_start", { type: "agent_start" }, context);
+  await api.emit("message_end", {
+    type: "message_end",
+    message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "旧轮结果" }] },
+  }, context);
+  await api.emit("agent_end", { type: "agent_end" }, context);
+  precedingDelay = new Promise<void>((resolve) => { releasePreceding = resolve; });
+  const oldSettlement = api.emit("agent_settled", { type: "agent_settled" }, context);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  idle = false;
+  await api.emit("agent_start", { type: "agent_start" }, context);
+  await api.emit("message_end", {
+    type: "message_end",
+    message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "新轮结果" }] },
+  }, context);
+  releasePreceding();
+  precedingDelay = undefined;
+  await oldSettlement;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(delivered.length, 0);
+
+  await api.emit("agent_end", { type: "agent_end" }, context);
+  idle = true;
+  await api.emit("agent_settled", { type: "agent_settled" }, context);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0]?.kind, "final");
+  if (delivered[0]?.kind === "final") assert.equal(delivered[0].text, "新轮结果");
+
+  await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
+  await parentChannel.release();
+  await listener.close();
+});
+
 test("生产运行时闭合直接父子的创建、消息、回复、等待、中断与关闭", async () => {
   const cwd = "C:\\workspace\\runtime";
   const api = new FakeExtensionApi();
@@ -545,7 +758,11 @@ test("生产运行时闭合直接父子的创建、消息、回复、等待、�
   });
 
   assert.deepEqual([...api.tools.keys()], [...AGENT_TOOL_NAMES]);
-  assert.deepEqual([...api.messageRenderers.keys()], ["pi-subagent-message", "pi-subagent-final"]);
+  assert.deepEqual([...api.messageRenderers.keys()], [
+    "pi-subagent-message",
+    "pi-subagent-final",
+    "pi-subagent-terminal",
+  ]);
   assert.equal(api.handlers.get("session_start")?.length, 1);
   assert.equal(api.handlers.get("session_shutdown")?.length, 1);
 
@@ -567,10 +784,10 @@ test("生产运行时闭合直接父子的创建、消息、回复、等待、�
   assert.equal(firstMessage.details?.accepted, true);
   assert.equal(typeof firstMessage.details?.message_id, "string");
 
-  await node.publishReply({
-    text: "直接回复",
-    images: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }],
-  });
+  const directReply = finalReply(AGENT_ID, "直接回复", [
+    { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+  ]);
+  await node.publishReply(directReply);
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -580,12 +797,18 @@ test("生产运行时闭合直接父子的创建、消息、回复、等待、�
       content: [
         {
           type: "text",
-          text: `Message Type: FINAL_ANSWER\nSender: ${AGENT_ID}\nPayload:\n直接回复`,
+          text: JSON.stringify(directReply),
         },
         { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
       ],
       display: true,
-      details: { agent_id: AGENT_ID, kind: "final", sender_name: "运行时子代理" },
+      details: {
+        agent_id: AGENT_ID,
+        kind: "final",
+        run_state: "settled",
+        output_state: "present",
+        sender_name: "运行时子代理",
+      },
     },
     options: { triggerTurn: true, deliverAs: "steer" },
   }]);
@@ -689,7 +912,31 @@ test("运行时以单数 agent 命令交付只读 TUI，并在会话关闭时清
     message: "代理故障：researcher ×1；internal_error ×1",
     type: "warning",
   }]);
-  assert.deepEqual(api.sentMessages, []);
+  assert.equal(api.sentMessages.length, 1);
+  assert.deepEqual(api.sentMessages[0], {
+    message: {
+      customType: "pi-subagent-terminal",
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          schema: "pi-subagent.terminal",
+          version: 1,
+          kind: "terminal",
+          agent_id: AGENT_ID,
+          node_state: "failed",
+          reason_code: "runtime_fault",
+        }),
+      }],
+      display: true,
+      details: {
+        agent_id: AGENT_ID,
+        kind: "terminal",
+        node_state: "failed",
+        sender_name: "TUI 子代理",
+      },
+    },
+    options: { triggerTurn: true, deliverAs: "steer" },
+  });
   await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
   assert.deepEqual(ui.widgetCalls.at(-1), {
     key: "pi-subagent-agents",
@@ -832,6 +1079,8 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
   const rootApi = new FakeExtensionApi();
   const childApi = new FakeExtensionApi();
+  let precedingSettleDelay: Promise<void> | undefined;
+  childApi.on("agent_settled", () => precedingSettleDelay);
   const parentNode = new RuntimeBridgeNode(transportAdapter);
   const grandchildNode = new RuntimeBridgeNode(transportAdapter);
   let rootController: AgentController | undefined;
@@ -872,6 +1121,7 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
     `- ${PARENT_COORDINATION_GUIDELINES.taskOwnership}`,
     `- ${PARENT_COORDINATION_GUIDELINES.sendMessage}`,
     `- ${PARENT_COORDINATION_GUIDELINES.waitAgent}`,
+    `- ${PARENT_COORDINATION_GUIDELINES.unusableFinal}`,
     `- ${PARENT_COORDINATION_GUIDELINES.interruptAgent}`,
   ].join("\n");
   const childFinalReplyGuidance = [
@@ -921,6 +1171,8 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
     onController: (controller) => { childController = controller; },
   });
   await childActivate(childApi as never, hostCapabilities);
+  let followingSettleDelay: Promise<void> | undefined;
+  childApi.on("agent_settled", () => followingSettleDelay);
   const childContext = extensionContext(cwd);
   await childApi.emit("session_start", { type: "session_start", reason: "startup" }, childContext);
   const childPromptHandler = childApi.handlers.get("before_agent_start")?.[0];
@@ -972,20 +1224,24 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
 
   const progressReply = await execute(childApi, CHILD_REPLY_TOOL_NAME, {
     message: "正在继续工作",
+    requires_response: false,
   }, childContext) as { details?: Record<string, unknown> };
   assert.equal(progressReply.details?.accepted, true);
-  assert.deepEqual(rootApi.sentMessages, [{
-    message: {
-      customType: "pi-subagent-message",
-      content: [{
-        type: "text",
-        text: `Message Type: AGENT_MESSAGE\nSender: ${parentId}\nPayload:\n正在继续工作`,
-      }],
-      display: true,
-      details: { agent_id: parentId, kind: "message", sender_name: "递归父代理" },
-    },
-    options: { triggerTurn: false, deliverAs: "steer" },
-  }]);
+  assert.equal(rootApi.sentMessages.length, 1);
+  const progressEnvelope = readSentReply(rootApi.sentMessages[0]!);
+  assert.equal(progressEnvelope.kind, "message");
+  if (progressEnvelope.kind === "message") {
+    assert.equal(progressEnvelope.agent_id, parentId);
+    assert.equal(progressEnvelope.text, "正在继续工作");
+    assert.equal(progressEnvelope.requires_response, false);
+  }
+  assert.deepEqual((rootApi.sentMessages[0]!.message as { details: unknown }).details, {
+    agent_id: parentId,
+    kind: "message",
+    requires_response: false,
+    sender_name: "递归父代理",
+  });
+  assert.deepEqual(rootApi.sentMessages[0]!.options, { triggerTurn: false, deliverAs: "steer" });
 
   const progressRenderer = rootApi.messageRenderers.get("pi-subagent-message");
   assert.ok(progressRenderer);
@@ -1006,32 +1262,24 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   await childApi.emit("agent_settled", { type: "agent_settled" }, childContext);
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.deepEqual(rootApi.sentMessages, [
-    {
-      message: {
-        customType: "pi-subagent-message",
-        content: [{
-          type: "text",
-          text: `Message Type: AGENT_MESSAGE\nSender: ${parentId}\nPayload:\n正在继续工作`,
-        }],
-        display: true,
-        details: { agent_id: parentId, kind: "message", sender_name: "递归父代理" },
-      },
-      options: { triggerTurn: false, deliverAs: "steer" },
-    },
-    {
-      message: {
-        customType: "pi-subagent-final",
-        content: [{
-          type: "text",
-          text: `Message Type: FINAL_ANSWER\nSender: ${parentId}\nPayload:\n真正 child 最终回复`,
-        }],
-        display: true,
-        details: { agent_id: parentId, kind: "final", sender_name: "递归父代理" },
-      },
-      options: { triggerTurn: true, deliverAs: "steer" },
-    },
-  ]);
+  assert.equal(rootApi.sentMessages.length, 2);
+  const parentFinalEnvelope = readSentReply(rootApi.sentMessages[1]!);
+  assert.equal(parentFinalEnvelope.kind, "final");
+  if (parentFinalEnvelope.kind === "final") {
+    assert.equal(parentFinalEnvelope.agent_id, parentId);
+    assert.equal(parentFinalEnvelope.turn_id, progressEnvelope.turn_id);
+    assert.equal(parentFinalEnvelope.run_state, "settled");
+    assert.equal(parentFinalEnvelope.output_state, "present");
+    assert.equal(parentFinalEnvelope.text, "真正 child 最终回复");
+  }
+  assert.deepEqual((rootApi.sentMessages[1]!.message as { details: unknown }).details, {
+    agent_id: parentId,
+    kind: "final",
+    run_state: "settled",
+    output_state: "present",
+    sender_name: "递归父代理",
+  });
+  assert.deepEqual(rootApi.sentMessages[1]!.options, { triggerTurn: true, deliverAs: "steer" });
   const recursiveFinalRenderer = rootApi.messageRenderers.get("pi-subagent-final");
   assert.ok(recursiveFinalRenderer);
   assert.match(
@@ -1078,6 +1326,33 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   assert.equal(AGENT_TOOL_NAMES.some((name) => leafActiveTools.includes(name)), false);
   assert.equal(leafActiveTools.includes(CHILD_REPLY_TOOL_NAME), true);
 
+  await childApi.emit("agent_start", { type: "agent_start" }, childContext);
+  parentNode.emitEvent({ type: "agent_start" });
+  await childApi.emit("message_end", {
+    type: "message_end",
+    message: {
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: "中间代理旧轮结果" }],
+    },
+  }, childContext);
+  await childApi.emit("agent_end", { type: "agent_end" }, childContext);
+  rootApi.sendMessageBlocked = true;
+  let releasePrecedingSettle!: () => void;
+  let releaseFollowingSettle!: () => void;
+  precedingSettleDelay = new Promise<void>((resolve) => {
+    releasePrecedingSettle = resolve;
+  });
+  followingSettleDelay = new Promise<void>((resolve) => {
+    releaseFollowingSettle = resolve;
+  });
+  let parentSettlementFinished = false;
+  const parentSettlement = childApi.emit("agent_settled", { type: "agent_settled" }, childContext).then(() => {
+    parentSettlementFinished = true;
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(parentSettlementFinished, false);
+
   await leafApi.emit("agent_start", { type: "agent_start" }, leafContext);
   await leafApi.emit("message_end", {
     type: "message_end",
@@ -1087,22 +1362,119 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
       content: [{ type: "text", text: "叶节点只回复直接父会话" }],
     },
   }, leafContext);
-  await leafApi.emit("agent_settled", { type: "agent_settled" }, leafContext);
+  await leafApi.emit("agent_end", { type: "agent_end" }, leafContext);
+  let leafSettlementFinished = false;
+  const leafSettlement = leafApi.emit("agent_settled", { type: "agent_settled" }, leafContext).then(() => {
+    leafSettlementFinished = true;
+  });
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.deepEqual(childApi.sentMessages, [{
-    message: {
-      customType: "pi-subagent-final",
-      content: [{
-        type: "text",
-        text: `Message Type: FINAL_ANSWER\nSender: ${grandchildId}\nPayload:\n叶节点只回复直接父会话`,
-      }],
-      display: true,
-      details: { agent_id: grandchildId, kind: "final", sender_name: "递归孙代理" },
-    },
-    options: { triggerTurn: true, deliverAs: "steer" },
-  }]);
+  assert.equal(leafSettlementFinished, false);
+  assert.equal(childApi.sentMessages.length, 0);
   assert.equal(rootApi.sentMessages.length, 2);
+
+  releasePrecedingSettle();
+  precedingSettleDelay = undefined;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  rootApi.sendMessageBlocked = false;
+  await rootController.retryPendingReplies();
+  assert.equal(rootApi.sentMessages.length, 3);
+  const delayedParentFinal = readSentReply(rootApi.sentMessages[2]!);
+  assert.equal(delayedParentFinal.kind, "final");
+  if (delayedParentFinal.kind === "final") assert.equal(delayedParentFinal.text, "中间代理旧轮结果");
+
+  // 本扩展之后的第三方 settled handler 仍未返回，但成功路径已经尝试放行。
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(parentSettlementFinished, false);
+  await leafSettlement;
+
+  assert.equal(childApi.sentMessages.length, 1);
+  const leafFinalEnvelope = readSentReply(childApi.sentMessages[0]!);
+  assert.equal(leafFinalEnvelope.kind, "final");
+  if (leafFinalEnvelope.kind === "final") {
+    assert.equal(leafFinalEnvelope.agent_id, grandchildId);
+    assert.equal(leafFinalEnvelope.run_state, "settled");
+    assert.equal(leafFinalEnvelope.output_state, "present");
+    assert.equal(leafFinalEnvelope.text, "叶节点只回复直接父会话");
+  }
+  assert.deepEqual((childApi.sentMessages[0]!.message as { details: unknown }).details, {
+    agent_id: grandchildId,
+    kind: "final",
+    run_state: "settled",
+    output_state: "present",
+    sender_name: "递归孙代理",
+  });
+  assert.deepEqual(childApi.sentMessages[0]!.options, { triggerTurn: true, deliverAs: "steer" });
+
+  // fake Pi 不会因 sendMessage 自动启动 loop，这里按生产事件顺序公开重叠新轮。
+  parentNode.setStreaming(true);
+  await childApi.emit("agent_start", { type: "agent_start" }, childContext);
+  parentNode.emitEvent({ type: "agent_start" });
+  let parentStatus = rootController.getAgentStatus(parentId);
+  assert.equal(parentStatus.ok, true);
+  if (parentStatus.ok) assert.equal(parentStatus.data.state, "working");
+
+  releaseFollowingSettle();
+  followingSettleDelay = undefined;
+  await parentSettlement;
+  // 旧轮 settle 在新 loop 已 streaming 后到达；祖先必须通过状态复核压住它。
+  parentNode.emitEvent({ type: "agent_settled" });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  parentStatus = rootController.getAgentStatus(parentId);
+  assert.equal(parentStatus.ok, true);
+  if (parentStatus.ok) assert.equal(parentStatus.data.state, "working");
+
+  const queuedProgress = await execute(rootApi, "wait_agent", {
+    agent_id: parentId,
+    timeout_ms: 10_000,
+  }, rootContext) as { details?: Record<string, unknown> };
+  assert.equal(queuedProgress.details?.outcome, "reply");
+
+  let waitFinished = false;
+  const waitingForNewTurn = execute(rootApi, "wait_agent", {
+    agent_id: parentId,
+    timeout_ms: 10_000,
+  }, rootContext).then((result) => {
+    waitFinished = true;
+    return result as { details?: Record<string, unknown> };
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(waitFinished, false);
+  const steered = await execute(rootApi, "send_message", {
+    agent_id: parentId,
+    message: "继续整理叶节点结果",
+  }, rootContext) as { details?: Record<string, unknown> };
+  assert.equal(steered.details?.accepted, true);
+  assert.equal(parentNode.operations().at(-1), "steer");
+  const interruptedNewTurn = await execute(rootApi, "interrupt_agent", {
+    agent_id: parentId,
+  }, rootContext) as { details?: Record<string, unknown> };
+  assert.equal(interruptedNewTurn.details?.changed, true);
+  assert.equal(parentNode.operations().at(-1), "abort");
+
+  await childApi.emit("message_end", {
+    type: "message_end",
+    message: {
+      role: "assistant",
+      stopReason: "aborted",
+      content: [{ type: "text", text: "未完成内容不得伪装为成功" }],
+    },
+  }, childContext);
+  await childApi.emit("agent_end", { type: "agent_end" }, childContext);
+  await childApi.emit("agent_settled", { type: "agent_settled" }, childContext);
+  parentNode.setStreaming(false);
+  parentNode.emitEvent({ type: "agent_settled" });
+  const waitedNewTurn = await waitingForNewTurn;
+  assert.equal(waitedNewTurn.details?.outcome, "settled");
+  assert.equal(waitedNewTurn.details?.state, "idle");
+  assert.equal(rootApi.sentMessages.length, 4);
+  const interruptedFinal = readSentReply(rootApi.sentMessages[3]!);
+  assert.equal(interruptedFinal.kind, "final");
+  if (interruptedFinal.kind === "final") {
+    assert.equal(interruptedFinal.run_state, "interrupted");
+    assert.equal(interruptedFinal.output_state, "absent");
+  }
 
   await new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -1213,7 +1585,8 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
     [],
   );
 
-  await firstNode.publishReply({ text: "交接窗口内的回复" });
+  const handoffReply = finalReply(firstId, "交接窗口内的回复");
+  await firstNode.publishReply(handoffReply);
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(oldApi.sentMessages.length, 0);
@@ -1242,10 +1615,15 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
       customType: "pi-subagent-final",
       content: [{
         type: "text",
-        text: `Message Type: FINAL_ANSWER\nSender: ${firstId}\nPayload:\n交接窗口内的回复`,
+        text: JSON.stringify(handoffReply),
       }],
       display: true,
-      details: { agent_id: firstId, kind: "final" },
+      details: {
+        agent_id: firstId,
+        kind: "final",
+        run_state: "settled",
+        output_state: "present",
+      },
     },
     options: { triggerTurn: true, deliverAs: "steer" },
   });
@@ -1276,7 +1654,7 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
   }, newContext) as { details?: Record<string, unknown> };
   assert.equal(reloadedTemplate.details?.agent_id, "cccccccc-cccc-4ccc-8ccc-cccccccccccc");
 
-  await firstNode.publishReply({ text: "交接后的回复" });
+  await firstNode.publishReply(finalReply(firstId, "交接后的回复", undefined, TURN_2));
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(oldApi.sentMessages.length, 0);
@@ -1403,18 +1781,21 @@ test("根与 child 跨实例 reload 保留同一监督连接，并让既有 chil
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(oldRootApi.sentMessages.length, 0);
   assert.equal(newRootApi.sentMessages.length, 1);
-  assert.deepEqual(newRootApi.sentMessages[0], {
-    message: {
-      customType: "pi-subagent-final",
-      content: [{
-        type: "text",
-        text: `Message Type: FINAL_ANSWER\nSender: ${parentId}\nPayload:\n双方 reload 后回复`,
-      }],
-      display: true,
-      details: { agent_id: parentId, kind: "final" },
-    },
-    options: { triggerTurn: true, deliverAs: "steer" },
+  const reloadFinalEnvelope = readSentReply(newRootApi.sentMessages[0]!);
+  assert.equal(reloadFinalEnvelope.kind, "final");
+  if (reloadFinalEnvelope.kind === "final") {
+    assert.equal(reloadFinalEnvelope.agent_id, parentId);
+    assert.equal(reloadFinalEnvelope.run_state, "settled");
+    assert.equal(reloadFinalEnvelope.output_state, "present");
+    assert.equal(reloadFinalEnvelope.text, "双方 reload 后回复");
+  }
+  assert.deepEqual((newRootApi.sentMessages[0]!.message as { details: unknown }).details, {
+    agent_id: parentId,
+    kind: "final",
+    run_state: "settled",
+    output_state: "present",
   });
+  assert.deepEqual(newRootApi.sentMessages[0]!.options, { triggerTurn: true, deliverAs: "steer" });
   const recursiveReloadRenderer = newRootApi.messageRenderers.get("pi-subagent-final");
   assert.ok(recursiveReloadRenderer);
   assert.match(

@@ -1,6 +1,9 @@
 import type { AgentController } from "./agent-controller.ts";
 import type { ChildReplyCoordinator } from "./child-reply-coordinator.ts";
 import {
+  CHILD_REPLY_MAX_IMAGE_MIME_TYPE_LENGTH,
+} from "./child-reply-envelope.ts";
+import {
   renderAgentToolCall,
   renderAgentToolResult,
   type AgentToolRenderContext,
@@ -74,6 +77,8 @@ interface JsonSchema {
   readonly maxLength?: number;
   readonly minimum?: number;
   readonly maximum?: number;
+  readonly minItems?: number;
+  readonly maxItems?: number;
 }
 
 const uuidSchema: JsonSchema = Object.freeze({
@@ -87,7 +92,7 @@ const imageSchema: JsonSchema = Object.freeze({
   properties: Object.freeze({
     type: Object.freeze({ type: "string", enum: ["image"] }),
     data: Object.freeze({ type: "string", minLength: 1, maxLength: 32 * 1024 }),
-    mimeType: Object.freeze({ type: "string", minLength: 7, maxLength: 128 }),
+    mimeType: Object.freeze({ type: "string", minLength: 7, maxLength: CHILD_REPLY_MAX_IMAGE_MIME_TYPE_LENGTH }),
   }),
   required: Object.freeze(["type", "data", "mimeType"]),
   additionalProperties: false,
@@ -171,6 +176,7 @@ const descriptions: Readonly<Record<AgentToolName, string>> = Object.freeze({
 export const PARENT_COORDINATION_GUIDELINES = Object.freeze({
   taskOwnership: "任务所有权硬约束：send_message 返回 accepted: true 后，已下发任务范围由目标直接子代理负责，直到该子代理给出最终答复或进入终态。同一任务包括为同一问题、工单或结论执行的调查、实现、测试、复现、验证、评审及其子范围；父会话不得亲自实施或再次委派这些工作。读取或搜索同一源码与文档、运行同一测试、只读分析和独立验证都属于重复实施；‘只读’‘无写冲突’‘交叉验证’不是例外。父会话只能使用 wait_agent 等待、查询状态、向同一子代理发送 steering，或处理派发前已明确拆分、产出独立、无数据依赖且无共享写资源的其他工作。",
   sendMessage: "send_message 返回 accepted: true 只表示消息已被接受，不表示任务完成；若返回 message_delivery_failed，交付状态可能无法确认，不要盲目重发，先查询状态并结合已有回复判断。",
+  unusableFinal: "收到 output_state: absent 的最终答复，或判断 present 正文仍不可用时，必须向同一 agent_id 尝试追问：只总结上一轮已完成工作并给出最终答复，不要重新执行任务；协议不自动重跑任务或切换模型。",
   waitAgent: "wait_agent 返回 outcome: reply 时，子代理仍在处理；直接父会话继续等待或使用 send_message 引导同一子代理。wait_agent 返回 outcome: timeout 只结束本次等待，不改变子代理生命周期，也不把任务交回直接父会话。",
   interruptAgent: "直接父会话需要接管已下发任务时，先使用 interrupt_agent，再使用 wait_agent 确认子代理已结束当前处理；确认后再实施相同任务或修改相同资源。",
 });
@@ -179,8 +185,12 @@ const promptGuidelines: Readonly<Partial<Record<AgentToolName, readonly string[]
   send_message: Object.freeze([
     PARENT_COORDINATION_GUIDELINES.taskOwnership,
     PARENT_COORDINATION_GUIDELINES.sendMessage,
+    PARENT_COORDINATION_GUIDELINES.unusableFinal,
   ]),
-  wait_agent: Object.freeze([PARENT_COORDINATION_GUIDELINES.waitAgent]),
+  wait_agent: Object.freeze([
+    PARENT_COORDINATION_GUIDELINES.waitAgent,
+    PARENT_COORDINATION_GUIDELINES.unusableFinal,
+  ]),
   interrupt_agent: Object.freeze([PARENT_COORDINATION_GUIDELINES.interruptAgent]),
 });
 
@@ -193,13 +203,18 @@ const childReplySchema: JsonSchema = Object.freeze({
       minLength: 1,
       maxLength: 16 * 1024,
     }),
+    requires_response: Object.freeze({
+      type: "boolean",
+      description: "父会话空闲时是否需要立即唤醒父模型处理此消息。",
+    }),
+    images: Object.freeze({ type: "array", items: imageSchema, minItems: 1, maxItems: 8 }),
   }),
-  required: Object.freeze(["message"]),
+  required: Object.freeze(["message", "requires_response"]),
   additionalProperties: false,
 });
 
 const childReplyDescription =
-  "向创建你的直接父会话发送一条工作中的回复，可用于汇报进度、提出问题或发送阶段性发现。无需提供 agent_id 或目标；调用成功后不会结束当前处理，请继续原任务。最终结果由运行时在完全 settled 后自动发送，不要使用本工具模拟最终完成。";
+  "向创建你的直接父会话发送一条工作中的回复，可用于汇报进度、提出问题或发送阶段性发现。必须显式声明 requires_response；true 表示父会话空闲时需要立即处理，false 表示仅记录。可选 images 携带图片进度。无需提供 agent_id 或目标；调用成功后不会结束当前处理，请继续原任务。最终结果由运行时在本轮结束边界自动发送，不要使用本工具模拟最终完成。";
 
 /** 返回给 Pi 的固定工具结果；details 只包含控制器安全数据。 */
 function toolResult<T>(result: ControlResult<T>, dataOnly = false): unknown {

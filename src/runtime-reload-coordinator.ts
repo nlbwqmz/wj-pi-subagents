@@ -12,6 +12,7 @@ export interface RuntimeReloadEventBus {
 
 export interface RuntimeReloadIdentity {
   readonly isChild: boolean;
+  readonly protocolVersion: string;
   readonly rootId?: string;
   readonly agentId?: string;
 }
@@ -420,7 +421,12 @@ function isReloadLeaseRequest(value: unknown): value is ReloadLeaseRequest {
 }
 
 function isReloadIdentity(value: unknown): value is RuntimeReloadIdentity {
-  if (!isRecord(value) || typeof value.isChild !== "boolean") return false;
+  if (
+    !isRecord(value)
+    || typeof value.isChild !== "boolean"
+    || typeof value.protocolVersion !== "string"
+    || value.protocolVersion.length === 0
+  ) return false;
   if (!value.isChild) return true;
   return typeof value.rootId === "string"
     && value.rootId.length > 0
@@ -429,7 +435,7 @@ function isReloadIdentity(value: unknown): value is RuntimeReloadIdentity {
 }
 
 function sameIdentity(left: RuntimeReloadIdentity, right: RuntimeReloadIdentity): boolean {
-  if (left.isChild !== right.isChild) return false;
+  if (left.isChild !== right.isChild || left.protocolVersion !== right.protocolVersion) return false;
   return !left.isChild || (left.rootId === right.rootId && left.agentId === right.agentId);
 }
 

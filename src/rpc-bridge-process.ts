@@ -6,6 +6,7 @@
  * 转发给父监督器。
  */
 import { randomBytes } from "node:crypto";
+import { CHILD_REPLY_MAX_IMAGE_MIME_TYPE_LENGTH } from "./child-reply-envelope.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -409,6 +410,7 @@ function normalizeImages(value: unknown): ManagedImage[] | undefined {
       images.length >= 8
       || !validBase64(item.data)
       || decodedBase64Length(item.data) > MAX_IMAGE_BYTES
+      || item.mimeType.length > CHILD_REPLY_MAX_IMAGE_MIME_TYPE_LENGTH
       || !/^image\/[a-z0-9.+-]+$/.test(item.mimeType)
     ) {
       return undefined;

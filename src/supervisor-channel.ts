@@ -1,5 +1,11 @@
-import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { parseAgentSnapshot as parseSafeAgentSnapshot } from "./agent-snapshot-codec.ts";
+import {
+  CHILD_REPLY_ENVELOPE_LIMITS,
+  parseChildReplyEnvelope,
+  type ChildReplyEnvelope,
+  type ChildReplyImage,
+} from "./child-reply-envelope.ts";
 import {
   AGENT_LIFECYCLE_EVENT_TYPES,
   AGENT_LIFECYCLE_STATES,
@@ -14,7 +20,7 @@ import {
 } from "./tree-controller.ts";
 
 /** 父子监督通道与 Pi 任务 RPC 完全隔离的固定协议版本。 */
-export const SUPERVISOR_PROTOCOL_VERSION = "pi-subagent/2";
+export const SUPERVISOR_PROTOCOL_VERSION = "pi-subagent/3";
 
 export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "hello",
@@ -49,7 +55,7 @@ const SUPERVISOR_FRAME_KEYS = new Set([
 export const SUPERVISOR_CHANNEL_LIMITS = Object.freeze({
   /** 可承载 8 张最大合法图片、最终文本及 JSON 转义后的完整监督帧。 */
   maxFrameBytes: 512 * 1024,
-  maxStringBytes: 16 * 1024,
+  maxStringBytes: CHILD_REPLY_ENVELOPE_LIMITS.maxStringBytes,
   /** 根权威向递归子控制器交付模板正文时使用的独立有界字符串预算。 */
   maxControlStringBytes: 64 * 1024,
   maxJsonDepth: 16,
@@ -57,9 +63,9 @@ export const SUPERVISOR_CHANNEL_LIMITS = Object.freeze({
   maxNodes: 64,
   maxReplyWindow: 32,
   maxRetiredStreams: 4,
-  maxImagesPerReply: 8,
+  maxImagesPerReply: CHILD_REPLY_ENVELOPE_LIMITS.maxImagesPerReply,
   /** 单张 Base64 图片解码后的字节上限。 */
-  maxImageBytes: 24 * 1024,
+  maxImageBytes: CHILD_REPLY_ENVELOPE_LIMITS.maxImageBytes,
   maxDepth: 8,
 } as const);
 
@@ -96,28 +102,16 @@ export interface SupervisorSnapshot {
   readonly nodes: readonly AgentSnapshot[];
 }
 
-export interface SupervisorReplyImage {
-  readonly type: "image";
-  readonly data: string;
-  readonly mimeType: string;
-}
+export type SupervisorReplyImage = ChildReplyImage;
+export type SupervisorReplyKind = ChildReplyEnvelope["kind"];
 
-export type SupervisorReplyKind = "message" | "final";
-
+/** v3 wire reply：传输序号与模型可见信封保持明确分层。 */
 export interface SupervisorReply {
   readonly reply_seq: number;
-  readonly kind: SupervisorReplyKind;
-  readonly text: string;
-  readonly images?: readonly SupervisorReplyImage[];
+  readonly envelope: ChildReplyEnvelope;
 }
 
-/**
- * 公开发送入口仍兼容包内旧替身省略 kind 的调用；线上帧始终由
- * `parseReply()` 补齐并严格携带 kind。旧调用按最终回复处理。
- */
-export type SupervisorReplyInput = Omit<SupervisorReply, "reply_seq" | "kind"> & {
-  readonly kind?: SupervisorReplyKind;
-};
+export type SupervisorReplyInput = ChildReplyEnvelope;
 
 /** 监督控制正文只允许可复制、可深冻结的纯 JSON 值。 */
 export type SupervisorJsonValue =
@@ -318,7 +312,6 @@ interface StoredReply {
 
 const SAFE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const SAFE_STREAM_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
-const SAFE_MIME_PATTERN = /^image\/[a-z0-9.+-]+$/;
 const RFC3339_MILLIS_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const EMPTY_FAULT: SupervisorChannelFault = Object.freeze({ code: "internal_error" });
 const EMPTY_NODES: readonly AgentSnapshot[] = Object.freeze([]);
@@ -364,23 +357,8 @@ function maxFrameStringBytes(limits: SupervisorChannelLimits): number {
   );
 }
 
-function validBase64(value: string): boolean {
-  if (value.length === 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return false;
-  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
-  if (padding > 0 && value.length % 4 !== 0) return false;
-  if ((value.length - padding) % 4 === 1) return false;
-  try {
-    const normalized = padding > 0 ? value : value + "=".repeat((4 - (value.length % 4)) % 4);
-    return Buffer.from(normalized, "base64").toString("base64").replace(/=+$/, "")
-      === normalized.replace(/=+$/, "");
-  } catch {
-    return false;
-  }
-}
-
-function decodedBase64Length(value: string): number {
-  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
-  return Math.floor(value.length * 3 / 4) - padding;
+function replySemanticDigest(envelope: ChildReplyEnvelope): string {
+  return createHash("sha256").update(JSON.stringify(envelope), "utf8").digest("base64url");
 }
 
 function cloneBytes(value: Uint8Array): Uint8Array<ArrayBuffer> {
@@ -927,38 +905,23 @@ function parseSnapshot(
 
 function parseReply(payload: Record<string, unknown>, limits: SupervisorChannelLimits): SupervisorReply {
   if (!Number.isSafeInteger(payload.reply_seq) || (payload.reply_seq as number) < 1) frameError("reply_invalid");
-  if (payload.kind !== "message" && payload.kind !== "final") frameError("reply_invalid");
-  if (!validBoundedString(payload.text, limits)) frameError("reply_invalid");
-  if (payload.images !== undefined && !Array.isArray(payload.images)) frameError("reply_invalid");
-  const images = payload.images as unknown[] | undefined;
-  if (images !== undefined && images.length > limits.maxImagesPerReply) frameError("reply_invalid");
-  const parsedImages: SupervisorReplyImage[] = [];
-  for (const image of images ?? []) {
-    if (typeof image !== "object" || image === null || Array.isArray(image)) frameError("reply_invalid");
-    const candidate = image as Record<string, unknown>;
-    if (
-      candidate.type !== "image" ||
-      typeof candidate.data !== "string" ||
-      typeof candidate.mimeType !== "string" ||
-      !SAFE_MIME_PATTERN.test(candidate.mimeType) ||
-      !validBase64(candidate.data) ||
-      decodedBase64Length(candidate.data) > limits.maxImageBytes ||
-      Object.keys(candidate).some((key) => key !== "type" && key !== "data" && key !== "mimeType")
-    ) frameError("reply_invalid");
-    parsedImages.push(Object.freeze({ type: "image", data: candidate.data, mimeType: candidate.mimeType }));
-  }
-  if ((payload.text as string).trim().length === 0 && parsedImages.length === 0) {
+  if (Object.keys(payload).some((key) => key !== "reply_seq" && key !== "envelope")) {
     frameError("reply_invalid");
   }
-  if (Object.keys(payload).some((key) => key !== "reply_seq" && key !== "kind" && key !== "text" && key !== "images")) {
-    frameError("reply_invalid");
-  }
+  const envelope = parseChildReplyEnvelope(payload.envelope, {
+    maxStringBytes: limits.maxStringBytes,
+    maxImagesPerReply: limits.maxImagesPerReply,
+    maxImageBytes: limits.maxImageBytes,
+  });
+  if (envelope === undefined) frameError("reply_invalid");
   return Object.freeze({
     reply_seq: payload.reply_seq as number,
-    kind: payload.kind as SupervisorReplyKind,
-    text: payload.text as string,
-    ...(parsedImages.length === 0 ? {} : { images: Object.freeze(parsedImages) }),
+    envelope,
   });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function randomStreamId(): string {
@@ -1006,6 +969,8 @@ export class SupervisorChannel {
   private readonly retiredIncomingOrder: string[] = [];
   private readonly outboundReplies = new Map<number, StoredReply>();
   private readonly bufferedReplies = new Map<number, SupervisorReply>();
+  private readonly receivedReplyDigests = new Map<number, string>();
+  private readonly acceptedFinalTurns = new Set<string>();
 
   private state: SupervisorChannelState = "new";
   private sendSeq = 0;
@@ -1111,26 +1076,34 @@ export class SupervisorChannel {
     return frame;
   }
 
-  /** child 仅能上行分类对话回复，不能夹带工具参数、结果或任意事件。 */
+  /** child 仅能上行经过统一 codec 校验的结构化回复信封。 */
   publishReply(reply: SupervisorReplyInput | SupervisorReply): SupervisorFrame {
     if (this.role !== "child" || this.terminationBarrier || this.state !== "ready") {
       throw new SupervisorProtocolError("closed");
     }
-    const candidate = reply as Record<string, unknown>;
-    const replySeq = candidate.reply_seq === undefined ? this.nextReplySeq : candidate.reply_seq;
-    const kind = candidate.kind === undefined ? "final" : candidate.kind;
+    const directEnvelope = parseChildReplyEnvelope(reply, {
+      maxStringBytes: this.limits.maxStringBytes,
+      maxImagesPerReply: this.limits.maxImagesPerReply,
+      maxImageBytes: this.limits.maxImageBytes,
+    });
+    const wireRecord = isRecord(reply) ? reply : undefined;
+    const wireCandidate = directEnvelope === undefined
+      && wireRecord !== undefined
+      && Number.isSafeInteger(wireRecord.reply_seq)
+      && Object.prototype.hasOwnProperty.call(wireRecord, "envelope");
+    const replySeq = wireCandidate ? wireRecord.reply_seq as number : this.nextReplySeq;
+    const envelope = directEnvelope ?? (wireCandidate ? wireRecord.envelope : reply as SupervisorReplyInput);
+    const parsed = parseReply({ reply_seq: replySeq, envelope }, this.limits);
     const messageWindow = Math.max(0, this.limits.maxReplyWindow - 1);
-    if (kind === "message" && this.outboundReplies.size >= messageWindow) {
+    if (parsed.envelope.kind === "message" && this.outboundReplies.size >= messageWindow) {
       throw new SupervisorProtocolError("reply_window_full");
     }
-    if (kind === "final" && this.outboundReplies.size >= this.limits.maxReplyWindow) {
+    if (parsed.envelope.kind === "final" && this.outboundReplies.size >= this.limits.maxReplyWindow) {
       throw new SupervisorProtocolError("reply_window_full");
     }
-    const parsed = parseReply({
-      ...candidate,
-      kind,
-      reply_seq: replySeq,
-    }, this.limits);
+    if (parsed.envelope.agent_id !== this.localAgentId) {
+      throw new SupervisorProtocolError("identity_mismatch");
+    }
     if (parsed.reply_seq !== this.nextReplySeq) throw new SupervisorProtocolError("reply_invalid");
     const frame = this.createFrame("reply", parsed as unknown as Record<string, unknown>);
     this.outboundReplies.set(parsed.reply_seq, { reply: parsed });
@@ -1540,6 +1513,11 @@ export class SupervisorChannel {
   private applyReplyFrame(frame: InternalFrame): { readonly replies: readonly SupervisorReply[]; readonly ackReplySeq: number } {
     if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
     const reply = parseReply(frame.payload, this.limits);
+    if (reply.envelope.agent_id !== this.peerAgentId) frameError("identity_mismatch");
+    const semantics = replySemanticDigest(reply.envelope);
+    const previousSemantics = this.receivedReplyDigests.get(reply.reply_seq);
+    if (previousSemantics !== undefined && previousSemantics !== semantics) frameError("reply_invalid");
+    if (previousSemantics === undefined) this.rememberReplySemantics(reply.reply_seq, semantics);
     if (reply.reply_seq < this.nextExpectedReplySeq) {
       return Object.freeze({ replies: EMPTY_REPLIES, ackReplySeq: this.highestReplyAck });
     }
@@ -1554,22 +1532,38 @@ export class SupervisorChannel {
     const delivered: SupervisorReply[] = [];
     let current = this.bufferedReplies.get(this.nextExpectedReplySeq);
     while (current !== undefined) {
-      let accepted = true;
-      try {
-        accepted = this.onReply?.(current) ?? true;
-      } catch {
-        accepted = false;
+      const duplicateFinal = current.envelope.kind === "final"
+        && this.acceptedFinalTurns.has(current.envelope.turn_id);
+      let accepted = duplicateFinal;
+      if (!duplicateFinal) {
+        accepted = true;
+        try {
+          accepted = this.onReply?.(current) ?? true;
+        } catch {
+          accepted = false;
+        }
       }
       // 注入失败时保留当前 reply；传输 ACK 仍可推进，但 reply ACK 必须等待
       // 当前或 reload 后的新父会话真正接纳正文。
       if (!accepted) break;
       this.bufferedReplies.delete(current.reply_seq);
-      delivered.push(current);
+      if (!duplicateFinal) {
+        delivered.push(current);
+        if (current.envelope.kind === "final") this.rememberFinalTurn(current.envelope.turn_id);
+      }
       this.highestReplyAck = current.reply_seq;
       this.nextExpectedReplySeq += 1;
       current = this.bufferedReplies.get(this.nextExpectedReplySeq);
     }
     return Object.freeze({ replies: Object.freeze(delivered), ackReplySeq: this.highestReplyAck });
+  }
+
+  private rememberReplySemantics(replySeq: number, semantics: string): void {
+    this.receivedReplyDigests.set(replySeq, semantics);
+  }
+
+  private rememberFinalTurn(turnId: string): void {
+    this.acceptedFinalTurns.add(turnId);
   }
 
   private applyAck(frame: InternalFrame): {

@@ -2,6 +2,12 @@ import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import {
+  CHILD_REPLY_SCHEMA,
+  CHILD_REPLY_VERSION,
+  type ChildFinalEnvelope,
+  type ChildMessageEnvelope,
+} from "../src/child-reply-envelope.ts";
+import {
   StreamSupervisorChannel,
   type SupervisorByteTransport,
 } from "../src/stream-supervisor-channel.ts";
@@ -12,8 +18,34 @@ import {
 import type { AgentSnapshot } from "../src/tree-controller.ts";
 
 const CHILD_ID = "550e8400-e29b-41d4-a716-446655440000";
+const TURN_ID = "550e8400-e29b-41d4-a716-446655440001";
 const ROOT_ID = "root-test";
 const CREDENTIAL = "stream-test-credential";
+
+function workingReply(text: string): ChildMessageEnvelope {
+  return {
+    schema: CHILD_REPLY_SCHEMA,
+    version: CHILD_REPLY_VERSION,
+    kind: "message",
+    agent_id: CHILD_ID,
+    turn_id: TURN_ID,
+    requires_response: false,
+    text,
+  };
+}
+
+function finalReply(text: string): ChildFinalEnvelope {
+  return {
+    schema: CHILD_REPLY_SCHEMA,
+    version: CHILD_REPLY_VERSION,
+    kind: "final",
+    agent_id: CHILD_ID,
+    turn_id: TURN_ID,
+    run_state: "settled",
+    output_state: "present",
+    text,
+  };
+}
 
 function snapshot(): AgentSnapshot {
   return Object.freeze({
@@ -117,7 +149,7 @@ test("回复与生命周期事件通过安全回调传递，观察者异常不�
   const replies: string[] = [];
   const events: unknown[] = [];
   const pair = channelPair((reply) => {
-    replies.push(reply.text);
+    replies.push(reply.envelope.text ?? "");
     return true;
   });
   pair.parent.onEvent((event) => {
@@ -129,7 +161,7 @@ test("回复与生命周期事件通过安全回调传递，观察者异常不�
   await pair.child.waitForReady(new AbortController().signal);
 
   await pair.child.publishEvent({ type: "agent_settled", expected_generation: 2 });
-  await pair.child.publishReply({ text: "安全回复" });
+  await pair.child.publishReply(finalReply("安全回复"));
   await settleIo();
   assert.deepEqual(replies, ["安全回复"]);
   assert.deepEqual(events, [{
@@ -146,17 +178,17 @@ test("回复与生命周期事件通过安全回调传递，观察者异常不�
 test("child reply 发布等待父端累计 ACK，message 与非空 final 共用序号域", async () => {
   const received: Array<{ kind: string; text: string }> = [];
   const pair = channelPair((reply) => {
-    received.push({ kind: reply.kind, text: reply.text });
+    received.push({ kind: reply.envelope.kind, text: reply.envelope.text ?? "" });
     return true;
   });
   await pair.child.bind(new AbortController().signal);
   await pair.parent.waitForReady(new AbortController().signal);
   await pair.child.waitForReady(new AbortController().signal);
 
-  const message = pair.child.publishReplyAndWaitForAck({ kind: "message", text: "进度" });
+  const message = pair.child.publishReplyAndWaitForAck(workingReply("进度"));
   await settleIo();
   await message;
-  const final = pair.child.publishReplyAndWaitForAck({ kind: "final", text: "完成" });
+  const final = pair.child.publishReplyAndWaitForAck(finalReply("完成"));
   await settleIo();
   await final;
   assert.deepEqual(received, [
@@ -173,10 +205,7 @@ test("reply ACK 等待在协议故障和通道释放时确定失败且不产生�
   await faulted.parent.waitForReady(new AbortController().signal);
   await faulted.child.waitForReady(new AbortController().signal);
 
-  const waitingForFault = faulted.child.publishReplyAndWaitForAck({
-    kind: "message",
-    text: "等待确认",
-  });
+  const waitingForFault = faulted.child.publishReplyAndWaitForAck(workingReply("等待确认"));
   await settleIo();
   assert.equal(faulted.child.getPublicState().pending_reply_count, 1);
   faulted.child.failProtocol();
@@ -190,10 +219,7 @@ test("reply ACK 等待在协议故障和通道释放时确定失败且不产生�
   await released.parent.waitForReady(new AbortController().signal);
   await released.child.waitForReady(new AbortController().signal);
 
-  const waitingForRelease = released.child.publishReplyAndWaitForAck({
-    kind: "final",
-    text: "最终结果",
-  });
+  const waitingForRelease = released.child.publishReplyAndWaitForAck(finalReply("最终结果"));
   await settleIo();
   await released.child.release();
   await assert.rejects(waitingForRelease, /监督回复未获确认/);

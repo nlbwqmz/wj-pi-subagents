@@ -273,7 +273,7 @@ function createMessageCallComponent(
       overflowText: "…（展开查看完整正文）",
     }),
   }];
-  const imageSummary = name === "send_message"
+  const imageSummary = name === "send_message" || name === "reply_to_parent"
     ? formatSafeImageSummary(readProperty(input, "images"))
     : undefined;
   if (imageSummary !== undefined) lines.push({ text: imageSummary, color: "muted" });

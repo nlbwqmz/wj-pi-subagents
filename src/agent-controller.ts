@@ -12,6 +12,9 @@ import {
   type TreeController,
 } from "./tree-controller.ts";
 import {
+  CHILD_REPLY_MAX_IMAGE_MIME_TYPE_LENGTH,
+} from "./child-reply-envelope.ts";
+import {
   listAgentTemplates,
   type AgentTemplateListItem,
   type TemplateDefinition,
@@ -104,6 +107,8 @@ export interface AgentControllerOptions {
     agentId: string,
     reply: Extract<RpcSupervisorEvent, { kind: "reply" }>['reply'],
   ) => void;
+  /** 节点故障通知必须在 terminal waiter 解除前同步进入父会话；false 表示稍后重试。 */
+  readonly onTerminal?: (agentId: string) => boolean | void;
   /** 生产运行时必须提供根权威端口；省略仅保留旧单节点测试 seam。 */
   readonly authority?: TreeAuthorityPort;
 }
@@ -175,12 +180,15 @@ export class AgentController {
   private readonly validateTemplate: AgentControllerOptions["validateTemplate"];
   private readonly waitTimeoutMs: number;
   private readonly onReply: AgentControllerOptions["onReply"];
+  private readonly onTerminal: AgentControllerOptions["onTerminal"];
   private readonly authority: TreeAuthorityPort | undefined;
   private readonly agents = new Map<string, ManagedAgentEntry>();
   /** start 抛出前无法取得公开身份的节点仍需保留内部回收能力。 */
   private readonly unassignedSupervisors = new Map<AgentSupervisor, () => void>();
   private readonly waiters = new Map<string, Set<PendingWaiter>>();
   private readonly pendingReplyNotifications = new Map<string, number>();
+  private readonly terminalNotifications = new Set<string>();
+  private readonly pendingTerminalNotifications = new Set<string>();
   private readonly messageIds = new Set<string>();
   private unsubscribeTreeChange: (() => void) | undefined;
   private readonly confirmedWithoutOwnership = new Set<string>();
@@ -200,6 +208,7 @@ export class AgentController {
     this.validateTemplate = options.validateTemplate;
     this.waitTimeoutMs = options.waitTimeoutMs ?? WAIT_AGENT_DEFAULT_TIMEOUT_MS;
     this.onReply = options.onReply;
+    this.onTerminal = options.onTerminal;
     this.authority = options.authority;
     if (!validWaitTimeout(this.waitTimeoutMs)) throw new TypeError("默认等待期限无效");
     this.unsubscribeTreeChange = this.tree.onChange(() => this.resolveAllReadyWaiters());
@@ -567,6 +576,7 @@ export class AgentController {
     current.unsubscribe();
     this.agents.delete(agentId);
     this.pendingReplyNotifications.delete(agentId);
+    this.terminalNotifications.delete(agentId);
   }
 
   getAgentStatus(agentId: unknown): ControlResult<AgentSnapshot> {
@@ -594,11 +604,17 @@ export class AgentController {
     this.createSupervisor.updateTemplateSnapshot?.(snapshot);
   }
 
-  /** 新 Pi API 已绑定后，逐个重试直接子通道中已接收但尚未确认的回复。 */
+  /** 新 Pi API 已绑定后，逐个重试未确认的 child reply 与节点故障通知。 */
   async retryPendingReplies(): Promise<void> {
     await Promise.allSettled([...this.agents.values()].map(async ({ supervisor }) => {
       await supervisor.retryPendingReplies?.();
     }));
+    for (const agentId of [...this.pendingTerminalNotifications]) {
+      if (!this.deliverTerminalNotification(agentId)) continue;
+      this.pendingTerminalNotifications.delete(agentId);
+      this.terminalNotifications.add(agentId);
+      this.resolveWaiters(agentId);
+    }
   }
 
   /**
@@ -680,6 +696,8 @@ export class AgentController {
     }
     this.waiters.clear();
     this.pendingReplyNotifications.clear();
+    this.terminalNotifications.clear();
+    this.pendingTerminalNotifications.clear();
     for (const entry of this.agents.values()) entry.unsubscribe();
     this.agents.clear();
     for (const unsubscribe of this.unassignedSupervisors.values()) unsubscribe();
@@ -782,16 +800,30 @@ export class AgentController {
         active_count: event.activity.active_count,
       });
     }
-    if (agentId !== undefined) this.resolveWaiters(agentId);
+    let runtimeFailedAgentId: string | undefined;
     if (
       agentId !== undefined
       && (
-        (event.kind === "fault")
+        event.kind === "fault"
         || (event.kind === "lifecycle" && event.event.type === "runtime_failed")
       )
     ) {
-      this.startOrphanTermination(agentId);
+      const status = this.tree.getStatus(agentId);
+      if (status.ok && status.data.state === "failed") runtimeFailedAgentId = agentId;
     }
+    if (
+      runtimeFailedAgentId !== undefined
+      && !this.terminalNotifications.has(runtimeFailedAgentId)
+      && !this.pendingTerminalNotifications.has(runtimeFailedAgentId)
+    ) {
+      if (this.deliverTerminalNotification(runtimeFailedAgentId)) {
+        this.terminalNotifications.add(runtimeFailedAgentId);
+      } else {
+        this.pendingTerminalNotifications.add(runtimeFailedAgentId);
+      }
+    }
+    if (agentId !== undefined) this.resolveWaiters(agentId);
+    if (runtimeFailedAgentId !== undefined) this.startOrphanTermination(runtimeFailedAgentId);
     if (
       agentId !== undefined
       && event.kind === "lifecycle"
@@ -800,6 +832,15 @@ export class AgentController {
       this.releaseTerminatedSupervisor(agentId);
     }
     this.resolveAllReadyWaiters();
+  }
+
+  private deliverTerminalNotification(agentId: string): boolean {
+    if (this.onTerminal === undefined) return true;
+    try {
+      return this.onTerminal(agentId) !== false;
+    } catch {
+      return false;
+    }
   }
 
   /** 运行故障只自动回收后代；故障父节点保持 failed，等待直接父显式终止。 */
@@ -854,6 +895,7 @@ export class AgentController {
     entry.unsubscribe();
     this.agents.delete(agentId);
     this.pendingReplyNotifications.delete(agentId);
+    this.terminalNotifications.delete(agentId);
   }
 
   private resolveAllReadyWaiters(): void {
@@ -883,7 +925,12 @@ export class AgentController {
 
   private waitOutcome(agentId: string, status: AgentSnapshot): WaitAgentData | undefined {
     if (status.state === "idle") return makeWaitData(status, "settled");
-    if (status.state === "failed" || status.state === "terminated") return makeWaitData(status, "terminal");
+    if (status.state === "failed") {
+      return this.terminalNotifications.has(agentId) ? makeWaitData(status, "terminal") : undefined;
+    }
+    if (status.state === "terminated" && !this.pendingTerminalNotifications.has(agentId)) {
+      return makeWaitData(status, "terminal");
+    }
     return undefined;
   }
 
@@ -932,6 +979,7 @@ function isSendMessageInput(value: unknown): value is SendMessageInput {
       && validBase64(item.data)
       && decodedBase64Length(item.data) <= 24 * 1024
       && typeof item.mimeType === "string"
+      && item.mimeType.length <= CHILD_REPLY_MAX_IMAGE_MIME_TYPE_LENGTH
       && /^image\/[a-z0-9.+-]+$/.test(item.mimeType)
       && Object.keys(item).every((key) => key === "type" || key === "data" || key === "mimeType");
   });

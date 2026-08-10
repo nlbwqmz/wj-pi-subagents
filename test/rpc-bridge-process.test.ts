@@ -121,7 +121,7 @@ test("生产桥接配合 fake RpcClient 完成真实本地监督握手、回复 
     credential: supervisorCredential,
     requestIdRegistry: new SupervisorRequestIdRegistry(),
     onReply: (reply) => {
-      replies.push(reply.text);
+      replies.push(reply.envelope.text ?? "");
       return true;
     },
   });
@@ -142,6 +142,10 @@ test("生产桥接配合 fake RpcClient 完成真实本地监督握手、回复 
 
   assert.equal(channel.isReady(), true);
   await node.prompt("触发监督回复");
+  await assert.rejects(
+    bridge.prompt("拒绝超长 MIME", [{ type: "image", data: "YWJj", mimeType: `image/${"x".repeat(123)}` }]),
+    /桥接命令失败/,
+  );
   const fakeState = await waitForReplyAcknowledgement(bridge);
   assert.deepEqual(replies, ["真正 child 监督回复"]);
   assert.deepEqual(bridgeEvents, [], "任务 RPC message_end 不得成为 bridge 事件");

@@ -121,13 +121,7 @@ export function createAgentSupervisorFactory(
           onReply: (reply) => {
             if (options.deliverReply === undefined) return false;
             try {
-              return options.deliverReply(context.agent_id, {
-                kind: reply.kind,
-                text: reply.text,
-                ...(reply.images === undefined
-                  ? {}
-                  : { images: reply.images.map((image) => Object.freeze({ ...image })) }),
-              }) === true;
+              return options.deliverReply(context.agent_id, reply.envelope) === true;
             } catch {
               return false;
             }

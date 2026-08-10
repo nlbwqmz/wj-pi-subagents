@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  CHILD_REPLY_SCHEMA,
+  CHILD_REPLY_VERSION,
+  type ChildFinalEnvelope,
+  type ChildMessageEnvelope,
+  type ChildReplyImage,
+} from "../src/child-reply-envelope.ts";
+import {
   SUPERVISOR_CHANNEL_LIMITS,
   SupervisorFrameDecoder,
   FakeSupervisorChannel,
@@ -15,8 +22,48 @@ import {
 const CHILD_ID = "550e8400-e29b-41d4-a716-446655440000";
 const GRANDCHILD_ID = "550e8400-e29b-41d4-a716-446655440001";
 const SIBLING_ID = "550e8400-e29b-41d4-a716-446655440002";
+const TURN_ID = "550e8400-e29b-41d4-a716-446655440003";
 const ROOT_ID = "root-test";
 const CREDENTIAL = "test-one-time-credential";
+
+function workingReply(text: string, requiresResponse = false): ChildMessageEnvelope {
+  return {
+    schema: CHILD_REPLY_SCHEMA,
+    version: CHILD_REPLY_VERSION,
+    kind: "message",
+    agent_id: CHILD_ID,
+    turn_id: TURN_ID,
+    requires_response: requiresResponse,
+    text,
+  };
+}
+
+function finalReply(text: string, images?: readonly ChildReplyImage[]): ChildFinalEnvelope {
+  return {
+    schema: CHILD_REPLY_SCHEMA,
+    version: CHILD_REPLY_VERSION,
+    kind: "final",
+    agent_id: CHILD_ID,
+    turn_id: TURN_ID,
+    run_state: "settled",
+    output_state: "present",
+    text,
+    ...(images === undefined ? {} : { images }),
+  };
+}
+
+function imageOnlyFinal(images: readonly ChildReplyImage[]): ChildFinalEnvelope {
+  return {
+    schema: CHILD_REPLY_SCHEMA,
+    version: CHILD_REPLY_VERSION,
+    kind: "final",
+    agent_id: CHILD_ID,
+    turn_id: TURN_ID,
+    run_state: "settled",
+    output_state: "present",
+    images,
+  };
+}
 
 function node(
   agentId: string,
@@ -56,7 +103,7 @@ function assertProtocolError(action: () => unknown, code: SupervisorProtocolErro
 
 test("长度边界 UTF-8 JSON 可处理分块与拼接帧，拒绝截断/损坏载荷", () => {
   const frame: SupervisorFrame = {
-    protocol: "pi-subagent/2",
+    protocol: "pi-subagent/3",
     kind: "event",
     stream_id: "stream_test",
     sender_agent_id: CHILD_ID,
@@ -138,7 +185,7 @@ test("child 仅在首个完整快照被父端确认后进入 ready", () => {
   pair.flush();
   assert.equal(pair.parent.getPublicState().state, "awaiting_snapshot");
   assert.equal(pair.child.getPublicState().state, "awaiting_snapshot");
-  assert.throws(() => pair.child.publishReply({ text: "过早回复" }), (error: unknown) => {
+  assert.throws(() => pair.child.publishReply(finalReply("过早回复")), (error: unknown) => {
     return error instanceof SupervisorProtocolError && error.code === "closed";
   });
 
@@ -278,13 +325,13 @@ test("普通回复按 reply_seq 有序注入并以累计 ACK 去重，窗口有�
     childAgentId: CHILD_ID,
     credential: CREDENTIAL,
     onReply: (reply) => {
-      replies.push(reply.text);
+      replies.push(reply.envelope.text ?? "");
       return true;
     },
   });
   handshake(pair);
-  const first = pair.child.publishReply({ text: "第一条" });
-  const second = pair.child.publishReply({ text: "第二条" });
+  const first = pair.child.publishReply(workingReply("第一条"));
+  const second = pair.child.publishReply(workingReply("第二条"));
   const firstOutOfOrder = {
     ...first,
     payload: second.payload,
@@ -325,8 +372,8 @@ test("普通回复按 reply_seq 有序注入并以累计 ACK 去重，窗口有�
     limits: { maxReplyWindow: 1 },
   });
   handshake(limited);
-  limited.child.publishReply({ text: "占用窗口" });
-  assert.throws(() => limited.child.publishReply({ text: "超限" }), (error: unknown) => {
+  limited.child.publishReply(finalReply("占用窗口"));
+  assert.throws(() => limited.child.publishReply(finalReply("超限")), (error: unknown) => {
     return error instanceof SupervisorProtocolError && error.code === "reply_window_full";
   });
 });
@@ -338,7 +385,10 @@ test("最大合法图片 final 以解码字节计量，并可超过单个桥接�
     childAgentId: CHILD_ID,
     credential: CREDENTIAL,
     onReply: (reply) => {
-      received.push({ text: reply.text, imageCount: reply.images?.length ?? 0 });
+      received.push({
+        text: reply.envelope.text ?? "",
+        imageCount: reply.envelope.images?.length ?? 0,
+      });
       return true;
     },
   });
@@ -349,7 +399,7 @@ test("最大合法图片 final 以解码字节计量，并可超过单个桥接�
     data: imageData,
     mimeType: "image/png",
   }));
-  const reply = pair.child.publishReply({ kind: "final", text: "附带最大合法图片", images });
+  const reply = pair.child.publishReply(finalReply("附带最大合法图片", images));
   const encoded = pair.child.encode(reply);
   assert.ok(encoded.byteLength > 64 * 1024);
 
@@ -366,21 +416,21 @@ test("工作中 message 为 final 预留窗口槽位，二者按同一 reply_seq
     credential: CREDENTIAL,
     limits: { maxReplyWindow: 3 },
     onReply: (reply) => {
-      replies.push({ kind: reply.kind, text: reply.text });
+      replies.push({ kind: reply.envelope.kind, text: reply.envelope.text ?? "" });
       return true;
     },
   });
   handshake(pair);
 
-  const first = pair.child.publishReply({ kind: "message", text: "阶段一" });
-  const second = pair.child.publishReply({ kind: "message", text: "阶段二" });
+  const first = pair.child.publishReply(workingReply("阶段一"));
+  const second = pair.child.publishReply(workingReply("阶段二"));
   assert.throws(
-    () => pair.child.publishReply({ kind: "message", text: "不得占用 final 槽位" }),
+    () => pair.child.publishReply(workingReply("不得占用 final 槽位")),
     (error: unknown) => error instanceof SupervisorProtocolError && error.code === "reply_window_full",
   );
-  const final = pair.child.publishReply({ kind: "final", text: "最终结果" });
+  const final = pair.child.publishReply(finalReply("最终结果"));
   assert.throws(
-    () => pair.child.publishReply({ kind: "final", text: "窗口已满" }),
+    () => pair.child.publishReply(finalReply("窗口已满")),
     (error: unknown) => error instanceof SupervisorProtocolError && error.code === "reply_window_full",
   );
 
@@ -408,17 +458,19 @@ test("工作中 message 为 final 预留窗口槽位，二者按同一 reply_seq
   assert.equal(pair.child.getPublicState().pending_reply_count, 0);
 });
 
-test("原始 reply 帧必须显式携带 kind，message/final 内容不能为空，图片 final 仍合法", () => {
-  const missingKind = createFakeSupervisorChannelPair({
+test("原始 v3 reply 必须携带合法 envelope，空载荷状态一致且图片 final 合法", () => {
+  const missingEnvelope = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,
     childAgentId: CHILD_ID,
     credential: CREDENTIAL,
   });
-  handshake(missingKind);
-  const valid = missingKind.child.publishReply({ kind: "final", text: "最终结果" });
-  const { kind: _replyKind, ...payloadWithoutKind } = valid.payload;
-  const invalid = { ...valid, payload: payloadWithoutKind } as SupervisorFrame;
-  assert.deepEqual(missingKind.parent.receive(invalid), {
+  handshake(missingEnvelope);
+  const valid = missingEnvelope.child.publishReply(finalReply("最终结果"));
+  const invalid = {
+    ...valid,
+    payload: { reply_seq: valid.payload.reply_seq },
+  } as SupervisorFrame;
+  assert.deepEqual(missingEnvelope.parent.receive(invalid), {
     kind: "protocol_fault",
     error: "reply_invalid",
   });
@@ -429,10 +481,17 @@ test("原始 reply 帧必须显式携带 kind，message/final 内容不能为空
     credential: CREDENTIAL,
   });
   handshake(emptyIncomingFinal);
-  const validIncomingFinal = emptyIncomingFinal.child.publishReply({ kind: "final", text: "最终结果" });
+  const validIncomingFinal = emptyIncomingFinal.child.publishReply(finalReply("最终结果"));
+  const {
+    text: _discardedText,
+    ...envelopeWithoutText
+  } = validIncomingFinal.payload.envelope as Record<string, unknown>;
   const forgedEmptyFinal = {
     ...validIncomingFinal,
-    payload: { ...validIncomingFinal.payload, text: "" },
+    payload: {
+      ...validIncomingFinal.payload,
+      envelope: envelopeWithoutText,
+    },
   } as SupervisorFrame;
   assert.deepEqual(emptyIncomingFinal.parent.receive(forgedEmptyFinal), {
     kind: "protocol_fault",
@@ -446,26 +505,22 @@ test("原始 reply 帧必须显式携带 kind，message/final 内容不能为空
   });
   handshake(emptyMessage);
   assert.throws(
-    () => emptyMessage.child.publishReply({ kind: "message", text: "   " }),
+    () => emptyMessage.child.publishReply(workingReply("   ")),
     (error: unknown) => error instanceof SupervisorProtocolError && error.code === "reply_invalid",
   );
   assert.throws(
-    () => emptyMessage.child.publishReply({ kind: "final", text: "" }),
+    () => emptyMessage.child.publishReply(finalReply("")),
     (error: unknown) => error instanceof SupervisorProtocolError && error.code === "reply_invalid",
   );
-  const imageOnlyFinal = emptyMessage.child.publishReply({
-    kind: "final",
-    text: "",
-    images: [{ type: "image", data: "YWJj", mimeType: "image/png" }],
-  });
-  assert.equal(imageOnlyFinal.payload.kind, "final");
-  assert.equal(imageOnlyFinal.payload.text, "");
+  const imageReply = emptyMessage.child.publishReply(imageOnlyFinal([
+    { type: "image", data: "YWJj", mimeType: "image/png" },
+  ]));
+  assert.equal((imageReply.payload.envelope as ChildFinalEnvelope).kind, "final");
+  assert.equal((imageReply.payload.envelope as ChildFinalEnvelope).text, undefined);
   assert.throws(
-    () => emptyMessage.child.publishReply({
-      kind: "final",
-      text: "",
-      images: [{ type: "image", data: "YWJj", mimeType: "text/plain" }],
-    }),
+    () => emptyMessage.child.publishReply(imageOnlyFinal([
+      { type: "image", data: "YWJj", mimeType: "text/plain" },
+    ])),
     (error: unknown) => error instanceof SupervisorProtocolError && error.code === "reply_invalid",
   );
 });
@@ -479,7 +534,7 @@ test("回复注入未成功时保留正文，父会话恢复后重试并发送 r
     onReply: () => parentAvailable,
   });
   handshake(pair);
-  const reply = pair.child.publishReply({ text: "等待父会话可用" });
+  const reply = pair.child.publishReply(finalReply("等待父会话可用"));
   const result = pair.parent.receive(reply);
   assert.equal(result.kind, "accepted");
   if (result.kind !== "accepted") return;
@@ -877,12 +932,12 @@ test("有限重连使用新流，首快照确认后重放未确认回复且丢�
     childAgentId: CHILD_ID,
     credential: CREDENTIAL,
     onReply: (reply) => {
-      replies.push(reply.text);
+      replies.push(reply.envelope.text ?? "");
       return true;
     },
   });
   handshake(pair);
-  const oldReply = pair.child.publishReply({ text: "断线前已到达" });
+  const oldReply = pair.child.publishReply(finalReply("断线前已到达"));
   assert.equal(pair.parent.receive(oldReply).kind, "accepted");
   assert.deepEqual(replies, ["断线前已到达"]);
   assert.equal(pair.child.getPublicState().pending_reply_count, 1);

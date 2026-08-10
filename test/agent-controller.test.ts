@@ -13,10 +13,12 @@ import {
   type RpcSupervisorStartupResult,
   type RpcSupervisorTerminationResult,
 } from "../src/rpc-supervisor.ts";
+import type { SupervisorEvent } from "../src/supervisor-channel.ts";
 import { ROOT_TREE_ACTOR, TreeController } from "../src/tree-controller.ts";
 
 class ReadyChannel implements RpcSupervisorChannel {
   private ready = true;
+  private readonly eventListeners = new Set<(event: SupervisorEvent) => void>();
   async bind(): Promise<void> {}
   async waitForReady(): Promise<void> {}
   isReady(): boolean { return this.ready; }
@@ -26,6 +28,13 @@ class ReadyChannel implements RpcSupervisorChannel {
   async waitForClose(): Promise<RpcSupervisorChannelCloseState> { return "released"; }
   async release(): Promise<void> {}
   onFault(): () => void { return () => {}; }
+  onEvent(listener: (event: SupervisorEvent) => void): () => void {
+    this.eventListeners.add(listener);
+    return () => this.eventListeners.delete(listener);
+  }
+  emitEvent(event: SupervisorEvent): void {
+    for (const listener of this.eventListeners) listener(event);
+  }
 }
 
 class ControlledSupervisor implements AgentSupervisor {
@@ -131,6 +140,14 @@ test("直接父子旅程闭合 spawn、prompt、steering、wait 和协作式 int
   assert.deepEqual(second.ok && second.data.accepted, true);
   assert.deepEqual(node.operations(), ["start", "get_state", "prompt", "steer"]);
 
+  const invalidImage = await controller.sendMessage({
+    agent_id: agentId,
+    message: "拒绝超长 MIME",
+    images: [{ type: "image", data: "YWJj", mimeType: `image/${"x".repeat(123)}` }],
+  });
+  assert.equal(invalidImage.ok, false);
+  if (!invalidImage.ok) assert.equal(invalidImage.error.code, "invalid_argument");
+
   const waitingOne = controller.waitAgent({ agent_id: agentId });
   const waitingTwo = controller.waitAgent({ agent_id: agentId });
   const interrupted = await controller.interruptAgent(agentId);
@@ -151,6 +168,49 @@ test("直接父子旅程闭合 spawn、prompt、steering、wait 和协作式 int
     assert.equal(one.data.state, "idle");
     assert.equal("observed_at" in one.data, false);
   }
+});
+
+test("自主 agent_start 后控制器保持 working，并按 steering、wait 和 interrupt 路由", async () => {
+  const id = "45454545-4545-4454-8454-454545454545";
+  const tree = makeTree(id);
+  let node: FakeManagedRpcNode | undefined;
+  const controller = new AgentController({
+    tree,
+    allowUnvalidatedTemplates: true,
+    createSupervisor: ({ actor, reservation }) => {
+      node = new FakeManagedRpcNode();
+      return new RpcSupervisor({
+        controller: tree,
+        actor,
+        reservation,
+        managedNode: node,
+        channel: new ReadyChannel(),
+        startupTimeoutMs: 100,
+        gracefulShutdownMs: 10,
+      });
+    },
+  });
+  const spawned = await controller.spawnAgent({ template_id: "researcher", name: "自主中间代理" });
+  assert.equal(spawned.ok, true);
+  if (!spawned.ok || node === undefined) return;
+
+  node.emitEvent({ type: "agent_start" });
+  const activeStatus = controller.getAgentStatus(id);
+  assert.equal(activeStatus.ok, true);
+  if (activeStatus.ok) assert.equal(activeStatus.data.state, "working");
+  const waiting = controller.waitAgent({ agent_id: id });
+  const steered = await controller.sendMessage({ agent_id: id, message: "继续整理孙代理结果" });
+  assert.equal(steered.ok, true);
+  assert.equal(node.operations().at(-1), "steer");
+
+  const interrupted = await controller.interruptAgent(id);
+  assert.equal(interrupted.ok, true);
+  if (interrupted.ok) assert.equal(interrupted.data.changed, true);
+  node.emitEvent({ type: "agent_settled" });
+  const result = await waiting;
+  assert.equal(result.ok, true);
+  if (result.ok) assert.equal(result.data.outcome, "settled");
+  await controller.shutdown();
 });
 
 test("工作中 reply 通知立即唤醒 wait_agent 且不改变子代理生命周期", async () => {
@@ -196,6 +256,133 @@ test("工作中 reply 通知立即唤醒 wait_agent 且不改变子代理生命�
     assert.equal(queued.data.state, "working");
   }
   node?.emitEvent({ type: "agent_settled" });
+  await controller.shutdown();
+});
+
+test("运行时故障先注入 terminal 通知再解除 wait_agent", async () => {
+  const id = "42424242-4242-4424-8424-424242424242";
+  const tree = makeTree(id);
+  const order: string[] = [];
+  let node: FakeManagedRpcNode | undefined;
+  const controller = new AgentController({
+    tree,
+    allowUnvalidatedTemplates: true,
+    onTerminal: (agentId) => {
+      assert.equal(agentId, id);
+      order.push("terminal");
+    },
+    createSupervisor: ({ actor, reservation }) => {
+      node = new FakeManagedRpcNode();
+      return new RpcSupervisor({
+        controller: tree,
+        actor,
+        reservation,
+        managedNode: node,
+        channel: new ReadyChannel(),
+        startupTimeoutMs: 100,
+        gracefulShutdownMs: 10,
+      });
+    },
+  });
+  const spawned = await controller.spawnAgent({ template_id: "researcher", name: "故障代理" });
+  assert.equal(spawned.ok, true);
+  assert.equal((await controller.sendMessage({ agent_id: id, message: "开始" })).ok, true);
+  const waiting = controller.waitAgent({ agent_id: id });
+  node?.emitTransportFault("eof");
+  const result = await waiting;
+  order.push("wait");
+  assert.deepEqual(order, ["terminal", "wait"]);
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.data.outcome, "terminal");
+    assert.equal(result.data.state, "failed");
+    assert.equal("text" in result.data, false);
+    assert.equal("final" in result.data, false);
+  }
+  await controller.shutdown();
+});
+
+test("迟到的 runtime_failed 事实不能伪造 TerminalNotice", async () => {
+  const id = "41414141-4141-4414-8414-414141414141";
+  const tree = makeTree(id);
+  const channel = new ReadyChannel();
+  let terminalNotices = 0;
+  const controller = new AgentController({
+    tree,
+    allowUnvalidatedTemplates: true,
+    onTerminal: () => { terminalNotices += 1; },
+    createSupervisor: ({ actor, reservation }) => new RpcSupervisor({
+      controller: tree,
+      actor,
+      reservation,
+      managedNode: new FakeManagedRpcNode(),
+      channel,
+      startupTimeoutMs: 100,
+      gracefulShutdownMs: 10,
+    }),
+  });
+  assert.equal((await controller.spawnAgent({ template_id: "researcher", name: "迟到事实代理" })).ok, true);
+
+  channel.emitEvent({
+    root_id: "root-stale-terminal",
+    agent_id: id,
+    type: "runtime_failed",
+    expected_generation: 0,
+    error_code: "internal_error",
+  });
+
+  assert.equal(terminalNotices, 0);
+  const status = controller.getAgentStatus(id);
+  assert.equal(status.ok, true);
+  if (status.ok) assert.equal(status.data.state, "idle");
+  await controller.shutdown();
+});
+
+test("terminal 通知注入失败时阻止 wait_agent 提前返回并在 API 恢复后重试", async () => {
+  const id = "43434343-4343-4434-8434-434343434343";
+  const tree = makeTree(id);
+  let node: FakeManagedRpcNode | undefined;
+  let parentAvailable = false;
+  let attempts = 0;
+  const controller = new AgentController({
+    tree,
+    allowUnvalidatedTemplates: true,
+    onTerminal: () => {
+      attempts += 1;
+      return parentAvailable;
+    },
+    createSupervisor: ({ actor, reservation }) => {
+      node = new FakeManagedRpcNode();
+      return new RpcSupervisor({
+        controller: tree,
+        actor,
+        reservation,
+        managedNode: node,
+        channel: new ReadyChannel(),
+        startupTimeoutMs: 100,
+        gracefulShutdownMs: 10,
+      });
+    },
+  });
+  assert.equal((await controller.spawnAgent({ template_id: "researcher", name: "故障重试代理" })).ok, true);
+  assert.equal((await controller.sendMessage({ agent_id: id, message: "开始" })).ok, true);
+
+  let resolved = false;
+  const waiting = controller.waitAgent({ agent_id: id }).then((result) => {
+    resolved = true;
+    return result;
+  });
+  node?.emitTransportFault("eof");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(attempts, 1);
+  assert.equal(resolved, false);
+
+  parentAvailable = true;
+  await controller.retryPendingReplies();
+  const result = await waiting;
+  assert.equal(attempts, 2);
+  assert.equal(result.ok, true);
+  if (result.ok) assert.equal(result.data.outcome, "terminal");
   await controller.shutdown();
 });
 

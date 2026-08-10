@@ -1,4 +1,8 @@
 import {
+  CHILD_REPLY_SCHEMA,
+  CHILD_REPLY_VERSION,
+} from "../../src/child-reply-envelope.ts";
+import {
   nativeLocalSupervisorTransportAdapter,
 } from "../../src/local-supervisor-transport.ts";
 import {
@@ -94,7 +98,16 @@ export class RpcClient {
         },
       });
     }
-    await this.#channel.publishReply({ text: "真正 child 监督回复" });
+    await this.#channel.publishReply({
+      schema: CHILD_REPLY_SCHEMA,
+      version: CHILD_REPLY_VERSION,
+      kind: "final",
+      agent_id: this.#agentId,
+      turn_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab",
+      run_state: "settled",
+      output_state: "present",
+      text: "真正 child 监督回复",
+    });
   }
 
   async steer() {}

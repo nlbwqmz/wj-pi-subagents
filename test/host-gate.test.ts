@@ -405,11 +405,11 @@ test("扩展 factory 探针期间保持 reload lease，成功时交接、失败�
   let cleanupCalls = 0;
   const common = {
     timeoutMs: 20,
-    activationIdentity: { isChild: false } as const,
+    activationIdentity: { isChild: false, protocolVersion: "pi-subagent/3" } as const,
     isTransfer: (value: unknown): value is Transfer =>
       typeof value === "object" && value !== null && "runtime" in value,
-    identityOfRuntime: () => ({ isChild: false } as const),
-    identityOfTransfer: () => ({ isChild: false } as const),
+    identityOfRuntime: () => ({ isChild: false, protocolVersion: "pi-subagent/3" } as const),
+    identityOfTransfer: () => ({ isChild: false, protocolVersion: "pi-subagent/3" } as const),
     createTransfer: (current: Runtime): Transfer => ({ runtime: current }),
     restoreTransfer: (transfer: Transfer): Runtime => transfer.runtime,
     setHandoffPending: (current: Runtime, pending: boolean) => {
@@ -493,6 +493,33 @@ test("扩展 factory 探针期间保持 reload lease，成功时交接、失败�
   assert.equal(cleanupCalls, 1);
   assert.equal(failedRuntime.handoffPending, false);
   assert.equal(oldActive, undefined);
+
+  const legacyRuntime: Runtime = { id: "v2-runtime", handoffPending: false };
+  let legacyActive: Runtime | undefined = legacyRuntime;
+  const cleanupBeforeProtocolMismatch = cleanupCalls;
+  const legacyCoordinator = new RuntimeReloadCoordinator<Runtime, Transfer>({
+    ...common,
+    eventBus,
+    activationIdentity: { isChild: false, protocolVersion: "pi-subagent/2" },
+    identityOfRuntime: () => ({ isChild: false, protocolVersion: "pi-subagent/2" }),
+    identityOfTransfer: () => ({ isChild: false, protocolVersion: "pi-subagent/2" }),
+    getActive: () => legacyActive,
+    setActive: (current) => { legacyActive = current; },
+  });
+  assert.equal(legacyCoordinator.beginHandoff(legacyRuntime), true);
+
+  let currentActive: Runtime | undefined;
+  const currentCoordinator = new RuntimeReloadCoordinator<Runtime, Transfer>({
+    ...common,
+    eventBus,
+    getActive: () => currentActive,
+    setActive: (current) => { currentActive = current; },
+  });
+  assert.equal(currentCoordinator.hasIncoming(), false);
+  assert.throws(() => currentCoordinator.prepareIncoming(), /reload 交接 lease 不可用/);
+  await new Promise<void>((resolve) => setTimeout(resolve, 30));
+  assert.equal(cleanupCalls, cleanupBeforeProtocolMismatch + 1);
+  assert.equal(legacyActive, undefined);
 });
 
 test("门禁失败只注册一次诊断桥，不注册公开面或运行副作用", async () => {

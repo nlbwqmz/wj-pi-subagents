@@ -2,6 +2,12 @@ import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import {
+  CHILD_REPLY_SCHEMA,
+  CHILD_REPLY_VERSION,
+  type ChildFinalEnvelope,
+  type ChildReplyImage,
+} from "../src/child-reply-envelope.ts";
 import { BridgeSupervisorEndpoint } from "./helpers/bridge-supervisor-endpoint.ts";
 import {
   FakeManagedRpcNode,
@@ -39,6 +45,25 @@ import {
 } from "../src/supervisor-channel.ts";
 
 const TREE = Object.freeze({ kind: "tree" });
+const TURN_ID = "77777777-7777-4777-8777-777777777777";
+
+function finalReply(
+  agentId: string,
+  text: string,
+  images?: readonly ChildReplyImage[],
+): ChildFinalEnvelope {
+  return {
+    schema: CHILD_REPLY_SCHEMA,
+    version: CHILD_REPLY_VERSION,
+    kind: "final",
+    agent_id: agentId,
+    turn_id: TURN_ID,
+    run_state: "settled",
+    output_state: "present",
+    text,
+    ...(images === undefined ? {} : { images }),
+  };
+}
 
 test("编译后的受管节点优先解析同目录 bridge，源码节点仍解析 dist bridge", () => {
   const compiledModuleUrl = "file:///D:/package/dist/src/managed-rpc-node.js";
@@ -405,8 +430,9 @@ test("ManagedRpcBridgeClient 使用固定版本与长度边界传递高层命令
   await client.start();
   await client.prompt("hello");
   assert.deepEqual(await client.getState(), { isStreaming: false });
+  parentOutput.write(encodeFrame({ protocol: MANAGED_RPC_BRIDGE_PROTOCOL, kind: "event", event: { type: "agent_start" } }));
   parentOutput.write(encodeFrame({ protocol: MANAGED_RPC_BRIDGE_PROTOCOL, kind: "event", event: { type: "agent_settled" } }));
-  assert.deepEqual(events, [{ type: "agent_settled" }]);
+  assert.deepEqual(events, [{ type: "agent_start" }, { type: "agent_settled" }]);
   parentOutput.end();
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.deepEqual(faults, ["eof"]);
@@ -785,7 +811,10 @@ test("受管监督通道重组分片后的最大 final 图片回复", async () =
     credential,
     requestIdRegistry: new SupervisorRequestIdRegistry(),
     onReply: (reply) => {
-      delivered.push({ text: reply.text, imageCount: reply.images?.length ?? 0 });
+      delivered.push({
+        text: reply.envelope.text ?? "",
+        imageCount: reply.envelope.images?.length ?? 0,
+      });
       return true;
     },
   });
@@ -815,11 +844,15 @@ test("受管监督通道重组分片后的最大 final 图片回复", async () =
   await channel.waitForReady(signal);
 
   const imageData = Buffer.alloc(24 * 1024, 0x7f).toString("base64");
-  await node.publishReply({
-    kind: "final",
-    text: "最大图片 final",
-    images: Array.from({ length: 8 }, () => ({ type: "image" as const, data: imageData, mimeType: "image/png" })),
-  });
+  await node.publishReply(finalReply(
+    childId,
+    "最大图片 final",
+    Array.from({ length: 8 }, () => ({
+      type: "image" as const,
+      data: imageData,
+      mimeType: "image/png",
+    })),
+  ));
   await new Promise<void>((resolve) => setImmediate(resolve));
 
   assert.deepEqual(delivered, [{ text: "最大图片 final", imageCount: 8 }]);
@@ -853,7 +886,7 @@ test("RpcSupervisor 通过真正 child 端点完成双握手和回复 ACK", asyn
           credential,
           requestIdRegistry: new SupervisorRequestIdRegistry(),
           onReply: (reply) => {
-            delivered.push(reply.text);
+            delivered.push(reply.envelope.text ?? "");
             return true;
           },
         }),
@@ -880,7 +913,7 @@ test("RpcSupervisor 通过真正 child 端点完成双握手和回复 ACK", asyn
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(node.supervisorState(), "ready");
   assert.deepEqual(await supervisor.prompt("触发回复"), { ok: true, accepted: true });
-  await node.publishReply({ text: "桥接回复" });
+  await node.publishReply(finalReply(id, "桥接回复"));
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(node.publishedReplies, 1);
   assert.equal(node.supervisorState(), "ready");

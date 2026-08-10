@@ -73,9 +73,11 @@ test("管理工具系统提示把重复调查与独立验证纳入任务所有�
   assert.deepEqual(readGuidelines("send_message"), [
     "任务所有权硬约束：send_message 返回 accepted: true 后，已下发任务范围由目标直接子代理负责，直到该子代理给出最终答复或进入终态。同一任务包括为同一问题、工单或结论执行的调查、实现、测试、复现、验证、评审及其子范围；父会话不得亲自实施或再次委派这些工作。读取或搜索同一源码与文档、运行同一测试、只读分析和独立验证都属于重复实施；‘只读’‘无写冲突’‘交叉验证’不是例外。父会话只能使用 wait_agent 等待、查询状态、向同一子代理发送 steering，或处理派发前已明确拆分、产出独立、无数据依赖且无共享写资源的其他工作。",
     "send_message 返回 accepted: true 只表示消息已被接受，不表示任务完成；若返回 message_delivery_failed，交付状态可能无法确认，不要盲目重发，先查询状态并结合已有回复判断。",
+    "收到 output_state: absent 的最终答复，或判断 present 正文仍不可用时，必须向同一 agent_id 尝试追问：只总结上一轮已完成工作并给出最终答复，不要重新执行任务；协议不自动重跑任务或切换模型。",
   ]);
   assert.deepEqual(readGuidelines("wait_agent"), [
     "wait_agent 返回 outcome: reply 时，子代理仍在处理；直接父会话继续等待或使用 send_message 引导同一子代理。wait_agent 返回 outcome: timeout 只结束本次等待，不改变子代理生命周期，也不把任务交回直接父会话。",
+    "收到 output_state: absent 的最终答复，或判断 present 正文仍不可用时，必须向同一 agent_id 尝试追问：只总结上一轮已完成工作并给出最终答复，不要重新执行任务；协议不自动重跑任务或切换模型。",
   ]);
   assert.deepEqual(readGuidelines("interrupt_agent"), [
     "直接父会话需要接管已下发任务时，先使用 interrupt_agent，再使用 wait_agent 确认子代理已结束当前处理；确认后再实施相同任务或修改相同资源。",
@@ -643,13 +645,25 @@ test("reply_to_parent 也使用相同的入参渲染", () => {
   const registrations: Array<Record<string, unknown>> = [];
   registerReplyToParentTool({ registerTool: (tool) => registrations.push(tool as Record<string, unknown>) }, async () => undefined);
   const lines = toolCallRenderer(registrations, CHILD_REPLY_TOOL_NAME)(
-    { message: "正在检查调用参数展示" },
+    {
+      message: "正在检查调用参数展示",
+      requires_response: false,
+      images: [{ type: "image", data: "DO_NOT_RENDER_REPLY_IMAGE", mimeType: "image/png" }],
+    },
     RENDER_THEME,
-    {},
+    { expanded: true },
   ).render(80);
 
   assert.match(lines.join("\n"), /reply_to_parent/);
   assert.match(lines.join("\n"), /正在检查调用参数展示/);
+  assert.match(lines.join("\n"), /图片 1/);
+  assert.doesNotMatch(lines.join("\n"), /DO_NOT_RENDER_REPLY_IMAGE/);
+  const parameters = registrations[0]?.parameters as {
+    readonly required?: readonly string[];
+    readonly properties?: Readonly<Record<string, unknown>>;
+  } | undefined;
+  assert.deepEqual(parameters?.required, ["message", "requires_response"]);
+  assert.ok(parameters?.properties?.images);
 });
 
 test("get_agent_templates 直接返回安全模板数组并保留空数组", async () => {

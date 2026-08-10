@@ -232,6 +232,7 @@ interface FailureEvent extends EventGeneration {
 /** 监督器可以归一化并提交给树控制器的生命周期事实闭集。 */
 export const AGENT_LIFECYCLE_EVENT_TYPES = Object.freeze([
   "startup_ready",
+  "agent_started",
   "startup_failed",
   "message_admitted",
   "message_rejected",
@@ -344,6 +345,7 @@ function isLifecycleEvent(value: unknown): value is AgentLifecycleEvent {
   if (typeof type !== "string") return false;
   const supported = [
     "startup_ready",
+    "agent_started",
     "startup_failed",
     "message_admitted",
     "message_rejected",
@@ -821,6 +823,11 @@ export class TreeController {
     switch (event.type) {
       case "startup_ready":
         if (record.state === "starting") applied = this.mutate(record, { state: "idle" });
+        break;
+      case "agent_started":
+        if (record.state === "idle" || record.state === "interrupting") {
+          applied = this.mutate(record, { state: "working" });
+        }
         break;
       case "startup_failed":
         if (record.state === "starting") {

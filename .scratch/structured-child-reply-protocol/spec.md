@@ -1,7 +1,7 @@
 # 结构化父子回复协议
 
-Status: ready-for-agent
-Label: ready-for-agent
+Status: implemented
+Implementation: complete
 
 ## Problem Statement
 
@@ -69,12 +69,15 @@ Label: ready-for-agent
 - **状态矩阵**：正常有输出为 `settled/present` 且省略原因码；正常无输出为 `settled/absent/no_output`；provider 错误可为 `failed/present` 或 `failed/absent/provider_error`；子代理运行时故障仍可提交 final 时使用 `failed/present|absent/runtime_fault`；中断使用 `interrupted/present|absent`，不重复携带 `interrupted` 原因码。
 - **部分输出**：失败或中断时保留本轮最近的安全候选。保留的文本或图片作为 final 载荷，但通过 `run_state` 表明它不是完整成功结果；不得再拼接运行时生成的说明性业务句子。
 - **无输出**：无文本和图片的 final 仍通过结构化 JSON 信封传输；不会生成“本轮无输出”等业务正文。TUI 可以根据固定枚举渲染说明，但该说明不进入模型正文。
-- **轮次**：每次 Pi `agent_start` 创建一个新的 `turn_id`，直到本轮 `settled`、`failed` 或 `interrupted`。该轮中的所有工作中回复和 final 共用 `turn_id`；父代理追问使用新的轮次。
+- **轮次**：每次 Pi `agent_start` 分配一个在当前 child 节点生命周期内未曾签发的随机 UUID v4 `turn_id`，直到本轮 `settled`、`failed` 或 `interrupted`。该轮中的所有工作中回复和 final 共用 `turn_id`；父代理追问使用新的轮次。轮次分配失败时废止当前轮次并关闭监督通道，后续生命周期事件不得借用上一轮标识出站。
 - **唤醒规则**：工作中 `message` 在父代理空闲时，`requires_response: true` 才触发模型；`false` 只进入会话。父代理正在运行时，两者都作为 steering 进入当前处理；父代理正在 `wait_agent` 时，任何已接纳的工作中消息都让等待返回 `outcome: reply`，不改变子代理生命周期。final 和 TerminalNotice 在父代理空闲时都触发处理。
+- **递归收尾顺序**：child runtime 从 `agent_end` 起暂缓会触发新 loop 的后代 final、`requires_response: true` message 和 TerminalNotice。自动续跑的下一次 `agent_start` 在 Pi 仍 streaming 时放行并重试；真正结束时只能在本轮 final 获 ACK 后延后一拍放行，暂缓期间不得提前发送 reply ACK。本扩展自己的 `agent_settled` handler 也必须先确认当前 `ExtensionContext.isIdle()`；若前置 handler 延迟期间已有新轮运行，则丢弃旧 settle，不借用新轮提交旧 final。若本扩展之后的第三方 settled handler 尚未返回，重叠 `agent_start` 会要求祖先监督器查询 Pi `isStreaming`，仍在运行时不得把旧轮迟到 `agent_settled` 提交为 idle。
+- **收尾失败边界**：final 无法形成或确认时，唤醒屏障永久进入失败态，不能重试被挡回复或启动新的模型 loop；协调器也废止当前轮次并拒绝后续 `agent_start`。`settle()` rejection 必须交给 Pi ExtensionRunner，使同一任务 RPC 流先发布 `extension_error`，再忽略迟到 `agent_settled`。关闭独立监督流继续作为第二条故障信号。
+- **自主生命周期**：任务 RPC 只公开无载荷 `agent_start` 安全事实。无命令接纳时，idle 节点收到该事实立即进入 `working`；命令接纳窗口先暂存 start，按到达顺序保留最后一个生命周期事实，命令成功时将对应 start 视为同轮启动事实，命令失败且节点仍 idle 时补交 `agent_started`，再处理同窗口的 `agent_settled`。若窗口末尾是新 start，则它覆盖更早的 settle；中断中的 settle-start 以不经过 idle 的方式恢复 `working`。
 - **父代理追问规范**：父代理收到 child final 后，如果 `output_state: absent`，或父代理判断 `present` 正文仍不可用，必须向同一 `agent_id` 尝试发送“仅总结上一轮已完成工作、不要重新执行任务”的追问。协议不规定追问次数、计数器或上限；父代理运行时不能保证模型一定调用 `send_message`。后续是否继续由父代理根据上下文决定。
 - **恢复边界**：当前插件不自动追问、不自动 fallback、不自动创建新代理、不自动完整重跑原任务。`provider_error`、`runtime_fault` 和副作用安全性只作为父代理决策事实，不携带 `retryable` 或恢复建议。
-- **final 唯一性**：同一 `turn_id` 只接受第一个 final。Child runtime 通过 settled latch 防止重复提交；父端对迟到的不同 final 不覆盖、不再次唤醒。普通工作中回复可以有多条。
-- **传输幂等**：相同 `reply_seq` 且信封语义相同的重放不重复注入父会话，但重复 ACK；相同 `reply_seq` 携带不同信封属于协议错误。`reply_seq` 只表达传输顺序，不表达模型结果。
+- **final 唯一性**：同一 `turn_id` 只接受第一个 final。Child runtime 通过 settled latch 和已签发轮次集合防止重复提交或轮次复用；父端在节点生命周期内保留已接纳 final 的轮次标识，对迟到的不同 final 不覆盖、不再次唤醒。普通工作中回复可以有多条。
+- **传输幂等**：相同 `reply_seq` 且信封语义相同的重放不重复注入父会话，但重复 ACK；相同 `reply_seq` 携带不同信封属于协议错误。父端在节点生命周期内只保留已接纳信封的 SHA-256 语义摘要用于窗口外重放判定，不保留正文，也不形成回复或追问额度。`reply_seq` 只表达传输顺序，不表达模型结果。
 - **父会话展示**：TUI 隐藏原始 JSON，展示消息类型、发送者、结果状态和自然语言正文；`turn_id`、`reply_seq` 和 schema 版本不作为主要展示内容。状态说明由 renderer 根据固定字段本地生成。
 - **等待和状态查询**：`wait_agent` 与 `get_agent_status` 保持现有生命周期契约，不重复携带 final 正文或 `TurnCompletionSummary`。父会话 final 是本轮业务结果的唯一来源；TerminalNotice 是节点故障的独立控制面通知。
 - **安全边界**：结构化信封不得包含 prompt、思考块、工具参数、工具结果、文件路径、环境、凭据、进程号、句柄、堆栈或原始 provider 异常。图片继续使用现有有界、可校验的图片载荷。
@@ -85,10 +88,11 @@ Label: ready-for-agent
 - **测试原则**：测试观察到的父会话消息、工具结果、节点状态、唤醒行为、ACK 和重放行为，不测试私有字段布局或单个函数调用次数，除非该调用次数本身是公开幂等契约的一部分。
 - **最高测试接缝**：以统一的 reply/terminal envelope codec 作为新增接缝。所有边界测试通过该接缝与既有 `ChildReplyCoordinator`、`SupervisorChannel`、`ParentReplyInbox` 和 `AgentController` 的公开行为完成，避免为 child、wire 和 TUI 各维护一套测试专用解析器。
 - **信封 codec 测试**：覆盖 message/final/terminal 的必需字段、类型、UUID、`turn_id`、枚举、文本/图片边界、未知字段忽略、缺字段拒绝、语义不一致拒绝、JSON 字段顺序与空白不影响解析，以及无任意业务 JSON 的边界。
-- **ChildReplyCoordinator 测试**：沿用当前候选提取和 ACK 测试，增加每次 `agent_start` 生成轮次、工作中消息与 final 共享轮次、运行时生成状态、正常无输出、provider error、interrupted partial output、图片-only 输出和同一轮 final latch。
-- **SupervisorChannel 测试**：沿用现有握手、帧边界、身份和重同步测试，迁移到 v3，覆盖 `reply_seq + envelope`、未知字段忽略、相同 reply 重放幂等、相同序号不同信封故障、乱序有序交付、ACK 水位和 v2 帧拒绝。
-- **ParentReplyInbox 测试**：验证父会话收到的正文是模型可见 JSON，验证 `agent_id` 来源、message 的 `requires_response` 空闲唤醒矩阵、final/terminal 的固定唤醒、工作中消息的 `wait_agent` 通知、图片保留和 TUI 语义渲染。
-- **AgentController 测试**：沿用当前工作中 reply、settled、terminal 和 timeout 测试，证明 `wait_agent` 结果不复制 final 摘要，工作中消息仍返回 `outcome: reply`，节点生命周期不因 reply 改变，父端故障先注入 TerminalNotice 再让等待返回 terminal。
+- **ChildReplyCoordinator 测试**：沿用当前候选提取和 ACK 测试，增加每次 `agent_start` 生成未复用 UUID v4 轮次、重复/非法轮次工厂值的重试与失败关闭、工作中消息与 final 共享轮次、运行时生成状态、正常无输出、provider error、interrupted partial output、图片-only 输出和同一轮 final latch。
+- **SupervisorChannel 测试**：沿用现有握手、帧边界、身份和重同步测试，迁移到 v3，覆盖 `reply_seq + envelope`、未知字段忽略、相同 reply 重放幂等、待 ACK 窗口外的同序号不同信封故障、乱序有序交付、ACK 水位，以及多个后续轮次后旧 final 仍不再次注入和 v2 帧拒绝。
+- **ParentReplyInbox 测试**：验证父会话收到的正文是模型可见 JSON，验证 `agent_id` 来源、message 的 `requires_response` 空闲唤醒矩阵、final/terminal 的固定唤醒、工作中消息的 `wait_agent` 通知、图片保留和 TUI 语义渲染；覆盖收尾屏障对 final、需响应 message 和 TerminalNotice 的统一暂缓，以及 final 失败后屏障不可恢复。
+- **AgentController 测试**：沿用当前工作中 reply、settled、terminal 和 timeout 测试，证明 `wait_agent` 结果不复制 final 摘要，工作中消息仍返回 `outcome: reply`，节点生命周期不因 reply 改变，父端故障先注入 TerminalNotice 再让等待返回 terminal；覆盖自主 `agent_start` 后 wait/send/interrupt 的 working 路由和命令接纳失败时的 pending-start 恢复。
+- **递归时序测试**：在 child 的 runtime handler 前后各注册一个可延迟的第三方 `agent_settled` handler，并延迟 final ACK；证明叶节点回复保持未 ACK，放行后的重叠新轮使祖先继续保持 working，旧轮迟到 settle 通过 Pi streaming 状态复核被压住，直至新轮自身 settled。final ACK 失败测试必须证明 handler rejection 向 Pi 冒泡且不会放行失败态屏障。
 - **父代理协调规范测试**：使用模型可观察的工具描述或提示契约测试验证：无输出 final 以及父模型判断现有正文不可用时，规范要求使用同一 `agent_id` 追问；不把该要求伪装为运行时强制保证；没有自动 fallback 或自动任务重跑行为。
 - **端到端测试**：在现有本地 fake Pi RPC 和父子 runtime 旅程上增加工作中消息、最终答复、无输出、部分失败、协作式中断、运行时故障和新轮次追问，验证消息进入直接父会话而不越级。
 - **reload 测试**：同版本 reload 继续验证已接纳回复按序重试和活动节点保留；v2/v3 版本转换验证明确拒绝旧协议并要求重建代理树，不验证跨版本热接管。
@@ -116,5 +120,5 @@ Label: ready-for-agent
 - 父代理追问属于模型协调规范，协议不追踪追问次数或额度；运行时只负责交付结构化 final/terminal、唤醒父代理和报告节点事实。
 - `output_state: present` 只证明运行时保留了文本或图片，不证明业务质量。父代理认为内容不可用时仍必须尝试同一子代理追问。
 - 未知字段忽略策略仅适用于新结构化信封；监督帧的认证、身份、长度、序号、ACK、重同步和安全边界仍由父子监督通道负责。
-- 实现前应同步更新领域词汇中关于父子回复、最终答复、工作中回复和运行时重载的描述，并把本规格拆分为协议 codec、child 运行时、父端 inbox/TUI、控制器交付和测试验收等独立实现任务。
-- 本规格发布为 `ready-for-agent`，但本轮只完成设计记录，未修改实现代码。
+- 已同步更新领域词汇中关于父子回复、最终答复、工作中回复、终止通知、运行时重载和 v3 监督通道的描述；实现由统一 codec、child 运行时、父端 inbox/TUI、控制器交付和测试验收共同覆盖。
+- 实现完成后已运行 `npm run check`、聚焦 runtime/bridge 测试和独立 code review；最终提交前以最新工作树的完整检查结果为准。

@@ -35,6 +35,17 @@ test("真正 child 回复端点只公开文本和图片，明确丢弃合法 thi
   });
 });
 
+test("任务桥接公开无载荷 agent_start 事实并剥离其余字段", () => {
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "agent_start",
+    prompt: "不得透传",
+    session: { secret: true },
+  }), {
+    kind: "event",
+    event: { type: "agent_start" },
+  });
+});
+
 test("任务桥接忽略全部 message_end，真正 child 回复端点仍拒绝未知内容块", () => {
   assert.deepEqual(normalizeRpcBridgeEvent({ type: "message_update", delta: "忽略" }), {
     kind: "ignored",

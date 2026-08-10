@@ -31,7 +31,7 @@
 - 不同节点可以并行工作；同一个节点上的控制命令按顺序处理。
 - 子代理可以继续创建自己的子代理，形成受深度和名额限制的树。
 - 父代理只能控制自己的直接子代理，不能越级操纵更深层后代。
-- 子代理只有主动调用 `reply_to_parent` 时才会上报工作中进度；处理完全 settled 后，运行时再向直接父代理自动提交一次最终答复。
+- 子代理只有主动调用 `reply_to_parent` 时才会上报工作中进度；处理到达结束边界后，运行时再向直接父代理自动提交一次最终答复。
 - 会话关闭时，扩展会递归清理受监督的子进程树。
 
 子代理不会复制父会话的对话历史。整棵树共享根会话启动时确定的工作目录、项目信任结果、环境快照和配额配置；具体工具、模型、thinking 和系统提示由代理模板决定。
@@ -117,7 +117,10 @@ pi install "D:\path\to\pi-subagents-wj" -l --approve
 
 ### 更新本地安装
 
-Pi 不管理本地路径中的源码副本。请先通过你实际取得源码的方式更新该目录，然后重新按锁文件装配生产依赖：
+Pi 不管理本地路径中的源码副本。请先通过你实际取得源码的方式更新该目录，然后重新按锁文件装配生产依赖。
+
+> [!IMPORTANT]
+> 监督协议主版本升级时不能热接管旧活动树。当前版本使用 `pi-subagent/3`，不兼容 v2 reply；从 v2 更新前应先退出旧 Pi 根会话并确认子树已清理，再更新源码和重启。只有协议主版本未变化的更新才可依赖 `/reload` 保留现有树。
 
 ```powershell
 Set-Location D:\path\to\pi-subagents-wj
@@ -294,7 +297,7 @@ Markdown 正文可以为空，UTF-8 编码后最多 `64 KiB`；该边界同时�
 
 工具成功只表示消息已被子 Pi 接受，不表示任务已经完成。消息被接受后，已下发任务范围在子代理给出最终答复或进入终态前由该子代理负责；父代理应等待、查询状态或发送 steering，不能以只读检查、运行相同测试、复现、评审或独立验证为名重复实施或再次委派同一任务。只有派发前已经明确拆分、产出独立、无数据依赖且无共享写资源的其他工作才适合并行。
 
-子代理的普通 assistant 过程输出不会自动上行：工作中汇报必须显式调用 `reply_to_parent`，最终答复则由运行时在 `agent_settled` 时自动提交。回复正文直接进入父会话；`wait_agent` 只观察回复通知和生命周期，不会在工具结果中重复复制正文。
+子代理的普通 assistant 过程输出不会自动上行：工作中汇报必须显式调用 `reply_to_parent`，最终答复则由运行时在处理结束边界自动提交。回复以结构化 JSON 进入父会话；`wait_agent` 只观察回复通知和生命周期，不会在工具结果中重复复制 final 正文。
 
 ### 等待、打断与终止
 
@@ -454,37 +457,66 @@ Markdown 正文可以为空，UTF-8 编码后最多 `64 KiB`；该边界同时�
 
 ```json
 {
-  "message": "正在核对第二个实现分支，完成后继续汇总。"
+  "message": "正在核对第二个实现分支，完成后继续汇总。",
+  "requires_response": false
 }
 ```
 
-`message` 必须非空且不超过 16 KiB UTF-8；工具不接受图片、回复类别、序号或“完成”开关。适合发送进度、问题和阶段性发现。成功结果中的 `accepted: true` 表示直接父会话已经接纳并确认该消息，但子代理仍处于当前处理，应继续完成原任务。
+`message` 必须非空且不超过 16 KiB UTF-8，`requires_response` 必须由子代理显式填写：`true` 表示父代理空闲时应立即处理，`false` 表示只记录到会话。可选 `images` 最多携带 8 张经过统一 codec 校验的图片；工具不接受回复类别、序号或“完成”开关。适合发送进度、问题和阶段性发现。成功结果中的 `accepted: true` 表示直接父会话已经接纳并确认该消息，但子代理仍处于当前处理，应继续完成原任务。
 
-不要用 `reply_to_parent` 模拟最终结果。子代理完全 settled 时，运行时会自动发送一次最终答复；根会话没有该工具，叶节点和 `subagents: disabled` 的子代理仍然有该工具。
+不要用 `reply_to_parent` 模拟最终结果。子代理到达本轮结束边界时，运行时会自动发送一次最终答复；根会话没有该工具，叶节点和 `subagents: disabled` 的子代理仍然有该工具。
 
 ### 父会话看到的回复
 
-工作中回复以模型可见信封进入直接父会话：
+父模型看到的是经过统一 codec 校验的普通 JSON 信封；TUI 会把它投影为发送者、类型、状态和自然语言正文，不直接显示协议字段。工作中回复示例：
 
-```text
-Message Type: AGENT_MESSAGE
-Sender: 550e8400-e29b-41d4-a716-446655440000
-Payload:
-正在核对第二个实现分支，完成后继续汇总。
+```json
+{
+  "schema": "pi-subagent.reply",
+  "version": 1,
+  "kind": "message",
+  "agent_id": "550e8400-e29b-41d4-a716-446655440000",
+  "turn_id": "550e8400-e29b-41d4-a716-446655440001",
+  "requires_response": false,
+  "text": "正在核对第二个实现分支，完成后继续汇总。"
+}
 ```
 
-它不会自行启动一个新的父代理 turn；如果父代理正在调用 `wait_agent`，这条回复会让等待立即以 `outcome: "reply"` 返回，而子代理继续工作。没有活动等待时，消息仍保留在父会话中，供父代理后续处理。
+`requires_response: false` 在父代理空闲时只把消息留在会话，`true` 会触发父代理处理；父代理正在运行时两者都作为 steering 进入当前处理。无论该字段取值如何，已接纳的工作中回复都会让活动的 `wait_agent` 立即以 `outcome: "reply"` 返回，子代理继续工作。
 
-最终答复由运行时在子代理 `agent_settled` 时自动提交：
+最终答复由运行时在本轮结束时自动提交，并由运行时而不是模型判定状态：
 
-```text
-Message Type: FINAL_ANSWER
-Sender: 550e8400-e29b-41d4-a716-446655440000
-Payload:
-已完成核对，结论如下……
+```json
+{
+  "schema": "pi-subagent.reply",
+  "version": 1,
+  "kind": "final",
+  "agent_id": "550e8400-e29b-41d4-a716-446655440000",
+  "turn_id": "550e8400-e29b-41d4-a716-446655440001",
+  "run_state": "settled",
+  "output_state": "present",
+  "text": "已完成核对，结论如下……"
+}
 ```
 
-最终答复会触发父代理继续处理。运行时会在本轮保留最近一条安全 assistant 内容；后续工具调用或空 assistant 消息不会清除已有候选。思考块、工具前说明、工具调用、工具参数和工具结果不会被当作最终答复。若最后一轮出错、被中断或本轮没有可用正文，运行时会发送简短说明；必要时可以尝试继续与该子代理沟通。正文和图片同时为空的 final 属于协议故障，不会被父端接纳或确认。父端会先确认合法的最终答复，再观察节点回到 `idle`。
+每次 `agent_start` 都生成一个未曾签发的随机 UUID v4 `turn_id`；同轮 message 和 final 共用该值，同轮只接纳第一条 final。父端在节点生命周期内保留已接纳信封的 SHA-256 语义摘要和 final 轮次标识，因此即使回复已经越过待 ACK 窗口，旧序号篡改仍会成为协议故障，旧轮次 final 也不会再次注入。该索引不保存业务正文，也不形成回复或追问额度。`run_state` 为 `settled`、`failed` 或 `interrupted`，`output_state` 为 `present` 或 `absent`。文本或至少一张合法图片存在时才是 `present`，所以 image-only final 合法；`absent` final 没有说明性业务正文，并通过 `reason_code` 表达 `no_output`、`provider_error` 或 `runtime_fault`。失败或中断可以保留最近的安全候选，但状态明确表示结果并非完整成功。
+
+final 总会触发父代理处理。思考块、工具前说明、工具调用、工具参数、工具结果和原始错误不会进入正文。父端先接纳并确认 final，再观察节点回到 `idle`；`wait_agent` 和 `get_agent_status` 不重复携带 final 正文。child runtime 从 `agent_end` 起暂缓会启动新轮的后代 final、需响应消息和 TerminalNotice；自动续跑的 `agent_start` 会在 Pi 仍处于 streaming 时安全放行，真正结束则在本轮 final 获 ACK 后延后一拍重试。本扩展自己的 settled handler 先检查 `ExtensionContext.isIdle()`，前置 handler 延迟期间若已有新轮则丢弃旧 settle；若后续第三方 settled handler 尚未返回，新 loop 可以先启动，但祖先监督器会在收到重叠 `agent_start` 后用带代际的 `isStreaming` 查询复核，从而压住旧轮迟到 settle，不会错误进入 idle。final 发布失败会通过 Pi 的 `extension_error` 先把祖先节点标成 `failed`，并永久禁止该 child runtime 被后代回复再次唤醒。收到 `output_state: "absent"`，或判断 `present` 正文仍不可用时，父代理应向同一 `agent_id` 请求“只总结上一轮已完成工作并给出最终答复，不要重新执行任务”；运行时不会自动重跑、切换模型或创建替代代理。
+
+节点控制面发生 runtime fault 时，直接父运行时另行注入通知，不伪装成 child final：
+
+```json
+{
+  "schema": "pi-subagent.terminal",
+  "version": 1,
+  "kind": "terminal",
+  "agent_id": "550e8400-e29b-41d4-a716-446655440000",
+  "node_state": "failed",
+  "reason_code": "runtime_fault"
+}
+```
+
+TerminalNotice 总会触发父代理，并在 `wait_agent` 返回 `outcome: "terminal"` 前进入父会话。它不携带原始错误或业务正文；主动 `terminate_agent` 不生成该通知。
 
 ### `wait_agent`
 
@@ -591,9 +623,9 @@ Payload:
 
 `failed` 不会自动恢复或重启，但仍需显式终止才能释放名额。`terminating` 也不是“已经结束”；它可能携带 `termination_incomplete`，并继续占用名额。只有 `terminated` 会真正释放直接子代理和全树配额。
 
-`pending_message_count` 表示已经受理、但尚未开始实际处理的父消息数量，不包含当前活动 prompt。因此 `working` 节点的 pending 可以是 0。
+`pending_message_count` 表示已经受理、但尚未开始实际处理的父消息数量，不包含当前活动 prompt。因此 `working` 节点的 pending 可以是 0。final、TerminalNotice 或 `requires_response: true` 的后代消息也可能唤醒一个原本 idle 的中间代理；任务 RPC 会把无载荷 `agent_start` 归一化为自主开始事实，使祖先树在整个处理期间保持 `working`。父命令触发的 `agent_start` 由同一监督器去重，仍以 `prompt_accepted` 作为原命令的线性化点；接纳窗口按最后到达的 start/settled 事实收束，若 prompt 接纳失败，窗口末尾的 start 会在节点仍 idle 时补交为自主 `working`，中断中的 settle-start 则不短暂经过 idle，不会随失败命令一起丢失。
 
-一次处理中的 assistant `message_end` 只用于更新本地最终候选，不会直接发送给父会话。`agent_settled` 是唯一自动 final 边界：运行时先提交并等待父端确认最终答复或说明性结果，然后父控制器才会继续观察该节点回到 `idle`。重复 settled 不会生成第二条最终答复。
+一次处理中的 assistant `message_end` 只用于更新本轮最近的安全最终候选，不会直接发送给父会话。正常 `agent_settled`、provider error 和协作式中断分别形成由运行时裁决的 `settled`、`failed` 或 `interrupted` final；运行时先提交并等待父端确认该结构化事实，然后父控制器才会继续观察节点生命周期。无业务载荷的 `absent` final 是合法结果，不生成占位正文；重复结束事件不会生成第二条 final。
 
 ## 安全与资源边界
 

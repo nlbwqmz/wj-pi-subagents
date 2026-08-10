@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import type { Readable, Writable } from "node:stream";
+import type { ChildReplyEnvelope } from "./child-reply-envelope.ts";
 import type { AgentSnapshot } from "./tree-controller.ts";
 import { SUPERVISOR_CHANNEL_LIMITS } from "./supervisor-channel.ts";
 import { LengthPrefixedFrameDecoder } from "./length-prefixed-frame-decoder.ts";
@@ -21,12 +22,7 @@ export interface ManagedRpcImage {
   readonly mimeType: string;
 }
 
-export interface ManagedRpcReply {
-  /** 旧包内替身省略时按 final 处理；生产监督帧始终明确携带分类。 */
-  readonly kind?: "message" | "final";
-  readonly text: string;
-  readonly images?: readonly ManagedRpcImage[];
-}
+export type ManagedRpcReply = ChildReplyEnvelope;
 
 export type ManagedRpcTransportFault = "eof" | "protocol_fault" | "process_exit";
 
@@ -948,6 +944,7 @@ function isBridgeCommandName(value: string): boolean {
 function isSafeBridgeEvent(value: unknown): boolean {
   if (!isRecord(value) || typeof value.type !== "string") return false;
   switch (value.type) {
+    case "agent_start":
     case "agent_settled":
       return Object.keys(value).length === 1;
     case "tool_execution_start":

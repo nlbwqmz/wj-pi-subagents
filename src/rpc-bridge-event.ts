@@ -1,6 +1,6 @@
 /** 桥接进程允许跨进程公开的 Pi 事件闭集。 */
 export type SafeRpcBridgeEvent =
-  | { readonly type: "agent_settled" }
+  | { readonly type: "agent_start" | "agent_settled" }
   | {
       readonly type: "tool_execution_start" | "tool_execution_end";
       readonly toolCallId: string;
@@ -39,8 +39,9 @@ const INVALID_EVENT: RpcBridgeEventNormalization = Object.freeze({ kind: "invali
 export function normalizeRpcBridgeEvent(event: unknown): RpcBridgeEventNormalization {
   if (!isRecord(event) || typeof event.type !== "string") return INVALID_EVENT;
   switch (event.type) {
+    case "agent_start":
     case "agent_settled":
-      return safeEvent(Object.freeze({ type: "agent_settled" }));
+      return safeEvent(Object.freeze({ type: event.type }));
     case "tool_execution_start":
     case "tool_execution_end":
       if (

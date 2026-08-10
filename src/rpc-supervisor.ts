@@ -1,3 +1,4 @@
+import type { ChildReplyEnvelope } from "./child-reply-envelope.ts";
 import type {
   ManagedRpcNodeLike,
   ManagedRpcNodeStartContext,
@@ -118,7 +119,7 @@ export interface FakeRpcClientOptions {
   readonly state?: unknown;
 }
 
-export type FakeRpcControlledOperation = "prompt" | "steer" | "abort";
+export type FakeRpcControlledOperation = "prompt" | "steer" | "abort" | "get_state";
 
 export interface FakeRpcCommandGate {
   readonly started: Promise<void>;
@@ -161,9 +162,11 @@ export class FakeRpcClient implements RpcSupervisorClient {
   private readonly operationLog: string[] = [];
   private readonly gates = new Map<FakeRpcControlledOperation, FakeRpcInternalGate[]>();
   private readonly inFlightGates = new Set<FakeRpcInternalGate>();
+  private state: unknown;
 
   constructor(options: FakeRpcClientOptions = {}) {
     this.options = options;
+    this.state = options.state ?? Object.freeze({ isStreaming: false, pendingMessageCount: 0 });
   }
 
   async start(): Promise<void> {
@@ -190,7 +193,12 @@ export class FakeRpcClient implements RpcSupervisorClient {
 
   async getState(): Promise<unknown> {
     this.record("get_state");
-    return this.options.state ?? Object.freeze({ isStreaming: false, pendingMessageCount: 0 });
+    await this.waitForGate("get_state");
+    return this.state;
+  }
+
+  setState(state: unknown): void {
+    this.state = state;
   }
 
   onEvent(listener: (event: unknown) => void): () => void {
@@ -289,7 +297,7 @@ export type RpcSupervisorEvent =
     }
   | {
       readonly kind: "reply";
-      readonly reply: Omit<SupervisorReply, "reply_seq">;
+      readonly reply: ChildReplyEnvelope;
     }
   | {
       readonly kind: "fault";
@@ -457,7 +465,6 @@ function abortError(): Error {
 }
 
 const IGNORED_RPC_EVENT_TYPES = new Set([
-  "agent_start",
   "agent_end",
   "turn_start",
   "turn_end",
@@ -532,7 +539,12 @@ export class RpcSupervisor {
   private readonly commandQueue: QueuedCommand[] = [];
   private activeCommand: QueuedCommand | undefined;
   private acceptancePending = false;
+  private startPending = false;
   private settlePending = false;
+  private pendingLifecycleTail: "start" | "settled" | undefined;
+  private lifecycleObservationToken = Symbol("lifecycle-observation");
+  private settleNeedsStateProbe = false;
+  private settleStateProbe: Promise<void> | undefined;
   private readonly eventListeners = new Set<(event: RpcSupervisorEvent) => void>();
   private readonly activeTools = new Map<string, RpcSupervisorActivityCategory>();
   private readonly activeToolCounts = new Map<RpcSupervisorActivityCategory, number>();
@@ -629,7 +641,11 @@ export class RpcSupervisor {
       this.lifecycleState === "interrupting";
     this.applyLifecycle({ type: "termination_requested" });
     this.phase = "terminating";
+    this.startPending = false;
     this.settlePending = false;
+    this.pendingLifecycleTail = undefined;
+    this.settleNeedsStateProbe = false;
+    this.settleStateProbe = undefined;
     this.channel?.establishTerminationBarrier();
     this.cancelQueuedCommands();
     this.resolveActiveMessageAsUnavailable();
@@ -827,11 +843,25 @@ export class RpcSupervisor {
       return;
     }
     switch (event.type) {
+      case "agent_start":
+        this.lifecycleObservationToken = Symbol("lifecycle-observation");
+        if (this.acceptancePending) {
+          this.startPending = true;
+          this.pendingLifecycleTail = "start";
+        } else if (this.lifecycleState === "idle") {
+          this.applyLifecycle({ type: "agent_started" });
+        } else if (this.lifecycleState === "working" || this.lifecycleState === "interrupting") {
+          this.settleNeedsStateProbe = true;
+        }
+        return;
       case "agent_settled":
+        this.lifecycleObservationToken = Symbol("lifecycle-observation");
         if (this.acceptancePending) {
           this.settlePending = true;
+          this.pendingLifecycleTail = "settled";
         } else {
-          this.applyLifecycle({ type: "agent_settled" });
+          if (this.settleStateProbe !== undefined) this.settleNeedsStateProbe = true;
+          this.applySettledAfterStateCheck();
         }
         return;
       case "tool_execution_start":
@@ -961,7 +991,11 @@ export class RpcSupervisor {
     if (this.phase !== "ready") return;
     this.applyLifecycle({ type: "runtime_failed", error_code: "internal_error" });
     this.phase = "failed";
+    this.startPending = false;
     this.settlePending = false;
+    this.pendingLifecycleTail = undefined;
+    this.settleNeedsStateProbe = false;
+    this.settleStateProbe = undefined;
     this.activeTools.clear();
     this.activeToolCounts.clear();
     while (this.commandQueue.length > 0) {
@@ -987,7 +1021,7 @@ export class RpcSupervisor {
   }
 
   private drainCommandQueue(): void {
-    if (this.activeCommand !== undefined || this.phase !== "ready") return;
+    if (this.activeCommand !== undefined || this.settleStateProbe !== undefined || this.phase !== "ready") return;
     const command = this.commandQueue.shift();
     if (command === undefined) return;
     this.activeCommand = command;
@@ -1009,9 +1043,14 @@ export class RpcSupervisor {
 
   private async executeMessageCommand(command: QueuedMessageCommand): Promise<void> {
     const commandGeneration = this.lifecycleGeneration;
+    const commandState = this.lifecycleState;
+    const effectiveKind: MessageCommandKind = command.kind === "steer" && this.lifecycleState === "idle"
+      ? "prompt"
+      : command.kind;
+    let accepted = false;
     this.acceptancePending = true;
     try {
-      if (command.kind === "prompt") {
+      if (effectiveKind === "prompt") {
         await this.commandClient().prompt(command.message, command.images);
       } else {
         await this.commandClient().steer(command.message, command.images);
@@ -1021,8 +1060,9 @@ export class RpcSupervisor {
         return;
       }
       this.applyLifecycle({
-        type: command.kind === "prompt" ? "prompt_accepted" : "steering_accepted",
+        type: effectiveKind === "prompt" ? "prompt_accepted" : "steering_accepted",
       });
+      accepted = true;
       command.resolve(Object.freeze({ ok: true, accepted: true }));
     } catch {
       if (this.phase === "ready" && commandGeneration === this.lifecycleGeneration) {
@@ -1031,7 +1071,9 @@ export class RpcSupervisor {
       command.resolve(Object.freeze({ ok: false, code: "message_delivery_failed" }));
     } finally {
       this.acceptancePending = false;
+      this.flushPendingStart(accepted, commandState);
       this.flushPendingSettle();
+      this.pendingLifecycleTail = undefined;
     }
   }
 
@@ -1092,10 +1134,89 @@ export class RpcSupervisor {
     }
   }
 
+  private flushPendingStart(
+    commandAccepted: boolean,
+    commandState: AgentLifecycleState | undefined,
+  ): void {
+    if (!this.startPending) return;
+    this.startPending = false;
+    if (!commandAccepted && this.phase === "ready" && this.lifecycleState === "idle") {
+      this.applyLifecycle({ type: "agent_started" });
+      return;
+    }
+    const settledBeforeLatestStart = this.settlePending && this.pendingLifecycleTail === "start";
+    if (
+      settledBeforeLatestStart
+      && this.phase === "ready"
+      && this.lifecycleState === "interrupting"
+    ) {
+      this.applyLifecycle({ type: "agent_started" });
+      return;
+    }
+    if (
+      (commandState === "working" || commandState === "interrupting")
+      && !settledBeforeLatestStart
+    ) {
+      this.settleNeedsStateProbe = true;
+    }
+  }
+
   private flushPendingSettle(): void {
     if (!this.settlePending) return;
     this.settlePending = false;
-    if (this.phase === "ready") this.applyLifecycle({ type: "agent_settled" });
+    if (this.pendingLifecycleTail === "start") return;
+    if (this.phase === "ready") this.applySettledAfterStateCheck();
+  }
+
+  private applySettledAfterStateCheck(): void {
+    if (this.phase !== "ready") return;
+    if (this.settleStateProbe !== undefined) {
+      this.settlePending = true;
+      return;
+    }
+    if (!this.settleNeedsStateProbe) {
+      this.applyLifecycle({ type: "agent_settled" });
+      return;
+    }
+    this.settleNeedsStateProbe = false;
+    const generation = this.lifecycleGeneration;
+    const observationToken = this.lifecycleObservationToken;
+    let stateResult: Promise<unknown>;
+    try {
+      stateResult = this.commandClient().getState();
+    } catch {
+      this.failRuntime("rpc_protocol_fault");
+      return;
+    }
+    const probe = stateResult.then(
+      (state) => {
+        if (
+          this.phase !== "ready"
+          || generation !== this.lifecycleGeneration
+          || observationToken !== this.lifecycleObservationToken
+        ) return;
+        if (!isRecord(state) || typeof state.isStreaming !== "boolean") {
+          this.failRuntime("rpc_protocol_fault");
+          return;
+        }
+        if (!state.isStreaming) this.applyLifecycle({ type: "agent_settled" });
+      },
+      () => {
+        if (
+          this.phase === "ready"
+          && generation === this.lifecycleGeneration
+          && observationToken === this.lifecycleObservationToken
+        ) this.failRuntime("rpc_protocol_fault");
+      },
+    ).finally(() => {
+      if (this.settleStateProbe !== probe) return;
+      this.settleStateProbe = undefined;
+      const pending = this.settlePending;
+      this.settlePending = false;
+      if (pending && this.phase === "ready") this.applySettledAfterStateCheck();
+      this.drainCommandQueue();
+    });
+    this.settleStateProbe = probe;
   }
 
   private cancelQueuedCommands(): void {

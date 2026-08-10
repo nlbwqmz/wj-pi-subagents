@@ -115,6 +115,7 @@ interface RuntimeContextView extends AgentTreeUiContext {
   readonly modelRegistry?: unknown;
   readonly scopedModels?: unknown;
   readonly isProjectTrusted?: unknown;
+  readonly isIdle?: unknown;
 }
 
 interface RuntimeSessionStartEvent {
@@ -207,6 +208,7 @@ interface RuntimeBindings {
 }
 
 interface RuntimeTransfer {
+  readonly protocolVersion: typeof SUPERVISOR_PROTOCOL_VERSION;
   readonly controller: AgentController;
   readonly templates: TemplateSnapshotController;
   readonly tree: TreeController;
@@ -233,6 +235,7 @@ const PARENT_COORDINATION_GUIDANCE = [
   `- ${PARENT_COORDINATION_GUIDELINES.taskOwnership}`,
   `- ${PARENT_COORDINATION_GUIDELINES.sendMessage}`,
   `- ${PARENT_COORDINATION_GUIDELINES.waitAgent}`,
+  `- ${PARENT_COORDINATION_GUIDELINES.unusableFinal}`,
   `- ${PARENT_COORDINATION_GUIDELINES.interruptAgent}`,
 ].join("\n");
 
@@ -250,7 +253,8 @@ function asRuntimeApi(api: ExtensionApiSurface): RuntimeExtensionApi {
 
 function isRuntimeTransfer(value: unknown): value is RuntimeTransfer {
   if (!isRecord(value) || !isRecord(value.bindings)) return false;
-  return isRecord(value.controller)
+  return value.protocolVersion === SUPERVISOR_PROTOCOL_VERSION
+    && isRecord(value.controller)
     && typeof value.controller.shutdown === "function"
     && typeof value.controller.getAgentTemplates === "function"
     && typeof value.controller.updateTemplateSnapshot === "function"
@@ -294,29 +298,38 @@ function hasCustomSystemPrompt(event: unknown): boolean {
 }
 
 function reloadIdentity(bootstrap: ChildRuntimeBootstrap | undefined): RuntimeReloadIdentity {
-  if (bootstrap === undefined) return Object.freeze({ isChild: false });
+  if (bootstrap === undefined) {
+    return Object.freeze({ isChild: false, protocolVersion: SUPERVISOR_PROTOCOL_VERSION });
+  }
   return Object.freeze({
     isChild: true,
+    protocolVersion: SUPERVISOR_PROTOCOL_VERSION,
     rootId: bootstrap.rootId,
     agentId: bootstrap.agentId,
   });
 }
 
 function reloadIdentityOfRuntime(runtime: ActiveRuntime): RuntimeReloadIdentity {
-  if (!runtime.isChild) return Object.freeze({ isChild: false });
+  if (!runtime.isChild) {
+    return Object.freeze({ isChild: false, protocolVersion: SUPERVISOR_PROTOCOL_VERSION });
+  }
   if (runtime.controller.actor.kind !== "agent") throw new Error("child reload 身份不可用");
   return Object.freeze({
     isChild: true,
+    protocolVersion: SUPERVISOR_PROTOCOL_VERSION,
     rootId: runtime.rootId,
     agentId: runtime.controller.actor.agent_id,
   });
 }
 
 function reloadIdentityOfTransfer(transfer: RuntimeTransfer): RuntimeReloadIdentity {
-  if (!transfer.isChild) return Object.freeze({ isChild: false });
+  if (!transfer.isChild) {
+    return Object.freeze({ isChild: false, protocolVersion: transfer.protocolVersion });
+  }
   if (transfer.controller.actor.kind !== "agent") throw new Error("child reload 交接身份不可用");
   return Object.freeze({
     isChild: true,
+    protocolVersion: transfer.protocolVersion,
     rootId: transfer.rootId,
     agentId: transfer.controller.actor.agent_id,
   });
@@ -324,6 +337,15 @@ function reloadIdentityOfTransfer(transfer: RuntimeTransfer): RuntimeReloadIdent
 
 function readContext(value: unknown): RuntimeContextView {
   return isRecord(value) ? value as RuntimeContextView : {};
+}
+
+function runtimeContextIsIdle(context: RuntimeContextView): boolean {
+  if (typeof context.isIdle !== "function") return false;
+  try {
+    return context.isIdle() === true;
+  } catch {
+    return false;
+  }
 }
 
 function environmentValue(
@@ -682,7 +704,15 @@ export function createPiSubagentRuntimeActivator(
     api.on("agent_start", () => {
       const current = active;
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
-      current.replyCoordinator?.observeAgentStart();
+      try {
+        current.replyCoordinator?.observeAgentStart();
+      } catch (error) {
+        current.replyInbox.failTurnTriggers();
+        throw error;
+      }
+      if (current.replyInbox.releaseTurnTriggers()) {
+        return current.controller.retryPendingReplies();
+      }
     });
 
     api.on("message_end", (event) => {
@@ -691,14 +721,33 @@ export function createPiSubagentRuntimeActivator(
       current.replyCoordinator?.observeAssistantMessageEnd(event);
     });
 
-    api.on("agent_settled", (event) => {
+    api.on("agent_end", () => {
       const current = active;
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
+      current.replyInbox.blockTurnTriggers();
+    });
+
+    api.on("agent_settled", (_event, rawContext) => {
+      const current = active;
+      if (current === undefined || !current.isChild || current.handoffPending === true) return;
+      if (!runtimeContextIsIdle(readContext(rawContext))) return;
       const coordinator = current.replyCoordinator;
       if (coordinator === undefined) return;
-      return coordinator.settle().catch(() => {
-        // 协调器已通知监督通道故障；这里吞掉异常，避免 Pi uncaughtException。
-      });
+      const turnTriggerBlock = current.replyInbox.blockTurnTriggers();
+      return coordinator.settle().then(
+        () => {
+          // 延后一拍避免当前 handler 内重入；若新轮已建立自己的收尾屏障，
+          // 旧轮令牌不能提前放行它。祖先仍通过 Pi streaming 复核迟到 settle。
+          setImmediate(() => {
+            if (!current.replyInbox.releaseTurnTriggers(turnTriggerBlock)) return;
+            void current.controller.retryPendingReplies();
+          });
+        },
+        (error: unknown) => {
+          current.replyInbox.failTurnTriggers();
+          throw error;
+        },
+      );
     });
 
     const makeState = (transfer: RuntimeTransfer, context: RuntimeContextView): ActiveRuntime => {
@@ -980,6 +1029,7 @@ export function createPiSubagentRuntimeActivator(
       const replyCoordinator = upstream === undefined
         ? undefined
         : new ChildReplyCoordinator({
+          agentId: bootstrap!.agentId,
           port: upstream.channel,
           onFinalFailure: () => {
             upstream.channel.failProtocol();
@@ -1035,6 +1085,7 @@ export function createPiSubagentRuntimeActivator(
         activeTools: () => activeBusinessTools(state.bindings.api),
         validateTemplate: (template) => validateTemplateAgainstContext(template, state.bindings.context),
         waitTimeoutMs: rootRuntime.config.waitTimeoutMs,
+        onTerminal: (agentId) => state.replyInbox.acceptTerminal(agentId),
         authority,
       });
       state.controller = controller;
@@ -1116,6 +1167,7 @@ export function createPiSubagentRuntimeActivator(
       identityOfRuntime: (runtime) => reloadIdentityOfRuntime(runtime),
       identityOfTransfer: (transfer) => reloadIdentityOfTransfer(transfer),
       createTransfer: (current) => Object.freeze({
+        protocolVersion: SUPERVISOR_PROTOCOL_VERSION,
         controller: current.controller,
         templates: current.templates,
         tree: current.tree,
