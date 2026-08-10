@@ -869,6 +869,7 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   assert.ok(rootPromptHandler);
   const parentCoordinationGuidance = [
     "父子任务协作要求：",
+    `- ${PARENT_COORDINATION_GUIDELINES.taskOwnership}`,
     `- ${PARENT_COORDINATION_GUIDELINES.sendMessage}`,
     `- ${PARENT_COORDINATION_GUIDELINES.waitAgent}`,
     `- ${PARENT_COORDINATION_GUIDELINES.interruptAgent}`,
@@ -890,6 +891,8 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
     "",
     parentCoordinationGuidance,
   ].join("\n"));
+  assert.match(String(rootCustomPromptResult.systemPrompt), /只读分析和独立验证都属于重复实施/);
+  assert.match(String(rootCustomPromptResult.systemPrompt), /‘无写冲突’/);
 
   const rootTemplates = await execute(rootApi, "get_agent_templates", {}, rootContext) as {
     details?: Array<{ template_id: string; tools: string[] }>;

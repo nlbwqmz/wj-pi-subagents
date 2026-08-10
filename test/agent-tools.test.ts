@@ -61,7 +61,7 @@ function toolResultRenderer(
   return tool.renderResult as ToolResultRenderer;
 }
 
-test("管理工具系统提示要求直接父会话等待已接纳任务并在接管前中断", () => {
+test("管理工具系统提示把重复调查与独立验证纳入任务所有权硬约束", () => {
   const registrations: Array<Record<string, unknown>> = [];
   registerAgentTools(
     { registerTool: (tool) => registrations.push(tool as Record<string, unknown>) },
@@ -71,7 +71,8 @@ test("管理工具系统提示要求直接父会话等待已接纳任务并在�
     registrations.find((tool) => tool.name === name)?.promptGuidelines;
 
   assert.deepEqual(readGuidelines("send_message"), [
-    "send_message 返回 accepted: true 后，该任务继续由目标直接子代理负责。直接父会话使用 wait_agent 等待，或只处理明确拆分、无数据依赖且无共享写资源的工作；在子代理给出最终答复或进入终态前，不在父会话实施或再次委派同一任务。若返回 message_delivery_failed，交付状态可能无法确认，不要盲目重发，先查询状态并结合已有回复判断。",
+    "任务所有权硬约束：send_message 返回 accepted: true 后，已下发任务范围由目标直接子代理负责，直到该子代理给出最终答复或进入终态。同一任务包括为同一问题、工单或结论执行的调查、实现、测试、复现、验证、评审及其子范围；父会话不得亲自实施或再次委派这些工作。读取或搜索同一源码与文档、运行同一测试、只读分析和独立验证都属于重复实施；‘只读’‘无写冲突’‘交叉验证’不是例外。父会话只能使用 wait_agent 等待、查询状态、向同一子代理发送 steering，或处理派发前已明确拆分、产出独立、无数据依赖且无共享写资源的其他工作。",
+    "send_message 返回 accepted: true 只表示消息已被接受，不表示任务完成；若返回 message_delivery_failed，交付状态可能无法确认，不要盲目重发，先查询状态并结合已有回复判断。",
   ]);
   assert.deepEqual(readGuidelines("wait_agent"), [
     "wait_agent 返回 outcome: reply 时，子代理仍在处理；直接父会话继续等待或使用 send_message 引导同一子代理。wait_agent 返回 outcome: timeout 只结束本次等待，不改变子代理生命周期，也不把任务交回直接父会话。",

@@ -169,13 +169,17 @@ const descriptions: Readonly<Record<AgentToolName, string>> = Object.freeze({
 });
 
 export const PARENT_COORDINATION_GUIDELINES = Object.freeze({
-  sendMessage: "send_message 返回 accepted: true 后，该任务继续由目标直接子代理负责。直接父会话使用 wait_agent 等待，或只处理明确拆分、无数据依赖且无共享写资源的工作；在子代理给出最终答复或进入终态前，不在父会话实施或再次委派同一任务。若返回 message_delivery_failed，交付状态可能无法确认，不要盲目重发，先查询状态并结合已有回复判断。",
+  taskOwnership: "任务所有权硬约束：send_message 返回 accepted: true 后，已下发任务范围由目标直接子代理负责，直到该子代理给出最终答复或进入终态。同一任务包括为同一问题、工单或结论执行的调查、实现、测试、复现、验证、评审及其子范围；父会话不得亲自实施或再次委派这些工作。读取或搜索同一源码与文档、运行同一测试、只读分析和独立验证都属于重复实施；‘只读’‘无写冲突’‘交叉验证’不是例外。父会话只能使用 wait_agent 等待、查询状态、向同一子代理发送 steering，或处理派发前已明确拆分、产出独立、无数据依赖且无共享写资源的其他工作。",
+  sendMessage: "send_message 返回 accepted: true 只表示消息已被接受，不表示任务完成；若返回 message_delivery_failed，交付状态可能无法确认，不要盲目重发，先查询状态并结合已有回复判断。",
   waitAgent: "wait_agent 返回 outcome: reply 时，子代理仍在处理；直接父会话继续等待或使用 send_message 引导同一子代理。wait_agent 返回 outcome: timeout 只结束本次等待，不改变子代理生命周期，也不把任务交回直接父会话。",
   interruptAgent: "直接父会话需要接管已下发任务时，先使用 interrupt_agent，再使用 wait_agent 确认子代理已结束当前处理；确认后再实施相同任务或修改相同资源。",
 });
 
 const promptGuidelines: Readonly<Partial<Record<AgentToolName, readonly string[]>>> = Object.freeze({
-  send_message: Object.freeze([PARENT_COORDINATION_GUIDELINES.sendMessage]),
+  send_message: Object.freeze([
+    PARENT_COORDINATION_GUIDELINES.taskOwnership,
+    PARENT_COORDINATION_GUIDELINES.sendMessage,
+  ]),
   wait_agent: Object.freeze([PARENT_COORDINATION_GUIDELINES.waitAgent]),
   interrupt_agent: Object.freeze([PARENT_COORDINATION_GUIDELINES.interruptAgent]),
 });
