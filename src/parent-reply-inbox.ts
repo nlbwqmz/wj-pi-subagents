@@ -1,4 +1,10 @@
 import {
+  Markdown,
+  truncateToWidth,
+  visibleWidth,
+  type MarkdownTheme,
+} from "@earendil-works/pi-tui";
+import {
   CHILD_REPLY_VERSION,
   CHILD_TERMINAL_SCHEMA,
   encodeChildReplyEnvelope,
@@ -11,6 +17,7 @@ import {
 import {
   createSafeTextComponent,
   formatSafeImageSummary,
+  sanitizeMultiline,
   type AgentToolRenderComponent,
   type AgentToolRenderTheme,
   type SafeRenderLine,
@@ -38,8 +45,25 @@ export interface ParentReplyMessageRenderOptions {
   readonly outputPad?: number;
 }
 
-export interface ParentReplyMessageTheme extends AgentToolRenderTheme {
+type ParentReplyMessageColor = Parameters<AgentToolRenderTheme["fg"]>[0]
+  | "mdHeading"
+  | "mdLink"
+  | "mdLinkUrl"
+  | "mdCode"
+  | "mdCodeBlock"
+  | "mdCodeBlockBorder"
+  | "mdQuote"
+  | "mdQuoteBorder"
+  | "mdHr"
+  | "mdListBullet";
+
+export interface ParentReplyMessageTheme {
+  fg(color: ParentReplyMessageColor, text: string): string;
   bg(color: "customMessageBg", text: string): string;
+  bold(text: string): string;
+  italic?(text: string): string;
+  strikethrough?(text: string): string;
+  underline?(text: string): string;
 }
 
 export type ParentReplyMessageRenderer = (
@@ -208,6 +232,7 @@ export function registerParentReplyMessageRenderers(
 }
 
 type VisibleKind = "message" | "final" | "terminal";
+const MAX_COLLAPSED_PAYLOAD_LINES = 8;
 
 function createParentReplyMessageRenderer(
   kind: VisibleKind,
@@ -239,7 +264,7 @@ function createParentReplyMessageRenderer(
       : senderName === undefined
         ? agentId
         : `${senderName} · ${agentId}`;
-    const lines: SafeRenderLine[] = [
+    const headerLines: SafeRenderLine[] = [
       {
         text: `Message Type: ${messageType}`,
         color: kind === "message" ? "customMessageLabel" : "success",
@@ -248,33 +273,126 @@ function createParentReplyMessageRenderer(
       { text: `Sender: ${sender}`, color: "muted" },
     ];
     if (visible?.status !== undefined) {
-      lines.push({ text: `Status: ${visible.status}`, color: "muted" });
+      headerLines.push({ text: `Status: ${visible.status}`, color: "muted" });
     }
-    lines.push(
+    headerLines.push(
       { text: "", color: "customMessageText" },
       {
         text: "Payload:",
         color: kind === "message" ? "customMessageLabel" : "success",
         bold: true,
       },
-      {
-        text: visible?.payload ?? "无法解析结构化回复。",
-        color: "customMessageText",
-        multiline: true,
-        ...(renderOptions.expanded === true ? {} : {
-          maxLines: 8,
-          overflowText: "…（展开查看完整正文）",
-        }),
-      },
+    );
+
+    const payload = sanitizeMultiline(visible?.payload ?? "无法解析结构化回复。");
+    const markdown = new Markdown(
+      payload,
+      0,
+      0,
+      createParentReplyMarkdownTheme(theme),
+      { color: (text) => theme.fg("customMessageText", text) },
     );
     const imageSummary = formatSafeImageSummary(content);
-    if (imageSummary !== undefined) lines.push({ text: imageSummary, color: "muted" });
-    return createSafeTextComponent(lines, theme, {}, {
-      paddingX: renderOptions.outputPad ?? 1,
-      paddingY: 1,
-      background: (text) => theme.bg("customMessageBg", text),
-    });
+    return new ParentReplyMarkdownComponent(
+      createSafeTextComponent(headerLines, theme, {}),
+      markdown,
+      imageSummary === undefined
+        ? undefined
+        : createSafeTextComponent([{ text: imageSummary, color: "muted" }], theme, {}),
+      theme,
+      renderOptions.expanded === true,
+      renderOptions.outputPad ?? 1,
+    );
   };
+}
+
+/** 将协议元数据的安全纯文本与业务 Markdown 组合为同一个消息区域。 */
+class ParentReplyMarkdownComponent implements AgentToolRenderComponent {
+  private readonly header: AgentToolRenderComponent;
+  private readonly payload: AgentToolRenderComponent;
+  private readonly footer: AgentToolRenderComponent | undefined;
+  private readonly theme: ParentReplyMessageTheme;
+  private readonly expanded: boolean;
+  private readonly requestedPadding: number;
+
+  constructor(
+    header: AgentToolRenderComponent,
+    payload: AgentToolRenderComponent,
+    footer: AgentToolRenderComponent | undefined,
+    theme: ParentReplyMessageTheme,
+    expanded: boolean,
+    requestedPadding: number,
+  ) {
+    this.header = header;
+    this.payload = payload;
+    this.footer = footer;
+    this.theme = theme;
+    this.expanded = expanded;
+    this.requestedPadding = requestedPadding;
+  }
+
+  render(width: number): string[] {
+    const availableWidth = Number.isSafeInteger(width) && width > 0 ? width : 1;
+    const paddingX = safeMessagePadding(this.requestedPadding, availableWidth);
+    const contentWidth = Math.max(1, availableWidth - paddingX * 2);
+    const payloadLines = this.payload.render(contentWidth);
+    const visiblePayloadLines = this.expanded || payloadLines.length <= MAX_COLLAPSED_PAYLOAD_LINES
+      ? payloadLines
+      : [
+        ...payloadLines.slice(0, MAX_COLLAPSED_PAYLOAD_LINES - 1),
+        this.theme.fg("customMessageText", "…（展开查看完整正文）"),
+      ];
+    const contentLines = [
+      ...this.header.render(contentWidth),
+      ...visiblePayloadLines,
+      ...(this.footer?.render(contentWidth) ?? []),
+    ];
+    const background = (text: string): string => this.theme.bg("customMessageBg", text);
+    const blank = background(" ".repeat(availableWidth));
+    const leftPadding = " ".repeat(paddingX);
+    return [
+      blank,
+      ...contentLines.map((line) => {
+        const clipped = truncateToWidth(line, contentWidth, "");
+        const rightPadding = " ".repeat(Math.max(
+          0,
+          availableWidth - paddingX - visibleWidth(clipped),
+        ));
+        return background(`${leftPadding}${clipped}${rightPadding}`);
+      }),
+      blank,
+    ];
+  }
+
+  invalidate(): void {
+    this.header.invalidate();
+    this.payload.invalidate();
+    this.footer?.invalidate();
+  }
+}
+
+function createParentReplyMarkdownTheme(theme: ParentReplyMessageTheme): MarkdownTheme {
+  return {
+    heading: (text) => theme.fg("mdHeading", text),
+    link: (text) => theme.fg("mdLink", text),
+    linkUrl: (text) => theme.fg("mdLinkUrl", text),
+    code: (text) => theme.fg("mdCode", text),
+    codeBlock: (text) => theme.fg("mdCodeBlock", text),
+    codeBlockBorder: (text) => theme.fg("mdCodeBlockBorder", text),
+    quote: (text) => theme.fg("mdQuote", text),
+    quoteBorder: (text) => theme.fg("mdQuoteBorder", text),
+    hr: (text) => theme.fg("mdHr", text),
+    listBullet: (text) => theme.fg("mdListBullet", text),
+    bold: (text) => theme.bold(text),
+    italic: (text) => theme.italic?.(text) ?? text,
+    strikethrough: (text) => theme.strikethrough?.(text) ?? text,
+    underline: (text) => theme.underline?.(text) ?? text,
+  };
+}
+
+function safeMessagePadding(value: number, width: number): number {
+  if (!Number.isSafeInteger(value) || value <= 0) return 0;
+  return Math.min(value, Math.floor(Math.max(0, width - 1) / 2));
 }
 
 function messageContent(envelope: ChildReplyEnvelope): Array<Record<string, string>> {

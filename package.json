@@ -9,13 +9,15 @@
     "node": ">=22.19.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "dependencies": {
     "semver": "7.8.0",
     "yaml": "2.9.0"
   },
   "devDependencies": {
+    "@earendil-works/pi-tui": "0.83.0",
     "@types/node": "24.12.4",
     "@types/semver": "7.7.1",
     "typescript": "5.9.3"

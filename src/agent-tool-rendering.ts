@@ -818,7 +818,7 @@ function readOptionalBoolean(record: Record<string, unknown> | undefined, key: s
   }
 }
 
-function sanitizeMultiline(value: string): string {
+export function sanitizeMultiline(value: string): string {
   return value
     .replace(/\r\n?/g, "\n")
     .replace(/\t/g, "  ")

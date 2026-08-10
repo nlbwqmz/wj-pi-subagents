@@ -617,20 +617,58 @@ test("父回复 renderer 隐藏原始 JSON 与协议字段并展示发送者、�
   assert.match(finalRendered, /无可用业务输出/);
 });
 
+test("工作中回复与最终答复正文按 Markdown 渲染", () => {
+  const renderers = new Map<string, ParentReplyMessageRenderer>();
+  registerParentReplyMessageRenderers({
+    registerMessageRenderer: (type, renderer) => { renderers.set(type, renderer); },
+  });
+  const markdown = "# 结论\n\n已完成 **Markdown 渲染**，并保留 `code`。";
+
+  for (const [type, envelope] of [
+    ["pi-subagent-message", messageEnvelope(markdown)],
+    ["pi-subagent-final", finalEnvelope(markdown)],
+  ] as const) {
+    const rendered = renderers.get(type)!({
+      customType: type,
+      content: [{ type: "text", text: createVisibleEnvelope(envelope) }],
+      details: { agent_id: AGENT_ID, kind: envelope.kind },
+    }, { expanded: true, outputPad: 0 }, RENDER_THEME).render(120).join("\n");
+
+    assert.match(rendered, /结论/);
+    assert.match(rendered, /已完成 Markdown 渲染，并保留 code。/);
+    assert.doesNotMatch(rendered, /# 结论|\*\*Markdown 渲染\*\*|`code`/);
+  }
+
+  const collapsedMarkdown = Array.from(
+    { length: 10 },
+    (_, index) => `段落 ${index + 1}`,
+  ).join("\n\n");
+  const collapsedEnvelope = messageEnvelope(collapsedMarkdown);
+  const collapsed = renderers.get("pi-subagent-message")!({
+    customType: "pi-subagent-message",
+    content: [{ type: "text", text: createVisibleEnvelope(collapsedEnvelope) }],
+    details: { agent_id: AGENT_ID, kind: "message" },
+  }, { expanded: false, outputPad: 0 }, RENDER_THEME).render(120).join("\n");
+  assert.match(collapsed, /…（展开查看完整正文）/);
+  assert.doesNotMatch(collapsed, /段落 10/);
+});
+
 test("renderer 清理不可信名称和无效结构化正文并保持宽度", () => {
   const renderers = new Map<string, ParentReplyMessageRenderer>();
   registerParentReplyMessageRenderers({
     registerMessageRenderer: (type, renderer) => { renderers.set(type, renderer); },
   });
-  const valid = messageEnvelope("第一行\n第二行");
+  const valid = messageEnvelope("第一行 **重点**\n第二行\u001b[31m危险\u202e");
   const lines = renderers.get("pi-subagent-message")!({
     customType: "pi-subagent-message",
     content: [{ type: "text", text: createVisibleEnvelope(valid) }],
     details: { agent_id: AGENT_ID, kind: "message", sender_name: "鉴权\n调查" },
   }, { expanded: false, outputPad: 0 }, RENDER_THEME).render(120);
-  assert.match(lines.join("\n"), new RegExp(`Sender: 鉴权 调查 · ${AGENT_ID}`));
-  assert.ok(lines.some((line) => line.includes("第一行")));
-  assert.ok(lines.some((line) => line.includes("第二行")));
+  const validDisplay = lines.join("\n");
+  assert.match(validDisplay, new RegExp(`Sender: 鉴权 调查 · ${AGENT_ID}`));
+  assert.match(validDisplay, /第一行 重点/);
+  assert.match(validDisplay, /第二行/);
+  assert.doesNotMatch(validDisplay, /\*\*重点\*\*|\u001b|\u202e/);
 
   const malformed = renderers.get("pi-subagent-message")!({
     customType: "pi-subagent-message",
