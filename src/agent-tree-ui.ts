@@ -426,7 +426,9 @@ export function renderAgentsWidget(
     : snapshot.scope.agent_id ?? null;
   const rows = snapshot.nodes
     .filter((node) => node.parent_agent_id === parentAgentId && node.state !== "terminated")
-    .map((node) => truncateToDisplayWidth(`  ${formatAgentFacts(node)}`, width));
+    .map((node) => truncateToDisplayWidth(`  ${formatAgentFacts(node, {
+      includeActivityCategoryCount: false,
+    })}`, width));
   if (rows.length === 0) return Object.freeze([]);
   return Object.freeze([truncateToDisplayWidth("Agents", width), ...rows]);
 }
@@ -881,11 +883,19 @@ function themeBold(theme: unknown, text: string): string {
   }
 }
 
-function formatAgentFacts(node: AgentSnapshot): string {
+interface FormatAgentFactsOptions {
+  readonly includeActivityCategoryCount?: boolean;
+}
+
+function formatAgentFacts(node: AgentSnapshot, options: FormatAgentFactsOptions = {}): string {
   const facts = [safeUiFact(node.template_id), safeUiFact(node.name), node.state];
   if (node.activity !== undefined) {
     facts.push(node.activity.phase);
-    if (node.activity.category !== undefined && node.activity.active_count !== undefined) {
+    if (
+      options.includeActivityCategoryCount !== false
+      && node.activity.category !== undefined
+      && node.activity.active_count !== undefined
+    ) {
       facts.push(`${node.activity.category} ${node.activity.active_count}`);
     }
   }

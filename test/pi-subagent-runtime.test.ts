@@ -1144,7 +1144,9 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
     `- ${PARENT_COORDINATION_GUIDELINES.taskOwnership}`,
     `- ${PARENT_COORDINATION_GUIDELINES.sendMessage}`,
     `- ${PARENT_COORDINATION_GUIDELINES.waitAgent}`,
-    `- ${PARENT_COORDINATION_GUIDELINES.unusableFinal}`,
+    `- ${PARENT_COORDINATION_GUIDELINES.slowProgress}`,
+    `- ${PARENT_COORDINATION_GUIDELINES.taskRecovery}`,
+    `- ${PARENT_COORDINATION_GUIDELINES.retryPolicy}`,
     `- ${PARENT_COORDINATION_GUIDELINES.interruptAgent}`,
   ].join("\n");
   const childFinalReplyGuidance = [
@@ -1168,6 +1170,11 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   ].join("\n"));
   assert.match(String(rootCustomPromptResult.systemPrompt), /只读分析和独立验证都属于重复实施/);
   assert.match(String(rootCustomPromptResult.systemPrompt), /‘无写冲突’/);
+  assert.match(String(rootCustomPromptResult.systemPrompt), /运行缓慢/);
+  assert.match(String(rootCustomPromptResult.systemPrompt), /默认重试 3 次/);
+  assert.match(String(rootCustomPromptResult.systemPrompt), /最多 5 次/);
+  assert.match(String(rootCustomPromptResult.systemPrompt), /spawn_failed 和 internal_error/);
+  assert.match(String(rootCustomPromptResult.systemPrompt), /不要只总结当前探索内容/);
 
   const rootTemplates = await execute(rootApi, "get_agent_templates", {}, rootContext) as {
     details?: Array<{ template_id: string; tools: string[] }>;

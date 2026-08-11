@@ -320,7 +320,7 @@ Markdown 正文可以为空，UTF-8 编码后最多 `64 KiB`；该边界同时�
 
 ## 查看代理树
 
-在交互式 TUI 中，编辑器上方的 `Agents` widget 会显示当前会话的直接、尚未终止的子代理，包括模板、名称、状态、活动阶段与类别、运行时长，以及 mailbox/宿主/reply outbox 三类队列的汇总。
+在交互式 TUI 中，编辑器上方的 `Agents` widget 会显示当前会话的直接、尚未终止的子代理，包括模板、名称、状态、活动阶段、运行时长，以及 mailbox/宿主/reply outbox 三类队列的汇总。为保持常驻区域紧凑，widget 不显示活动类别及其计数；完整 `/agent` 面板仍保留这些信息。
 
 输入以下命令打开当前可见作用域的完整只读树：
 
@@ -493,7 +493,13 @@ Markdown 正文可以为空，UTF-8 编码后最多 `64 KiB`；该边界同时�
 
 final 总会触发父代理处理。raw `agent_settled` 只建立 provisional settlement，handler 随即返回；final 发布和 ACK 在独立 outbox 中完成，不能阻塞同一事件上的第三方压缩处理。final 只有在父会话接纳与匹配 settlement 两个条件都满足时才提交并获得 reply ACK。压缩若在 provisional settlement 后发生，会撤销旧候选并等待恢复 `agent_start`；处理中压缩则保持同一任务。第三方 mid-run 压缩成功但没有恢复轮次时节点进入 `suspended/resume_required`，压缩失败进入 `suspended/maintenance_failed`，不会伪造完成。
 
-思考块、工具前说明、工具调用、工具参数、工具结果和原始错误不会进入 final 正文。`wait_agent` 和 `get_agent_status` 不重复携带 final 正文，只通过 `last_task` 保留任务身份、结果枚举和输出是否存在。收到 `output_state: "absent"`，或判断 `present` 正文仍不可用时，父代理应向同一 `agent_id` 请求“只总结上一轮已完成工作并给出最终答复，不要重新执行任务”；运行时不会自动重跑、切换模型或创建替代代理。
+思考块、工具前说明、工具调用、工具参数、工具结果和原始错误不会进入 final 正文。`wait_agent` 和 `get_agent_status` 不重复携带 final 正文，只通过 `last_task` 保留任务身份、结果枚举和输出是否存在。
+
+`wait_agent` 返回 `timeout`，或节点长时间保持 `working / processing`，并不表示任务失败。父代理不应仅因耗时较长而要求子代理提前总结、中断或终止任务；必要时可以通过 `send_message` 询问当前进度、阻塞点和剩余工作，该 steering 不会中断当前任务，随后应继续等待。
+
+收到 `task_failed`、`task_interrupted`、`output_state: "absent"`，或判断 `present` 正文仍不可用时，父代理先查询同一节点的状态和 `last_task`，再要求该子代理根据自身任务完成情况恢复：已完成则提交完整最终答复，未完成则从未完成步骤继续，不重复已经完成的副作用，也不只总结当前探索内容。
+
+父子协作提示采用独立于控制面 `retryable` 元数据的重试策略：除明确错误码 `spawn_failed` 和 `internal_error` 外，其他异常均视为可重试，包括 `message_delivery_failed` 和 `suspended`。重试前必须先修正或核对参数、配置、配额、交付及节点状态，禁止原样盲重试。建议默认重试 3 次；若每次仍有进展、状态变化或错误原因变化，可增加到最多 5 次。`message_delivery_failed` 或 `suspended` 必须先查询错误、队列和 `activity.phase`，通过等待、对账或恢复 steering 消除不确定性，再决定是否重发原任务。出现 `spawn_failed`、`internal_error`、节点已终止、用户取消或达到 5 次上限后停止自动重试并请求裁决。运行时本身不会自动重跑、切换模型或创建替代代理。
 
 节点控制面发生 runtime fault 时，直接父运行时另行注入通知，不伪装成 child final：
 

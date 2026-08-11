@@ -130,6 +130,35 @@ test("常驻 Agents widget 只按稳定字段顺序显示作用域直接子代�
   assert.doesNotMatch(renderAgentsWidget(snapshot, 120).join("\n"), /secret-canary|terminate|interrupt|reload/i);
 });
 
+test("常驻 Agents widget 隐藏活动类别计数但代理树面板保留", () => {
+  const snapshot = subtreeSnapshot([
+    node({ agent_id: PARENT_ID, parent_agent_id: null, template_id: "parent", name: "当前会话" }),
+    node({
+      agent_id: WORKING_ID,
+      parent_agent_id: PARENT_ID,
+      template_id: "worker",
+      name: "活动子代理",
+      state: "working",
+      activity: Object.freeze({
+        phase: "executing_tools",
+        category: "reading",
+        active_count: 2,
+      }),
+    }),
+  ], 2);
+
+  const widget = renderAgentsWidget(snapshot, 120);
+  assert.deepEqual(widget, [
+    "Agents",
+    "  worker · 活动子代理 · working · executing_tools · 1m 00s",
+  ]);
+  assert.doesNotMatch(widget.join("\n"), /reading 2/);
+  assert.match(
+    new AgentTreePanelModel(snapshot).render(120).join("\n"),
+    /worker · 活动子代理 · working · executing_tools · reading 2 · 1m 00s/,
+  );
+});
+
 test("所有 UI 文本出口净化模板与名称中的终端控制字符", () => {
   const maliciousTemplate = "worker\u001b[31m\n伪造行";
   const maliciousName = "代理\u009b2J\r\nAgents";

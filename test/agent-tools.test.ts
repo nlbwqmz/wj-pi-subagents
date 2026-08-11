@@ -4,6 +4,7 @@ import {
   AGENT_TOOL_NAMES,
   CHILD_REPLY_GUIDELINE,
   CHILD_REPLY_TOOL_NAME,
+  PARENT_COORDINATION_GUIDELINES,
   registerAgentTools,
   registerReplyToParentTool,
   SubagentToolError,
@@ -63,7 +64,7 @@ function toolResultRenderer(
   return tool.renderResult as ToolResultRenderer;
 }
 
-test("管理工具系统提示把重复调查与独立验证纳入任务所有权硬约束", () => {
+test("管理工具系统提示约束任务所有权并覆盖慢任务和异常恢复", () => {
   const registrations: Array<Record<string, unknown>> = [];
   registerAgentTools(
     { registerTool: (tool) => registrations.push(tool as Record<string, unknown>) },
@@ -73,17 +74,30 @@ test("管理工具系统提示把重复调查与独立验证纳入任务所有�
     registrations.find((tool) => tool.name === name)?.promptGuidelines;
 
   assert.deepEqual(readGuidelines("send_message"), [
-    "任务所有权硬约束：send_message 返回 accepted: true 后，已下发任务范围由目标直接子代理负责，直到该子代理给出最终答复或进入终态。同一任务包括为同一问题、工单或结论执行的调查、实现、测试、复现、验证、评审及其子范围；父会话不得亲自实施或再次委派这些工作。读取或搜索同一源码与文档、运行同一测试、只读分析和独立验证都属于重复实施；‘只读’‘无写冲突’‘交叉验证’不是例外。父会话只能使用 wait_agent 等待、查询状态、向同一子代理发送 steering，或处理派发前已明确拆分、产出独立、无数据依赖且无共享写资源的其他工作。",
-    "send_message 返回 accepted: true 只表示插件 mailbox 已接纳消息并分配 message_id/task_id，不表示 Pi 或模型已经读取，也不表示任务完成；若返回 message_delivery_failed，交付状态可能无法确认，不要盲目重发，先查询状态并结合已有回复判断。",
-    "收到 output_state: absent 的最终答复，或判断 present 正文仍不可用时，必须向同一 agent_id 尝试追问：只总结上一轮已完成工作并给出最终答复，不要重新执行任务；协议不自动重跑任务或切换模型。",
+    PARENT_COORDINATION_GUIDELINES.taskOwnership,
+    PARENT_COORDINATION_GUIDELINES.sendMessage,
+    PARENT_COORDINATION_GUIDELINES.slowProgress,
+    PARENT_COORDINATION_GUIDELINES.taskRecovery,
+    PARENT_COORDINATION_GUIDELINES.retryPolicy,
   ]);
   assert.deepEqual(readGuidelines("wait_agent"), [
-    "wait_agent 应在一次调用的 agent_ids 中传入所有待观察的直接子代理，并在任一目标产生结果时返回。outcome: reply 时获胜子代理仍在处理；task_completed、task_failed 或 task_interrupted 表示其最近逻辑任务已提交；suspended 表示需要查询状态并人工裁决；batch_released 表示同一 assistant 工具批次的另一个 wait_agent 已取得结果；timeout 只结束共享观察窗口，不改变任何节点生命周期，也不把任务交回直接父会话。",
-    "收到 output_state: absent 的最终答复，或判断 present 正文仍不可用时，必须向同一 agent_id 尝试追问：只总结上一轮已完成工作并给出最终答复，不要重新执行任务；协议不自动重跑任务或切换模型。",
+    PARENT_COORDINATION_GUIDELINES.waitAgent,
+    PARENT_COORDINATION_GUIDELINES.slowProgress,
+    PARENT_COORDINATION_GUIDELINES.taskRecovery,
+    PARENT_COORDINATION_GUIDELINES.retryPolicy,
   ]);
   assert.deepEqual(readGuidelines("interrupt_agent"), [
-    "直接父会话需要接管已下发任务时，先使用 interrupt_agent，再使用 wait_agent 确认子代理已结束当前处理；确认后再实施相同任务或修改相同资源。",
+    PARENT_COORDINATION_GUIDELINES.interruptAgent,
   ]);
+  assert.match(PARENT_COORDINATION_GUIDELINES.slowProgress, /不构成失败/);
+  assert.match(PARENT_COORDINATION_GUIDELINES.slowProgress, /不会中断当前任务/);
+  assert.match(PARENT_COORDINATION_GUIDELINES.taskRecovery, /根据自身任务完成情况继续/);
+  assert.match(PARENT_COORDINATION_GUIDELINES.taskRecovery, /不要只总结当前探索内容/);
+  assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /spawn_failed 和 internal_error/);
+  assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /message_delivery_failed 和 suspended/);
+  assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /默认重试 3 次/);
+  assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /最多 5 次/);
+  assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /禁止原样盲重试/);
   for (const name of AGENT_TOOL_NAMES) {
     if (name === "send_message" || name === "wait_agent" || name === "interrupt_agent") continue;
     assert.equal(readGuidelines(name), undefined, `${name} 不应重复携带委派规则`);
