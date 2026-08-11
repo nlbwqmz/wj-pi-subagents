@@ -131,6 +131,31 @@ async function nextTask(): Promise<void> {
   await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
+test("Pi 自动重试在 settled 前启动新轮时沿用同一逻辑任务", async () => {
+  const port = new TaskStartedBarrierPort();
+  const value = coordinator(port);
+  const assignedTaskId = "450e8400-e29b-41d4-a716-446655440002";
+  value.observeTaskAssignment({
+    message_id: "msg_retry_assignment",
+    task_id: assignedTaskId,
+    mode: "prompt",
+  });
+  value.observeAgentStart();
+  await nextTask();
+  port.acknowledgeStarted();
+  await nextTask();
+
+  // Pi 的自动重试没有先发 agent_settled，会直接进入下一次 agent_start。
+  value.observeAgentEnd();
+  value.observeAgentStart();
+  await nextTask();
+
+  assert.deepEqual(port.events, [
+    { kind: "started", task_id: assignedTaskId, turn_id: TURN_1 },
+    { kind: "started", task_id: assignedTaskId, turn_id: TURN_2 },
+  ]);
+});
+
 test("task_started 获 transport ACK 前同一 turn 的业务 reply 不得越过身份事实", async () => {
   const port = new TaskStartedBarrierPort();
   const value = coordinator(port);

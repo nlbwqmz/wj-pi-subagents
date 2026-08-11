@@ -307,7 +307,7 @@ thinking: medium
 
 ### 6.3 任务、队列、修订与时间
 
-**REQ-023**：首条 mailbox 消息建立不可复用的 UUID v4 `task_id`；同一任务可以跨 steering、压缩和多个 Pi loop 保持身份。每次实际 loop 使用新的 UUID v4 `turn_id`；final 使用不可复用的 UUID v4 `commit_id`。中断栅栏后的消息必须获得后继 task，不能 steer 到正在取消的 run。
+**REQ-023**：首条 mailbox 消息建立不可复用的 UUID v4 `task_id`；没有新的 task assignment 时，同一任务可以跨自动重试、steering、压缩和多个 Pi loop 保持身份。每次实际 loop 使用新的 UUID v4 `turn_id`；final 使用不可复用的 UUID v4 `commit_id`。中断栅栏后的消息必须获得后继 task，不能 steer 到正在取消的 run。
 
 节点必须在一个原子快照中公开三类非负安全整数计数：
 

@@ -489,7 +489,7 @@ Markdown 正文可以为空，UTF-8 编码后最多 `64 KiB`；该边界同时�
 }
 ```
 
-一次父级任务使用随机 UUID v4 `task_id` 标识，并可跨 steering、压缩和恢复保持不变；每次实际 Pi `agent_start` 另生成 `turn_id`。同一 turn 的 message 和 final 共用 `task_id/turn_id`，恢复后的新 turn 会拒绝旧 turn final。final 还携带幂等 `commit_id`，父端只允许匹配当前任务和轮次的 commit 从 `prepared` 单调推进到 `accepted`。父端同时保留已接纳信封的 SHA-256 语义摘要和已接受 final turn，因此窗口外序号篡改会成为协议故障，重复 final 也不会再次注入；这些索引不保存业务正文。
+一次父级任务使用随机 UUID v4 `task_id` 标识，并可跨 steering、Pi 自动重试续轮、压缩和恢复保持不变；每次实际 Pi `agent_start` 另生成 `turn_id`。同一 turn 的 message 和 final 共用 `task_id/turn_id`，恢复后的新 turn 会拒绝旧 turn final。final 还携带幂等 `commit_id`，父端只允许匹配当前任务和轮次的 commit 从 `prepared` 单调推进到 `accepted`。父端同时保留已接纳信封的 SHA-256 语义摘要和已接受 final turn，因此窗口外序号篡改会成为协议故障，重复 final 也不会再次注入；这些索引不保存业务正文。
 
 `run_state` 为 `settled`、`failed` 或 `interrupted`，`output_state` 为 `present` 或 `absent`。只有非空文本存在时才是 `present`；assistant 图片块会被忽略，图片-only 输出形成 `absent` final。`absent` final 没有说明性业务正文，并通过 `reason_code` 表达 `no_output`、`provider_error` 或 `runtime_fault`。失败或中断可以保留最近的安全文本候选，但状态明确表示结果并非完整成功。
 
@@ -625,7 +625,7 @@ TerminalNotice 总会触发父代理，并在 `wait_agent` 返回 `outcome: "ter
 
 每个活动节点原子发布三类队列计数：`mailbox_pending_count` 是插件已接纳但尚未交给 Pi 的消息数，`host_pending_count` 是 Pi 报告的宿主待处理数，`reply_outbox_pending_count` 是等待 settlement/父端 ACK 的 final 数。`idle` 时三者必须全为 0 且没有 `activity`。`activity.phase` 描述处理、工具执行、压缩、对账、finalizing、等待父 ACK 或挂起原因；工具类别仍只使用脱敏闭集。
 
-父端先通过监督通道发送 `task_assignment` 并等待 transport ACK，再调用 Pi prompt/steer；child 每次实际 loop start 必须先发布有序 `task_started { task_id, turn_id }`，之后才能发布该 turn 的 reply。`task_id` 跨 steering、压缩与恢复稳定，`turn_id` 只标识一次 Pi loop；interrupt 栅栏后的消息属于后继任务。raw `agent_settled` 只建立 provisional candidate，宿主若仍 streaming 会撤销它，只有匹配 final 获父端接纳后才能原子提交 `last_task` 并在真正静止时进入 `idle`。
+父端先通过监督通道发送 `task_assignment` 并等待 transport ACK，再调用 Pi prompt/steer；child 每次实际 loop start 必须先发布有序 `task_started { task_id, turn_id }`，之后才能发布该 turn 的 reply。没有新的 `task_assignment` 时，自动重试、steering、压缩与恢复继续沿用同一 `task_id`，每次新 Pi loop 只递增 `turn_id`；interrupt 栅栏后的消息属于后继任务。raw `agent_settled` 只建立 provisional candidate，宿主若仍 streaming 会撤销它，只有匹配 final 获父端接纳后才能原子提交 `last_task` 并在真正静止时进入 `idle`。
 
 一次处理中的 assistant `message_end` 只更新当前 turn 最近的安全最终候选，不直接发送给父会话。正常、provider error 和协作式中断分别形成 `settled`、`failed` 或 `interrupted` final；重复或旧 turn 的 final 会被隔离。无业务载荷的 `absent` final 是合法结果，不生成占位正文。
 

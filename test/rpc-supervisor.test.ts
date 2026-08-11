@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  ChildReplyCoordinator,
+} from "../src/child-reply-coordinator.ts";
+import {
   CHILD_REPLY_SCHEMA,
   CHILD_REPLY_VERSION,
   type ChildFinalEnvelope,
@@ -658,6 +661,63 @@ test("同一节点的 prompt 与 steering 只按一个 RPC 写入顺序域执行
   if (status.ok) {
     assert.equal(status.data.state, "working");
     assert.equal(status.data.mailbox_pending_count, 0);
+  }
+});
+
+test("Pi 自动重试沿用父端任务身份且不把继续执行投影为 internal_error", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "自动重试" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+  const promptGate = rpcClient.deferNext("prompt");
+  const delivery = await supervisor.prompt("执行可能触发供应商重试的任务");
+  assert.equal(delivery.ok, true);
+  if (!delivery.ok) return;
+  await promptGate.started;
+
+  const assignment = channel.publishedTaskAssignments()[0];
+  assert.ok(assignment);
+  let turnIndex = 0;
+  const child = new ChildReplyCoordinator({
+    agentId: FIRST_AGENT_ID,
+    port: {
+      async publishTaskStarted(started): Promise<void> {
+        channel.emitTaskStarted(started);
+      },
+      async publishReplyAndWaitForAck(): Promise<void> {},
+    },
+    taskIdFactory: () => AUTONOMOUS_TASK_ID,
+    turnIdFactory: () => [TURN_ID, NEXT_TURN_ID][turnIndex++]!,
+    commitIdFactory: () => COMMIT_ID,
+  });
+  child.observeTaskAssignment(assignment);
+  rpcClient.emitEvent({ type: "agent_start" });
+  child.observeAgentStart();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  promptGate.resolve();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  child.observeAgentEnd();
+  rpcClient.emitEvent({ type: "agent_end", messages: [], willRetry: true });
+  rpcClient.emitEvent({ type: "agent_start" });
+  child.observeAgentStart();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "working");
+    assert.equal(status.data.error, undefined);
+    assert.equal(status.data.activity?.task_id, delivery.task_id);
   }
 });
 

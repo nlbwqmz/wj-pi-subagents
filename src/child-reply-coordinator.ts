@@ -113,13 +113,12 @@ export class ChildReplyCoordinator {
     this.settlementEpoch += 1;
   }
 
-  /** 新 Pi loop：压缩恢复沿用 task_id，普通 prompt 消费监督租约。 */
+  /** 新 Pi loop：没有新的父端 task_assignment 时沿用当前逻辑任务，只递增 turn_id。 */
   observeAgentStart(): void {
     if (this.terminalFailure) throw new Error("child_reply_coordinator_failed");
-    const resume = this.compactionActive || this.resumePending;
-    const taskId = resume && this.currentTaskId !== undefined
-      ? this.currentTaskId
-      : this.pendingPromptTaskId ?? this.allocateId(this.taskIdFactory);
+    const taskId = this.pendingPromptTaskId
+      ?? this.currentTaskId
+      ?? this.allocateId(this.taskIdFactory);
     const turnId = this.allocateId(this.turnIdFactory);
     if (taskId === undefined || turnId === undefined) {
       this.terminalFailure = true;
