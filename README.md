@@ -31,7 +31,7 @@
 - 不同节点可以并行工作；同一个节点上的控制命令按顺序处理。
 - 子代理可以继续创建自己的子代理，形成受深度和名额限制的树。
 - 父代理只能控制自己的直接子代理，不能越级操纵更深层后代。
-- 子代理只有主动调用 `reply_to_parent` 时才会上报工作中进度；处理到达结束边界后，运行时再向直接父代理自动提交一次最终答复。
+- 子代理只在遇到必须由直接父代理处理或裁决的阻塞问题，或父代理明确要求过程回报时调用 `reply_to_parent`；处理到达结束边界后，运行时再向直接父代理自动提交一次最终答复。
 - 会话关闭时，扩展会递归清理受监督的子进程树。
 
 子代理不会复制父会话的对话历史。整棵树共享根会话启动时确定的工作目录、项目信任结果、环境快照和配额配置；具体工具、模型、thinking 和系统提示由代理模板决定。
@@ -120,7 +120,7 @@ pi install "D:\path\to\pi-subagents-wj" -l --approve
 Pi 不管理本地路径中的源码副本。请先通过你实际取得源码的方式更新该目录，然后重新按锁文件装配生产依赖。
 
 > [!IMPORTANT]
-> 监督协议主版本升级时不能热接管旧活动树。当前版本使用 `pi-subagent/5` 和第 3 版 reply envelope，不兼容 `pi-subagent/4` 或第 2 版 reply；更新前应先退出旧 Pi 根会话并确认子树已清理，再更新源码和重启。只有协议主版本未变化的更新才可依赖 `/reload` 保留现有树。
+> 监督协议主版本升级时不能热接管旧活动树。当前版本使用 `pi-subagent/6` 和第 4 版 reply envelope，不兼容 `pi-subagent/5` 或第 3 版 reply；更新前应先退出旧 Pi 根会话并确认子树已清理，再更新源码和重启。只有协议主版本未变化的更新才可依赖 `/reload` 保留现有树。
 
 ```powershell
 Set-Location D:\path\to\pi-subagents-wj
@@ -204,9 +204,9 @@ systemPromptMode: append
 1. 根代理调用 `get_agent_templates` 查看当前有效模板，并原样复制返回的 `template_id`。
 2. 根代理调用 `spawn_agent`，创建后得到唯一 `agent_id`。
 3. 根代理调用 `send_message` 发送第一项任务。
-4. 子代理需要汇报进度、提问或给出阶段性发现时，调用 `reply_to_parent`；该调用不会结束当前工作。
+4. 子代理遇到必须由直接父代理处理或裁决的阻塞问题，或父代理明确要求过程回报时，调用 `reply_to_parent`；该调用不会结束当前工作。
 5. 子代理到达 raw settlement 后，运行时先保留 provisional candidate；只有匹配任务/轮次的 final 已进入父会话并获 ACK，任务才提交为完成、失败或中断。
-6. 根代理可调用 `wait_agent` 等待工作中回复、最近任务提交、挂起或终态。
+6. 根代理可调用一次 `wait_agent`，在 `agent_ids` 中列出所有待观察的直接子代理，等待任一目标的工作中回复、最近任务提交、挂起或终态。
 7. 后续仍可向同一 `agent_id` 发送任务，以复用其上下文。
 8. 不再需要时调用 `terminate_agent`，递归回收该节点和所有后代。
 
@@ -298,11 +298,11 @@ Markdown 正文可以为空，UTF-8 编码后最多 `64 KiB`；该边界同时�
 
 工具成功会返回 `message_id` 和 `task_id`。`accepted: true` 只表示插件 mailbox 已接纳消息，不表示 Pi 或模型已经读取，也不表示任务已经完成。真实 Pi 命令随后失败或连接中断时，状态会保守投影为 `suspended`/`delivery_uncertain`，不会撤销已经返回的接纳事实。消息被接受后，已下发任务范围在子代理给出最终答复或进入终态前由该子代理负责；父代理应等待、查询状态或发送 steering，不能以只读检查、运行相同测试、复现、评审或独立验证为名重复实施或再次委派同一任务。只有派发前已经明确拆分、产出独立、无数据依赖且无共享写资源的其他工作才适合并行。
 
-子代理的普通 assistant 过程输出不会自动上行：工作中汇报必须显式调用 `reply_to_parent`，最终答复则由运行时在处理结束边界自动提交。回复以结构化 JSON 进入父会话；`wait_agent` 只观察回复通知和生命周期，不会在工具结果中重复复制 final 正文。
+子代理的普通 assistant 过程输出不会自动上行：必要的工作中协作消息必须显式调用 `reply_to_parent`，最终答复则由运行时在处理结束边界自动提交。回复以结构化 JSON 进入父会话；`wait_agent` 只观察回复通知和生命周期，不会在工具结果中重复复制 final 正文。
 
 ### 等待、打断与终止
 
-- `wait_agent`：等待工作中回复、最近逻辑任务提交、节点挂起、进入稳定终态或超时。工作中回复只结束本次等待，不会让节点停止；超时也不打断节点。
+- `wait_agent`：在一次调用中等待一个或多个直接子代理，任一目标产生工作中回复、最近逻辑任务提交、挂起或稳定终态即返回。所有目标共享一个 timeout；工作中回复和 timeout 都不会让节点停止。
 - `interrupt_agent`：协作式中断当前处理，保留节点、上下文和后代。它不会自动升级为终止。
 - `terminate_agent`：永久递归终止目标和全部后代，并同步等待资源回收确认。目标必须是调用者的直接子代理。
 
@@ -440,18 +440,17 @@ Markdown 正文可以为空，UTF-8 编码后最多 `64 KiB`；该边界同时�
 
 ### `reply_to_parent`
 
-该工具只存在于子代理会话，用于向创建自己的直接父会话发送工作中回复。目标身份已经由监督通道绑定，因此不接受 `agent_id` 或任意目标参数：
+该工具只存在于子代理会话，用于向创建自己的直接父会话发送必要的工作中协作消息。目标身份已经由监督通道绑定，因此不接受 `agent_id`、唤醒开关或任意目标参数：
 
 ```json
 {
-  "message": "正在核对第二个实现分支，完成后继续汇总。",
-  "requires_response": false
+  "message": "需要父代理裁决：任务要求与当前接口契约冲突。"
 }
 ```
 
-`message` 必须非空且不超过 16 KiB UTF-8，`requires_response` 必须由子代理显式填写：`true` 表示父代理空闲时应立即处理，`false` 表示只记录到会话。工具只接受文本，不支持 `images`，也不应构造或附带图片 Base64；它同样不接受回复类别、序号或“完成”开关。适合发送进度、问题和阶段性发现。成功结果中的 `accepted: true` 表示直接父会话已经接纳并确认该消息，但子代理仍处于当前处理，应继续完成原任务。
+`message` 必须非空且不超过 16 KiB UTF-8。仅在当前任务于最终答复前遇到必须由直接父代理处理或裁决的阻塞问题，或者直接父代理已经明确要求过程回报时使用。不得用于常规进度、心跳、阶段性总结、完成通知或替代最终答复。工具只接受文本，不支持 `images`，也不接受回复类别、序号或“完成”开关。每条成功接纳的消息都会唤醒直接父代理；`accepted: true` 表示直接父会话已经接纳并确认该消息，但子代理仍处于当前处理，应继续完成原任务。
 
-不要用 `reply_to_parent` 模拟最终结果。子代理到达本轮结束边界时，运行时会自动发送一次最终答复；根会话没有该工具，叶节点和 `subagents: disabled` 的子代理仍然有该工具。
+子代理到达本轮结束边界时，运行时会自动发送一次最终答复；根会话没有 `reply_to_parent`，叶节点和 `subagents: disabled` 的子代理仍然有该工具。
 
 ### 父会话看到的回复
 
@@ -460,24 +459,23 @@ Markdown 正文可以为空，UTF-8 编码后最多 `64 KiB`；该边界同时�
 ```json
 {
   "schema": "pi-subagent.reply",
-  "version": 3,
+  "version": 4,
   "kind": "message",
   "agent_id": "550e8400-e29b-41d4-a716-446655440000",
   "task_id": "450e8400-e29b-41d4-a716-446655440002",
   "turn_id": "550e8400-e29b-41d4-a716-446655440001",
-  "requires_response": false,
-  "text": "正在核对第二个实现分支，完成后继续汇总。"
+  "text": "需要父代理裁决：任务要求与当前接口契约冲突。"
 }
 ```
 
-`requires_response: false` 在父代理空闲时只把消息留在会话，`true` 会触发父代理处理；父代理正在运行时两者都作为 steering 进入当前处理。无论该字段取值如何，已接纳的工作中回复都会让活动的 `wait_agent` 立即以 `outcome: "reply"` 返回，子代理继续工作。
+工作中回复固定以 steering 进入父会话并触发父代理处理；被接纳后，所有包含该子代理的活动 `wait_agent` 都会立即以 `outcome: "reply"` 返回，子代理继续工作。
 
 最终答复由运行时在本轮结束时自动提交，并由运行时而不是模型判定状态：
 
 ```json
 {
   "schema": "pi-subagent.reply",
-  "version": 3,
+  "version": 4,
   "kind": "final",
   "agent_id": "550e8400-e29b-41d4-a716-446655440000",
   "task_id": "450e8400-e29b-41d4-a716-446655440002",
@@ -502,7 +500,7 @@ final 总会触发父代理处理。raw `agent_settled` 只建立 provisional se
 ```json
 {
   "schema": "pi-subagent.terminal",
-  "version": 3,
+  "version": 4,
   "kind": "terminal",
   "agent_id": "550e8400-e29b-41d4-a716-446655440000",
   "node_state": "failed",
@@ -514,26 +512,30 @@ TerminalNotice 总会触发父代理，并在 `wait_agent` 返回 `outcome: "ter
 
 ### `wait_agent`
 
-等待一个直接子代理：
+等待一个或多个直接子代理中的任意一个。应在一次调用中列出全部目标，不要为同一批次分别发起多个等待：
 
 ```json
 {
-  "agent_id": "550e8400-e29b-41d4-a716-446655440000",
+  "agent_ids": [
+    "550e8400-e29b-41d4-a716-446655440000",
+    "650e8400-e29b-41d4-a716-446655440000"
+  ],
   "timeout_ms": 120000
 }
 ```
 
-`timeout_ms` 可省略，合法范围为 10,000 到 600,000 毫秒。返回的 `outcome` 为：
+`agent_ids` 必须非空，最多 64 项，重复 ID 会按首次出现顺序忽略；所有目标都必须是调用者的直接子代理。`timeout_ms` 可省略，合法范围为 10,000 到 600,000 毫秒。所有目标共享一个 timer，任一目标产生以下事件即返回真实获胜 `agent_id` 和安全快照：
 
-- `reply`：直接子代理发来一条工作中回复；返回快照通常仍是 `working` 或 `interrupting`，子代理会继续当前处理；
-- `task_completed`：最近逻辑任务已提交 `completed` final；
-- `task_failed`：最近逻辑任务已提交 `failed` final；
-- `task_interrupted`：最近逻辑任务已提交 `interrupted` final；
-- `suspended`：交付或压缩恢复状态无法确认，需要先查询 `activity.phase` 再决定中断或终止；
-- `terminal`：节点已经或随后进入 `failed` / `terminated`；
-- `timeout`：本次观察到期，节点继续保持原有状态。
+- `reply`：获胜子代理发来一条必要的工作中回复；返回快照通常仍是 `working` 或 `interrupting`，子代理会继续当前处理；
+- `task_completed`：获胜子代理最近逻辑任务已提交 `completed` final；
+- `task_failed`：获胜子代理最近逻辑任务已提交 `failed` final；
+- `task_interrupted`：获胜子代理最近逻辑任务已提交 `interrupted` final；
+- `suspended`：获胜节点的交付或压缩恢复状态无法确认，需要先查询 `activity.phase` 再决定中断或终止；
+- `terminal`：获胜节点已经或随后进入 `failed` / `terminated`。
 
-任务级结果会携带安全的 `last_task`，其中只有 `task_id`、`turn_id`、`commit_id`、`outcome` 和 `output_state`，不会复制 final 正文。
+观察期限先到时没有获胜节点，结果为 `{ "agent_ids": [...], "outcome": "timeout" }`，不附加伪造的单一节点状态。任务级结果会携带安全的 `last_task`，其中只有 `task_id`、`turn_id`、`commit_id`、`outcome` 和 `output_state`，不会复制 final 正文。
+
+Pi 会把不同供应商的工具调用统一为 assistant message 中的结构化 `toolCall`。如果模型仍在同一 assistant 工具批次中错误生成多个 `wait_agent`，插件会按最终 session entry 合并合法目标并只启动一个共享等待：包含获胜节点的调用返回真实结果，其他 sibling 返回 `batch_released` 以及 `released_by_agent_id` / `released_by_outcome`。共享 timeout 会同时结束全部 sibling，不会累计成多个完整等待窗口；该 outcome 只表示工具批次已解除，不表示目标节点发生生命周期变化。
 
 ### `interrupt_agent`
 
@@ -718,7 +720,7 @@ TUI warning 只显示逻辑来源、直属文件名和固定原因，不显示�
 
 ### `wait_agent` 超时
 
-`outcome: "timeout"` 不是错误，也不会停止子代理。可以查询 `get_agent_status` 或 `get_agent_tree`，然后继续等待、发送 steering、调用 `interrupt_agent`，或在确定不再需要时调用 `terminate_agent`。
+`outcome: "timeout"` 不是错误，也不会停止任何子代理；结果中的 `agent_ids` 是本次共享观察窗口的完整去重目标集合。可以查询 `get_agent_status` 或 `get_agent_tree`，然后继续用一次 `wait_agent` 等待全部相关目标、发送 steering、调用 `interrupt_agent`，或在确定不再需要时调用 `terminate_agent`。
 
 ### 节点停在 `interrupting`、`suspended`、`failed` 或 `terminating`
 

@@ -175,8 +175,8 @@ test("直接父子旅程闭合 spawn、prompt、steering、wait 和协作式 int
   assert.equal(invalidImages.ok, false);
   if (!invalidImages.ok) assert.equal(invalidImages.error.code, "invalid_argument");
 
-  const waitingOne = controller.waitAgent({ agent_id: agentId });
-  const waitingTwo = controller.waitAgent({ agent_id: agentId });
+  const waitingOne = controller.waitAgents({ agent_ids: [agentId] });
+  const waitingTwo = controller.waitAgents({ agent_ids: [agentId] });
   const interrupted = await controller.interruptAgent(agentId);
   assert.equal(interrupted.ok, true);
   if (interrupted.ok) {
@@ -233,7 +233,7 @@ test("自主 agent_start 后控制器保持 working，并按 steering、wait 和
   const activeStatus = controller.getAgentStatus(id);
   assert.equal(activeStatus.ok, true);
   if (activeStatus.ok) assert.equal(activeStatus.data.state, "working");
-  const waiting = controller.waitAgent({ agent_id: id });
+  const waiting = controller.waitAgents({ agent_ids: [id] });
   const steered = await controller.sendMessage({ agent_id: id, message: "继续整理孙代理结果" });
   assert.equal(steered.ok, true);
   assert.equal(node.operations().at(-1), "steer");
@@ -278,7 +278,7 @@ test("工作中 reply 通知立即唤醒 wait_agent 且不改变子代理生命�
   assert.equal(spawned.ok, true);
   if (!spawned.ok) return;
   assert.equal((await controller.sendMessage({ agent_id: id, message: "开始" })).ok, true);
-  const waiting = controller.waitAgent({ agent_id: id });
+  const waiting = controller.waitAgents({ agent_ids: [id] });
   assert.equal(controller.notifyAgentReply(id), true);
   const result = await waiting;
   assert.equal(result.ok, true);
@@ -290,13 +290,68 @@ test("工作中 reply 通知立即唤醒 wait_agent 且不改变子代理生命�
   assert.equal(status.ok && status.data.state, "working");
 
   assert.equal(controller.notifyAgentReply(id), true);
-  const queued = await controller.waitAgent({ agent_id: id });
+  const queued = await controller.waitAgents({ agent_ids: [id] });
   assert.equal(queued.ok, true);
   if (queued.ok) {
     assert.equal(queued.data.outcome, "reply");
     assert.equal(queued.data.state, "working");
   }
   node?.emitEvent({ type: "agent_settled" });
+  await controller.shutdown();
+});
+
+test("多目标 wait 由首个 reply 原子结算并从其余目标索引移除", async () => {
+  const ids = [
+    "46464646-4646-4464-8464-464646464646",
+    "47474747-4747-4474-8474-474747474747",
+  ];
+  let nextId = 0;
+  const tree = new TreeController({
+    config: { maxDepth: 2, maxChildrenPerAgent: 4, maxAgentsPerTree: 16, waitTimeoutMs: 60_000 },
+    idFactory: () => ids[nextId++] ?? ids[ids.length - 1]!,
+  });
+  const nodes = new Map<string, FakeManagedRpcNode>();
+  const controller = new AgentController({
+    tree,
+    allowUnvalidatedTemplates: true,
+    createSupervisor: ({ actor, reservation }) => {
+      const node = new FakeManagedRpcNode();
+      const id = ids[nodes.size]!;
+      nodes.set(id, node);
+      return new RpcSupervisor({
+        controller: tree,
+        actor,
+        reservation,
+        managedNode: node,
+        channel: new ReadyChannel(),
+        startupTimeoutMs: 100,
+        gracefulShutdownMs: 10,
+      });
+    },
+  });
+  for (const [index, id] of ids.entries()) {
+    const spawned = await controller.spawnAgent({ template_id: "researcher", name: `等待代理 ${index + 1}` });
+    assert.equal(spawned.ok, true);
+    assert.equal((await controller.sendMessage({ agent_id: id, message: "开始" })).ok, true);
+  }
+
+  const waiting = controller.waitAgents({ agent_ids: [ids[0]!, ids[0]!, ids[1]!] });
+  assert.equal(controller.notifyAgentReply(ids[1]), true);
+  const result = await waiting;
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.data.outcome, "reply");
+    assert.equal("agent_id" in result.data && result.data.agent_id, ids[1]);
+  }
+
+  assert.equal(controller.notifyAgentReply(ids[0]), true);
+  const next = await controller.waitAgents({ agent_ids: [ids[0]!] });
+  assert.equal(next.ok, true);
+  if (next.ok) {
+    assert.equal(next.data.outcome, "reply");
+    assert.equal("agent_id" in next.data && next.data.agent_id, ids[0]);
+  }
+  for (const node of nodes.values()) node.emitEvent({ type: "agent_settled" });
   await controller.shutdown();
 });
 
@@ -328,7 +383,7 @@ test("运行时故障先注入 terminal 通知再解除 wait_agent", async () =>
   const spawned = await controller.spawnAgent({ template_id: "researcher", name: "故障代理" });
   assert.equal(spawned.ok, true);
   assert.equal((await controller.sendMessage({ agent_id: id, message: "开始" })).ok, true);
-  const waiting = controller.waitAgent({ agent_id: id });
+  const waiting = controller.waitAgents({ agent_ids: [id] });
   node?.emitTransportFault("eof");
   const result = await waiting;
   order.push("wait");
@@ -409,7 +464,7 @@ test("terminal 通知注入失败时阻止 wait_agent 提前返回并在 API 恢
   assert.equal((await controller.sendMessage({ agent_id: id, message: "开始" })).ok, true);
 
   let resolved = false;
-  const waiting = controller.waitAgent({ agent_id: id }).then((result) => {
+  const waiting = controller.waitAgents({ agent_ids: [id] }).then((result) => {
     resolved = true;
     return result;
   });
@@ -493,8 +548,8 @@ test("等待参数越界和非直接子代理调用在启动 RPC 前稳定失败
       throw new Error("不应启动");
     },
   });
-  const invalidWait = await controller.waitAgent({
-    agent_id: "55555555-5555-4555-8555-555555555555",
+  const invalidWait = await controller.waitAgents({
+    agent_ids: ["55555555-5555-4555-8555-555555555555"],
     timeout_ms: 9_999,
   });
   assert.equal(invalidWait.ok, false);

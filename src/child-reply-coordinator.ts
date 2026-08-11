@@ -17,7 +17,6 @@ import { controlFailure, isCanonicalUuid, isCanonicalUuidV4, type ControlResult 
 
 export interface ReplyToParentInput {
   readonly message: string;
-  readonly requires_response: boolean;
 }
 
 export interface ReplyToParentData {
@@ -203,7 +202,6 @@ export class ChildReplyCoordinator {
       agent_id: this.agentId,
       task_id: taskId,
       turn_id: turnId,
-      requires_response: input.requires_response,
       text: input.message,
     });
     if (reply === undefined) return controlFailure("invalid_argument");
@@ -384,8 +382,7 @@ function isReplyToParentInput(value: unknown): value is ReplyToParentInput {
   return typeof candidate.message === "string"
     && candidate.message.trim().length > 0
     && utf8Length(candidate.message) <= CHILD_REPLY_ENVELOPE_LIMITS.maxStringBytes
-    && typeof candidate.requires_response === "boolean"
-    && Object.keys(candidate).every((key) => key === "message" || key === "requires_response");
+    && Object.keys(candidate).every((key) => key === "message");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

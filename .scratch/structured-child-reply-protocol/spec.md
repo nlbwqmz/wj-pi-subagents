@@ -3,6 +3,8 @@
 Status: implemented
 Implementation: complete
 
+> 当前契约已由 [ADR-0006](../../docs/adr/0006-multi-target-wait-batches.md) 升级：工作中 reply 删除 `requires_response` 并固定唤醒父代理，信封版本为 4，监督协议为 `pi-subagent/6`。下文保留为第 3 版协议的历史实现规格。
+
 ## Problem Statement
 
 父会话目前能够收到直接子代理的工作中回复和最终答复，但两类内容主要依赖 `kind`、自然语言正文和宿主侧展示元数据区分。父模型无法仅凭稳定的模型可见载荷可靠判断以下事实：这条内容属于哪一轮、子代理本轮如何结束、是否产生可用业务输出、回复是否需要父代理立即关注，以及节点故障是否来自子代理运行时还是一次模型处理结果。

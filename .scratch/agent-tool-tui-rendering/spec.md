@@ -2,6 +2,8 @@
 
 Status: ready-for-agent
 
+> 当前 `wait_agent` 已由 [ADR-0006](../../docs/adr/0006-multi-target-wait-batches.md) 改为 `agent_ids` 多目标调用，并新增 timeout 与 `batch_released` 的专用结果投影。下文单 `agent_id` 渲染要求保留为历史基线。
+
 ## Problem Statement
 
 交互式 Pi TUI 当前对本扩展的代理管理工具调用和结果使用了不适合人类阅读的原始 JSON。调用行会把参数对象直接序列化，结果行在没有自定义结果渲染器时又回退到工具返回文本，因此模板列表、代理快照、等待结果和树快照都难以扫描。

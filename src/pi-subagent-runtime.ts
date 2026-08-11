@@ -10,6 +10,7 @@ import {
 } from "./agent-supervisor-factory.ts";
 import {
   AGENT_TOOL_NAMES,
+  CHILD_REPLY_GUIDELINE,
   CHILD_REPLY_TOOL_NAME,
   PARENT_COORDINATION_GUIDELINES,
   registerAgentTools,
@@ -17,6 +18,7 @@ import {
   type AgentToolRegistrationApi,
 } from "./agent-tools.ts";
 import { ChildReplyCoordinator } from "./child-reply-coordinator.ts";
+import { ParentWaitBatchCoordinator } from "./parent-wait-batch-coordinator.ts";
 import type {
   AvailableHostCapabilities,
   ExtensionApiSurface,
@@ -241,7 +243,7 @@ const PARENT_COORDINATION_GUIDANCE = [
 
 const CHILD_FINAL_REPLY_GUIDANCE = [
   "子代理任务与最终答复要求：",
-  "- reply_to_parent 只用于工作中的进度、问题或阶段性发现；发送成功后继续当前逻辑任务。",
+  `- ${CHILD_REPLY_GUIDELINE}`,
   "- 压缩或自动续轮后继续同一逻辑任务，不重复已经完成的副作用。",
   "- 任务结束前必须输出一条非空且可用的最终 assistant 答复；运行时会以该文本准备 final。",
   "- 如果产物已经写入文件，仍要说明完成内容、关键结果和产物路径。",
@@ -653,6 +655,7 @@ export function createPiSubagentRuntimeActivator(
     registerParentReplyMessageRenderers(api, {
       resolveSenderName: (agentId) => readDirectChildDisplayName(active, agentId, false),
     });
+    const waitBatchCoordinator = new ParentWaitBatchCoordinator();
     registerAgentTools(api, async (toolContext) => {
       if (active !== undefined) active.bindings.context = readContext(toolContext);
       return active?.handoffPending === true
@@ -663,6 +666,7 @@ export function createPiSubagentRuntimeActivator(
       readWaitTimeoutMs: () => active?.handoffPending === true
         ? undefined
         : active?.rootRuntime.config.waitTimeoutMs,
+      waitBatchCoordinator,
     });
 
     if (bootstrapAtActivation.kind === "child") {
@@ -715,6 +719,10 @@ export function createPiSubagentRuntimeActivator(
       if (current.replyInbox.releaseTurnTriggers()) {
         return current.controller.retryPendingReplies();
       }
+    });
+
+    api.on("turn_end", () => {
+      waitBatchCoordinator.clear();
     });
 
     api.on("message_end", (event) => {
@@ -1132,6 +1140,7 @@ export function createPiSubagentRuntimeActivator(
     };
 
     const shutdownSession = async (event: unknown): Promise<void> => {
+      waitBatchCoordinator.clear();
       const current = active;
       if (current === undefined) {
         await reloadCoordinator.cleanupIncoming();

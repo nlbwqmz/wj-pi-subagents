@@ -32,7 +32,6 @@ function workingReply(text: string): ChildMessageEnvelope {
     agent_id: CHILD_ID,
     task_id: TASK_ID,
     turn_id: TURN_ID,
-    requires_response: false,
     text,
   };
 }

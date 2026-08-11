@@ -129,8 +129,8 @@ export class ParentReplyInbox {
   accept(agentId: string, reply: ManagedRpcReply): boolean {
     const envelope = parseChildReplyEnvelope(reply);
     if (envelope === undefined || envelope.agent_id !== agentId) return false;
-    const triggerTurn = envelope.kind === "final" || envelope.requires_response;
-    if (triggerTurn && this.turnTriggerState !== "open") return false;
+    const triggerTurn = true;
+    if (this.turnTriggerState !== "open") return false;
     const content = messageContent(envelope);
     const senderName = this.safeReadSenderName(agentId);
     try {
@@ -143,7 +143,7 @@ export class ParentReplyInbox {
           kind: envelope.kind,
           ...(envelope.kind === "final"
             ? { run_state: envelope.run_state, output_state: envelope.output_state }
-            : { requires_response: envelope.requires_response }),
+            : {}),
           ...(senderName === undefined ? {} : { sender_name: senderName }),
         },
       }, {
@@ -442,7 +442,7 @@ function parseVisibleEnvelope(text: string, kind: VisibleKind): VisibleEnvelope 
   if (envelope.kind === "message") {
     return Object.freeze({
       agentId: envelope.agent_id,
-      status: envelope.requires_response ? "response required" : "informational",
+      status: "working reply",
       payload: envelope.text,
     });
   }

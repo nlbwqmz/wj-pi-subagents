@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   AGENT_TOOL_NAMES,
+  CHILD_REPLY_GUIDELINE,
   CHILD_REPLY_TOOL_NAME,
   registerAgentTools,
   registerReplyToParentTool,
   SubagentToolError,
 } from "../src/agent-tools.ts";
 import { displayWidth } from "../src/agent-tree-ui.ts";
+import { ParentWaitBatchCoordinator } from "../src/parent-wait-batch-coordinator.ts";
 import { controlFailure } from "../src/tree-controller.ts";
 
 const RENDER_THEME = Object.freeze({
@@ -76,7 +78,7 @@ test("管理工具系统提示把重复调查与独立验证纳入任务所有�
     "收到 output_state: absent 的最终答复，或判断 present 正文仍不可用时，必须向同一 agent_id 尝试追问：只总结上一轮已完成工作并给出最终答复，不要重新执行任务；协议不自动重跑任务或切换模型。",
   ]);
   assert.deepEqual(readGuidelines("wait_agent"), [
-    "wait_agent 返回 outcome: reply 时，子代理仍在处理；task_completed、task_failed 或 task_interrupted 表示最近逻辑任务已提交；suspended 表示交付或维护恢复无法确认，应先查询状态再决定中断或终止；timeout 只结束本次等待，不改变生命周期，也不把任务交回直接父会话。",
+    "wait_agent 应在一次调用的 agent_ids 中传入所有待观察的直接子代理，并在任一目标产生结果时返回。outcome: reply 时获胜子代理仍在处理；task_completed、task_failed 或 task_interrupted 表示其最近逻辑任务已提交；suspended 表示需要查询状态并人工裁决；batch_released 表示同一 assistant 工具批次的另一个 wait_agent 已取得结果；timeout 只结束共享观察窗口，不改变任何节点生命周期，也不把任务交回直接父会话。",
     "收到 output_state: absent 的最终答复，或判断 present 正文仍不可用时，必须向同一 agent_id 尝试追问：只总结上一轮已完成工作并给出最终答复，不要重新执行任务；协议不自动重跑任务或切换模型。",
   ]);
   assert.deepEqual(readGuidelines("interrupt_agent"), [
@@ -199,21 +201,24 @@ test("消息、等待与父回复通过语义化渲染隐藏内部确认字段",
     { registerTool: (tool) => registrations.push(tool as Record<string, unknown>) },
     async () => ({
       sendMessage: async () => ({ ok: true, data: { message_id: "msg-secret", accepted: true } }),
-      waitAgent: async () => ({ ok: true, data: {
-        agent_id: agentId,
-        outcome,
-        state: ["task_completed", "task_failed", "task_interrupted"].includes(outcome)
-          ? "idle"
-          : outcome === "suspended"
-            ? "suspended"
-            : outcome === "terminal"
-              ? "failed"
-              : "working",
-        revision: 42,
-        ...(outcome === "terminal" ? {
-          error: { code: "internal_error", message: "控制器内部错误", retryable: false },
-        } : {}),
-      } }),
+      waitAgents: async () => ({ ok: true, data: outcome === "timeout"
+        ? { agent_ids: [agentId], outcome }
+        : {
+          agent_id: agentId,
+          outcome,
+          state: ["task_completed", "task_failed", "task_interrupted"].includes(outcome)
+            ? "idle"
+            : outcome === "suspended"
+              ? "suspended"
+              : outcome === "terminal"
+                ? "failed"
+                : "working",
+          revision: 42,
+          ...(outcome === "terminal" ? {
+            error: { code: "internal_error", message: "控制器内部错误", retryable: false },
+          } : {}),
+        },
+      }),
     } as never),
     {
       resolveAgentName: (candidate: string) => candidate === agentId ? "鉴权调查" : undefined,
@@ -233,7 +238,7 @@ test("消息、等待与父回复通过语义化渲染隐藏内部确认字段",
     ],
   );
   assert.deepEqual(
-    toolCallRenderer(registrations, "wait_agent")({ agent_id: agentId }, RENDER_THEME, {}).render(100),
+    toolCallRenderer(registrations, "wait_agent")({ agent_ids: [agentId] }, RENDER_THEME, {}).render(100),
     [`wait_agent · ${agentId} · timeout_ms 45000`],
   );
 
@@ -271,18 +276,20 @@ test("消息、等待与父回复通过语义化渲染隐藏内部确认字段",
     "terminal",
   ] as const) {
     outcome = expected;
-    const waitResult = await executeWait("wait", { agent_id: agentId }, undefined, undefined, {});
+    const waitResult = await executeWait("wait", { agent_ids: [agentId] }, undefined, undefined, {});
     const waitDisplay = toolResultRenderer(registrations, "wait_agent")(
       waitResult,
       { expanded: false },
       RENDER_THEME,
-      { args: { agent_id: agentId } },
+      { args: { agent_ids: [agentId] } },
     ).render(80).join("\n");
     assert.equal(
       waitDisplay,
       expected === "terminal"
         ? "鉴权调查 · terminal · internal_error"
-        : `鉴权调查 · ${expected}`,
+        : expected === "timeout"
+          ? "1 agents · timeout"
+          : `鉴权调查 · ${expected}`,
     );
     assert.doesNotMatch(waitDisplay, /revision|working|idle| · failed(?: ·|$)|42/);
   }
@@ -588,11 +595,21 @@ test("公开注册入口一次注册完整八工具集合并说明模板选择�
   assert.deepEqual(names, AGENT_TOOL_NAMES);
   assert.deepEqual(registrations.map((tool) => tool.name), [...AGENT_TOOL_NAMES]);
   for (const tool of registrations) {
-    assert.equal(tool.executionMode, "sequential");
+    assert.equal(tool.executionMode, tool.name === "wait_agent" ? "parallel" : "sequential");
     assert.equal(typeof tool.execute, "function");
     assert.equal(typeof tool.parameters, "object");
     assert.equal(typeof tool.renderCall, "function");
   }
+
+  const waitTool = registrations.find((tool) => tool.name === "wait_agent");
+  assert.ok(waitTool);
+  const waitParameters = waitTool.parameters as {
+    readonly required?: readonly string[];
+    readonly properties?: { readonly agent_ids?: { readonly minItems?: number; readonly maxItems?: number } };
+  };
+  assert.deepEqual(waitParameters.required, ["agent_ids"]);
+  assert.equal(waitParameters.properties?.agent_ids?.minItems, 1);
+  assert.equal(waitParameters.properties?.agent_ids?.maxItems, 64);
 
   const spawnTool = registrations.find((tool) => tool.name === "spawn_agent");
   assert.ok(spawnTool);
@@ -608,13 +625,322 @@ test("公开注册入口一次注册完整八工具集合并说明模板选择�
   assert.match(parameters.properties?.template_id?.description ?? "", /完全一致|精确/);
 });
 
+test("同一 assistant 批次的顺序 wait 合并目标并缓存首个结果", async () => {
+  const registrations: Array<Record<string, unknown>> = [];
+  const firstAgentId = "550e8400-e29b-41d4-a716-446655440000";
+  const secondAgentId = "650e8400-e29b-41d4-a716-446655440000";
+  const waitInputs: unknown[] = [];
+  let resolveWait!: (result: unknown) => void;
+  const waitResult = new Promise<unknown>((resolve) => { resolveWait = resolve; });
+  const controller = {
+    getAgentStatus: (agentId: string) => ({ ok: true, data: { agent_id: agentId } }),
+    getWaitTimeoutMs: () => 60_000,
+    waitAgents: async (input: unknown) => {
+      waitInputs.push(input);
+      return waitResult;
+    },
+  };
+  registerAgentTools(
+    { registerTool: (tool) => registrations.push(tool as Record<string, unknown>) },
+    async () => controller as never,
+  );
+  const waitTool = registrations.find((tool) => tool.name === "wait_agent");
+  assert.ok(waitTool);
+  const executeWait = waitTool.execute as (...args: unknown[]) => Promise<{ readonly details: unknown }>;
+  const context = {
+    sessionManager: {
+      getBranch: () => [{
+        type: "message",
+        id: "assistant-batch-sequential",
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "toolCall",
+              id: "wait-first",
+              name: "wait_agent",
+              arguments: { agent_ids: [firstAgentId], timeout_ms: 600_000 },
+            },
+            {
+              type: "toolCall",
+              id: "wait-second",
+              name: "wait_agent",
+              arguments: { agent_ids: [secondAgentId], timeout_ms: 10_000 },
+            },
+          ],
+        },
+      }],
+    },
+  };
+
+  const first = executeWait(
+    "wait-first",
+    { agent_ids: [firstAgentId], timeout_ms: 600_000 },
+    undefined,
+    undefined,
+    context,
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(waitInputs, [{
+    agent_ids: [firstAgentId, secondAgentId],
+    timeout_ms: 10_000,
+  }]);
+  resolveWait({
+    ok: true,
+    data: {
+      agent_id: firstAgentId,
+      outcome: "reply",
+      state: "working",
+      revision: 7,
+    },
+  });
+  assert.deepEqual((await first).details, {
+    agent_id: firstAgentId,
+    outcome: "reply",
+    state: "working",
+    revision: 7,
+  });
+
+  const second = await executeWait(
+    "wait-second",
+    { agent_ids: [secondAgentId], timeout_ms: 10_000 },
+    undefined,
+    undefined,
+    context,
+  );
+  assert.deepEqual(second.details, {
+    agent_ids: [secondAgentId],
+    outcome: "batch_released",
+    released_by_agent_id: firstAgentId,
+    released_by_outcome: "reply",
+  });
+  assert.equal(waitInputs.length, 1);
+});
+
+test("同一 assistant 批次的并行 wait 在共享 timeout 后全部立即结束", async () => {
+  const registrations: Array<Record<string, unknown>> = [];
+  const firstAgentId = "750e8400-e29b-41d4-a716-446655440000";
+  const secondAgentId = "850e8400-e29b-41d4-a716-446655440000";
+  let waitCalls = 0;
+  const controller = {
+    getAgentStatus: (agentId: string) => ({ ok: true, data: { agent_id: agentId } }),
+    getWaitTimeoutMs: () => 60_000,
+    waitAgents: async (input: { readonly agent_ids: readonly string[] }) => {
+      waitCalls += 1;
+      return { ok: true, data: { agent_ids: input.agent_ids, outcome: "timeout" } };
+    },
+  };
+  registerAgentTools(
+    { registerTool: (tool) => registrations.push(tool as Record<string, unknown>) },
+    async () => controller as never,
+  );
+  const waitTool = registrations.find((tool) => tool.name === "wait_agent");
+  assert.ok(waitTool);
+  const executeWait = waitTool.execute as (...args: unknown[]) => Promise<{ readonly details: unknown }>;
+  const context = {
+    sessionManager: {
+      getBranch: () => [{
+        type: "message",
+        id: "assistant-batch-parallel",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "toolCall", id: "parallel-first", name: "wait_agent", arguments: { agent_ids: [firstAgentId] } },
+            { type: "toolCall", id: "parallel-second", name: "wait_agent", arguments: { agent_ids: [secondAgentId] } },
+          ],
+        },
+      }],
+    },
+  };
+
+  const [first, second] = await Promise.all([
+    executeWait("parallel-first", { agent_ids: [firstAgentId] }, undefined, undefined, context),
+    executeWait("parallel-second", { agent_ids: [secondAgentId] }, undefined, undefined, context),
+  ]);
+  const expected = {
+    agent_ids: [firstAgentId, secondAgentId],
+    outcome: "timeout",
+  };
+  assert.deepEqual(first.details, expected);
+  assert.deepEqual(second.details, expected);
+  assert.equal(waitCalls, 1);
+});
+
+test("同批次非法 sibling 独立失败且不污染合法联合目标", async () => {
+  const registrations: Array<Record<string, unknown>> = [];
+  const validAgentId = "950e8400-e29b-41d4-a716-446655440000";
+  const invalidAgentId = "a50e8400-e29b-41d4-a716-446655440000";
+  const waitInputs: unknown[] = [];
+  const controller = {
+    getAgentStatus: (agentId: string) => agentId === validAgentId
+      ? { ok: true, data: { agent_id: agentId } }
+      : controlFailure("agent_not_found"),
+    getWaitTimeoutMs: () => 60_000,
+    waitAgents: async (input: unknown) => {
+      waitInputs.push(input);
+      return {
+        ok: true,
+        data: {
+          agent_id: validAgentId,
+          outcome: "reply",
+          state: "working",
+          revision: 3,
+        },
+      };
+    },
+  };
+  registerAgentTools(
+    { registerTool: (tool) => registrations.push(tool as Record<string, unknown>) },
+    async () => controller as never,
+  );
+  const waitTool = registrations.find((tool) => tool.name === "wait_agent");
+  assert.ok(waitTool);
+  const executeWait = waitTool.execute as (...args: unknown[]) => Promise<{ readonly details: unknown }>;
+  const context = {
+    sessionManager: {
+      getBranch: () => [{
+        type: "message",
+        id: "assistant-batch-invalid-sibling",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "toolCall", id: "valid-wait", name: "wait_agent", arguments: { agent_ids: [validAgentId] } },
+            { type: "toolCall", id: "invalid-wait", name: "wait_agent", arguments: { agent_ids: [invalidAgentId] } },
+          ],
+        },
+      }],
+    },
+  };
+
+  await assert.rejects(
+    executeWait("invalid-wait", { agent_ids: [invalidAgentId] }, undefined, undefined, context),
+    (error: unknown) => error instanceof SubagentToolError && error.code === "agent_not_found",
+  );
+  const valid = await executeWait(
+    "valid-wait",
+    { agent_ids: [validAgentId] },
+    undefined,
+    undefined,
+    context,
+  );
+  assert.deepEqual(valid.details, {
+    agent_id: validAgentId,
+    outcome: "reply",
+    state: "working",
+    revision: 3,
+  });
+  assert.deepEqual(waitInputs, [{ agent_ids: [validAgentId], timeout_ms: 60_000 }]);
+});
+
+test("持久化参数与实际执行参数不一致时只启动当前独立等待", async () => {
+  const firstAgentId = "b50e8400-e29b-41d4-a716-446655440000";
+  const secondAgentId = "c50e8400-e29b-41d4-a716-446655440000";
+  const waitInputs: unknown[] = [];
+  const controller = {
+    getAgentStatus: (agentId: string) => ({ ok: true, data: { agent_id: agentId } }),
+    getWaitTimeoutMs: () => 60_000,
+    waitAgents: async (input: unknown) => {
+      waitInputs.push(input);
+      return {
+        ok: true,
+        data: {
+          agent_id: secondAgentId,
+          outcome: "reply",
+          state: "working",
+          revision: 4,
+        },
+      };
+    },
+  };
+  const coordinator = new ParentWaitBatchCoordinator();
+  const context = {
+    sessionManager: {
+      getBranch: () => [{
+        type: "message",
+        id: "assistant-batch-mismatch",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "toolCall", id: "mismatch", name: "wait_agent", arguments: { agent_ids: [firstAgentId] } },
+            { type: "toolCall", id: "sibling", name: "wait_agent", arguments: { agent_ids: [secondAgentId] } },
+          ],
+        },
+      }],
+    },
+  };
+
+  const result = await coordinator.wait(
+    controller as never,
+    "mismatch",
+    { agent_ids: [secondAgentId] },
+    undefined,
+    context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(waitInputs, [{ agent_ids: [secondAgentId] }]);
+});
+
+test("清理 assistant 等待批次会 abort 共享控制器 waiter", async () => {
+  const firstAgentId = "d50e8400-e29b-41d4-a716-446655440000";
+  const secondAgentId = "e50e8400-e29b-41d4-a716-446655440000";
+  let sharedSignal: AbortSignal | undefined;
+  const controller = {
+    getAgentStatus: (agentId: string) => ({ ok: true, data: { agent_id: agentId } }),
+    getWaitTimeoutMs: () => 60_000,
+    waitAgents: async (_input: unknown, signal: AbortSignal | undefined) => {
+      sharedSignal = signal;
+      return new Promise<ReturnType<typeof controlFailure>>((resolve) => {
+        if (signal?.aborted === true) {
+          resolve(controlFailure("agent_unavailable"));
+          return;
+        }
+        signal?.addEventListener("abort", () => resolve(controlFailure("agent_unavailable")), { once: true });
+      });
+    },
+  };
+  const coordinator = new ParentWaitBatchCoordinator();
+  const context = {
+    sessionManager: {
+      getBranch: () => [{
+        type: "message",
+        id: "assistant-batch-clear",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "toolCall", id: "clear-first", name: "wait_agent", arguments: { agent_ids: [firstAgentId] } },
+            { type: "toolCall", id: "clear-second", name: "wait_agent", arguments: { agent_ids: [secondAgentId] } },
+          ],
+        },
+      }],
+    },
+  };
+
+  const waiting = coordinator.wait(
+    controller as never,
+    "clear-first",
+    { agent_ids: [firstAgentId] },
+    undefined,
+    context,
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(sharedSignal?.aborted, false);
+
+  coordinator.clear();
+
+  const result = await waiting;
+  assert.equal(sharedSignal?.aborted, true);
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error.code, "agent_unavailable");
+});
+
 test("代理工具调用行显示入参并安全折叠长消息", () => {
   const registrations: Array<Record<string, unknown>> = [];
   registerAgentTools({ registerTool: (tool) => registrations.push(tool as Record<string, unknown>) }, async () => ({} as never));
   const agentId = "550e8400-e29b-41d4-a716-446655440000";
 
   const waitLines = toolCallRenderer(registrations, "wait_agent")(
-    { agent_id: agentId, timeout_ms: 600_000 },
+    { agent_ids: [agentId], timeout_ms: 600_000 },
     RENDER_THEME,
     {},
   ).render(80);
@@ -676,7 +1002,6 @@ test("reply_to_parent 只展示文本且 schema 不暴露图片字段", () => {
   const lines = toolCallRenderer(registrations, CHILD_REPLY_TOOL_NAME)(
     {
       message: "正在检查调用参数展示",
-      requires_response: false,
       images: [{ type: "image", data: "DO_NOT_RENDER_REPLY_IMAGE", mimeType: "image/png" }],
     },
     RENDER_THEME,
@@ -691,8 +1016,12 @@ test("reply_to_parent 只展示文本且 schema 不暴露图片字段", () => {
     readonly required?: readonly string[];
     readonly properties?: Readonly<Record<string, unknown>>;
   } | undefined;
-  assert.deepEqual(parameters?.required, ["message", "requires_response"]);
-  assert.deepEqual(Object.keys(parameters?.properties ?? {}), ["message", "requires_response"]);
+  assert.deepEqual(parameters?.required, ["message"]);
+  assert.deepEqual(Object.keys(parameters?.properties ?? {}), ["message"]);
+  assert.deepEqual(registration?.promptGuidelines, [CHILD_REPLY_GUIDELINE]);
+  assert.match(String(registration?.description ?? ""), /必须由直接父代理处理或裁决的阻塞问题/);
+  assert.match(String(registration?.description ?? ""), /不得用于常规进度、心跳、阶段性总结、完成通知/);
+  assert.doesNotMatch(JSON.stringify(registration?.parameters), /requires_response/);
   assert.match(String(registration?.description ?? ""), /不支持 images/);
 });
 

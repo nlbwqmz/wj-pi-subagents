@@ -13,6 +13,7 @@ import {
 } from "../src/child-reply-envelope.ts";
 import {
   AGENT_TOOL_NAMES,
+  CHILD_REPLY_GUIDELINE,
   CHILD_REPLY_TOOL_NAME,
   PARENT_COORDINATION_GUIDELINES,
   SubagentToolError,
@@ -848,7 +849,7 @@ test("生产运行时闭合直接父子的创建、消息、回复、等待、�
   assert.match(finalDisplay, /Payload[^\r\n]*\r?\n[^\r\n]*直接回复/);
   assert.doesNotMatch(finalDisplay, /图片|aGVsbG8=/);
 
-  const waited = await execute(api, "wait_agent", { agent_id: AGENT_ID }, context) as {
+  const waited = await execute(api, "wait_agent", { agent_ids: [AGENT_ID] }, context) as {
     details?: Record<string, unknown>;
   };
   assert.equal(waited.details?.outcome, "task_completed");
@@ -1148,7 +1149,7 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   ].join("\n");
   const childFinalReplyGuidance = [
     "子代理任务与最终答复要求：",
-    "- reply_to_parent 只用于工作中的进度、问题或阶段性发现；发送成功后继续当前逻辑任务。",
+    `- ${CHILD_REPLY_GUIDELINE}`,
     "- 压缩或自动续轮后继续同一逻辑任务，不重复已经完成的副作用。",
     "- 任务结束前必须输出一条非空且可用的最终 assistant 答复；运行时会以该文本准备 final。",
     "- 如果产物已经写入文件，仍要说明完成内容、关键结果和产物路径。",
@@ -1248,7 +1249,6 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
 
   const progressReply = await execute(childApi, CHILD_REPLY_TOOL_NAME, {
     message: "正在继续工作",
-    requires_response: false,
   }, childContext) as { details?: Record<string, unknown> };
   assert.equal(progressReply.details?.accepted, true);
   assert.equal(rootApi.sentMessages.length, 1);
@@ -1257,15 +1257,13 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   if (progressEnvelope.kind === "message") {
     assert.equal(progressEnvelope.agent_id, parentId);
     assert.equal(progressEnvelope.text, "正在继续工作");
-    assert.equal(progressEnvelope.requires_response, false);
   }
   assert.deepEqual((rootApi.sentMessages[0]!.message as { details: unknown }).details, {
     agent_id: parentId,
     kind: "message",
-    requires_response: false,
     sender_name: "递归父代理",
   });
-  assert.deepEqual(rootApi.sentMessages[0]!.options, { triggerTurn: false, deliverAs: "steer" });
+  assert.deepEqual(rootApi.sentMessages[0]!.options, { triggerTurn: true, deliverAs: "steer" });
 
   const progressRenderer = rootApi.messageRenderers.get("pi-subagent-message");
   assert.ok(progressRenderer);
@@ -1466,14 +1464,14 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   if (parentStatus.ok) assert.equal(parentStatus.data.state, "working");
 
   const queuedProgress = await execute(rootApi, "wait_agent", {
-    agent_id: parentId,
+    agent_ids: [parentId],
     timeout_ms: 10_000,
   }, rootContext) as { details?: Record<string, unknown> };
   assert.equal(queuedProgress.details?.outcome, "reply");
 
   let waitFinished = false;
   const waitingForNewTurn = execute(rootApi, "wait_agent", {
-    agent_id: parentId,
+    agent_ids: [parentId],
     timeout_ms: 10_000,
   }, rootContext).then((result) => {
     waitFinished = true;

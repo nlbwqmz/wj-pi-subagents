@@ -32,6 +32,7 @@ import {
 export const WAIT_AGENT_MIN_TIMEOUT_MS = 10_000;
 export const WAIT_AGENT_MAX_TIMEOUT_MS = 600_000;
 export const WAIT_AGENT_DEFAULT_TIMEOUT_MS = 60_000;
+export const WAIT_AGENT_MAX_TARGETS = 64;
 
 export interface SpawnAgentInput {
   readonly template_id: string;
@@ -44,7 +45,7 @@ export interface SendMessageInput {
 }
 
 export interface WaitAgentInput {
-  readonly agent_id: string;
+  readonly agent_ids: readonly string[];
   readonly timeout_ms?: number;
 }
 
@@ -111,29 +112,38 @@ interface ManagedAgentEntry {
 }
 
 interface PendingWaiter {
+  readonly agentIds: readonly string[];
   readonly resolve: (result: WaitAgentResult) => void;
   readonly timer: ReturnType<typeof setTimeout>;
+  readonly signal?: AbortSignal;
+  readonly abortListener?: () => void;
 }
 
-export type WaitAgentOutcome =
+export type WaitAgentEventOutcome =
   | "reply"
   | "task_completed"
   | "task_failed"
   | "task_interrupted"
   | "suspended"
-  | "timeout"
   | "terminal";
+
+export type WaitAgentOutcome = WaitAgentEventOutcome | "timeout";
 
 export interface WaitAgentData {
   readonly agent_id: string;
-  readonly outcome: WaitAgentOutcome;
+  readonly outcome: WaitAgentEventOutcome;
   readonly state: AgentSnapshot["state"];
   readonly revision: number;
   readonly error?: AgentSnapshot["error"];
   readonly last_task?: AgentSnapshot["last_task"];
 }
 
-export type WaitAgentResult = ControlResult<WaitAgentData>;
+export interface WaitAgentTimeoutData {
+  readonly agent_ids: readonly string[];
+  readonly outcome: "timeout";
+}
+
+export type WaitAgentResult = ControlResult<WaitAgentData | WaitAgentTimeoutData>;
 
 export interface InterruptAgentData {
   readonly agent_id: string;
@@ -185,6 +195,7 @@ export class AgentController {
   /** start 抛出前无法取得公开身份的节点仍需保留内部回收能力。 */
   private readonly unassignedSupervisors = new Map<AgentSupervisor, () => void>();
   private readonly waiters = new Map<string, Set<PendingWaiter>>();
+  private readonly pendingWaiters = new Set<PendingWaiter>();
   private readonly pendingReplyNotifications = new Map<string, number>();
   private readonly terminalNotifications = new Set<string>();
   private readonly pendingTerminalNotifications = new Set<string>();
@@ -358,41 +369,56 @@ export class AgentController {
     });
   }
 
-  async waitAgent(input: WaitAgentInput | unknown): Promise<WaitAgentResult> {
-    if (!isWaitInput(input)) return controlFailure("invalid_argument");
-    const target = await this.admittedDirectChild(input.agent_id, "wait_agent");
-    if (!target.ok) return target;
-    const timeout = input.timeout_ms ?? this.waitTimeoutMs;
-    const pendingReply = this.takeReplyNotification(input.agent_id, target.data);
-    if (pendingReply !== undefined) return Object.freeze({ ok: true, data: pendingReply });
-    const immediate = this.waitOutcome(input.agent_id, target.data);
-    if (immediate !== undefined) return Object.freeze({ ok: true, data: immediate });
+  async waitAgents(input: WaitAgentInput | unknown, signal?: AbortSignal): Promise<WaitAgentResult> {
+    const parsed = normalizeWaitAgentInput(input);
+    if (parsed === undefined) return controlFailure("invalid_argument");
+    for (const agentId of parsed.agent_ids) {
+      const target = await this.admittedDirectChild(agentId, "wait_agent");
+      if (!target.ok) return target;
+    }
+    if (signal?.aborted === true) return controlFailure("agent_unavailable");
+
+    const immediate = this.readyWaitResult(parsed.agent_ids);
+    if (immediate !== undefined) return immediate;
+    const timeout = parsed.timeout_ms ?? this.waitTimeoutMs;
 
     return new Promise<WaitAgentResult>((resolve) => {
+      let waiter!: PendingWaiter;
       const timer = setTimeout(() => {
-        const set = this.waiters.get(input.agent_id);
-        if (set !== undefined) {
-          for (const waiter of set) {
-            if (waiter.resolve === resolve) set.delete(waiter);
-          }
-          if (set.size === 0) this.waiters.delete(input.agent_id);
-        }
-        const latest = this.tree.getStatus(input.agent_id);
-        if (!latest.ok) resolve(latest);
-        else resolve(Object.freeze({ ok: true, data: makeWaitData(latest.data, "timeout") }));
+        this.finishWaiter(waiter, Object.freeze({
+          ok: true,
+          data: makeWaitTimeoutData(parsed.agent_ids),
+        }));
       }, timeout);
-      const waiter: PendingWaiter = { resolve, timer };
-      const set = this.waiters.get(input.agent_id) ?? new Set<PendingWaiter>();
-      set.add(waiter);
-      this.waiters.set(input.agent_id, set);
-      // 原子检查、登记、再次检查，避免事件恰好落在登记边界丢失。
-      const latest = this.tree.getStatus(input.agent_id);
-      if (latest.ok) {
-        const outcome = this.takeReplyNotification(input.agent_id, latest.data)
-          ?? this.waitOutcome(input.agent_id, latest.data);
-        if (outcome !== undefined) this.finishWaiter(input.agent_id, waiter, Object.freeze({ ok: true, data: outcome }));
+      const abortListener = signal === undefined
+        ? undefined
+        : () => this.finishWaiter(waiter, controlFailure("agent_unavailable"));
+      waiter = {
+        agentIds: parsed.agent_ids,
+        resolve,
+        timer,
+        ...(signal === undefined ? {} : { signal }),
+        ...(abortListener === undefined ? {} : { abortListener }),
+      };
+      this.pendingWaiters.add(waiter);
+      for (const agentId of parsed.agent_ids) {
+        const set = this.waiters.get(agentId) ?? new Set<PendingWaiter>();
+        set.add(waiter);
+        this.waiters.set(agentId, set);
       }
+      if (signal !== undefined && abortListener !== undefined) {
+        signal.addEventListener("abort", abortListener, { once: true });
+      }
+      // 原子检查、登记、再次检查，避免事件恰好落在登记边界丢失。
+      const ready = signal?.aborted === true
+        ? controlFailure("agent_unavailable")
+        : this.readyWaitResult(parsed.agent_ids);
+      if (ready !== undefined) this.finishWaiter(waiter, ready);
     });
+  }
+
+  getWaitTimeoutMs(): number {
+    return this.waitTimeoutMs;
   }
 
   /** 父端 reply inbox 在工作中消息被 Pi 会话接纳后调用。 */
@@ -405,7 +431,7 @@ export class AgentController {
     const set = this.waiters.get(agentId);
     if (set !== undefined && set.size > 0) {
       const result = Object.freeze({ ok: true as const, data: makeWaitData(status.data, "reply") });
-      for (const waiter of [...set]) this.finishWaiter(agentId, waiter, result);
+      for (const waiter of [...set]) this.finishWaiter(waiter, result);
       return true;
     }
     const pending = this.pendingReplyNotifications.get(agentId) ?? 0;
@@ -689,12 +715,11 @@ export class AgentController {
     this.disposed = true;
     this.unsubscribeTreeChange?.();
     this.unsubscribeTreeChange = undefined;
-    for (const [agentId, set] of this.waiters) {
-      for (const waiter of [...set]) {
-        this.finishWaiter(agentId, waiter, controlFailure("agent_unavailable"));
-      }
+    for (const waiter of [...this.pendingWaiters]) {
+      this.finishWaiter(waiter, controlFailure("agent_unavailable"));
     }
     this.waiters.clear();
+    this.pendingWaiters.clear();
     this.pendingReplyNotifications.clear();
     this.terminalNotifications.clear();
     this.pendingTerminalNotifications.clear();
@@ -907,20 +932,48 @@ export class AgentController {
     if (set === undefined) return;
     const status = this.tree.getStatus(agentId);
     if (!status.ok) {
-      for (const waiter of [...set]) this.finishWaiter(agentId, waiter, status);
+      for (const waiter of [...set]) this.finishWaiter(waiter, status);
       return;
     }
     const outcome = this.waitOutcome(agentId, status.data);
     if (outcome === undefined) return;
-    for (const waiter of [...set]) this.finishWaiter(agentId, waiter, Object.freeze({ ok: true, data: outcome }));
+    for (const waiter of [...set]) this.finishWaiter(waiter, Object.freeze({ ok: true, data: outcome }));
   }
 
-  private finishWaiter(agentId: string, waiter: PendingWaiter, result: WaitAgentResult): void {
-    const set = this.waiters.get(agentId);
-    if (set === undefined || !set.delete(waiter)) return;
+  private finishWaiter(waiter: PendingWaiter, result: WaitAgentResult): void {
+    if (!this.pendingWaiters.delete(waiter)) return;
     clearTimeout(waiter.timer);
-    if (set.size === 0) this.waiters.delete(agentId);
+    if (waiter.signal !== undefined && waiter.abortListener !== undefined) {
+      waiter.signal.removeEventListener("abort", waiter.abortListener);
+    }
+    for (const agentId of waiter.agentIds) {
+      const set = this.waiters.get(agentId);
+      if (set === undefined) continue;
+      set.delete(waiter);
+      if (set.size === 0) this.waiters.delete(agentId);
+    }
     waiter.resolve(result);
+  }
+
+  private readyWaitResult(agentIds: readonly string[]): WaitAgentResult | undefined {
+    const statuses = new Map<string, AgentSnapshot>();
+    for (const agentId of agentIds) {
+      const status = this.tree.getStatus(agentId);
+      if (!status.ok) return status;
+      statuses.set(agentId, status.data);
+    }
+    for (const agentId of agentIds) {
+      const status = statuses.get(agentId)!;
+      const pendingReply = this.takeReplyNotification(agentId, status);
+      if (pendingReply !== undefined) {
+        return Object.freeze({ ok: true, data: pendingReply });
+      }
+    }
+    for (const agentId of agentIds) {
+      const outcome = this.waitOutcome(agentId, statuses.get(agentId)!);
+      if (outcome !== undefined) return Object.freeze({ ok: true, data: outcome });
+    }
+    return undefined;
   }
 
   private waitOutcome(agentId: string, status: AgentSnapshot): WaitAgentData | undefined {
@@ -968,19 +1021,25 @@ function isSendMessageInput(value: unknown): value is SendMessageInput {
     && Object.keys(candidate).every((key) => key === "agent_id" || key === "message");
 }
 
-function isWaitInput(value: unknown): value is WaitAgentInput {
-  if (typeof value !== "object" || value === null) return false;
+export function normalizeWaitAgentInput(value: unknown): WaitAgentInput | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   const candidate = value as Record<string, unknown>;
-  if (!isCanonicalUuid(candidate.agent_id)) return false;
-  if (candidate.timeout_ms !== undefined && !validWaitTimeout(candidate.timeout_ms as number)) return false;
-  return Object.keys(candidate).every((key) => key === "agent_id" || key === "timeout_ms");
+  if (!Array.isArray(candidate.agent_ids)) return undefined;
+  if (candidate.agent_ids.length < 1 || candidate.agent_ids.length > WAIT_AGENT_MAX_TARGETS) return undefined;
+  if (!candidate.agent_ids.every(isCanonicalUuid)) return undefined;
+  if (candidate.timeout_ms !== undefined && !validWaitTimeout(candidate.timeout_ms as number)) return undefined;
+  if (!Object.keys(candidate).every((key) => key === "agent_ids" || key === "timeout_ms")) return undefined;
+  return Object.freeze({
+    agent_ids: Object.freeze([...new Set(candidate.agent_ids as string[])]),
+    ...(candidate.timeout_ms === undefined ? {} : { timeout_ms: candidate.timeout_ms as number }),
+  });
 }
 
 function validWaitTimeout(value: number): boolean {
   return Number.isSafeInteger(value) && value >= WAIT_AGENT_MIN_TIMEOUT_MS && value <= WAIT_AGENT_MAX_TIMEOUT_MS;
 }
 
-function makeWaitData(status: AgentSnapshot, outcome: WaitAgentOutcome): WaitAgentData {
+function makeWaitData(status: AgentSnapshot, outcome: WaitAgentEventOutcome): WaitAgentData {
   return Object.freeze({
     agent_id: status.agent_id,
     outcome,
@@ -988,6 +1047,13 @@ function makeWaitData(status: AgentSnapshot, outcome: WaitAgentOutcome): WaitAge
     revision: status.revision,
     ...(status.error === undefined ? {} : { error: status.error }),
     ...(status.last_task === undefined ? {} : { last_task: status.last_task }),
+  });
+}
+
+function makeWaitTimeoutData(agentIds: readonly string[]): WaitAgentTimeoutData {
+  return Object.freeze({
+    agent_ids: Object.freeze([...agentIds]),
+    outcome: "timeout",
   });
 }
 

@@ -2,6 +2,8 @@
 
 Status: accepted
 
+> 当前运行时的多目标等待、工作中 message 固定唤醒、reply envelope 第 4 版和 `pi-subagent/6` 迁移由 [ADR-0006](./0006-multi-target-wait-batches.md) 覆盖。下文关于 `requires_response` 和旧协议版本的内容只记录历史决策，不再是当前契约。
+
 > 图片载荷决策已由 [ADR-0004](./0004-text-only-subagent-messaging.md) 覆盖；任务身份、生命周期与当前协议版本已由 [ADR-0005](./0005-task-mailbox-and-delayed-final-commit.md) 覆盖。本文其余结构化回复和唤醒语义继续有效。
 
 父子监督协议升级为 `pi-subagent/3`。reply 帧只传输单调 `reply_seq` 和一个经过统一 codec 校验的 `pi-subagent.reply` envelope；v2 顶层 `kind`、`text` 和 `images` 不再兼容，协议主版本不同的活动树必须结束并重建，不能通过 reload 热接管。模型可见父会话消息直接包含普通 JSON envelope，TUI 只展示其发送者、类型、状态、自然语言正文和图片摘要，不显示原始协议字段。

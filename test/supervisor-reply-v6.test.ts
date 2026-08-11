@@ -26,7 +26,6 @@ function envelope(text = "进度"): ChildMessageEnvelope {
     agent_id: CHILD_ID,
     task_id: TASK_ID,
     turn_id: TURN_ID,
-    requires_response: false,
     text,
   };
 }
@@ -67,19 +66,19 @@ function receiveAndAck(
   return result;
 }
 
-test("v5 reply wire payload contains only reply_seq and envelope", () => {
+test("v6 reply wire payload contains only reply_seq and envelope", () => {
   const pair = readyPair();
   const value = envelope();
   const frame = pair.child.publishReply(value);
-  assert.equal(frame.protocol, "pi-subagent/5");
+  assert.equal(frame.protocol, "pi-subagent/6");
   assert.deepEqual(frame.payload, { reply_seq: 1, envelope: value });
 });
 
-test("v5 rejects v4 frames and reply envelopes with a forged agent identity", () => {
+test("v6 rejects v5 frames and reply envelopes with a forged agent identity", () => {
   const legacyPair = readyPair();
   const valid = legacyPair.child.publishReply(envelope());
-  const v4 = { ...valid, protocol: "pi-subagent/4" } as unknown as SupervisorFrame;
-  assert.deepEqual(legacyPair.parent.receive(v4), {
+  const v5 = { ...valid, protocol: "pi-subagent/5" } as unknown as SupervisorFrame;
+  assert.deepEqual(legacyPair.parent.receive(v5), {
     kind: "protocol_fault",
     error: "protocol_mismatch",
   });

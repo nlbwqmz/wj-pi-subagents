@@ -405,11 +405,11 @@ test("扩展 factory 探针期间保持 reload lease，成功时交接、失败�
   let cleanupCalls = 0;
   const common = {
     timeoutMs: 20,
-    activationIdentity: { isChild: false, protocolVersion: "pi-subagent/5" } as const,
+    activationIdentity: { isChild: false, protocolVersion: "pi-subagent/6" } as const,
     isTransfer: (value: unknown): value is Transfer =>
       typeof value === "object" && value !== null && "runtime" in value,
-    identityOfRuntime: () => ({ isChild: false, protocolVersion: "pi-subagent/5" } as const),
-    identityOfTransfer: () => ({ isChild: false, protocolVersion: "pi-subagent/5" } as const),
+    identityOfRuntime: () => ({ isChild: false, protocolVersion: "pi-subagent/6" } as const),
+    identityOfTransfer: () => ({ isChild: false, protocolVersion: "pi-subagent/6" } as const),
     createTransfer: (current: Runtime): Transfer => ({ runtime: current }),
     restoreTransfer: (transfer: Transfer): Runtime => transfer.runtime,
     setHandoffPending: (current: Runtime, pending: boolean) => {

@@ -231,10 +231,15 @@ export function renderAgentToolCall(
     return createMessageCallComponent(name, input, theme, context, expanded);
   }
   if (name === "wait_agent") {
-    const agentId = readString(input, "agent_id");
+    const agentIds = readStringArray(input, "agent_ids");
+    const target = agentIds === undefined
+      ? "…"
+      : agentIds.length === 1
+        ? agentIds[0]!
+        : `${agentIds.length} agents`;
     const timeout = readWaitTimeout(input, lookups);
     return createSafeTextComponent([
-      title(`${name} · ${agentId} · timeout_ms ${timeout}`),
+      title(`${name} · ${target} · timeout_ms ${timeout}`),
     ], theme, context);
   }
   if (name === "interrupt_agent" || name === "terminate_agent" || name === "get_agent_status") {
@@ -394,8 +399,41 @@ function renderWaitResult(
   lookups: AgentToolRenderLookups,
 ): AgentToolRenderComponent {
   const details = readRecord(readProperty(result, "details"));
-  const agentId = readOptionalString(details, "agent_id");
   const outcome = readOptionalString(details, "outcome");
+  if (outcome === "timeout") {
+    const agentIds = readStringArray(details, "agent_ids");
+    if (agentIds === undefined || agentIds.length === 0) return invalidResult(theme, context);
+    return createSafeTextComponent([{
+      text: `${agentIds.length} agents · timeout`,
+      color: "warning",
+    }], theme, context);
+  }
+  if (outcome === "batch_released") {
+    const agentIds = readStringArray(details, "agent_ids");
+    const releasedByAgentId = readOptionalString(details, "released_by_agent_id");
+    const releasedByOutcome = readOptionalString(details, "released_by_outcome");
+    if (
+      agentIds === undefined
+      || agentIds.length === 0
+      || releasedByAgentId === undefined
+      || releasedByOutcome === undefined
+      || ![
+        "reply",
+        "task_completed",
+        "task_failed",
+        "task_interrupted",
+        "suspended",
+        "terminal",
+      ].includes(releasedByOutcome)
+    ) return invalidResult(theme, context);
+    const releasedBy = resolveName(releasedByAgentId, lookups) ?? releasedByAgentId;
+    return createSafeTextComponent([{
+      text: `batch_released · ${releasedBy} · ${releasedByOutcome}`,
+      color: "success",
+    }], theme, context);
+  }
+
+  const agentId = readOptionalString(details, "agent_id");
   const state = readOptionalString(details, "state");
   const revision = readOptionalSafeInteger(details, "revision");
   if (
@@ -407,7 +445,6 @@ function renderWaitResult(
       "task_failed",
       "task_interrupted",
       "suspended",
-      "timeout",
       "terminal",
     ].includes(outcome)
     || state === undefined
@@ -809,6 +846,17 @@ function readOptionalString(record: Record<string, unknown> | undefined, key: st
   try {
     const value = record?.[key];
     return typeof value === "string" ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readStringArray(record: Record<string, unknown> | undefined, key: string): readonly string[] | undefined {
+  try {
+    const value = record?.[key];
+    return Array.isArray(value) && value.every((item) => typeof item === "string")
+      ? value as string[]
+      : undefined;
   } catch {
     return undefined;
   }

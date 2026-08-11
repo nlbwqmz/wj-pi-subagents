@@ -172,7 +172,7 @@ export function isRfc3339Millis(value: unknown): value is string {
   return typeof value === "string" && RFC3339_MILLIS_PATTERN.test(value);
 }
 
-/** 从不可信边界逐字段重建 v5 安全快照。 */
+/** 从不可信边界逐字段重建 v6 安全快照。 */
 export function parseAgentSnapshot(
   value: unknown,
   options: AgentSnapshotCodecOptions = {},

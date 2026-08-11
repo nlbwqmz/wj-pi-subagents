@@ -31,7 +31,7 @@ Status: active
 <!-- 每个已解决决策只在对应票中保存完整答案；此处仅追加摘要与链接。 -->
 
 - [核实 Pi 原生子代理承载能力](issues/01-verify-pi-native-capabilities.md) — Pi 可直接承载长期无持久化 RPC 节点，但代理树控制面、强中断和跨平台进程树回收必须由扩展补足。
-- [确定父会话控制工具契约](issues/02-define-parent-control-tools.md) — 公开控制面固定为八个直接父子工具；v5 的 `send_message` 返回 mailbox 接纳身份，`wait_agent` 使用七类任务级 outcome，协作式中断与同步级联终止保持独立。
+- [确定父会话控制工具契约](issues/02-define-parent-control-tools.md) — 公开控制面固定为八个直接父子工具；v6 的 `send_message` 返回 mailbox 接纳身份，`wait_agent` 使用多目标 first-event 与批次协同 outcome，协作式中断与同步级联终止保持独立。
 - [建模子代理生命周期与状态转换](issues/03-model-agent-lifecycle.md) — 当前 v5 生命周期为八态，新增 `suspended`；`idle` 严格静止，状态与 activity、三类队列和 `last_task` 由任务 mailbox 原子投影，raw settlement 不再等于完成。
 - [核实 Pi 文件访问与项目资源边界](issues/13-verify-pi-filesystem-and-resource-boundaries.md) — 固定 `cwd` 不阻止外部路径访问；project trust 只约束资源加载，逐路径策略若要成为强边界必须同时限制 shell、扩展或依赖 OS 隔离。
 - [核实 Pi 代理模板文件惯例](issues/14-verify-pi-agent-template-conventions.md) — Pi 核心没有代理模板 API；第一方 Subagent 示例采用 Markdown、YAML frontmatter 与正文提示，但严格校验和能力不足即拒绝创建须由本扩展新增。
@@ -39,8 +39,8 @@ Status: active
 - [确定子代理能力与上下文继承规则](issues/04-define-capability-and-context-inheritance.md) — 固定根 `cwd`、环境和项目资源信任，严格控制子代理管理能力；模板业务工具只在创建时完整预检，运行后保留 Pi 动态 reload，不做全量能力握手或持续复核。
 - [确定代理模板发现与信任策略](issues/05-define-agent-template-discovery-and-trust.md) — 根控制器在可信用户/项目 Markdown 来源中建立原子模板发现快照，以严格 schema、项目覆盖和精确错误码决定后续创建；无效模板与来源问题只通过根 UI 诊断展示、不进入模型上下文，根 `/reload` 仅刷新未来创建。
 - [确定深度、并发与资源配额](issues/06-define-depth-concurrency-and-budgets.md) — 根启动时一次确定 `maxDepth`、`maxChildrenPerAgent` 与 `maxAgentsPerTree`，分别以默认值 `2/4/16` 和硬上限 `8/16/64` 约束深度、每个父会话直接子代理数及整棵树未终止节点数；创建前原子预留，完整终止回收后释放，耗尽立即返回稳定错误码且不自动等待或回收。不同节点可并行，但不增加同时运行数、模型成本、空闲超时或创建速率控制；配置问题仅 UI-only 警告，非法根参数拒绝启动。
-- [确定父子控制与代理树状态上报协议](issues/11-prototype-parent-child-tree-protocol.md) — 当前监督协议为 `pi-subagent/5`，在既有可靠帧、快照和逐跳控制上新增 task assignment/start；协议生成 outbound 必须先于 listener 重入应用发送，reply 通过 task/turn/commit 身份与累计 ACK 保序。
-- [确定代理树可观测性与流式交互](issues/07-prototype-tree-observability.md) — 常驻 widget 与 `/agent` 只显示调用者可见作用域；v5 行与摘要使用生命周期、activity phase、三类队列、`last_task`、时长和稳定故障，不暴露正文或内部 transport 身份。
+- [确定父子控制与代理树状态上报协议](issues/11-prototype-parent-child-tree-protocol.md) — 当前监督协议为 `pi-subagent/6`，在既有可靠帧、快照和逐跳控制上保留 task assignment/start；reply 第 4 版删除模型唤醒开关，协议生成 outbound 必须先于 listener 重入应用发送。
+- [确定代理树可观测性与流式交互](issues/07-prototype-tree-observability.md) — v6 行与摘要使用生命周期、activity phase、三类队列、`last_task`、时长和稳定故障；常驻 widget 与 `/agent` 只显示调用者可见作用域，不暴露正文或内部 transport 身份。
 - [确定中断、失败与级联清理语义](issues/08-define-failure-cancellation-and-cleanup.md) — 中断先建立 mailbox 栅栏，后继消息不能进入正在取消的 task；raw settlement 只准备 interrupted final，commit 后才可复用。终止仍不可逆、后代优先，suspended/failed 节点继续占名额直到显式回收。
 - [确定 RPC 监督器与跨平台进程回收架构](issues/12-prototype-rpc-supervisor.md) — `ManagedRpcNode` 继续独占 Pi RPC 与平台树；`RpcSupervisor` 以 `AgentTaskMailbox` 线性化接纳、assignment、Pi command、压缩、settlement、final/ACK 和终止，不拼接客户端、不猜测不确定交付。
 - [预构资源确认边界与可注入进程树替身](issues/17-process-tree-resource-boundary.md) — 固定不透明 `ProcessTreeAdapter` 句柄与进程树三态观察；仅退出和整树资源释放同时确认才得到进程树级 `confirmed_exited`，生命周期与配额仍由后续控制器结合监督端点、本节点和全部后代裁决，fake 以场景序列稳定复现优雅超时、孙进程残留、部分回收、重复回收和句柄释放。
@@ -50,7 +50,8 @@ Status: active
 - [冻结根工作基础、环境、信任与配置](issues/18-root-runtime-context-config.md) — 根会话一次冻结规范化 `cwd`、project trust、环境和逐字段配额配置；后代只能从根环境投影并接收控制器追加的固定元数据，配置只读取可信项目与用户的规范路径，错误仅以脱敏 UI-only 诊断呈现。
 - [发布可信代理模板发现快照](issues/19-template-discovery-snapshot.md) — 根模板发现模块以双来源严格扫描、文件名精确身份、项目覆盖和候选/来源诊断建立不可变快照；首次发现与根 `/reload` 通过 UI-only 脱敏通知发布，失败来源不回退旧目录。
 - [建立代理树身份、八态生命周期与配额内核](issues/20-tree-lifecycle-quota-core.md) — `TreeController` 保持身份、所有权与配额权威，并通过原子 `applyTaskProjection` 接纳 mailbox 的状态、activity、三类队列和 `last_task`；只有 `terminated` 释放名额。
-- [实现父子监督协议与安全子树汇聚](issues/21-supervisor-channel-protocol.md) — v5 保留隔离帧、认证握手、完整快照和有界窗口，新增 assignment/start 顺序事实、reply v3 身份与接收分发出站屏障；同版本 reload 保留未确认回复，跨主版本拒绝接管。
+- [实现父子监督协议与安全子树汇聚](issues/21-supervisor-channel-protocol.md) — v6 保留隔离帧、认证握手、完整快照、assignment/start 顺序事实和有界窗口，reply v4 删除唤醒配置并继续使用 task/turn/commit 身份；同版本 reload 保留未确认回复，跨主版本拒绝接管。
+- [采用多目标等待与 assistant 批次协调](../../docs/adr/0006-multi-target-wait-batches.md) — `wait_agent` 以 `agent_ids` 建立单 timer first-event waiter；同一最终 assistant session entry 中的重复 wait 合并合法目标，顺序 sibling 读取缓存，工作中 reply 固定唤醒父代理。
 - [采用任务 mailbox 与延迟 final 提交](../../docs/adr/0005-task-mailbox-and-delayed-final-commit.md) — 稳定 `task_id` 与 Pi `turn_id` 分离；raw settlement 形成 provisional candidate，父会话接纳与 settlement 双条件 commit；第三方 mid-run compact 无 lease 时以撤销候选、恢复新 turn 和 `suspended` 保守表达。
 - [实现 Windows Job Object 进程树适配器](issues/22-windows-job-object-adapter.md) — Windows 启动路径使用 `CREATE_SUSPENDED`，先完成节点专用 Job Object 分配并正确写入 `KILL_ON_JOB_CLOSE` 的 native 结构布局，再恢复目标线程；强制回收只调用 Job Object，资源确认使用进程 ID 列表的 `present`/`released`/`unknown` 三态。原生测试以 `detached`/`unref` 孙进程证明后代仍在 Job 内并可整树回收；句柄释放或观察失败时保留 `unknown`，不伪造终止确认。宿主门禁已在 Windows 标准入口加载该适配器，Unix 平台在对应适配器交付前继续失败关闭。
 - [实现 macOS/Linux process group 进程树适配器](issues/23-unix-process-tree-adapter.md) — Unix 代码和宿主接入已保留，但本里程碑只在 Windows 做平台原生验证；macOS/Linux 原生 runner、资源回收证据和支持结论延期到独立计划。

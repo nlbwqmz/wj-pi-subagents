@@ -88,7 +88,6 @@ function coordinator(port: ChildReplyPort, turns = [TURN_1, TURN_2]): ChildReply
 
 function messageEnvelope(
   text: string,
-  requiresResponse = false,
   turnId = TURN_1,
 ): ChildMessageEnvelope {
   return {
@@ -98,7 +97,6 @@ function messageEnvelope(
     agent_id: AGENT_ID,
     task_id: TASK_1,
     turn_id: turnId,
-    requires_response: requiresResponse,
     text,
   };
 }
@@ -165,7 +163,7 @@ test("task_started 获 transport ACK 前同一 turn 的业务 reply 不得越过
     mode: "prompt",
   });
   value.observeAgentStart();
-  const reply = value.replyToParent({ message: "进行中", requires_response: false });
+  const reply = value.replyToParent({ message: "进行中" });
   await nextTask();
   assert.deepEqual(port.events, [{ kind: "started", task_id: TASK_1, turn_id: TURN_1 }]);
 
@@ -191,10 +189,9 @@ test("工作中消息与 settled final 共享运行时轮次并按 ACK 顺序发
   });
   const progress = value.replyToParent({
     message: "正在读取文件，完成后继续。",
-    requires_response: true,
   });
   await nextTask();
-  assert.deepEqual(port.replies, [messageEnvelope("正在读取文件，完成后继续。", true)]);
+  assert.deepEqual(port.replies, [messageEnvelope("正在读取文件，完成后继续。")]);
   port.acknowledgeAll();
   assert.deepEqual(await progress, { ok: true, data: { accepted: true } });
 
@@ -236,7 +233,6 @@ test("final 提交后迟到的 message_end 不能重新打开同一轮工作中�
   });
   const lateReply = await value.replyToParent({
     message: "不应出站",
-    requires_response: false,
   });
   assert.equal(lateReply.ok, false);
   if (!lateReply.ok) assert.equal(lateReply.error.code, "message_delivery_failed");
@@ -249,7 +245,6 @@ test("工作中回复拒绝 images 扩展字段", async () => {
   value.observeAgentStart();
   const progress = await value.replyToParent({
     message: "附带截图的进度",
-    requires_response: false,
     images: [{ type: "image", data: "YWJj", mimeType: "image/png" }],
   });
 
@@ -469,11 +464,11 @@ test("正常无输出与运行时故障均发送无正文结构化 final", async
   await failedSettle;
 });
 
-test("requires_response 必须显式提供，final 确认失败只通知一次", async () => {
+test("reply_to_parent 拒绝已移除的配置字段，final 确认失败只通知一次", async () => {
   const port = new RecordingPort();
   const value = coordinator(port);
   value.observeAgentStart();
-  const invalid = await value.replyToParent({ message: "缺少布尔值" });
+  const invalid = await value.replyToParent({ message: "旧格式", requires_response: false });
   assert.equal(invalid.ok, false);
   if (!invalid.ok) assert.equal(invalid.error.code, "invalid_argument");
 
@@ -539,36 +534,36 @@ const RENDER_THEME = Object.freeze({
   bold: (text: string): string => text,
 });
 
-test("父端 inbox 注入纯文本模型可见 JSON 和完整唤醒矩阵", () => {
+test("父端 inbox 对所有工作中回复和 final 使用完整唤醒矩阵", () => {
   const sent: Array<{ message: unknown; options: unknown }> = [];
   const notified: string[] = [];
   const inbox = new ParentReplyInbox({
     readApi: () => ({ sendMessage: (message, options) => sent.push({ message, options }) }),
     notifyMessage: (agentId) => notified.push(agentId),
   });
-  const informational = messageEnvelope("只记录", false);
-  const question = messageEnvelope("需要回答", true);
+  const firstMessage = messageEnvelope("第一条工作中回复");
+  const secondMessage = messageEnvelope("第二条工作中回复");
   const final = finalEnvelope(undefined);
   const imageFinal = {
     ...finalEnvelope("不得接纳"),
     images: [{ type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" }],
   };
-  assert.equal(inbox.accept(AGENT_ID, informational), true);
-  assert.equal(inbox.accept(AGENT_ID, question), true);
+  assert.equal(inbox.accept(AGENT_ID, firstMessage), true);
+  assert.equal(inbox.accept(AGENT_ID, secondMessage), true);
   assert.equal(inbox.accept(AGENT_ID, final), true);
   assert.equal(inbox.accept(AGENT_ID, imageFinal as never), false);
-  assert.equal(inbox.accept(OTHER_AGENT_ID, informational), false);
+  assert.equal(inbox.accept(OTHER_AGENT_ID, firstMessage), false);
   assert.equal(inbox.acceptTerminal(AGENT_ID, TURN_1), true);
 
   assert.deepEqual(sent.map((entry) => entry.options), [
-    { triggerTurn: false, deliverAs: "steer" },
+    { triggerTurn: true, deliverAs: "steer" },
     { triggerTurn: true, deliverAs: "steer" },
     { triggerTurn: true, deliverAs: "steer" },
     { triggerTurn: true, deliverAs: "steer" },
   ]);
   assert.deepEqual(notified, [AGENT_ID, AGENT_ID]);
   const firstText = (sent[0]!.message as { content: Array<{ text: string }> }).content[0]!.text;
-  assert.deepEqual(JSON.parse(firstText), informational);
+  assert.deepEqual(JSON.parse(firstText), firstMessage);
   assert.equal((sent[2]!.message as { content: unknown[] }).content.length, 1);
   const terminal = JSON.parse(
     (sent[3]!.message as { content: Array<{ text: string }> }).content[0]!.text,
@@ -584,7 +579,7 @@ test("父端 inbox 注入纯文本模型可见 JSON 和完整唤醒矩阵", () =
   });
 });
 
-test("settling gate 暂缓 final、需响应消息和 TerminalNotice，但不阻塞纯记录消息", () => {
+test("settling gate 暂缓所有工作中回复、final 和 TerminalNotice", () => {
   const sent: Array<{ message: unknown; options: unknown }> = [];
   const inbox = new ParentReplyInbox({
     readApi: () => ({ sendMessage: (message, options) => sent.push({ message, options }) }),
@@ -593,18 +588,17 @@ test("settling gate 暂缓 final、需响应消息和 TerminalNotice，但不阻
   inbox.blockTurnTriggers();
   inbox.blockTurnTriggers();
 
-  assert.equal(inbox.accept(AGENT_ID, messageEnvelope("只记录", false)), true);
-  assert.equal(inbox.accept(AGENT_ID, messageEnvelope("需要回答", true)), false);
+  assert.equal(inbox.accept(AGENT_ID, messageEnvelope("工作中回复")), false);
   assert.equal(inbox.accept(AGENT_ID, finalEnvelope("阶段结果")), false);
   assert.equal(inbox.acceptTerminal(AGENT_ID, TURN_1), false);
-  assert.equal(sent.length, 1);
+  assert.equal(sent.length, 0);
 
   assert.equal(inbox.releaseTurnTriggers(), true);
   assert.equal(inbox.releaseTurnTriggers(), false);
-  assert.equal(inbox.accept(AGENT_ID, messageEnvelope("需要回答", true)), true);
+  assert.equal(inbox.accept(AGENT_ID, messageEnvelope("已放行回复")), true);
   assert.equal(inbox.accept(AGENT_ID, finalEnvelope("阶段结果")), true);
   assert.equal(inbox.acceptTerminal(AGENT_ID, TURN_1), true);
-  assert.deepEqual(sent.slice(1).map((entry) => entry.options), [
+  assert.deepEqual(sent.map((entry) => entry.options), [
     { triggerTurn: true, deliverAs: "steer" },
     { triggerTurn: true, deliverAs: "steer" },
     { triggerTurn: true, deliverAs: "steer" },
@@ -639,7 +633,7 @@ test("final 失败后 settling gate 不可由后续 agent_start 重新放行", (
   inbox.failTurnTriggers();
   assert.equal(inbox.releaseTurnTriggers(), false);
   assert.equal(inbox.accept(AGENT_ID, finalEnvelope("不得投递")), false);
-  assert.equal(inbox.accept(AGENT_ID, messageEnvelope("不得唤醒", true)), false);
+  assert.equal(inbox.accept(AGENT_ID, messageEnvelope("不得唤醒")), false);
   assert.equal(inbox.acceptTerminal(AGENT_ID), false);
   assert.deepEqual(sent, []);
 });

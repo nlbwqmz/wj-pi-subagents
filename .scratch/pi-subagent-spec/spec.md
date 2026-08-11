@@ -436,25 +436,25 @@ thinking: medium
 
 ### 6.6.1 `reply_to_parent`
 
-**REQ-055**：每个子运行时必须注册 `reply_to_parent`，根运行时不得注册。输入字段闭集只允许非空 `message` 和模型必填的 `requires_response`：
+**REQ-055**：每个子运行时必须注册 `reply_to_parent`，根运行时不得注册。输入字段闭集只允许非空 `message`：
 
 ```json
-{ "message": "正在核对实现，完成后继续当前任务。", "requires_response": false }
+{ "message": "需要父代理裁决：现有接口契约与任务要求冲突。" }
 ```
 
-正文不得超过监督通道字符串上限。工具不接受 `agent_id`、目标路径、图片、回复类别、序号或完成标记；目标由已认证的直接父子监督关系唯一绑定。`requires_response` 只控制父代理空闲时是否触发处理，任何已接纳 message 都可解除一次 wait。成功表示直接父会话已经接纳并 ACK：
+正文不得超过监督通道字符串上限。工具不接受 `agent_id`、目标路径、唤醒开关、图片、回复类别、序号或完成标记；目标由已认证的直接父子监督关系唯一绑定。每条成功接纳的 message 固定以 `deliverAs: "steer"` 和 `triggerTurn: true` 进入直接父会话，并可解除一次包含该节点的 wait。成功表示直接父会话已经接纳并 ACK：
 
 ```json
 { "ok": true, "data": { "accepted": true } }
 ```
 
-成功不会停止、settle、中断或另起当前子代理处理；模型必须继续原任务。最终答复由运行时自动提交，模型不得用本工具模拟 final。监督通道或父会话无法确认接纳时返回 `message_delivery_failed`，不得泄露正文或底层传输错误。
+成功不会停止、settle、中断或另起当前子代理处理；模型必须继续原任务。仅当任务在最终答复前遇到必须由直接父代理处理或裁决的阻塞问题，或者直接父代理已明确要求过程回报时才能调用；不得用于常规进度、心跳、阶段性总结、完成通知或替代最终答复。最终答复由运行时自动提交。监督通道或父会话无法确认接纳时返回 `message_delivery_failed`，不得泄露正文或底层传输错误。
 
 ### 6.7 `wait_agent`
 
-**REQ-027**：输入为直接子代理 `agent_id` 和可选 `timeout_ms`。单次值必须在 `10000..600000` 毫秒；省略时使用根解析的 `waitTimeoutMs`。等待只观察一个节点，不改变节点或工作。
+**REQ-027**：输入字段闭集为非空 `agent_ids` 数组和可选 `timeout_ms`。`agent_ids` 包含 `1..64` 个 canonical UUID，重复项按首次出现顺序忽略；所有目标都必须是调用者的直接子代理。`timeout_ms` 必须在 `10000..600000` 毫秒；省略时使用根解析的 `waitTimeoutMs`。一次调用为所有目标建立一个观察窗口，不改变节点或工作。
 
-实现必须采用“原子检查、登记等待、再次检查”，允许多个等待者由同一事件完成。完成边界是 final commit 或节点 suspension/terminal，而不是 raw `agent_settled`。返回示例：
+控制器必须采用“检查全部目标、登记一个 waiter 到全部目标反向索引、再次检查”的原子流程。工作中回复、final commit、suspension 或 terminal 的第一个已提交事件结算 waiter，并从其余目标索引同步移除；多个等待者仍可由同一事件完成。完成边界不是 raw `agent_settled`。有获胜目标时返回示例：
 
 ```json
 {
@@ -475,17 +475,54 @@ thinking: medium
 }
 ```
 
-`outcome` 只有：
+`outcome` 的节点事件值只有：
 
 - `reply`：直接子代理工作中回复已被父会话接纳；只结束本次等待，子代理通常仍继续处理；
 - `task_completed`：节点为 `idle`，最近任务以 completed final 提交；新建后尚无任务的严格 idle 也使用该 outcome，但省略 `last_task`；
 - `task_failed`：最近任务以 failed final 提交；节点可以仍为健康 `idle`；
 - `task_interrupted`：最近任务以 interrupted final 提交；节点可以继续复用；
 - `suspended`：节点交付或维护恢复不可确认；返回 activity 供调用者裁决；
-- `terminal`：调用时已经或等待中进入 `failed`/`terminated`；`failed` 必须附 `data.error`；
-- `timeout`：观察期限先到；不改变节点。
+- `terminal`：调用时已经或等待中进入 `failed`/`terminated`；`failed` 必须附 `data.error`。
 
-结束原因与返回快照分开线性化，因此可以出现 `reply + working`，任务级 outcome 则必须对应已提交 `last_task` 和严格 idle。工作中回复通知、任务 commit、suspension、terminal 与 timeout 由先提交者决定唯一 outcome；回复/final 正文已作为独立父会话消息注入，wait 结果不得复制正文。
+观察期限先到时没有获胜节点，返回完整去重目标集合，不附加 `state` 或 `revision`：
+
+```json
+{
+  "ok": true,
+  "data": {
+    "agent_ids": [
+      "550e8400-e29b-41d4-a716-446655440000",
+      "650e8400-e29b-41d4-a716-446655440000"
+    ],
+    "outcome": "timeout"
+  }
+}
+```
+
+工具固定使用 `executionMode: "parallel"`。Pi provider adapter 已将供应商调用归一化为最终 assistant message 中的 `{ type: "toolCall", id, name, arguments }`；插件不得解析供应商原始协议。同一最终 assistant session entry 是一个工具批次，其 entry ID 为批次键，`toolCallId` 为调用键。同批次存在多个 schema 合法的 `wait_agent` 时，插件必须：
+
+1. 分别校验每个调用的直接子代理权限；语义非法调用独立失败，不污染合法 sibling；
+2. 合并合法目标并只启动一个控制器 waiter；共享期限取各合法调用解析后期限的最小值；
+3. 任一目标产生节点事件后，让包含获胜 `agent_id` 的调用返回真实节点结果；其他调用返回：
+
+```json
+{
+  "ok": true,
+  "data": {
+    "agent_ids": ["650e8400-e29b-41d4-a716-446655440000"],
+    "outcome": "batch_released",
+    "released_by_agent_id": "550e8400-e29b-41d4-a716-446655440000",
+    "released_by_outcome": "reply"
+  }
+}
+```
+
+4. 共享期限先到时让所有合法 sibling 返回同一联合 `timeout`，不得继续累计后续调用的期限；
+5. 在后续 sibling 被 Pi 顺序执行时读取已缓存结果立即返回，并在 `turn_end`、abort、reload 或 shutdown 后清理批次状态。
+
+`batch_released` 只表示同一工具批次已由其他目标事件解除，不伪造调用目标的生命周期变化。无法从当前 session branch 唯一确认 assistant entry、批次内出现重复 `toolCallId`，或持久化参数与实际执行参数不一致时，只能退化为当前调用的独立多目标等待；不得使用时间窗口或全局任意回复唤醒。
+
+结束原因与返回快照分开线性化，因此可以出现 `reply + working`，任务级 outcome 则必须对应已提交 `last_task` 和严格 idle。工作中回复通知、任务 commit、suspension、terminal 与 timeout 由先提交者决定唯一结果；回复/final 正文已作为独立父会话消息注入，wait 结果不得复制正文。
 
 ### 6.8 `interrupt_agent`
 
@@ -593,7 +630,7 @@ Unix 使用本地 Unix socket，Windows 使用命名管道。上层必须用带�
 
 ```json
 {
-  "protocol": "pi-subagent/5",
+  "protocol": "pi-subagent/6",
   "kind": "hello|hello_ack|event|snapshot_request|snapshot|reply|task_assignment|task_started|control_request|control_response|ack|close",
   "stream_id": "stream_...",
   "sender_agent_id": "550e8400-e29b-41d4-a716-446655440000",
@@ -632,7 +669,7 @@ Unix 使用本地 Unix socket，Windows 使用命名管道。上层必须用带�
 
 ### 7.4 分类回复与最终提交屏障
 
-**REQ-036**：直接父子监督 `reply` 必须携带独立单调 `reply_seq` 和经过统一 codec 校验的第 3 版结构化 envelope。所有 reply 都要求 `agent_id`、`task_id` 和 `turn_id`；message 另要求 `requires_response` 与有界非空 `text`，final 另要求唯一 `commit_id`、`run_state` 和 `output_state`。`present` 必须有文本，`absent` 不得伪造说明性正文，`images` 显式拒绝。
+**REQ-036**：直接父子监督 `reply` 必须携带独立单调 `reply_seq` 和经过统一 codec 校验的第 4 版结构化 envelope。所有 reply 都要求 `agent_id`、`task_id` 和 `turn_id`；message 另要求有界非空 `text`，final 另要求唯一 `commit_id`、`run_state` 和 `output_state`。message 不接受唤醒开关并固定触发直接父代理；`present` 必须有文本，`absent` 不得伪造说明性正文，`images` 显式拒绝。
 
 父端必须在每条正文 Pi command 前发布并等待 transport ACK 的 `task_assignment { message_id, task_id, mode }`。child 消费 assignment 后，每次实际 `agent_start` 生成新 `turn_id`，发布 `task_started { task_id, turn_id }` 并等待累计 ACK；该 turn 的 message/final 不得越过这一身份事实。
 
@@ -645,7 +682,7 @@ final 到达父端后先 prepare。仅当 task/turn 匹配、provisional settlem
 
 压缩若在 provisional settlement 后开始，必须撤销旧 candidate/final 并等待同一 `task_id` 的新 `turn_id`；处理中压缩保持当前 task。压缩失败或成功后未观察到必要恢复分别进入 `suspended/maintenance_failed`、`suspended/resume_required`。第三方 settled handler 不得因本扩展等待 final ACK 而阻塞。
 
-父控制器按 `reply_seq` 接纳并累计 ACK；同 seq 同 envelope 重放幂等，同 seq 不同语义是协议故障。过期 task/turn reply 可确认后隔离，不能再次注入；匹配 final 未满足双条件时不能 ACK。message 注入通知 `wait_agent: reply`，final 注入触发父会话处理；wait/status 不复制正文。
+父控制器按 `reply_seq` 接纳并累计 ACK；同 seq 同 envelope 重放幂等，同 seq 不同语义是协议故障。过期 task/turn reply 可确认后隔离，不能再次注入；匹配 final 未满足双条件时不能 ACK。message 以 `triggerTurn: true` 注入并通知所有包含该节点的 waiter，final 注入触发父会话处理；wait/status 不复制正文。
 
 ### 7.5 有界状态与安全
 
@@ -897,7 +934,7 @@ Windows 执行两个锁定宿主组合：
 | `AC-017` | 状态和树查询 | 直接状态权限、根/子树裁剪、原子 tree revision、安全字段 |
 | `AC-018` | 公开错误码闭集 | 非法 UUID 与未注册 UUID 分流；每个错误码、retryable 和无副作用；无额外阶段错误码 |
 | `AC-019` | 监督握手和快照 | 身份/版本/凭据、初始快照、subtree replacement、原子根修订 |
-| `AC-020` | v5 seq、ACK、重同步与出站屏障 | assignment/start、reply dedupe、final 槽位、ACK 失败、listener 重入时协议 outbound 优先 |
+| `AC-020` | v6 seq、ACK、重同步与出站屏障 | assignment/start、reply dedupe、final 槽位、ACK 失败、listener 重入时协议 outbound 优先 |
 | `AC-021` | mailbox 与监督器命令顺序 | 先挂接 OS 树、双通道就绪、接纳/宿主交付分离、终止和中断栅栏、迟到丢弃 |
 | `AC-022` | Windows 原生进程树回收 | Windows Job Object、资源确认和孙进程整树回收；Unix 原生部分延期 |
 | `AC-023` | 父故障、mid-run 压缩、根关闭与 reload | 防孤儿、provisional settlement 撤销、同 task 新 turn、suspension、跨实例保留、失败 reload 清树 |

@@ -2,8 +2,8 @@ import { isCanonicalUuid, isCanonicalUuidV4 } from "./tree-controller.ts";
 
 export const CHILD_REPLY_SCHEMA = "pi-subagent.reply" as const;
 export const CHILD_TERMINAL_SCHEMA = "pi-subagent.terminal" as const;
-/** v5 监督协议使用第三版 reply 信封；v2 不可在活动树上热接管。 */
-export const CHILD_REPLY_VERSION = 3 as const;
+/** v6 监督协议使用第四版 reply 信封；旧版不可在活动树上热接管。 */
+export const CHILD_REPLY_VERSION = 4 as const;
 
 export const CHILD_REPLY_ENVELOPE_LIMITS = Object.freeze({
   maxStringBytes: 16 * 1024,
@@ -21,7 +21,6 @@ interface ChildReplyCommon {
 
 export interface ChildMessageEnvelope extends ChildReplyCommon {
   readonly kind: "message";
-  readonly requires_response: boolean;
   readonly text: string;
 }
 
@@ -56,7 +55,7 @@ export interface ChildReplyEnvelopeLimits {
   readonly maxStringBytes: number;
 }
 
-/** 校验并按字段闭集重建 v5 child reply。 */
+/** 校验并按字段闭集重建 v6 child reply。 */
 export function parseChildReplyEnvelope(
   value: unknown,
   limits: ChildReplyEnvelopeLimits = CHILD_REPLY_ENVELOPE_LIMITS,
@@ -134,12 +133,10 @@ function parseMessageEnvelope(
     "agent_id",
     "task_id",
     "turn_id",
-    "requires_response",
     "text",
   ]);
   if (
     Object.keys(value).some((key) => !allowed.has(key))
-    || typeof value.requires_response !== "boolean"
     || !validNonBlankText(value.text, limits.maxStringBytes)
   ) return undefined;
   return Object.freeze({
@@ -149,7 +146,6 @@ function parseMessageEnvelope(
     agent_id: value.agent_id as string,
     task_id: value.task_id as string,
     turn_id: value.turn_id as string,
-    requires_response: value.requires_response,
     text: value.text,
   });
 }

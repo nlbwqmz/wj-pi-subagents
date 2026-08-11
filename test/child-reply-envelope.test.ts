@@ -33,7 +33,6 @@ function message(overrides: Partial<ChildMessageEnvelope> = {}): ChildMessageEnv
     agent_id: AGENT_ID,
     task_id: TASK_ID,
     turn_id: TURN_ID,
-    requires_response: false,
     text: "正在处理",
     ...overrides,
   };
@@ -66,7 +65,7 @@ test("reply envelope validates required fields and rejects unknown fields", () =
     future_field: { accepted: true },
   }), undefined);
 
-  assert.equal(parseChildReplyEnvelope({ ...message(), requires_response: undefined }), undefined);
+  assert.equal(parseChildReplyEnvelope({ ...message(), requires_response: false }), undefined);
   assert.equal(parseChildReplyEnvelope({ ...message(), run_state: "settled" }), undefined);
   assert.equal(parseChildReplyEnvelope({ ...message(), output_state: "present" }), undefined);
   assert.equal(parseChildReplyEnvelope({ ...message(), reason_code: "no_output" }), undefined);

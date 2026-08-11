@@ -27,7 +27,7 @@ const COMMIT_ID = "750e8400-e29b-41d4-a716-446655440003";
 const ROOT_ID = "root-test";
 const CREDENTIAL = "test-one-time-credential";
 
-function workingReply(text: string, requiresResponse = false): ChildMessageEnvelope {
+function workingReply(text: string): ChildMessageEnvelope {
   return {
     schema: CHILD_REPLY_SCHEMA,
     version: CHILD_REPLY_VERSION,
@@ -35,7 +35,6 @@ function workingReply(text: string, requiresResponse = false): ChildMessageEnvel
     agent_id: CHILD_ID,
     task_id: TASK_ID,
     turn_id: TURN_ID,
-    requires_response: requiresResponse,
     text,
   };
 }
@@ -135,7 +134,7 @@ test("task assignment 与 task_started 在同一累计 ACK 顺序域传递 UUIDv
 
 test("长度边界 UTF-8 JSON 可处理分块与拼接帧，拒绝截断/损坏载荷", () => {
   const frame: SupervisorFrame = {
-    protocol: "pi-subagent/5",
+    protocol: "pi-subagent/6",
     kind: "event",
     stream_id: "stream_test",
     sender_agent_id: CHILD_ID,
@@ -470,7 +469,7 @@ test("工作中 message 为 final 预留窗口槽位，二者按同一 reply_seq
   assert.equal(pair.child.getPublicState().pending_reply_count, 0);
 });
 
-test("原始 v5 reply 必须携带合法 envelope，且 message/final 都拒绝图片字段", () => {
+test("原始 v6 reply 必须携带合法 envelope，且 message/final 都拒绝图片字段", () => {
   const missingEnvelope = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,
     childAgentId: CHILD_ID,
