@@ -25,6 +25,8 @@ const AGENT_ID = "550e8400-e29b-41d4-a716-446655440000";
 const OTHER_AGENT_ID = "650e8400-e29b-41d4-a716-446655440000";
 const TURN_1 = "550e8400-e29b-41d4-a716-446655440001";
 const TURN_2 = "550e8400-e29b-41d4-a716-446655440002";
+const TASK_1 = "450e8400-e29b-41d4-a716-446655440001";
+const COMMIT_1 = "750e8400-e29b-41d4-a716-446655440001";
 const UUID_V1 = "550e8400-e29b-11d4-a716-446655440001";
 
 class RecordingPort implements ChildReplyPort {
@@ -41,6 +43,27 @@ class RecordingPort implements ChildReplyPort {
   }
 }
 
+class TaskStartedBarrierPort implements ChildReplyPort {
+  readonly events: Array<{ readonly kind: "started" | "reply"; readonly task_id: string; readonly turn_id: string }> = [];
+  private releaseStarted!: () => void;
+  private readonly startedAck = new Promise<void>((resolve) => {
+    this.releaseStarted = resolve;
+  });
+
+  async publishTaskStarted(started: { readonly task_id: string; readonly turn_id: string }): Promise<void> {
+    this.events.push({ kind: "started", ...started });
+    await this.startedAck;
+  }
+
+  async publishReplyAndWaitForAck(reply: ChildReplyEnvelope): Promise<void> {
+    this.events.push({ kind: "reply", task_id: reply.task_id, turn_id: reply.turn_id });
+  }
+
+  acknowledgeStarted(): void {
+    this.releaseStarted();
+  }
+}
+
 class RejectingPort implements ChildReplyPort {
   calls = 0;
 
@@ -51,11 +74,15 @@ class RejectingPort implements ChildReplyPort {
 }
 
 function coordinator(port: ChildReplyPort, turns = [TURN_1, TURN_2]): ChildReplyCoordinator {
-  let index = 0;
+  let turnIndex = 0;
+  let taskIndex = 0;
+  let commitIndex = 0;
   return new ChildReplyCoordinator({
     agentId: AGENT_ID,
     port,
-    turnIdFactory: () => turns[index++]!,
+    turnIdFactory: () => turns[turnIndex++]!,
+    taskIdFactory: () => `450e8400-e29b-41d4-a716-44665544000${++taskIndex}`,
+    commitIdFactory: () => `750e8400-e29b-41d4-a716-44665544000${++commitIndex}`,
   });
 }
 
@@ -69,6 +96,7 @@ function messageEnvelope(
     version: CHILD_REPLY_VERSION,
     kind: "message",
     agent_id: AGENT_ID,
+    task_id: TASK_1,
     turn_id: turnId,
     requires_response: requiresResponse,
     text,
@@ -86,7 +114,9 @@ function finalEnvelope(
     version: CHILD_REPLY_VERSION,
     kind: "final" as const,
     agent_id: AGENT_ID,
+    task_id: TASK_1,
     turn_id: TURN_1,
+    commit_id: COMMIT_1,
     run_state: "settled" as const,
     output_state: text === undefined ? "absent" as const : "present" as const,
     ...(text === undefined ? { reason_code: "no_output" as const } : { text }),
@@ -100,6 +130,27 @@ function finalEnvelope(
 async function nextTask(): Promise<void> {
   await new Promise<void>((resolve) => setImmediate(resolve));
 }
+
+test("task_started 获 transport ACK 前同一 turn 的业务 reply 不得越过身份事实", async () => {
+  const port = new TaskStartedBarrierPort();
+  const value = coordinator(port);
+  value.observeTaskAssignment({
+    message_id: "msg_assignment",
+    task_id: TASK_1,
+    mode: "prompt",
+  });
+  value.observeAgentStart();
+  const reply = value.replyToParent({ message: "进行中", requires_response: false });
+  await nextTask();
+  assert.deepEqual(port.events, [{ kind: "started", task_id: TASK_1, turn_id: TURN_1 }]);
+
+  port.acknowledgeStarted();
+  assert.deepEqual(await reply, { ok: true, data: { accepted: true } });
+  assert.deepEqual(port.events, [
+    { kind: "started", task_id: TASK_1, turn_id: TURN_1 },
+    { kind: "reply", task_id: TASK_1, turn_id: TURN_1 },
+  ]);
+});
 
 test("工作中消息与 settled final 共享运行时轮次并按 ACK 顺序发布", async () => {
   const port = new RecordingPort();
@@ -151,7 +202,8 @@ test("final 提交后迟到的 message_end 不能重新打开同一轮工作中�
     type: "message_end",
     message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "已完成" }] },
   });
-  await value.settle();
+  value.settle();
+  await nextTask();
 
   value.observeAssistantMessageEnd({
     type: "message_end",
@@ -166,22 +218,19 @@ test("final 提交后迟到的 message_end 不能重新打开同一轮工作中�
   assert.deepEqual(replies, [finalEnvelope("已完成")]);
 });
 
-test("工作中回复可以携带经 codec 校验的图片", async () => {
+test("工作中回复拒绝 images 扩展字段", async () => {
   const port = new RecordingPort();
   const value = coordinator(port);
   value.observeAgentStart();
-  const progress = value.replyToParent({
+  const progress = await value.replyToParent({
     message: "附带截图的进度",
     requires_response: false,
     images: [{ type: "image", data: "YWJj", mimeType: "image/png" }],
   });
-  await nextTask();
-  assert.deepEqual(port.replies[0], {
-    ...messageEnvelope("附带截图的进度", false),
-    images: [{ type: "image", data: "YWJj", mimeType: "image/png" }],
-  });
-  port.acknowledgeAll();
-  assert.deepEqual(await progress, { ok: true, data: { accepted: true } });
+
+  assert.equal(progress.ok, false);
+  if (!progress.ok) assert.equal(progress.error.code, "invalid_argument");
+  assert.deepEqual(port.replies, []);
 });
 
 test("每次 agent_start 生成新轮次且不会覆盖上一轮 final", async () => {
@@ -220,7 +269,7 @@ test("轮次分配拒绝 UUID v1，重试重复值，并在耗尽后废止旧轮
     turnIdFactory: () => UUID_V1,
     onFinalFailure: () => { invalidFailures += 1; },
   });
-  assert.throws(() => invalid.observeAgentStart(), /invalid_child_turn_id/);
+  assert.throws(() => invalid.observeAgentStart(), /invalid_child_task_identity/);
   assert.equal(invalid.getCurrentTurnId(), undefined);
   await nextTask();
   assert.equal(invalidFailures, 1);
@@ -247,8 +296,9 @@ test("轮次分配拒绝 UUID v1，重试重复值，并在耗尽后废止旧轮
   await nextTask();
   exhaustedPort.acknowledgeAll();
   await first;
+  await nextTask();
 
-  assert.throws(() => exhausted.observeAgentStart(), /invalid_child_turn_id/);
+  assert.throws(() => exhausted.observeAgentStart(), /invalid_child_task_identity/);
   assert.equal(exhausted.getCurrentTurnId(), undefined);
   await nextTask();
   assert.equal(exhaustedFailures, 1);
@@ -261,7 +311,7 @@ test("轮次分配拒绝 UUID v1，重试重复值，并在耗尽后废止旧轮
   assert.equal(exhausted.getFinalCandidate(), undefined);
 });
 
-test("最终候选连接文本块并支持图片-only present", async () => {
+test("最终候选连接文本块并忽略图片内容", async () => {
   const port = new RecordingPort();
   const value = coordinator(port);
   value.observeAgentStart();
@@ -281,21 +331,17 @@ test("最终候选连接文本块并支持图片-only present", async () => {
     message: {
       role: "assistant",
       stopReason: "stop",
-      content: [{ type: "image", data: "YWJj", mimeType: "image/png" }],
+      content: [{ type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" }],
     },
   });
   const settled = value.settle();
   await nextTask();
-  assert.deepEqual(port.replies, [finalEnvelope(undefined, {
-    output_state: "present",
-    reason_code: undefined,
-    images: [{ type: "image", data: "YWJj", mimeType: "image/png" }],
-  })]);
+  assert.deepEqual(port.replies, [finalEnvelope("第一部分\n第二部分")]);
   port.acknowledgeAll();
   await settled;
 });
 
-test("最终候选图片必须通过统一 codec 边界", async () => {
+test("图片-only assistant 输出形成无正文 final", async () => {
   const port = new RecordingPort();
   const value = coordinator(port);
   value.observeAgentStart();
@@ -306,8 +352,8 @@ test("最终候选图片必须通过统一 codec 边界", async () => {
       stopReason: "stop",
       content: [{
         type: "image",
-        data: "YWJj",
-        mimeType: `image/${"x".repeat(123)}`,
+        data: "iVBORw0KGgo=",
+        mimeType: "image/png",
       }],
     },
   });
@@ -415,14 +461,15 @@ test("requires_response 必须显式提供，final 确认失败只通知一次",
     onFinalFailure: () => { failures += 1; },
   });
   rejecting.observeAgentStart();
-  await assert.rejects(rejecting.settle(), /子代理最终回复未获父会话确认/);
-  await rejecting.settle();
+  rejecting.settle();
+  rejecting.settle();
+  await nextTask();
   await nextTask();
   assert.equal(rejectingPort.calls, 1);
   assert.equal(failures, 1);
 });
 
-test("final 失败先向 handler 返回 rejection，再发出独立监督流关闭信号", async () => {
+test("final 失败不阻塞 settled handler，并通过独立监督流关闭信号报告", async () => {
   const order: string[] = [];
   const value = new ChildReplyCoordinator({
     agentId: AGENT_ID,
@@ -432,13 +479,11 @@ test("final 失败先向 handler 返回 rejection，再发出独立监督流关�
   });
   value.observeAgentStart();
 
-  const settlement = value.settle().catch((error: unknown) => {
-    order.push("rejection");
-    throw error;
-  });
-  await assert.rejects(settlement, /子代理最终回复未获父会话确认/);
+  assert.equal(value.settle(), undefined);
+  order.push("handler_returned");
   await nextTask();
-  assert.deepEqual(order, ["rejection", "close"]);
+  await nextTask();
+  assert.deepEqual(order, ["handler_returned", "close"]);
 });
 
 test("final 失败后协调器永久废止轮次且不能签发下一轮", async () => {
@@ -452,7 +497,9 @@ test("final 失败后协调器永久废止轮次且不能签发下一轮", async
     onFinalFailure: () => { failures += 1; },
   });
   value.observeAgentStart();
-  await assert.rejects(value.settle(), /子代理最终回复未获父会话确认/);
+  value.settle();
+  await nextTask();
+  await nextTask();
 
   assert.throws(() => value.observeAgentStart());
   assert.equal(value.getCurrentTurnId(), undefined);
@@ -467,10 +514,9 @@ const RENDER_THEME = Object.freeze({
   bold: (text: string): string => text,
 });
 
-test("父端 inbox 注入模型可见 JSON、图片和完整唤醒矩阵", () => {
+test("父端 inbox 注入纯文本模型可见 JSON 和完整唤醒矩阵", () => {
   const sent: Array<{ message: unknown; options: unknown }> = [];
   const notified: string[] = [];
-  const imageData = "YWJj";
   const inbox = new ParentReplyInbox({
     readApi: () => ({ sendMessage: (message, options) => sent.push({ message, options }) }),
     notifyMessage: (agentId) => notified.push(agentId),
@@ -478,15 +524,14 @@ test("父端 inbox 注入模型可见 JSON、图片和完整唤醒矩阵", () =>
   const informational = messageEnvelope("只记录", false);
   const question = messageEnvelope("需要回答", true);
   const final = finalEnvelope(undefined);
-  const imageFinal = finalEnvelope(undefined, {
-    output_state: "present",
-    reason_code: undefined,
-    images: [{ type: "image", data: imageData, mimeType: "image/png" }],
-  });
+  const imageFinal = {
+    ...finalEnvelope("不得接纳"),
+    images: [{ type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" }],
+  };
   assert.equal(inbox.accept(AGENT_ID, informational), true);
   assert.equal(inbox.accept(AGENT_ID, question), true);
   assert.equal(inbox.accept(AGENT_ID, final), true);
-  assert.equal(inbox.accept(AGENT_ID, imageFinal), true);
+  assert.equal(inbox.accept(AGENT_ID, imageFinal as never), false);
   assert.equal(inbox.accept(OTHER_AGENT_ID, informational), false);
   assert.equal(inbox.acceptTerminal(AGENT_ID, TURN_1), true);
 
@@ -495,15 +540,13 @@ test("父端 inbox 注入模型可见 JSON、图片和完整唤醒矩阵", () =>
     { triggerTurn: true, deliverAs: "steer" },
     { triggerTurn: true, deliverAs: "steer" },
     { triggerTurn: true, deliverAs: "steer" },
-    { triggerTurn: true, deliverAs: "steer" },
   ]);
   assert.deepEqual(notified, [AGENT_ID, AGENT_ID]);
   const firstText = (sent[0]!.message as { content: Array<{ text: string }> }).content[0]!.text;
   assert.deepEqual(JSON.parse(firstText), informational);
-  const imageContent = (sent[3]!.message as { content: unknown[] }).content;
-  assert.equal(imageContent.length, 2);
+  assert.equal((sent[2]!.message as { content: unknown[] }).content.length, 1);
   const terminal = JSON.parse(
-    (sent[4]!.message as { content: Array<{ text: string }> }).content[0]!.text,
+    (sent[3]!.message as { content: Array<{ text: string }> }).content[0]!.text,
   ) as TerminalNotice;
   assert.deepEqual(terminal, {
     schema: CHILD_TERMINAL_SCHEMA,

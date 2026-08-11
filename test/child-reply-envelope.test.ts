@@ -16,10 +16,12 @@ import {
 
 const AGENT_ID = "550e8400-e29b-41d4-a716-446655440000";
 const TURN_ID = "550e8400-e29b-41d4-a716-446655440001";
+const TASK_ID = "450e8400-e29b-41d4-a716-446655440001";
+const COMMIT_ID = "750e8400-e29b-41d4-a716-446655440001";
 const UUID_V1 = "550e8400-e29b-11d4-a716-446655440001";
 const IMAGE = {
   type: "image" as const,
-  data: "aGVsbG8=",
+  data: "iVBORw0KGgo=",
   mimeType: "image/png",
 };
 
@@ -29,6 +31,7 @@ function message(overrides: Partial<ChildMessageEnvelope> = {}): ChildMessageEnv
     version: CHILD_REPLY_VERSION,
     kind: "message",
     agent_id: AGENT_ID,
+    task_id: TASK_ID,
     turn_id: TURN_ID,
     requires_response: false,
     text: "正在处理",
@@ -44,7 +47,9 @@ function final(
     version: CHILD_REPLY_VERSION,
     kind: "final" as const,
     agent_id: AGENT_ID,
+    task_id: TASK_ID,
     turn_id: TURN_ID,
+    commit_id: COMMIT_ID,
     run_state: "settled" as const,
     output_state: "present" as const,
     text: "已完成",
@@ -55,12 +60,11 @@ function final(
   ) as unknown as ChildFinalEnvelope;
 }
 
-test("reply envelope validates required fields and ignores unknown fields", () => {
-  const parsed = parseChildReplyEnvelope({
+test("reply envelope validates required fields and rejects unknown fields", () => {
+  assert.equal(parseChildReplyEnvelope({
     ...message(),
     future_field: { accepted: true },
-  });
-  assert.deepEqual(parsed, message());
+  }), undefined);
 
   assert.equal(parseChildReplyEnvelope({ ...message(), requires_response: undefined }), undefined);
   assert.equal(parseChildReplyEnvelope({ ...message(), run_state: "settled" }), undefined);
@@ -70,10 +74,11 @@ test("reply envelope validates required fields and ignores unknown fields", () =
   assert.equal(parseChildReplyEnvelope({ ...message(), agent_id: "agent" }), undefined);
 });
 
-test("reply envelope enforces identifiers, enums, text bytes, and natural-language payloads", () => {
+test("reply envelope enforces identifiers, version, enums, and text bytes", () => {
   assert.equal(parseChildReplyEnvelope({ ...message(), turn_id: "turn-1" }), undefined);
   assert.equal(parseChildReplyEnvelope({ ...message(), turn_id: UUID_V1 }), undefined);
-  assert.equal(parseChildReplyEnvelope({ ...message(), version: 2 }), undefined);
+  assert.equal(parseChildReplyEnvelope({ ...message(), version: 1 }), undefined);
+  assert.equal(parseChildReplyEnvelope({ ...message(), version: CHILD_REPLY_VERSION + 1 }), undefined);
   assert.equal(parseChildReplyEnvelope({ ...message(), kind: "progress" }), undefined);
   assert.equal(parseChildReplyEnvelope({ ...message(), text: { arbitrary: "json" } }), undefined);
 
@@ -106,46 +111,19 @@ test("final envelope validates the complete lifecycle/output state matrix", () =
   assert.equal(parseChildReplyEnvelope({ ...final(), requires_response: false }), undefined);
 });
 
-test("image-only final is present and empty final has no business text", () => {
-  const imageOnly = final({ output_state: "present", text: undefined, images: [IMAGE] });
-  assert.deepEqual(parseChildReplyEnvelope(imageOnly), imageOnly);
+test("message 和 final 都拒绝 images，空 final 只保留状态", () => {
+  assert.equal(parseChildReplyEnvelope({ ...message(), images: [IMAGE] }), undefined);
+  assert.equal(parseChildReplyEnvelope({ ...final(), images: [IMAGE] }), undefined);
+  assert.equal(parseChildReplyEnvelope({
+    ...final({ output_state: "present", text: undefined }),
+    images: [IMAGE],
+  }), undefined);
+
   const empty = final({ output_state: "absent", text: undefined, reason_code: "no_output" });
   assert.deepEqual(parseChildReplyEnvelope(empty), empty);
 });
 
-test("reply image limits use decoded bytes and reject malformed image payloads", () => {
-  const exactData = Buffer.alloc(CHILD_REPLY_ENVELOPE_LIMITS.maxImageBytes).toString("base64");
-  const exactImage = { ...IMAGE, data: exactData };
-  const maxImages = Array.from(
-    { length: CHILD_REPLY_ENVELOPE_LIMITS.maxImagesPerReply },
-    () => exactImage,
-  );
-  assert.equal(parseChildReplyEnvelope(final({ text: undefined, images: maxImages }))?.kind, "final");
-  assert.equal(parseChildReplyEnvelope(final({
-    text: undefined,
-    images: [{ ...IMAGE, data: Buffer.alloc(CHILD_REPLY_ENVELOPE_LIMITS.maxImageBytes + 1).toString("base64") }],
-  })), undefined);
-  assert.equal(parseChildReplyEnvelope(final({
-    text: undefined,
-    images: [...maxImages, IMAGE],
-  })), undefined);
-  assert.equal(parseChildReplyEnvelope(final({ text: undefined, images: [{ ...IMAGE, data: "***" }] })), undefined);
-  assert.equal(parseChildReplyEnvelope(final({
-    text: undefined,
-    images: [{ ...IMAGE, mimeType: `image/${"x".repeat(122)}` }],
-  }))?.kind, "final");
-  assert.equal(parseChildReplyEnvelope(final({
-    text: undefined,
-    images: [{ ...IMAGE, mimeType: `image/${"x".repeat(123)}` }],
-  })), undefined);
-  assert.equal(parseChildReplyEnvelope(final({ text: undefined, images: [{ ...IMAGE, mimeType: "text/plain" }] })), undefined);
-  assert.equal(parseChildReplyEnvelope({
-    ...final({ text: undefined, images: [IMAGE] }),
-    images: [{ ...IMAGE, unexpected: "must-not-be-ignored" }],
-  }), undefined);
-});
-
-test("terminal notice validates its fixed failure fact and ignores extensions", () => {
+test("terminal notice validates its fixed failure fact and rejects extensions", () => {
   const notice: TerminalNotice = {
     schema: CHILD_TERMINAL_SCHEMA,
     version: CHILD_REPLY_VERSION,
@@ -155,7 +133,7 @@ test("terminal notice validates its fixed failure fact and ignores extensions", 
     node_state: "failed",
     reason_code: "runtime_fault",
   };
-  assert.deepEqual(parseTerminalNotice({ ...notice, future_field: "ignored" }), notice);
+  assert.equal(parseTerminalNotice({ ...notice, future_field: "ignored" }), undefined);
   assert.equal(parseTerminalNotice({ ...notice, node_state: "terminated" }), undefined);
   assert.equal(parseTerminalNotice({ ...notice, turn_id: "turn-1" }), undefined);
   assert.equal(parseTerminalNotice({ ...notice, turn_id: UUID_V1 }), undefined);
@@ -163,7 +141,7 @@ test("terminal notice validates its fixed failure fact and ignores extensions", 
 });
 
 test("reply and terminal envelopes use ordinary JSON independent of field order and whitespace", () => {
-  const value = final({ output_state: "present", images: [IMAGE] });
+  const value = final();
   const encoded = encodeChildReplyEnvelope(value);
   assert.deepEqual(parseChildReplyEnvelope(JSON.parse(encoded)), value);
   assert.match(encoded, /\"schema\":\"pi-subagent.reply\"/);
@@ -171,13 +149,14 @@ test("reply and terminal envelopes use ordinary JSON independent of field order 
   const reordered = JSON.stringify({
     text: value.text,
     output_state: value.output_state,
+    commit_id: value.commit_id,
+    task_id: value.task_id,
     turn_id: value.turn_id,
     kind: value.kind,
     run_state: value.run_state,
     agent_id: value.agent_id,
     version: value.version,
     schema: value.schema,
-    images: value.images,
   }, null, 2);
   assert.deepEqual(parseChildReplyEnvelope(JSON.parse(`  \n${reordered}\n  `)), value);
 

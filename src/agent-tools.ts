@@ -1,9 +1,6 @@
 import type { AgentController } from "./agent-controller.ts";
 import type { ChildReplyCoordinator } from "./child-reply-coordinator.ts";
 import {
-  CHILD_REPLY_MAX_IMAGE_MIME_TYPE_LENGTH,
-} from "./child-reply-envelope.ts";
-import {
   renderAgentToolCall,
   renderAgentToolResult,
   type AgentToolRenderContext,
@@ -77,25 +74,12 @@ interface JsonSchema {
   readonly maxLength?: number;
   readonly minimum?: number;
   readonly maximum?: number;
-  readonly minItems?: number;
-  readonly maxItems?: number;
 }
 
 const uuidSchema: JsonSchema = Object.freeze({
   type: "string",
   minLength: 36,
   maxLength: 36,
-});
-
-const imageSchema: JsonSchema = Object.freeze({
-  type: "object",
-  properties: Object.freeze({
-    type: Object.freeze({ type: "string", enum: ["image"] }),
-    data: Object.freeze({ type: "string", minLength: 1, maxLength: 32 * 1024 }),
-    mimeType: Object.freeze({ type: "string", minLength: 7, maxLength: CHILD_REPLY_MAX_IMAGE_MIME_TYPE_LENGTH }),
-  }),
-  required: Object.freeze(["type", "data", "mimeType"]),
-  additionalProperties: false,
 });
 
 const schemas: Readonly<Record<AgentToolName, JsonSchema>> = Object.freeze({
@@ -123,7 +107,6 @@ const schemas: Readonly<Record<AgentToolName, JsonSchema>> = Object.freeze({
     properties: Object.freeze({
       agent_id: uuidSchema,
       message: Object.freeze({ type: "string", minLength: 1, maxLength: 16 * 1024 }),
-      images: Object.freeze({ type: "array", items: imageSchema }),
     }),
     required: Object.freeze(["agent_id", "message"]),
     additionalProperties: false,
@@ -165,8 +148,8 @@ const schemas: Readonly<Record<AgentToolName, JsonSchema>> = Object.freeze({
 const descriptions: Readonly<Record<AgentToolName, string>> = Object.freeze({
   get_agent_templates: "列出当前发现且格式有效的子代理模板，直接返回 JSON 数组。每项包含 template_id、可选 description 和模板声明的子代理初始业务 tools；tools 不要求向父会话当前活动工具向下缩减。返回 [] 表示当前没有有效模板，此时不能调用 spawn_agent。非空模板仍须通过 spawn_agent 的模板格式、工具注册、模型、thinking 和管理能力预检。",
   spawn_agent: "使用有效模板创建一个直接子代理并等待它完成启动握手。调用前先调用 get_agent_templates；template_id 必须从当前返回数组中原样复制、区分大小写，不得猜测、裁剪、改写或用 description 代替。模板 tools 是子代理的初始业务工具请求，不要求是父会话活动工具的子集。若 get_agent_templates 返回 []，则不能调用 spawn_agent。创建成功后使用 send_message 发送首项任务。",
-  send_message: "向直接子代理发送任务消息或当前处理的 steering。返回 accepted: true 只表示消息已被接受，不表示任务完成；若返回 message_delivery_failed，交付状态可能无法确认，不要盲目重发。",
-  wait_agent: "等待直接子代理发来工作中回复、完全 settled 或进入终态。收到 outcome: reply 时子代理会继续处理；outcome: timeout 只结束本次等待，不改变节点生命周期。",
+  send_message: "向直接子代理发送纯文本任务消息或当前处理的 steering；不支持 images，也不要构造或附带图片 Base64。返回 accepted: true 只表示插件 mailbox 已接纳并分配 message_id/task_id，不表示 Pi 或模型已经读取，更不表示任务完成；若返回 message_delivery_failed，交付状态可能无法确认，不要盲目重发。",
+  wait_agent: "等待直接子代理发来工作中回复、提交当前任务结果、进入 suspended 或终态。outcome: reply 表示子代理仍在处理；task_completed、task_failed 和 task_interrupted 表示最近逻辑任务已提交；suspended 表示需要查询状态并人工裁决；timeout 只结束本次等待，不改变节点生命周期。",
   interrupt_agent: "协作式中断直接子代理当前处理，保留节点和上下文；调用成功后仍需使用 wait_agent 确认处理真正结束。",
   terminate_agent: "永久终止直接子代理及其已登记子树并确认资源回收；只有确定不再复用该分支时使用。",
   get_agent_status: "读取直接子代理最近确认的安全状态快照。",
@@ -175,9 +158,9 @@ const descriptions: Readonly<Record<AgentToolName, string>> = Object.freeze({
 
 export const PARENT_COORDINATION_GUIDELINES = Object.freeze({
   taskOwnership: "任务所有权硬约束：send_message 返回 accepted: true 后，已下发任务范围由目标直接子代理负责，直到该子代理给出最终答复或进入终态。同一任务包括为同一问题、工单或结论执行的调查、实现、测试、复现、验证、评审及其子范围；父会话不得亲自实施或再次委派这些工作。读取或搜索同一源码与文档、运行同一测试、只读分析和独立验证都属于重复实施；‘只读’‘无写冲突’‘交叉验证’不是例外。父会话只能使用 wait_agent 等待、查询状态、向同一子代理发送 steering，或处理派发前已明确拆分、产出独立、无数据依赖且无共享写资源的其他工作。",
-  sendMessage: "send_message 返回 accepted: true 只表示消息已被接受，不表示任务完成；若返回 message_delivery_failed，交付状态可能无法确认，不要盲目重发，先查询状态并结合已有回复判断。",
+  sendMessage: "send_message 返回 accepted: true 只表示插件 mailbox 已接纳消息并分配 message_id/task_id，不表示 Pi 或模型已经读取，也不表示任务完成；若返回 message_delivery_failed，交付状态可能无法确认，不要盲目重发，先查询状态并结合已有回复判断。",
   unusableFinal: "收到 output_state: absent 的最终答复，或判断 present 正文仍不可用时，必须向同一 agent_id 尝试追问：只总结上一轮已完成工作并给出最终答复，不要重新执行任务；协议不自动重跑任务或切换模型。",
-  waitAgent: "wait_agent 返回 outcome: reply 时，子代理仍在处理；直接父会话继续等待或使用 send_message 引导同一子代理。wait_agent 返回 outcome: timeout 只结束本次等待，不改变子代理生命周期，也不把任务交回直接父会话。",
+  waitAgent: "wait_agent 返回 outcome: reply 时，子代理仍在处理；task_completed、task_failed 或 task_interrupted 表示最近逻辑任务已提交；suspended 表示交付或维护恢复无法确认，应先查询状态再决定中断或终止；timeout 只结束本次等待，不改变生命周期，也不把任务交回直接父会话。",
   interruptAgent: "直接父会话需要接管已下发任务时，先使用 interrupt_agent，再使用 wait_agent 确认子代理已结束当前处理；确认后再实施相同任务或修改相同资源。",
 });
 
@@ -207,14 +190,13 @@ const childReplySchema: JsonSchema = Object.freeze({
       type: "boolean",
       description: "父会话空闲时是否需要立即唤醒父模型处理此消息。",
     }),
-    images: Object.freeze({ type: "array", items: imageSchema, minItems: 1, maxItems: 8 }),
   }),
   required: Object.freeze(["message", "requires_response"]),
   additionalProperties: false,
 });
 
 const childReplyDescription =
-  "向创建你的直接父会话发送一条工作中的回复，可用于汇报进度、提出问题或发送阶段性发现。必须显式声明 requires_response；true 表示父会话空闲时需要立即处理，false 表示仅记录。可选 images 携带图片进度。无需提供 agent_id 或目标；调用成功后不会结束当前处理，请继续原任务。最终结果由运行时在本轮结束边界自动发送，不要使用本工具模拟最终完成。";
+  "向创建你的直接父会话发送一条工作中的回复，可用于汇报进度、提出问题或发送阶段性发现。必须显式声明 requires_response；true 表示父会话空闲时需要立即处理，false 表示仅记录。本工具只发送文本，不支持 images，也不要构造或附带图片 Base64。无需提供 agent_id 或目标；调用成功后不会结束当前处理，请继续原任务。最终结果由运行时在本轮结束边界自动发送，不要使用本工具模拟最终完成。";
 
 /** 返回给 Pi 的固定工具结果；details 只包含控制器安全数据。 */
 function toolResult<T>(result: ControlResult<T>, dataOnly = false): unknown {

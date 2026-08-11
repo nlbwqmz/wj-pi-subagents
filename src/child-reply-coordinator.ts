@@ -3,20 +3,21 @@ import {
   CHILD_REPLY_ENVELOPE_LIMITS,
   CHILD_REPLY_SCHEMA,
   CHILD_REPLY_VERSION,
-  isValidChildReplyImages,
   parseChildReplyEnvelope,
   type ChildFinalEnvelope,
   type ChildFinalReasonCode,
-  type ChildReplyImage,
   type ChildReplyEnvelope,
 } from "./child-reply-envelope.ts";
 import { normalizeAssistantMessageEnd } from "./rpc-bridge-event.ts";
+import type {
+  SupervisorTaskAssignment,
+  SupervisorTaskStarted,
+} from "./supervisor-channel.ts";
 import { controlFailure, isCanonicalUuid, isCanonicalUuidV4, type ControlResult } from "./tree-controller.ts";
 
 export interface ReplyToParentInput {
   readonly message: string;
   readonly requires_response: boolean;
-  readonly images?: readonly ChildReplyImage[];
 }
 
 export interface ReplyToParentData {
@@ -25,47 +26,61 @@ export interface ReplyToParentData {
 
 export interface FinalCandidate {
   readonly text: string;
-  readonly images?: readonly ChildReplyImage[];
   readonly stopReason: "stop" | "length";
 }
 
-/** 子端上行端口由已经认证的直接父监督通道绑定，不接受目标身份参数。 */
 export interface ChildReplyPort {
   publishReplyAndWaitForAck(
     reply: ChildReplyEnvelope,
     signal?: AbortSignal,
   ): Promise<void>;
+  publishTaskStarted?(started: SupervisorTaskStarted): Promise<void>;
 }
 
 export interface ChildReplyCoordinatorOptions {
   readonly agentId: string;
   readonly port: ChildReplyPort;
   readonly turnIdFactory?: () => string;
-  /** 无法形成或确认 final 时通知运行时关闭监督通道，避免 Pi 误报 idle。 */
+  readonly taskIdFactory?: () => string;
+  readonly commitIdFactory?: () => string;
+  readonly scheduleQuarantine?: (operation: () => void) => void;
+  /** parent 已同步接纳 final 后释放本轮 child reply trigger 栅栏。 */
+  readonly onFinalAccepted?: () => void;
   readonly onFinalFailure?: () => void;
 }
 
 type Publication = () => Promise<void>;
 type RunFinalState = "normal" | "failed" | "interrupted";
 
-const MAX_TURN_ID_GENERATION_ATTEMPTS = 32;
+const MAX_ID_GENERATION_ATTEMPTS = 32;
 
 /**
- * 将 Pi 生命周期事件和父端回复语义集中在一个小而有状态的模块中。
- * message_end 从不直接上行，只有显式工具和 settled final 能进入端口。
+ * child 侧任务/turn/final 深模块。raw settled 只准备候选并立即返回；隔离区内
+ * 任何压缩、新轮或任务租约都会使旧提交失效。final ACK 在后台 outbox 等待。
  */
 export class ChildReplyCoordinator {
   private readonly agentId: string;
   private readonly port: ChildReplyPort;
   private readonly turnIdFactory: () => string;
-  private readonly issuedTurnIds = new Set<string>();
+  private readonly taskIdFactory: () => string;
+  private readonly commitIdFactory: () => string;
+  private readonly scheduleQuarantine: (operation: () => void) => void;
+  private readonly issuedIds = new Set<string>();
+  private readonly onFinalAccepted: (() => void) | undefined;
   private readonly onFinalFailure: (() => void) | undefined;
   private publicationTail: Promise<void> = Promise.resolve();
   private candidate: FinalCandidate | undefined;
   private finalState: RunFinalState = "normal";
   private failureReason: Exclude<ChildFinalReasonCode, "no_output"> | undefined;
+  private currentTaskId: string | undefined;
   private currentTurnId: string | undefined;
+  private pendingSettledTurnId: string | undefined;
+  private pendingPromptTaskId: string | undefined;
   private runActive = false;
+  private compactionActive = false;
+  private compactionAfterSettlement = false;
+  private resumePending = false;
+  private settlementEpoch = 0;
   private finalSubmitted = false;
   private terminalFailure = false;
   private finalFailureNotified = false;
@@ -75,37 +90,73 @@ export class ChildReplyCoordinator {
     this.agentId = options.agentId;
     this.port = options.port;
     this.turnIdFactory = options.turnIdFactory ?? randomUUID;
+    this.taskIdFactory = options.taskIdFactory ?? randomUUID;
+    this.commitIdFactory = options.commitIdFactory ?? randomUUID;
+    this.scheduleQuarantine = options.scheduleQuarantine ?? ((operation) => setImmediate(operation));
+    this.onFinalAccepted = options.onFinalAccepted;
     this.onFinalFailure = options.onFinalFailure;
   }
 
-  /** 一个新的 Pi agent loop 开始，生成轮次并清除上一轮候选和 settled latch。 */
+  /** 监督租约先于 prompt/steer 到达；正文和任务标识始终分离。 */
+  observeTaskAssignment(assignment: SupervisorTaskAssignment): void {
+    if (this.terminalFailure) return;
+    if (assignment.mode === "steer" && this.currentTaskId === assignment.task_id) return;
+    // suspended/失败压缩后的新 prompt 必须取代旧逻辑任务，不能被误判为 resume。
+    if (assignment.mode === "prompt" && assignment.task_id !== this.currentTaskId) {
+      this.compactionActive = false;
+      this.compactionAfterSettlement = false;
+      this.resumePending = false;
+      this.finalSubmitted = false;
+    }
+    this.pendingPromptTaskId = assignment.task_id;
+    // 新任务租约到达结束隔离区时，旧 raw settled 不能抢先发布 final。
+    this.settlementEpoch += 1;
+  }
+
+  /** 新 Pi loop：压缩恢复沿用 task_id，普通 prompt 消费监督租约。 */
   observeAgentStart(): void {
     if (this.terminalFailure) throw new Error("child_reply_coordinator_failed");
-    this.currentTurnId = undefined;
-    this.runActive = false;
-    this.finalSubmitted = true;
+    const resume = this.compactionActive || this.resumePending;
+    const taskId = resume && this.currentTaskId !== undefined
+      ? this.currentTaskId
+      : this.pendingPromptTaskId ?? this.allocateId(this.taskIdFactory);
+    const turnId = this.allocateId(this.turnIdFactory);
+    if (taskId === undefined || turnId === undefined) {
+      this.terminalFailure = true;
+      this.currentTaskId = undefined;
+      this.currentTurnId = undefined;
+      this.runActive = false;
+      this.notifyFinalFailure();
+      throw new TypeError("invalid_child_task_identity");
+    }
+    this.pendingPromptTaskId = undefined;
+    this.currentTaskId = taskId;
+    this.currentTurnId = turnId;
+    this.runActive = true;
+    this.compactionActive = false;
+    this.resumePending = false;
+    this.finalSubmitted = false;
     this.candidate = undefined;
     this.finalState = "normal";
     this.failureReason = undefined;
-
-    const turnId = this.allocateTurnId();
-    if (turnId === undefined) {
-      this.terminalFailure = true;
-      this.notifyFinalFailure();
-      throw new TypeError("invalid_child_turn_id");
+    this.settlementEpoch += 1;
+    const publishTaskStarted = this.port.publishTaskStarted;
+    if (publishTaskStarted !== undefined) {
+      const started = Object.freeze({ task_id: taskId, turn_id: turnId });
+      void this.enqueue(() => publishTaskStarted.call(this.port, started)).catch(() => this.failFinal());
     }
-    this.issuedTurnIds.add(turnId);
-    this.currentTurnId = turnId;
-    this.runActive = true;
-    this.finalSubmitted = false;
   }
 
-  /** 只在活动轮次内更新候选；非 assistant 或迟到消息不会改变已提交 final。 */
+  /** agent_end 先记录本次 Pi loop；迟到的 settled handler 不能结算后继 turn。 */
+  observeAgentEnd(): void {
+    if (!this.runActive || this.currentTurnId === undefined) return;
+    this.pendingSettledTurnId = this.currentTurnId;
+  }
+
   observeAssistantMessageEnd(event: unknown): void {
     if (!this.runActive || this.finalSubmitted || this.currentTurnId === undefined) return;
     const parsed = normalizeAssistantMessageEnd(event);
     if (parsed.kind === "ignored") return;
-    this.runActive = true;
     if (parsed.kind !== "event" || parsed.event.type !== "message_end") {
       this.finalState = "failed";
       this.failureReason = "runtime_fault";
@@ -132,93 +183,100 @@ export class ChildReplyCoordinator {
       .filter((item): item is { readonly type: "text"; readonly text: string } => item.type === "text")
       .map((item) => item.text)
       .join("\n");
-    const images = parsed.event.message.content
-      .filter((item): item is ChildReplyImage => item.type === "image")
-      .map((item) => Object.freeze({ ...item }));
-    if (
-      text.trim().length === 0
-      && images.length === 0
-      || utf8Length(text) > CHILD_REPLY_ENVELOPE_LIMITS.maxStringBytes
-      || images.length > CHILD_REPLY_ENVELOPE_LIMITS.maxImagesPerReply
-      || (images.length > 0 && !isValidChildReplyImages(images))
-    ) return;
-    this.candidate = Object.freeze({
-      text,
-      ...(images.length === 0 ? {} : { images: Object.freeze(images) }),
-      stopReason,
-    });
+    if (text.trim().length === 0 || utf8Length(text) > CHILD_REPLY_ENVELOPE_LIMITS.maxStringBytes) return;
+    this.candidate = Object.freeze({ text, stopReason });
   }
 
-  /**
-   * 向唯一直接父会话发送工作中回复。成功只代表父端已经 ACK 接纳，
-   * 不改变当前处理或最终候选。
-   */
   async replyToParent(
     input: ReplyToParentInput | unknown,
     signal?: AbortSignal,
   ): Promise<ControlResult<ReplyToParentData>> {
     if (!isReplyToParentInput(input)) return controlFailure("invalid_argument");
+    const taskId = this.currentTaskId;
     const turnId = this.currentTurnId;
-    if (!this.runActive || turnId === undefined) return controlFailure("message_delivery_failed");
+    if (!this.runActive || taskId === undefined || turnId === undefined) {
+      return controlFailure("message_delivery_failed");
+    }
     const reply = parseChildReplyEnvelope({
       schema: CHILD_REPLY_SCHEMA,
       version: CHILD_REPLY_VERSION,
       kind: "message",
       agent_id: this.agentId,
+      task_id: taskId,
       turn_id: turnId,
       requires_response: input.requires_response,
       text: input.message,
-      ...(input.images === undefined ? {} : { images: input.images }),
     });
     if (reply === undefined) return controlFailure("invalid_argument");
     try {
-      await this.enqueue(async () => {
-        await this.port.publishReplyAndWaitForAck(reply, signal);
-      });
+      await this.enqueue(() => this.port.publishReplyAndWaitForAck(reply, signal));
     } catch {
       return controlFailure("message_delivery_failed");
     }
     return Object.freeze({ ok: true, data: Object.freeze({ accepted: true as const }) });
   }
 
-  /** settled 是唯一 final 提交入口；无业务载荷时只发送状态字段。 */
-  async settle(): Promise<void> {
-    if (!this.runActive || this.finalSubmitted || this.currentTurnId === undefined) return;
-    this.finalSubmitted = true;
+  /** Pi 已开始压缩；撤销所有未出站 final candidate，但保留逻辑任务。 */
+  observeCompactionStart(): void {
+    if (this.terminalFailure || this.currentTaskId === undefined) return;
+    this.compactionAfterSettlement = !this.runActive;
+    this.compactionActive = true;
+    this.resumePending = false;
+    this.finalSubmitted = false;
+    this.settlementEpoch += 1;
+  }
+
+  /** 成功压缩若发生在 provisional settled 之后，必须等待恢复的新 agent_start。 */
+  observeCompactionEnd(): void {
+    if (!this.compactionActive) return;
+    this.compactionActive = false;
+    this.resumePending = this.compactionAfterSettlement;
+    this.compactionAfterSettlement = false;
+    this.settlementEpoch += 1;
+  }
+
+  /**
+   * raw settled 只建立隔离候选并立即返回。发布与 ACK 都在回调之外执行，故不会
+   * 阻塞第三方 settled handler 调用 ctx.compact()。
+   */
+  settle(): void {
+    const settledTurnId = this.pendingSettledTurnId ?? this.currentTurnId;
+    this.pendingSettledTurnId = undefined;
+    if (
+      !this.runActive
+      || this.finalSubmitted
+      || this.currentTaskId === undefined
+      || this.currentTurnId === undefined
+      || settledTurnId !== this.currentTurnId
+    ) return;
     this.runActive = false;
-    const candidate = this.candidate;
-    const hasText = candidate !== undefined && candidate.text.trim().length > 0;
-    const hasImages = candidate?.images !== undefined && candidate.images.length > 0;
-    const outputState = hasText || hasImages ? "present" : "absent";
-    const runState: ChildFinalEnvelope["run_state"] = this.finalState === "normal"
-      ? "settled"
-      : this.finalState;
-    const reasonCode: ChildFinalReasonCode | undefined = runState === "settled" && outputState === "absent"
-      ? "no_output"
-      : runState === "failed"
-        ? this.failureReason ?? "runtime_fault"
-        : undefined;
-    const reply: ChildFinalEnvelope = {
-      schema: CHILD_REPLY_SCHEMA,
-      version: CHILD_REPLY_VERSION,
-      kind: "final",
-      agent_id: this.agentId,
-      turn_id: this.currentTurnId,
-      run_state: runState,
-      output_state: outputState,
-      ...(reasonCode === undefined ? {} : { reason_code: reasonCode }),
-      ...(hasText ? { text: candidate.text } : {}),
-      ...(hasImages ? { images: candidate.images } : {}),
-    };
-    try {
-      await this.enqueue(() => this.port.publishReplyAndWaitForAck(reply));
-    } catch {
-      this.currentTurnId = undefined;
-      this.candidate = undefined;
-      this.terminalFailure = true;
-      this.notifyFinalFailure();
-      throw new Error("子代理最终回复未获父会话确认");
-    }
+    const epoch = ++this.settlementEpoch;
+    this.scheduleQuarantine(() => {
+      if (
+        this.terminalFailure
+        || this.compactionActive
+        || this.resumePending
+        || this.runActive
+        || this.finalSubmitted
+        || epoch !== this.settlementEpoch
+      ) return;
+      const final = this.createFinal();
+      if (final === undefined) {
+        this.failFinal();
+        return;
+      }
+      this.finalSubmitted = true;
+      void this.enqueue(() => this.port.publishReplyAndWaitForAck(final)).then(
+        () => {
+          if (this.currentTaskId !== final.task_id || this.currentTurnId !== final.turn_id) return;
+          this.currentTaskId = undefined;
+          this.currentTurnId = undefined;
+          this.candidate = undefined;
+          this.notifyFinalAccepted();
+        },
+        () => this.failFinal(),
+      );
+    });
   }
 
   getFinalCandidate(): FinalCandidate | undefined {
@@ -227,6 +285,62 @@ export class ChildReplyCoordinator {
 
   getCurrentTurnId(): string | undefined {
     return this.currentTurnId;
+  }
+
+  getCurrentTaskId(): string | undefined {
+    return this.currentTaskId;
+  }
+
+  private createFinal(): ChildFinalEnvelope | undefined {
+    const taskId = this.currentTaskId;
+    const turnId = this.currentTurnId;
+    const commitId = this.allocateId(this.commitIdFactory);
+    if (taskId === undefined || turnId === undefined || commitId === undefined) return undefined;
+    const candidate = this.candidate;
+    const hasText = candidate !== undefined && candidate.text.trim().length > 0;
+    const outputState = hasText ? "present" : "absent";
+    const runState: ChildFinalEnvelope["run_state"] = this.finalState === "normal"
+      ? "settled"
+      : this.finalState;
+    const reasonCode: ChildFinalReasonCode | undefined = runState === "settled" && outputState === "absent"
+      ? "no_output"
+      : runState === "failed"
+        ? this.failureReason ?? "runtime_fault"
+        : undefined;
+    return parseChildReplyEnvelope({
+      schema: CHILD_REPLY_SCHEMA,
+      version: CHILD_REPLY_VERSION,
+      kind: "final",
+      agent_id: this.agentId,
+      task_id: taskId,
+      turn_id: turnId,
+      commit_id: commitId,
+      run_state: runState,
+      output_state: outputState,
+      ...(reasonCode === undefined ? {} : { reason_code: reasonCode }),
+      ...(hasText ? { text: candidate.text } : {}),
+    }) as ChildFinalEnvelope | undefined;
+  }
+
+  private notifyFinalAccepted(): void {
+    const notify = this.onFinalAccepted;
+    if (notify === undefined) return;
+    setImmediate(() => {
+      try {
+        notify();
+      } catch {
+        // final 已被父端确认，通知失败不能倒退 commit。
+      }
+    });
+  }
+
+  private failFinal(): void {
+    this.terminalFailure = true;
+    this.runActive = false;
+    this.currentTaskId = undefined;
+    this.currentTurnId = undefined;
+    this.candidate = undefined;
+    this.notifyFinalFailure();
   }
 
   private notifyFinalFailure(): void {
@@ -238,20 +352,21 @@ export class ChildReplyCoordinator {
       try {
         notify();
       } catch {
-        // 独立监督流关闭是 rejection 之后的第二信号，回调异常不能再次冒泡。
+        // 独立监督流关闭是第二信号，回调异常不能再次冒泡。
       }
     });
   }
 
-  private allocateTurnId(): string | undefined {
-    for (let attempt = 0; attempt < MAX_TURN_ID_GENERATION_ATTEMPTS; attempt += 1) {
+  private allocateId(factory: () => string): string | undefined {
+    for (let attempt = 0; attempt < MAX_ID_GENERATION_ATTEMPTS; attempt += 1) {
       let candidate: unknown;
       try {
-        candidate = this.turnIdFactory();
+        candidate = factory();
       } catch {
         continue;
       }
-      if (!isCanonicalUuidV4(candidate) || this.issuedTurnIds.has(candidate)) continue;
+      if (!isCanonicalUuidV4(candidate) || this.issuedIds.has(candidate)) continue;
+      this.issuedIds.add(candidate);
       return candidate;
     }
     return undefined;
@@ -271,8 +386,7 @@ function isReplyToParentInput(value: unknown): value is ReplyToParentInput {
     && candidate.message.trim().length > 0
     && utf8Length(candidate.message) <= CHILD_REPLY_ENVELOPE_LIMITS.maxStringBytes
     && typeof candidate.requires_response === "boolean"
-    && (candidate.images === undefined || isValidChildReplyImages(candidate.images))
-    && Object.keys(candidate).every((key) => key === "message" || key === "requires_response" || key === "images");
+    && Object.keys(candidate).every((key) => key === "message" || key === "requires_response");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

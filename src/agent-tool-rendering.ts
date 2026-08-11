@@ -52,8 +52,6 @@ export interface AgentToolResultView {
   readonly content: readonly {
     readonly type: string;
     readonly text?: string;
-    readonly data?: string;
-    readonly mimeType?: string;
   }[];
   readonly details?: unknown;
 }
@@ -273,10 +271,6 @@ function createMessageCallComponent(
       overflowText: "…（展开查看完整正文）",
     }),
   }];
-  const imageSummary = name === "send_message" || name === "reply_to_parent"
-    ? formatSafeImageSummary(readProperty(input, "images"))
-    : undefined;
-  if (imageSummary !== undefined) lines.push({ text: imageSummary, color: "muted" });
   return createSafeTextComponent(lines, theme, context);
 }
 
@@ -407,16 +401,28 @@ function renderWaitResult(
   if (
     agentId === undefined
     || outcome === undefined
-    || !["reply", "settled", "timeout", "terminal"].includes(outcome)
+    || ![
+      "reply",
+      "task_completed",
+      "task_failed",
+      "task_interrupted",
+      "suspended",
+      "timeout",
+      "terminal",
+    ].includes(outcome)
     || state === undefined
     || !(AGENT_LIFECYCLE_STATES as readonly string[]).includes(state)
     || revision === undefined
   ) return invalidResult(theme, context);
   const errorCode = outcome === "terminal" ? readFaultCode(readProperty(details, "error")) : undefined;
+  const warning = errorCode !== undefined
+    || outcome === "task_failed"
+    || outcome === "task_interrupted"
+    || outcome === "suspended";
   const name = resolveName(agentId, lookups) ?? agentId;
   return createSafeTextComponent([{
     text: `${name} · ${outcome}${errorCode === undefined ? "" : ` · ${errorCode}`}`,
-    color: errorCode === undefined ? "success" : "warning",
+    color: warning ? "warning" : "success",
   }], theme, context);
 }
 
@@ -496,14 +502,25 @@ function collapsedStatusLines(snapshot: AgentSnapshot): readonly SafeRenderLine[
     { text: `name: ${snapshot.name}`, color: "muted" },
     { text: `state: ${snapshot.state}`, color: "dim" },
     { text: `depth: ${snapshot.depth}`, color: "dim" },
-    { text: `pending_message_count: ${snapshot.pending_message_count}`, color: "dim" },
+    { text: `mailbox_pending_count: ${snapshot.mailbox_pending_count}`, color: "dim" },
+    { text: `host_pending_count: ${snapshot.host_pending_count}`, color: "dim" },
+    { text: `reply_outbox_pending_count: ${snapshot.reply_outbox_pending_count}`, color: "dim" },
   ];
   if (snapshot.lifecycle_elapsed_ms !== undefined) {
     lines.push({ text: `lifecycle_elapsed_ms: ${snapshot.lifecycle_elapsed_ms}`, color: "dim" });
   }
   if (snapshot.activity !== undefined) {
-    lines.push({ text: `activity.category: ${snapshot.activity.category}`, color: "dim" });
-    lines.push({ text: `activity.active_count: ${snapshot.activity.active_count}`, color: "dim" });
+    lines.push({ text: `activity.phase: ${snapshot.activity.phase}`, color: "dim" });
+    if (snapshot.activity.category !== undefined) {
+      lines.push({ text: `activity.category: ${snapshot.activity.category}`, color: "dim" });
+    }
+    if (snapshot.activity.active_count !== undefined) {
+      lines.push({ text: `activity.active_count: ${snapshot.activity.active_count}`, color: "dim" });
+    }
+  }
+  if (snapshot.last_task !== undefined) {
+    lines.push({ text: `last_task.outcome: ${snapshot.last_task.outcome}`, color: "dim" });
+    lines.push({ text: `last_task.output_state: ${snapshot.last_task.output_state}`, color: "dim" });
   }
   if (snapshot.error !== undefined) lines.push({ text: `error.code: ${snapshot.error.code}`, color: "warning" });
   if (snapshot.termination_result !== undefined) {
@@ -520,7 +537,9 @@ function expandedStatusLines(snapshot: AgentSnapshot): readonly SafeRenderLine[]
     { text: `parent_agent_id: ${snapshot.parent_agent_id}`, color: "dim" },
     { text: `depth: ${snapshot.depth}`, color: "dim" },
     { text: `state: ${snapshot.state}`, color: "dim" },
-    { text: `pending_message_count: ${snapshot.pending_message_count}`, color: "dim" },
+    { text: `mailbox_pending_count: ${snapshot.mailbox_pending_count}`, color: "dim" },
+    { text: `host_pending_count: ${snapshot.host_pending_count}`, color: "dim" },
+    { text: `reply_outbox_pending_count: ${snapshot.reply_outbox_pending_count}`, color: "dim" },
     { text: `revision: ${snapshot.revision}`, color: "dim" },
   ];
   if (snapshot.created_at !== undefined) lines.push({ text: `created_at: ${snapshot.created_at}`, color: "dim" });
@@ -528,8 +547,23 @@ function expandedStatusLines(snapshot: AgentSnapshot): readonly SafeRenderLine[]
     lines.push({ text: `lifecycle_elapsed_ms: ${snapshot.lifecycle_elapsed_ms}`, color: "dim" });
   }
   if (snapshot.activity !== undefined) {
-    lines.push({ text: `activity.category: ${snapshot.activity.category}`, color: "dim" });
-    lines.push({ text: `activity.active_count: ${snapshot.activity.active_count}`, color: "dim" });
+    lines.push({ text: `activity.phase: ${snapshot.activity.phase}`, color: "dim" });
+    if (snapshot.activity.task_id !== undefined) {
+      lines.push({ text: `activity.task_id: ${snapshot.activity.task_id}`, color: "dim" });
+    }
+    if (snapshot.activity.category !== undefined) {
+      lines.push({ text: `activity.category: ${snapshot.activity.category}`, color: "dim" });
+    }
+    if (snapshot.activity.active_count !== undefined) {
+      lines.push({ text: `activity.active_count: ${snapshot.activity.active_count}`, color: "dim" });
+    }
+  }
+  if (snapshot.last_task !== undefined) {
+    lines.push({ text: `last_task.task_id: ${snapshot.last_task.task_id}`, color: "dim" });
+    lines.push({ text: `last_task.turn_id: ${snapshot.last_task.turn_id}`, color: "dim" });
+    lines.push({ text: `last_task.commit_id: ${snapshot.last_task.commit_id}`, color: "dim" });
+    lines.push({ text: `last_task.outcome: ${snapshot.last_task.outcome}`, color: "dim" });
+    lines.push({ text: `last_task.output_state: ${snapshot.last_task.output_state}`, color: "dim" });
   }
   if (snapshot.error !== undefined) {
     lines.push({ text: `error.code: ${snapshot.error.code}`, color: "warning" });
@@ -629,8 +663,10 @@ function treeSummary(tree: ScopedAgentTreeSnapshot): string {
   const failed = tree.nodes.filter((node) => node.state === "failed" || node.termination_result === "failed").length;
   const completed = tree.nodes.filter((node) => node.termination_result === "completed").length;
   const incomplete = tree.nodes.filter((node) => node.termination_result === "incomplete").length;
-  const pending = tree.nodes.reduce((total, node) => total + node.pending_message_count, 0);
-  return `scope: ${formatScope(tree)} · active ${active} · working ${working} · failed ${failed} · completed ${completed} · pending ${pending}${incomplete === 0 ? "" : ` · incomplete ${incomplete}`}`;
+  const mailboxPending = tree.nodes.reduce((total, node) => total + node.mailbox_pending_count, 0);
+  const hostPending = tree.nodes.reduce((total, node) => total + node.host_pending_count, 0);
+  const replyPending = tree.nodes.reduce((total, node) => total + node.reply_outbox_pending_count, 0);
+  return `scope: ${formatScope(tree)} · active ${active} · working ${working} · failed ${failed} · completed ${completed} · queues ${mailboxPending}/${hostPending}/${replyPending}${incomplete === 0 ? "" : ` · incomplete ${incomplete}`}`;
 }
 
 function formatScope(tree: ScopedAgentTreeSnapshot): string {
@@ -749,24 +785,6 @@ function resolveName(agentId: string, lookups: AgentToolRenderLookups): string |
 
 function readAgentId(value: unknown): string | undefined {
   return readOptionalString(readRecord(value), "agent_id");
-}
-
-export function formatSafeImageSummary(value: unknown): string | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const counts = new Map<string, number>();
-  let count = 0;
-  for (const image of value) {
-    const record = readRecord(image);
-    if (readProperty(record, "type") !== "image") continue;
-    count += 1;
-    const mimeType = readOptionalString(record, "mimeType") ?? "unknown";
-    counts.set(mimeType, (counts.get(mimeType) ?? 0) + 1);
-  }
-  if (count === 0) return undefined;
-  const mimeSummary = [...counts.entries()]
-    .map(([mime, amount]) => `${mime} ×${amount}`)
-    .join(" · ");
-  return `图片 ${count}${mimeSummary.length === 0 ? "" : ` · ${mimeSummary}`}`;
 }
 
 function readRecord(value: unknown): Record<string, unknown> | undefined {

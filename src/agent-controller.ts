@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import {
   controlFailure,
   isCanonicalUuid,
@@ -11,9 +10,6 @@ import {
   type TreeActor,
   type TreeController,
 } from "./tree-controller.ts";
-import {
-  CHILD_REPLY_MAX_IMAGE_MIME_TYPE_LENGTH,
-} from "./child-reply-envelope.ts";
 import {
   listAgentTemplates,
   type AgentTemplateListItem,
@@ -28,7 +24,6 @@ import type {
 import {
   type RpcSupervisorCommandResult,
   type RpcSupervisorEvent,
-  type RpcSupervisorImage,
   type RpcSupervisorInterruptResult,
   type RpcSupervisorStartupResult,
   type RpcSupervisorTerminationResult,
@@ -46,7 +41,6 @@ export interface SpawnAgentInput {
 export interface SendMessageInput {
   readonly agent_id: string;
   readonly message: string;
-  readonly images?: readonly RpcSupervisorImage[];
 }
 
 export interface WaitAgentInput {
@@ -64,14 +58,10 @@ export interface AgentSupervisorFactoryInput {
 /** 控制器只依赖单节点监督器的公开命令面，不接触其进程树或传输实现。 */
 export interface AgentSupervisor {
   start(): Promise<RpcSupervisorStartupResult>;
-  prompt(
-    message: string,
-    images?: readonly RpcSupervisorImage[],
-  ): Promise<RpcSupervisorCommandResult>;
-  steer(
-    message: string,
-    images?: readonly RpcSupervisorImage[],
-  ): Promise<RpcSupervisorCommandResult>;
+  /** 消息先进入监督器 mailbox；prompt/steer 由 reducer 与宿主适配器决定。 */
+  submit(message: string): Promise<RpcSupervisorCommandResult>;
+  prompt(message: string): Promise<RpcSupervisorCommandResult>;
+  steer(message: string): Promise<RpcSupervisorCommandResult>;
   interrupt(): Promise<RpcSupervisorInterruptResult>;
   terminate(): Promise<RpcSupervisorTerminationResult>;
   /** 故障节点的平台进程树边界回收；节点记录本身继续保持 failed。 */
@@ -125,7 +115,14 @@ interface PendingWaiter {
   readonly timer: ReturnType<typeof setTimeout>;
 }
 
-export type WaitAgentOutcome = "reply" | "settled" | "terminal" | "timeout";
+export type WaitAgentOutcome =
+  | "reply"
+  | "task_completed"
+  | "task_failed"
+  | "task_interrupted"
+  | "suspended"
+  | "timeout"
+  | "terminal";
 
 export interface WaitAgentData {
   readonly agent_id: string;
@@ -133,6 +130,7 @@ export interface WaitAgentData {
   readonly state: AgentSnapshot["state"];
   readonly revision: number;
   readonly error?: AgentSnapshot["error"];
+  readonly last_task?: AgentSnapshot["last_task"];
 }
 
 export type WaitAgentResult = ControlResult<WaitAgentData>;
@@ -155,6 +153,7 @@ export interface TerminateAgentData {
 
 export interface AgentMessageData {
   readonly message_id: string;
+  readonly task_id: string;
   readonly accepted: true;
 }
 
@@ -189,7 +188,6 @@ export class AgentController {
   private readonly pendingReplyNotifications = new Map<string, number>();
   private readonly terminalNotifications = new Set<string>();
   private readonly pendingTerminalNotifications = new Set<string>();
-  private readonly messageIds = new Set<string>();
   private unsubscribeTreeChange: (() => void) | undefined;
   private readonly confirmedWithoutOwnership = new Set<string>();
   private readonly terminationFlows = new Map<string, Promise<ControlResult<TerminateAgentData>>>();
@@ -343,19 +341,21 @@ export class AgentController {
     if (target.data.state === "failed" || target.data.state === "terminating" || target.data.state === "terminated") {
       return controlFailure("agent_unavailable");
     }
-    const messageId = this.allocateMessageId();
     let result: RpcSupervisorCommandResult;
     try {
-      // Pi 0.83.0 的公共 RpcClient 未暴露 prompt.streamingBehavior；REQ-026
-      // 采用控制器已确认状态的空闲 prompt / 工作 steering 兼容路由，避免访问私有 JSONL。
-      result = target.data.state === "idle"
-        ? await entry.supervisor.prompt(input.message, input.images)
-        : await entry.supervisor.steer(input.message, input.images);
+      result = await entry.supervisor.submit(input.message);
     } catch {
       return controlFailure("message_delivery_failed");
     }
     if (!result.ok) return controlFailure(result.code);
-    return Object.freeze({ ok: true, data: Object.freeze({ message_id: messageId, accepted: true }) });
+    return Object.freeze({
+      ok: true,
+      data: Object.freeze({
+        message_id: result.message_id,
+        task_id: result.task_id,
+        accepted: true,
+      }),
+    });
   }
 
   async waitAgent(input: WaitAgentInput | unknown): Promise<WaitAgentResult> {
@@ -924,7 +924,12 @@ export class AgentController {
   }
 
   private waitOutcome(agentId: string, status: AgentSnapshot): WaitAgentData | undefined {
-    if (status.state === "idle") return makeWaitData(status, "settled");
+    if (status.state === "suspended") return makeWaitData(status, "suspended");
+    if (status.state === "idle") {
+      if (status.last_task?.outcome === "failed") return makeWaitData(status, "task_failed");
+      if (status.last_task?.outcome === "interrupted") return makeWaitData(status, "task_interrupted");
+      return makeWaitData(status, "task_completed");
+    }
     if (status.state === "failed") {
       return this.terminalNotifications.has(agentId) ? makeWaitData(status, "terminal") : undefined;
     }
@@ -941,13 +946,6 @@ export class AgentController {
     else this.pendingReplyNotifications.set(agentId, pending - 1);
     return makeWaitData(status, "reply");
   }
-
-  private allocateMessageId(): string {
-    let candidate = `msg_${randomUUID()}`;
-    while (this.messageIds.has(candidate)) candidate = `msg_${randomUUID()}`;
-    this.messageIds.add(candidate);
-    return candidate;
-  }
 }
 
 function isSpawnInput(value: unknown): value is SpawnAgentInput {
@@ -963,26 +961,11 @@ function isSpawnInput(value: unknown): value is SpawnAgentInput {
 function isSendMessageInput(value: unknown): value is SendMessageInput {
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as Record<string, unknown>;
-  if (
-    !isCanonicalUuid(candidate.agent_id)
-    || typeof candidate.message !== "string"
-    || candidate.message.length === 0
-    || utf8Length(candidate.message) > 16 * 1024
-  ) return false;
-  if (candidate.images === undefined) return true;
-  if (!Array.isArray(candidate.images) || candidate.images.length > 8) return false;
-  return candidate.images.every((image) => {
-    if (typeof image !== "object" || image === null) return false;
-    const item = image as Record<string, unknown>;
-    return item.type === "image"
-      && typeof item.data === "string"
-      && validBase64(item.data)
-      && decodedBase64Length(item.data) <= 24 * 1024
-      && typeof item.mimeType === "string"
-      && item.mimeType.length <= CHILD_REPLY_MAX_IMAGE_MIME_TYPE_LENGTH
-      && /^image\/[a-z0-9.+-]+$/.test(item.mimeType)
-      && Object.keys(item).every((key) => key === "type" || key === "data" || key === "mimeType");
-  });
+  return isCanonicalUuid(candidate.agent_id)
+    && typeof candidate.message === "string"
+    && candidate.message.length > 0
+    && utf8Length(candidate.message) <= 16 * 1024
+    && Object.keys(candidate).every((key) => key === "agent_id" || key === "message");
 }
 
 function isWaitInput(value: unknown): value is WaitAgentInput {
@@ -1004,6 +987,7 @@ function makeWaitData(status: AgentSnapshot, outcome: WaitAgentOutcome): WaitAge
     state: status.state,
     revision: status.revision,
     ...(status.error === undefined ? {} : { error: status.error }),
+    ...(status.last_task === undefined ? {} : { last_task: status.last_task }),
   });
 }
 
@@ -1020,25 +1004,6 @@ function spawnData(status: AgentSnapshot): SpawnAgentData {
 
 function utf8Length(value: string): number {
   return new TextEncoder().encode(value).byteLength;
-}
-
-function validBase64(value: string): boolean {
-  if (value.length === 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return false;
-  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
-  if (padding > 0 && value.length % 4 !== 0) return false;
-  if ((value.length - padding) % 4 === 1) return false;
-  try {
-    const normalized = padding > 0 ? value : value + "=".repeat((4 - (value.length % 4)) % 4);
-    return Buffer.from(normalized, "base64").toString("base64").replace(/=+$/, "")
-      === normalized.replace(/=+$/, "");
-  } catch {
-    return false;
-  }
-}
-
-function decodedBase64Length(value: string): number {
-  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
-  return Math.floor(value.length * 3 / 4) - padding;
 }
 
 function interruptData(status: AgentSnapshot, changed: boolean): InterruptAgentData {

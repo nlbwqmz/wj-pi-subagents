@@ -2,6 +2,8 @@
 
 Status: accepted
 
+> 图片载荷决策已由 [ADR-0004](./0004-text-only-subagent-messaging.md) 覆盖；任务身份、生命周期与当前协议版本已由 [ADR-0005](./0005-task-mailbox-and-delayed-final-commit.md) 覆盖。本文其余结构化回复和唤醒语义继续有效。
+
 父子监督协议升级为 `pi-subagent/3`。reply 帧只传输单调 `reply_seq` 和一个经过统一 codec 校验的 `pi-subagent.reply` envelope；v2 顶层 `kind`、`text` 和 `images` 不再兼容，协议主版本不同的活动树必须结束并重建，不能通过 reload 热接管。模型可见父会话消息直接包含普通 JSON envelope，TUI 只展示其发送者、类型、状态、自然语言正文和图片摘要，不显示原始协议字段。
 
 每次 child `agent_start` 由运行时分配一个在该节点生命周期内未曾签发的随机 UUID v4 `turn_id`，同轮显式 message 与自动 final 共享该标识。轮次分配失败会废止当前轮次并关闭监督通道，后续生命周期事件不能借用上一轮标识出站。message 必须包含非空 `text` 和模型显式选择的 `requires_response`，并可选携带经过统一 codec 校验的图片；该布尔字段只控制父代理空闲时是否触发处理，任何已接纳 message 仍会解除一次 `wait_agent`。final 的 `run_state`、`output_state` 和 `reason_code` 完全由运行时依据结束边界与安全候选生成，模型不能自行声明。无输出 final 可以没有业务正文；失败和中断可以保留最近的安全候选，但运行时不追加说明性文字。

@@ -5,11 +5,13 @@ import {
   AGENT_FAULT_METADATA,
   isCanonicalAgentUuid,
   parseAgentActivitySummary,
+  parseAgentLastTask,
   parseAgentSnapshot,
   type AgentActivityCategory,
   type AgentActivitySummary,
   type AgentFault,
   type AgentFaultCode,
+  type AgentLastTask,
   type AgentLifecycleState,
   type AgentSnapshot,
   type AgentTerminationResult,
@@ -17,15 +19,20 @@ import {
 
 export {
   AGENT_ACTIVITY_CATEGORIES,
+  AGENT_ACTIVITY_PHASES,
   AGENT_FAULT_CODES,
   AGENT_LIFECYCLE_STATES,
+  AGENT_TASK_OUTCOMES,
   AGENT_TERMINATION_RESULTS,
   type AgentActivityCategory,
+  type AgentActivityPhase,
   type AgentActivitySummary,
   type AgentFault,
   type AgentFaultCode,
+  type AgentLastTask,
   type AgentLifecycleState,
   type AgentSnapshot,
+  type AgentTaskOutcome,
   type AgentTerminationResult,
 } from "./agent-snapshot-codec.ts";
 
@@ -229,20 +236,19 @@ interface FailureEvent extends EventGeneration {
   readonly error_code?: AgentFaultCode;
 }
 
-/** 监督器可以归一化并提交给树控制器的生命周期事实闭集。 */
+export interface AgentTaskProjectionInput {
+  readonly state: "idle" | "working" | "interrupting" | "suspended";
+  readonly mailbox_pending_count: number;
+  readonly host_pending_count: number;
+  readonly reply_outbox_pending_count: number;
+  readonly activity?: AgentActivitySummary;
+  readonly last_task?: AgentLastTask;
+}
+
+/** 监督器可以归一化并提交给树控制器的资源生命周期事实闭集。 */
 export const AGENT_LIFECYCLE_EVENT_TYPES = Object.freeze([
   "startup_ready",
-  "agent_started",
   "startup_failed",
-  "message_admitted",
-  "message_rejected",
-  "message_delivery_failed",
-  "message_cancelled",
-  "prompt_accepted",
-  "steering_accepted",
-  "agent_settled",
-  "interrupt_accepted",
-  "abort_completed",
   "runtime_failed",
   "termination_requested",
   "termination_incomplete",
@@ -292,7 +298,9 @@ interface AgentRecord {
   readonly depth: number;
   readonly managementEnabled: boolean;
   state: AgentLifecycleState;
-  pendingMessageCount: number;
+  mailboxPendingCount: number;
+  hostPendingCount: number;
+  replyOutboxPendingCount: number;
   revision: number;
   lifecycleGeneration: number;
   createdAt: string | undefined;
@@ -300,6 +308,7 @@ interface AgentRecord {
   frozenLifecycleElapsedMs: number | undefined;
   activity: AgentActivitySummary | undefined;
   activityCounts: Map<AgentActivityCategory, number>;
+  lastTask: AgentLastTask | undefined;
   error: AgentFault | undefined;
   terminationResult: AgentTerminationResult | undefined;
   terminationHadFailure: boolean;
@@ -323,15 +332,53 @@ interface ResolvedActor {
 
 interface PublicMutation {
   readonly state?: AgentLifecycleState;
-  readonly pendingMessageCount?: number;
+  readonly mailboxPendingCount?: number;
+  readonly hostPendingCount?: number;
+  readonly replyOutboxPendingCount?: number;
   readonly errorCode?: AgentFaultCode;
   readonly clearError?: boolean;
   /** undefined 表示保持，null 表示清除。 */
   readonly activity?: AgentActivitySummary | null;
+  /** undefined 表示保持，null 表示清除。 */
+  readonly lastTask?: AgentLastTask | null;
 }
 
-function isAgentActivitySummary(value: unknown, allowZero: boolean): value is AgentActivitySummary {
-  return parseAgentActivitySummary(value, allowZero) !== undefined;
+function isAgentTaskProjection(value: unknown): value is AgentTaskProjectionInput {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  if (
+    !["idle", "working", "interrupting", "suspended"].includes(String(candidate.state))
+    || !Number.isSafeInteger(candidate.mailbox_pending_count)
+    || (candidate.mailbox_pending_count as number) < 0
+    || !Number.isSafeInteger(candidate.host_pending_count)
+    || (candidate.host_pending_count as number) < 0
+    || !Number.isSafeInteger(candidate.reply_outbox_pending_count)
+    || (candidate.reply_outbox_pending_count as number) < 0
+    || Object.keys(candidate).some((key) => ![
+      "state",
+      "mailbox_pending_count",
+      "host_pending_count",
+      "reply_outbox_pending_count",
+      "activity",
+      "last_task",
+    ].includes(key))
+  ) return false;
+  const activity = candidate.activity === undefined ? undefined : parseAgentActivitySummary(candidate.activity);
+  const lastTask = candidate.last_task === undefined ? undefined : parseAgentLastTask(candidate.last_task);
+  if ((candidate.activity !== undefined && activity === undefined)
+    || (candidate.last_task !== undefined && lastTask === undefined)) return false;
+  if (candidate.state === "idle" && (
+    candidate.mailbox_pending_count !== 0
+    || candidate.host_pending_count !== 0
+    || candidate.reply_outbox_pending_count !== 0
+    || activity !== undefined
+  )) return false;
+  if (candidate.state !== "idle" && activity === undefined) return false;
+  return true;
+}
+
+function isAgentActivitySummary(value: unknown): value is AgentActivitySummary {
+  return parseAgentActivitySummary(value) !== undefined;
 }
 
 function isAgentFaultCode(value: unknown): value is AgentFaultCode {
@@ -345,17 +392,7 @@ function isLifecycleEvent(value: unknown): value is AgentLifecycleEvent {
   if (typeof type !== "string") return false;
   const supported = [
     "startup_ready",
-    "agent_started",
     "startup_failed",
-    "message_admitted",
-    "message_rejected",
-    "message_delivery_failed",
-    "message_cancelled",
-    "prompt_accepted",
-    "steering_accepted",
-    "agent_settled",
-    "interrupt_accepted",
-    "abort_completed",
     "runtime_failed",
     "termination_requested",
     "termination_incomplete",
@@ -445,6 +482,7 @@ function sameSnapshot(
         record.state === "idle"
         || record.state === "working"
         || record.state === "interrupting"
+        || record.state === "suspended"
         || record.state === "terminating"
       )
       && node.lifecycle_elapsed_ms !== undefined
@@ -455,11 +493,14 @@ function sameSnapshot(
     && record.name === node.name
     && record.depth === node.depth
     && record.state === node.state
-    && record.pendingMessageCount === node.pending_message_count
+    && record.mailboxPendingCount === node.mailbox_pending_count
+    && record.hostPendingCount === node.host_pending_count
+    && record.replyOutboxPendingCount === node.reply_outbox_pending_count
     && record.revision === node.revision
     && record.createdAt === node.created_at
     && lifecycleMatches
     && JSON.stringify(record.activity) === JSON.stringify(node.activity)
+    && JSON.stringify(record.lastTask) === JSON.stringify(node.last_task)
     && JSON.stringify(currentFault) === JSON.stringify(nextFault)
     && record.terminationResult === node.termination_result
   );
@@ -476,7 +517,10 @@ function safeWallClockNow(now: () => Date): string {
 }
 
 function isManagementState(state: AgentLifecycleState): boolean {
-  return state === "idle" || state === "working" || state === "interrupting";
+  return state === "idle"
+    || state === "working"
+    || state === "interrupting"
+    || state === "suspended";
 }
 
 function isQuotaConsumingState(state: AgentLifecycleState): boolean {
@@ -545,7 +589,9 @@ export class TreeController {
         depth: initialActor.depth,
         managementEnabled: initialActor.managementEnabled,
         state: "idle",
-        pendingMessageCount: 0,
+        mailboxPendingCount: 0,
+        hostPendingCount: 0,
+        replyOutboxPendingCount: 0,
         revision: 1,
         lifecycleGeneration: 0,
         createdAt,
@@ -553,6 +599,7 @@ export class TreeController {
         frozenLifecycleElapsedMs: undefined,
         activity: undefined,
         activityCounts: new Map(),
+        lastTask: undefined,
         error: undefined,
         terminationResult: undefined,
         terminationHadFailure: false,
@@ -641,7 +688,9 @@ export class TreeController {
       ? {}
       : {
           state: "terminated",
-          pendingMessageCount: 0,
+          mailboxPendingCount: 0,
+          hostPendingCount: 0,
+          replyOutboxPendingCount: 0,
           clearError: true,
         });
     return controlSuccess(this.outcome(
@@ -715,7 +764,9 @@ export class TreeController {
         && input.subagents !== "disabled"
         && depth < this.config.maxDepth,
       state: "starting",
-      pendingMessageCount: 0,
+      mailboxPendingCount: 0,
+      hostPendingCount: 0,
+      replyOutboxPendingCount: 0,
       revision: 1,
       lifecycleGeneration: 0,
       createdAt: undefined,
@@ -723,6 +774,7 @@ export class TreeController {
       frozenLifecycleElapsedMs: undefined,
       activity: undefined,
       activityCounts: new Map(),
+      lastTask: undefined,
       error: undefined,
       terminationResult: undefined,
       terminationHadFailure: false,
@@ -780,7 +832,9 @@ export class TreeController {
       depth: node.depth,
       managementEnabled: input.management_enabled,
       state: "starting",
-      pendingMessageCount: node.pending_message_count,
+      mailboxPendingCount: node.mailbox_pending_count,
+      hostPendingCount: node.host_pending_count,
+      replyOutboxPendingCount: node.reply_outbox_pending_count,
       revision: node.revision,
       lifecycleGeneration: input.lifecycle_generation,
       createdAt: undefined,
@@ -788,6 +842,7 @@ export class TreeController {
       frozenLifecycleElapsedMs: undefined,
       activity: undefined,
       activityCounts: new Map(),
+      lastTask: undefined,
       error: undefined,
       terminationResult: undefined,
       terminationHadFailure: false,
@@ -824,70 +879,32 @@ export class TreeController {
       case "startup_ready":
         if (record.state === "starting") applied = this.mutate(record, { state: "idle" });
         break;
-      case "agent_started":
-        if (record.state === "idle" || record.state === "interrupting") {
-          applied = this.mutate(record, { state: "working" });
-        }
-        break;
       case "startup_failed":
         if (record.state === "starting") {
           applied = this.failStartingNode(record, eventFaultCode(event, "spawn_failed"));
         }
         break;
-      case "message_admitted":
-        if (record.state === "idle" || record.state === "working" || record.state === "interrupting") {
-          applied = this.mutate(record, { pendingMessageCount: record.pendingMessageCount + 1 });
-        }
-        break;
-      case "message_rejected":
-      case "message_delivery_failed":
-      case "message_cancelled":
-        if (record.pendingMessageCount > 0 && record.state !== "failed" && record.state !== "terminated") {
-          applied = this.mutate(record, { pendingMessageCount: record.pendingMessageCount - 1 });
-        }
-        break;
-      case "prompt_accepted":
-        if (record.state === "idle") {
-          applied = this.mutate(record, {
-            state: "working",
-            pendingMessageCount: Math.max(0, record.pendingMessageCount - 1),
-          });
-        }
-        break;
-      case "steering_accepted":
-        if (
-          (record.state === "working" || record.state === "interrupting") &&
-          record.pendingMessageCount > 0
-        ) {
-          applied = this.mutate(record, { pendingMessageCount: record.pendingMessageCount - 1 });
-        }
-        break;
-      case "agent_settled":
-        if (record.state === "working" || record.state === "interrupting") {
-          applied = this.mutate(record, { state: "idle" });
-        }
-        break;
-      case "interrupt_accepted":
-        if (record.state === "working") applied = this.mutate(record, { state: "interrupting" });
-        break;
-      case "abort_completed":
-        // abort 响应不是 settle 事实，故意不改变生命周期。
-        break;
       case "runtime_failed":
         if (record.state === "starting") {
           applied = this.failStartingNode(record, eventFaultCode(event, "spawn_failed"));
         } else if (
-          record.state === "idle" ||
-          record.state === "working" ||
-          record.state === "interrupting"
+          record.state === "idle"
+          || record.state === "working"
+          || record.state === "interrupting"
+          || record.state === "suspended"
         ) {
           applied = this.failRuntimeAndOrphans(record, eventFaultCode(event, "spawn_failed"));
         }
         break;
       case "termination_requested":
         if (record.state !== "terminated" && record.state !== "terminating") {
-          // 运行故障是历史诊断；进入终止阶段后仅暴露清理是否完成。
-          applied = this.mutate(record, { state: "terminating", clearError: true });
+          applied = this.mutate(record, {
+            state: "terminating",
+            mailboxPendingCount: 0,
+            hostPendingCount: 0,
+            replyOutboxPendingCount: 0,
+            clearError: true,
+          });
         }
         break;
       case "termination_incomplete":
@@ -899,7 +916,9 @@ export class TreeController {
         if (record.state === "terminating" && this.allDirectChildrenTerminated(record.agentId)) {
           applied = this.mutate(record, {
             state: "terminated",
-            pendingMessageCount: 0,
+            mailboxPendingCount: 0,
+            hostPendingCount: 0,
+            replyOutboxPendingCount: 0,
             clearError: true,
           });
         }
@@ -908,34 +927,52 @@ export class TreeController {
     return controlSuccess(this.outcome(record, applied));
   }
 
-  /** 将监督器确认的工具边界折叠成单个安全活动事实。 */
+  /**
+   * 单节点协调器一次性提交完整任务投影。状态、活动、三类队列和 last_task
+   * 共用一个 revision/tree_revision，状态查询、树和 TUI 因此不会看到撕裂快照。
+   */
+  applyTaskProjection(
+    agentId: unknown,
+    projection: AgentTaskProjectionInput | unknown,
+  ): ControlResult<LifecycleEventOutcome> {
+    const resolved = this.findAgent(agentId);
+    if (!resolved.ok) return resolved;
+    if (!isAgentTaskProjection(projection)) return controlFailure("invalid_argument");
+    const record = resolved.data;
+    if (record.state === "starting" || record.state === "failed" || record.state === "terminating" || record.state === "terminated") {
+      return controlSuccess(this.outcome(record, false));
+    }
+    const parsedActivity = projection.activity === undefined
+      ? undefined
+      : parseAgentActivitySummary(projection.activity);
+    const parsedLastTask = projection.last_task === undefined
+      ? undefined
+      : parseAgentLastTask(projection.last_task);
+    const applied = this.mutate(record, {
+      state: projection.state,
+      mailboxPendingCount: projection.mailbox_pending_count,
+      hostPendingCount: projection.host_pending_count,
+      replyOutboxPendingCount: projection.reply_outbox_pending_count,
+      activity: parsedActivity ?? null,
+      ...(parsedLastTask === undefined ? {} : { lastTask: parsedLastTask }),
+    });
+    return controlSuccess(this.outcome(record, applied));
+  }
+
+  /** 兼容安全工具活动观察；真正 phase 由任务协调器投影。 */
   updateActivity(
     agentId: unknown,
     activity: AgentActivitySummary | unknown,
   ): ControlResult<LifecycleEventOutcome> {
     const resolved = this.findAgent(agentId);
     if (!resolved.ok) return resolved;
-    if (!isAgentActivitySummary(activity, true)) return controlFailure("invalid_argument");
+    const parsed = parseAgentActivitySummary(activity);
+    if (parsed === undefined) return controlFailure("invalid_argument");
     const record = resolved.data;
-    if (
-      record.state === "starting"
-      || record.state === "failed"
-      || record.state === "terminating"
-      || record.state === "terminated"
-    ) return controlSuccess(this.outcome(record, false));
-    const nextCounts = new Map(record.activityCounts);
-    if (activity.active_count === 0) nextCounts.delete(activity.category);
-    else nextCounts.set(activity.category, activity.active_count);
-    const fallback = [...nextCounts].at(-1);
-    const next = activity.active_count > 0
-      ? Object.freeze({ category: activity.category, active_count: activity.active_count })
-      : record.activity?.category !== activity.category
-        ? record.activity ?? null
-        : fallback === undefined
-          ? null
-          : Object.freeze({ category: fallback[0], active_count: fallback[1] });
-    record.activityCounts = nextCounts;
-    const applied = this.mutate(record, { activity: next });
+    if (record.state !== "working" && record.state !== "interrupting" && record.state !== "suspended") {
+      return controlSuccess(this.outcome(record, false));
+    }
+    const applied = this.mutate(record, { activity: parsed });
     return controlSuccess(this.outcome(record, applied));
   }
 
@@ -1121,7 +1158,9 @@ export class TreeController {
           depth: node.depth,
           managementEnabled: parentRecord?.managementEnabled ?? scope.managementEnabled,
           state: node.state,
-          pendingMessageCount: node.pending_message_count,
+          mailboxPendingCount: node.mailbox_pending_count,
+          hostPendingCount: node.host_pending_count,
+          replyOutboxPendingCount: node.reply_outbox_pending_count,
           revision: node.revision,
           lifecycleGeneration: 0,
           createdAt: node.created_at,
@@ -1133,9 +1172,10 @@ export class TreeController {
               ? node.lifecycle_elapsed_ms
               : undefined,
           activity: node.activity,
-          activityCounts: node.activity === undefined
+          activityCounts: node.activity?.category === undefined || node.activity.active_count === undefined
             ? new Map()
             : new Map([[node.activity.category, node.activity.active_count]]),
+          lastTask: node.last_task,
           error: node.error,
           terminationResult: node.termination_result,
           terminationHadFailure: snapshotHadTerminationFailure(node),
@@ -1223,13 +1263,16 @@ export class TreeController {
   ): void {
     const stateChanged = record.state !== node.state;
     record.state = node.state;
-    record.pendingMessageCount = node.pending_message_count;
+    record.mailboxPendingCount = node.mailbox_pending_count;
+    record.hostPendingCount = node.host_pending_count;
+    record.replyOutboxPendingCount = node.reply_outbox_pending_count;
     record.revision = node.revision;
     record.createdAt = node.created_at;
     record.activity = node.activity === undefined ? undefined : Object.freeze({ ...node.activity });
-    record.activityCounts = node.activity === undefined
+    record.activityCounts = node.activity?.category === undefined || node.activity.active_count === undefined
       ? new Map()
       : new Map([[node.activity.category, node.activity.active_count]]);
+    record.lastTask = node.last_task === undefined ? undefined : Object.freeze({ ...node.last_task });
     record.error = cloneAgentFault(node.error);
     record.terminationHadFailure ||= snapshotHadTerminationFailure(node);
     record.terminationHadIncompleteCleanup ||= snapshotHadIncompleteCleanup(node);
@@ -1373,7 +1416,9 @@ export class TreeController {
         if (existingTarget?.state === "failed") {
           changed = this.mutate(existingTarget, {
             state: "terminating",
-            pendingMessageCount: 0,
+            mailboxPendingCount: 0,
+            hostPendingCount: 0,
+            replyOutboxPendingCount: 0,
             clearError: true,
           });
         }
@@ -1387,7 +1432,13 @@ export class TreeController {
     const memberIds = Object.freeze(memberRecords.map((record) => record.agentId));
     const changed = this.mutateMany(memberRecords, (record) => {
       if (preserveTargetFailure && record.agentId === targetAgentId) return {};
-      return { state: "terminating", clearError: true };
+      return {
+        state: "terminating",
+        mailboxPendingCount: 0,
+        hostPendingCount: 0,
+        replyOutboxPendingCount: 0,
+        clearError: true,
+      };
     });
     const barrier: TerminationBarrierRecord = Object.freeze({
       barrierId: `termination_${targetAgentId}`,
@@ -1440,8 +1491,20 @@ export class TreeController {
       .filter((candidate) => candidate.agentId !== record.agentId && candidate.state !== "terminated");
     const members = [record, ...this.orderDescendantsFirst(descendants)];
     const applied = this.mutateMany(members, (candidate) => candidate.agentId === record.agentId
-      ? { state: "failed", pendingMessageCount: 0, errorCode }
-      : { state: "terminating", pendingMessageCount: 0, clearError: true });
+      ? {
+          state: "failed",
+          mailboxPendingCount: 0,
+          hostPendingCount: 0,
+          replyOutboxPendingCount: 0,
+          errorCode,
+        }
+      : {
+          state: "terminating",
+          mailboxPendingCount: 0,
+          hostPendingCount: 0,
+          replyOutboxPendingCount: 0,
+          clearError: true,
+        });
     const barrier: TerminationBarrierRecord = Object.freeze({
       barrierId: `termination_${record.agentId}`,
       targetAgentId: record.agentId,
@@ -1456,7 +1519,9 @@ export class TreeController {
   private failStartingNode(record: AgentRecord, errorCode: AgentFaultCode): boolean {
     const failedApplied = this.mutate(record, {
       state: "failed",
-      pendingMessageCount: 0,
+      mailboxPendingCount: 0,
+      hostPendingCount: 0,
+      replyOutboxPendingCount: 0,
       errorCode,
     });
     const terminatingApplied = this.mutate(record, { state: "terminating" });
@@ -1500,28 +1565,41 @@ export class TreeController {
     monotonicAt: number,
   ): boolean {
     const nextState = mutation.state ?? record.state;
-    const nextPending = mutation.pendingMessageCount ?? record.pendingMessageCount;
+    const nextMailboxPending = mutation.mailboxPendingCount ?? record.mailboxPendingCount;
+    const nextHostPending = mutation.hostPendingCount ?? record.hostPendingCount;
+    const nextReplyPending = mutation.replyOutboxPendingCount ?? record.replyOutboxPendingCount;
     const nextErrorCode = mutation.errorCode === undefined
       ? (mutation.clearError === true ? undefined : record.error?.code)
       : mutation.errorCode;
     const stateChanged = nextState !== record.state;
-    const pendingChanged = nextPending !== record.pendingMessageCount;
+    const queuesChanged = nextMailboxPending !== record.mailboxPendingCount
+      || nextHostPending !== record.hostPendingCount
+      || nextReplyPending !== record.replyOutboxPendingCount;
     const errorChanged = nextErrorCode !== record.error?.code;
     const nextActivity = mutation.activity === undefined
       ? record.activity
       : mutation.activity === null
         ? undefined
         : mutation.activity;
+    const nextLastTask = mutation.lastTask === undefined
+      ? record.lastTask
+      : mutation.lastTask === null
+        ? undefined
+        : mutation.lastTask;
     const activityChanged = JSON.stringify(nextActivity) !== JSON.stringify(record.activity);
-    if (!stateChanged && !pendingChanged && !errorChanged && !activityChanged) return false;
+    const lastTaskChanged = JSON.stringify(nextLastTask) !== JSON.stringify(record.lastTask);
+    if (!stateChanged && !queuesChanged && !errorChanged && !activityChanged && !lastTaskChanged) return false;
 
     const elapsedAtMutation = this.lifecycleElapsed(record, monotonicAt);
     const nextError = mutation.errorCode === undefined
       ? (mutation.clearError === true ? undefined : record.error)
       : this.createFault(mutation.errorCode);
     record.state = nextState;
-    record.pendingMessageCount = nextPending;
+    record.mailboxPendingCount = nextMailboxPending;
+    record.hostPendingCount = nextHostPending;
+    record.replyOutboxPendingCount = nextReplyPending;
     record.activity = nextActivity;
+    record.lastTask = nextLastTask;
     record.error = nextError;
     if (nextState === "failed") record.terminationHadFailure = true;
     if (nextErrorCode === "termination_incomplete") record.terminationHadIncompleteCleanup = true;
@@ -1620,7 +1698,9 @@ export class TreeController {
       name: record.name,
       depth: record.depth,
       state: record.state,
-      pending_message_count: record.pendingMessageCount,
+      mailbox_pending_count: record.mailboxPendingCount,
+      host_pending_count: record.hostPendingCount,
+      reply_outbox_pending_count: record.replyOutboxPendingCount,
       revision: record.revision,
     } as const;
     const base = record.createdAt === undefined
@@ -1633,9 +1713,12 @@ export class TreeController {
     const withTerminationResult = record.terminationResult === undefined
       ? base
       : { ...base, termination_result: record.terminationResult };
-    const withActivity = record.activity === undefined
+    const withLastTask = record.lastTask === undefined
       ? withTerminationResult
-      : { ...withTerminationResult, activity: Object.freeze({ ...record.activity }) };
+      : { ...withTerminationResult, last_task: Object.freeze({ ...record.lastTask }) };
+    const withActivity = record.activity === undefined
+      ? withLastTask
+      : { ...withLastTask, activity: Object.freeze({ ...record.activity }) };
     if (record.error === undefined) return Object.freeze(withActivity);
     return Object.freeze({ ...withActivity, error: record.error });
   }

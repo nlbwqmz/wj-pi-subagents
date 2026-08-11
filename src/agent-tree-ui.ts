@@ -632,7 +632,7 @@ export class AgentTreePanelModel {
   ): boolean {
     if (
       node.state !== "idle"
-      || node.pending_message_count > 0
+      || pendingQueueCount(node) > 0
       || node.activity !== undefined
       || node.error !== undefined
     ) return true;
@@ -653,7 +653,7 @@ export class AgentTreePanelModel {
         descendants += 1;
         if (child.state === "working") working += 1;
         if (child.state === "failed") failed += 1;
-        pending += child.pending_message_count;
+        pending += pendingQueueCount(child);
         visit(child.agent_id);
       }
     };
@@ -884,12 +884,18 @@ function themeBold(theme: unknown, text: string): string {
 function formatAgentFacts(node: AgentSnapshot): string {
   const facts = [safeUiFact(node.template_id), safeUiFact(node.name), node.state];
   if (node.activity !== undefined) {
-    facts.push(`${node.activity.category} ${node.activity.active_count}`);
+    facts.push(node.activity.phase);
+    if (node.activity.category !== undefined && node.activity.active_count !== undefined) {
+      facts.push(`${node.activity.category} ${node.activity.active_count}`);
+    }
   }
   if (node.state !== "starting" && node.lifecycle_elapsed_ms !== undefined) {
     facts.push(formatElapsed(node.lifecycle_elapsed_ms));
   }
-  if (node.pending_message_count > 0) facts.push(`pending ${node.pending_message_count}`);
+  const pending = pendingQueueCount(node);
+  if (pending > 0) {
+    facts.push(`queues ${node.mailbox_pending_count}/${node.host_pending_count}/${node.reply_outbox_pending_count}`);
+  }
   if (
     node.error !== undefined
     && (
@@ -898,6 +904,10 @@ function formatAgentFacts(node: AgentSnapshot): string {
     )
   ) facts.push(node.error.code);
   return facts.join(" · ");
+}
+
+function pendingQueueCount(node: AgentSnapshot): number {
+  return node.mailbox_pending_count + node.host_pending_count + node.reply_outbox_pending_count;
 }
 
 function formatBranchAggregate(aggregate: BranchAggregate): string {
@@ -982,10 +992,13 @@ function sameAgentFactsExceptElapsed(left: AgentSnapshot, right: AgentSnapshot):
     && left.name === right.name
     && left.depth === right.depth
     && left.state === right.state
-    && left.pending_message_count === right.pending_message_count
+    && left.mailbox_pending_count === right.mailbox_pending_count
+    && left.host_pending_count === right.host_pending_count
+    && left.reply_outbox_pending_count === right.reply_outbox_pending_count
     && left.revision === right.revision
     && left.created_at === right.created_at
     && JSON.stringify(left.activity) === JSON.stringify(right.activity)
+    && JSON.stringify(left.last_task) === JSON.stringify(right.last_task)
     && JSON.stringify(left.error) === JSON.stringify(right.error)
     && left.termination_result === right.termination_result;
 }

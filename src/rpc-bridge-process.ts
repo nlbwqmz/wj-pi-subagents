@@ -6,7 +6,6 @@
  * 转发给父监督器。
  */
 import { randomBytes } from "node:crypto";
-import { CHILD_REPLY_MAX_IMAGE_MIME_TYPE_LENGTH } from "./child-reply-envelope.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -33,22 +32,15 @@ const MAX_FRAME_BYTES = MANAGED_RPC_BRIDGE_MAX_FRAME_BYTES;
 const PROTOCOL = MANAGED_RPC_BRIDGE_PROTOCOL;
 const CREDENTIAL_ENV = MANAGED_RPC_BRIDGE_CREDENTIAL_ENV;
 const MAX_MESSAGE_BYTES = 16 * 1024;
-const MAX_IMAGE_BYTES = 24 * 1024;
 
 interface BridgeClient {
   start(): Promise<void>;
   stop(): Promise<void>;
-  prompt(message: string, images?: readonly ManagedImage[]): Promise<void>;
-  steer(message: string, images?: readonly ManagedImage[]): Promise<void>;
+  prompt(message: string): Promise<void>;
+  steer(message: string): Promise<void>;
   abort(): Promise<void>;
   getState(): Promise<unknown>;
   onEvent(listener: (event: unknown) => void): () => void;
-}
-
-interface ManagedImage {
-  readonly type: "image";
-  readonly data: string;
-  readonly mimeType: string;
 }
 
 interface BridgeCommand {
@@ -399,30 +391,6 @@ function normalizeSupervisorInit(value: unknown): ManagedRpcSupervisorInit | und
   }
 }
 
-function normalizeImages(value: unknown): ManagedImage[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const images: ManagedImage[] = [];
-  for (const item of value) {
-    if (!isRecord(item) || item.type !== "image" || typeof item.data !== "string" || typeof item.mimeType !== "string") {
-      return undefined;
-    }
-    if (
-      images.length >= 8
-      || !validBase64(item.data)
-      || decodedBase64Length(item.data) > MAX_IMAGE_BYTES
-      || item.mimeType.length > CHILD_REPLY_MAX_IMAGE_MIME_TYPE_LENGTH
-      || !/^image\/[a-z0-9.+-]+$/.test(item.mimeType)
-    ) {
-      return undefined;
-    }
-    if (!Object.keys(item).every((key) => key === "type" || key === "data" || key === "mimeType")) {
-      return undefined;
-    }
-    images.push({ type: "image", data: item.data, mimeType: item.mimeType });
-  }
-  return images;
-}
-
 async function ensureClient(): Promise<BridgeClient> {
   if (client !== undefined) return client;
   const options = isRecord(config.rpc) ? config.rpc : {};
@@ -585,17 +553,13 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
     if (command.command === "prompt" || command.command === "steer") {
       if (!isRecord(command.payload) || typeof command.payload.message !== "string"
         || command.payload.message.length === 0
-        || new TextEncoder().encode(command.payload.message).byteLength > MAX_MESSAGE_BYTES) {
+        || new TextEncoder().encode(command.payload.message).byteLength > MAX_MESSAGE_BYTES
+        || !hasOnlyKeys(command.payload, ["message"])) {
         response(command.id, false);
         return;
       }
-      const images = command.payload.images === undefined ? undefined : normalizeImages(command.payload.images);
-      if (command.payload.images !== undefined && images === undefined) {
-        response(command.id, false);
-        return;
-      }
-      if (command.command === "prompt") await current.prompt(command.payload.message, images);
-      else await current.steer(command.payload.message, images);
+      if (command.command === "prompt") await current.prompt(command.payload.message);
+      else await current.steer(command.payload.message);
       response(command.id, true);
       return;
     }
@@ -806,25 +770,6 @@ process.on("uncaughtException", () => {
 process.on("unhandledRejection", () => {
   failAndExit("process_exit");
 });
-
-function validBase64(value: string): boolean {
-  if (value.length === 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return false;
-  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
-  if (padding > 0 && value.length % 4 !== 0) return false;
-  if ((value.length - padding) % 4 === 1) return false;
-  try {
-    const normalized = padding > 0 ? value : value + "=".repeat((4 - (value.length % 4)) % 4);
-    return Buffer.from(normalized, "base64").toString("base64").replace(/=+$/, "")
-      === normalized.replace(/=+$/, "");
-  } catch {
-    return false;
-  }
-}
-
-function decodedBase64Length(value: string): number {
-  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
-  return Math.floor(value.length * 3 / 4) - padding;
-}
 
 function decodeBase64Url(value: string): Uint8Array | undefined {
   if (value.length === 0 || !/^[A-Za-z0-9_-]+={0,2}$/.test(value)) return undefined;

@@ -15,6 +15,8 @@ import {
 
 const CHILD_ID = "550e8400-e29b-41d4-a716-446655440000";
 const TURN_ID = "550e8400-e29b-41d4-a716-446655440001";
+const TASK_ID = "450e8400-e29b-41d4-a716-446655440001";
+const COMMIT_ID = "750e8400-e29b-41d4-a716-446655440001";
 
 function envelope(text = "进度"): ChildMessageEnvelope {
   return {
@@ -22,6 +24,7 @@ function envelope(text = "进度"): ChildMessageEnvelope {
     version: CHILD_REPLY_VERSION,
     kind: "message",
     agent_id: CHILD_ID,
+    task_id: TASK_ID,
     turn_id: TURN_ID,
     requires_response: false,
     text,
@@ -44,7 +47,9 @@ function readyPair(options: Pick<FakeSupervisorChannelPairOptions, "limits" | "o
     name: "资料代理",
     depth: 1,
     state: "idle" as const,
-    pending_message_count: 0,
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
     revision: 1,
   }], 1);
   pair.flush();
@@ -62,19 +67,19 @@ function receiveAndAck(
   return result;
 }
 
-test("v3 reply wire payload contains only reply_seq and envelope", () => {
+test("v5 reply wire payload contains only reply_seq and envelope", () => {
   const pair = readyPair();
   const value = envelope();
   const frame = pair.child.publishReply(value);
-  assert.equal(frame.protocol, "pi-subagent/3");
+  assert.equal(frame.protocol, "pi-subagent/5");
   assert.deepEqual(frame.payload, { reply_seq: 1, envelope: value });
 });
 
-test("v3 rejects v2 frames and reply envelopes with a forged agent identity", () => {
-  const v2Pair = readyPair();
-  const valid = v2Pair.child.publishReply(envelope());
-  const v2 = { ...valid, protocol: "pi-subagent/2" } as unknown as SupervisorFrame;
-  assert.deepEqual(v2Pair.parent.receive(v2), {
+test("v5 rejects v4 frames and reply envelopes with a forged agent identity", () => {
+  const legacyPair = readyPair();
+  const valid = legacyPair.child.publishReply(envelope());
+  const v4 = { ...valid, protocol: "pi-subagent/4" } as unknown as SupervisorFrame;
+  assert.deepEqual(legacyPair.parent.receive(v4), {
     kind: "protocol_fault",
     error: "protocol_mismatch",
   });
@@ -117,7 +122,9 @@ test("same reply_seq replay is idempotent but a different envelope is a protocol
     name: "资料代理",
     depth: 1,
     state: "idle" as const,
-    pending_message_count: 0,
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
     revision: 1,
   }], 1);
   replayPair.flush();
@@ -181,7 +188,9 @@ test("only the first final for a turn is injected while later finals are acknowl
     name: "资料代理",
     depth: 1,
     state: "idle" as const,
-    pending_message_count: 0,
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
     revision: 1,
   }], 1);
   pair.flush();
@@ -190,7 +199,9 @@ test("only the first final for a turn is injected while later finals are acknowl
     version: CHILD_REPLY_VERSION,
     kind: "final" as const,
     agent_id: CHILD_ID,
+    task_id: TASK_ID,
     turn_id: TURN_ID,
+    commit_id: COMMIT_ID,
     run_state: "settled" as const,
     output_state: "present" as const,
     text: "第一份最终答复",
@@ -222,7 +233,9 @@ test("final turn dedupe remains exact beyond the pending reply window", () => {
     version: CHILD_REPLY_VERSION,
     kind: "final" as const,
     agent_id: CHILD_ID,
+    task_id: TASK_ID,
     turn_id: turnId,
+    commit_id: turnId,
     run_state: "settled" as const,
     output_state: "present" as const,
     text,

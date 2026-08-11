@@ -72,11 +72,11 @@ test("管理工具系统提示把重复调查与独立验证纳入任务所有�
 
   assert.deepEqual(readGuidelines("send_message"), [
     "任务所有权硬约束：send_message 返回 accepted: true 后，已下发任务范围由目标直接子代理负责，直到该子代理给出最终答复或进入终态。同一任务包括为同一问题、工单或结论执行的调查、实现、测试、复现、验证、评审及其子范围；父会话不得亲自实施或再次委派这些工作。读取或搜索同一源码与文档、运行同一测试、只读分析和独立验证都属于重复实施；‘只读’‘无写冲突’‘交叉验证’不是例外。父会话只能使用 wait_agent 等待、查询状态、向同一子代理发送 steering，或处理派发前已明确拆分、产出独立、无数据依赖且无共享写资源的其他工作。",
-    "send_message 返回 accepted: true 只表示消息已被接受，不表示任务完成；若返回 message_delivery_failed，交付状态可能无法确认，不要盲目重发，先查询状态并结合已有回复判断。",
+    "send_message 返回 accepted: true 只表示插件 mailbox 已接纳消息并分配 message_id/task_id，不表示 Pi 或模型已经读取，也不表示任务完成；若返回 message_delivery_failed，交付状态可能无法确认，不要盲目重发，先查询状态并结合已有回复判断。",
     "收到 output_state: absent 的最终答复，或判断 present 正文仍不可用时，必须向同一 agent_id 尝试追问：只总结上一轮已完成工作并给出最终答复，不要重新执行任务；协议不自动重跑任务或切换模型。",
   ]);
   assert.deepEqual(readGuidelines("wait_agent"), [
-    "wait_agent 返回 outcome: reply 时，子代理仍在处理；直接父会话继续等待或使用 send_message 引导同一子代理。wait_agent 返回 outcome: timeout 只结束本次等待，不改变子代理生命周期，也不把任务交回直接父会话。",
+    "wait_agent 返回 outcome: reply 时，子代理仍在处理；task_completed、task_failed 或 task_interrupted 表示最近逻辑任务已提交；suspended 表示交付或维护恢复无法确认，应先查询状态再决定中断或终止；timeout 只结束本次等待，不改变生命周期，也不把任务交回直接父会话。",
     "收到 output_state: absent 的最终答复，或判断 present 正文仍不可用时，必须向同一 agent_id 尝试追问：只总结上一轮已完成工作并给出最终答复，不要重新执行任务；协议不自动重跑任务或切换模型。",
   ]);
   assert.deepEqual(readGuidelines("interrupt_agent"), [
@@ -187,7 +187,14 @@ test("模板查询与创建通过注册渲染接口提供语义化调用和结�
 test("消息、等待与父回复通过语义化渲染隐藏内部确认字段", async () => {
   const registrations: Array<Record<string, unknown>> = [];
   const agentId = "550e8400-e29b-41d4-a716-446655440000";
-  let outcome: "reply" | "settled" | "timeout" | "terminal" = "reply";
+  let outcome:
+    | "reply"
+    | "task_completed"
+    | "task_failed"
+    | "task_interrupted"
+    | "suspended"
+    | "timeout"
+    | "terminal" = "reply";
   registerAgentTools(
     { registerTool: (tool) => registrations.push(tool as Record<string, unknown>) },
     async () => ({
@@ -195,7 +202,13 @@ test("消息、等待与父回复通过语义化渲染隐藏内部确认字段",
       waitAgent: async () => ({ ok: true, data: {
         agent_id: agentId,
         outcome,
-        state: outcome === "settled" ? "idle" : outcome === "terminal" ? "failed" : "working",
+        state: ["task_completed", "task_failed", "task_interrupted"].includes(outcome)
+          ? "idle"
+          : outcome === "suspended"
+            ? "suspended"
+            : outcome === "terminal"
+              ? "failed"
+              : "working",
         revision: 42,
         ...(outcome === "terminal" ? {
           error: { code: "internal_error", message: "控制器内部错误", retryable: false },
@@ -212,15 +225,11 @@ test("消息、等待与父回复通过语义化渲染隐藏内部确认字段",
     toolCallRenderer(registrations, "send_message")({
       agent_id: agentId,
       message: "核对鉴权入口",
-      images: [
-        { type: "image", data: "BASE64_CANARY_A", mimeType: "image/png" },
-        { type: "image", data: "BASE64_CANARY_B", mimeType: "image/jpeg" },
-      ],
+      images: [{ type: "image", data: "DO_NOT_RENDER_IMAGE", mimeType: "image/png" }],
     }, RENDER_THEME, {}).render(100),
     [
       `send_message · ${agentId}`,
       "核对鉴权入口",
-      "图片 2 · image/png ×1 · image/jpeg ×1",
     ],
   );
   assert.deepEqual(
@@ -252,7 +261,15 @@ test("消息、等待与父回复通过语义化渲染隐藏内部确认字段",
   assert.equal(sendDisplay, "已发送给 鉴权调查");
   assert.doesNotMatch(sendDisplay, /msg-secret|550e8400|核对鉴权入口/);
 
-  for (const expected of ["reply", "settled", "timeout", "terminal"] as const) {
+  for (const expected of [
+    "reply",
+    "task_completed",
+    "task_failed",
+    "task_interrupted",
+    "suspended",
+    "timeout",
+    "terminal",
+  ] as const) {
     outcome = expected;
     const waitResult = await executeWait("wait", { agent_id: agentId }, undefined, undefined, {});
     const waitDisplay = toolResultRenderer(registrations, "wait_agent")(
@@ -267,7 +284,7 @@ test("消息、等待与父回复通过语义化渲染隐藏内部确认字段",
         ? "鉴权调查 · terminal · internal_error"
         : `鉴权调查 · ${expected}`,
     );
-    assert.doesNotMatch(waitDisplay, /revision|working|idle|failed|42/);
+    assert.doesNotMatch(waitDisplay, /revision|working|idle| · failed(?: ·|$)|42/);
   }
 
   const replyRegistrations: Array<Record<string, unknown>> = [];
@@ -336,7 +353,7 @@ test("工具失败结果只显示稳定错误码与安全中文原因", async ()
       isError: true,
     },
   ).render(80).join("\n");
-  assert.equal(display, "message_delivery_failed: 消息未获确认接收");
+  assert.equal(display, "message_delivery_failed: 消息交付状态不确定");
   assert.doesNotMatch(display, /retryable|details|stack|[{}]/);
 });
 
@@ -383,11 +400,13 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
     name: "鉴权调查",
     depth: 1,
     state: "working",
-    pending_message_count: 0,
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
     revision: 7,
     created_at: "2026-01-02T03:04:05.006Z",
     lifecycle_elapsed_ms: 1234,
-    activity: { category: "reading", active_count: 1 },
+    activity: { phase: "executing_tools", category: "reading", active_count: 1 },
   } as const;
   const child = {
     agent_id: childId,
@@ -395,11 +414,14 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
     template_id: "review",
     name: "复核分支",
     depth: 2,
-    state: "idle",
-    pending_message_count: 2,
+    state: "working",
+    mailbox_pending_count: 2,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
     revision: 8,
     created_at: "2026-01-02T03:04:06.006Z",
     lifecycle_elapsed_ms: 2345,
+    activity: { phase: "reconciling" },
   } as const;
   const finished = {
     agent_id: finishedId,
@@ -408,7 +430,9 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
     name: "已回收分支",
     depth: 2,
     state: "terminated",
-    pending_message_count: 0,
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
     revision: 9,
     created_at: "2026-01-02T03:04:07.006Z",
     lifecycle_elapsed_ms: 3456,
@@ -484,7 +508,9 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
         name: "鉴权调查",
         depth: 1,
         state: "failed",
-        pending_message_count: 0,
+        mailbox_pending_count: 0,
+        host_pending_count: 0,
+        reply_outbox_pending_count: 0,
         revision: 10,
         created_at: "2026-01-02T03:04:08.006Z",
         lifecycle_elapsed_ms: 4567,
@@ -515,6 +541,7 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
     ).render(100).join("\n");
     assert.match(statusCollapsed, /template_id: Explore/);
     assert.match(statusCollapsed, /name: 鉴权调查/);
+    assert.match(statusCollapsed, /activity\.phase: executing_tools/);
     assert.match(statusCollapsed, /activity\.category: reading/);
     assert.doesNotMatch(statusCollapsed, /agent_id:|parent_agent_id:|revision: 7|created_at:/);
 
@@ -529,7 +556,7 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
     const treeCollapsed = toolResultRenderer(registrations, "get_agent_tree")(
       tree, { expanded: false }, RENDER_THEME, { args: {} },
     ).render(160).join("\n");
-    assert.equal(treeCollapsed, "scope: root · active 2 · working 1 · failed 0 · completed 1 · pending 2");
+    assert.equal(treeCollapsed, "scope: root · active 2 · working 2 · failed 0 · completed 1 · queues 2/0/0");
     assert.doesNotMatch(treeCollapsed, /鉴权调查|复核分支|550e8400/);
 
     const emptyTree = toolResultRenderer(registrations, "get_agent_tree")(
@@ -538,7 +565,7 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
       } },
       { expanded: false }, RENDER_THEME, { args: {} },
     ).render(160).join("\n");
-    assert.equal(emptyTree, "scope: root · active 0 · working 0 · failed 0 · completed 0 · pending 0");
+    assert.equal(emptyTree, "scope: root · active 0 · working 0 · failed 0 · completed 0 · queues 0/0/0");
 
     const treeExpandedLines = toolResultRenderer(registrations, "get_agent_tree")(
       tree, { expanded: true }, RENDER_THEME, { args: {} },
@@ -546,7 +573,7 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
     const treeExpanded = treeExpandedLines.join("\n");
     assert.match(treeExpanded, /tree_revision: 12/);
     assert.match(treeExpanded, /Explore · 鉴权调查 · working · 550e8400/);
-    assert.match(treeExpanded, /  - review · 复核分支 · idle · 650e8400/);
+    assert.match(treeExpanded, /  - review · 复核分支 · working · 650e8400/);
     assert.match(treeExpanded, /finished · completed 1/);
     assert.ok(treeExpandedLines.every((line) => displayWidth(line) <= 160));
   });
@@ -581,7 +608,7 @@ test("公开注册入口一次注册完整八工具集合并说明模板选择�
   assert.match(parameters.properties?.template_id?.description ?? "", /完全一致|精确/);
 });
 
-test("代理工具调用行显示入参，并安全折叠长消息和图片 payload", () => {
+test("代理工具调用行显示入参并安全折叠长消息", () => {
   const registrations: Array<Record<string, unknown>> = [];
   registerAgentTools({ registerTool: (tool) => registrations.push(tool as Record<string, unknown>) }, async () => ({} as never));
   const agentId = "550e8400-e29b-41d4-a716-446655440000";
@@ -596,21 +623,18 @@ test("代理工具调用行显示入参，并安全折叠长消息和图片 payl
   assert.match(waitDisplay, new RegExp(agentId));
   assert.match(waitDisplay, /600000/);
 
-  const base64Canary = "DO_NOT_RENDER_BASE64";
   const messageTail = "完整消息尾部";
   const message = `开头\u001b[31m\u202e${"消息内容".repeat(40)}${messageTail}`;
   const sendRenderer = toolCallRenderer(registrations, "send_message");
   const collapsedLines = sendRenderer({
     agent_id: agentId,
     message,
-    images: [{ type: "image", data: base64Canary, mimeType: "image/png" }],
   }, RENDER_THEME, {}).render(36);
   const collapsedDisplay = collapsedLines.join("\n");
   assert.match(collapsedDisplay, /send_message/);
   assert.ok(collapsedDisplay.replaceAll(/\s/gu, "").includes(agentId));
   assert.match(collapsedDisplay, /展开查看完整正文/);
   assert.doesNotMatch(collapsedDisplay, /Ctrl\+O/);
-  assert.doesNotMatch(collapsedDisplay, new RegExp(base64Canary));
   assert.equal(collapsedDisplay.includes("\u001b"), false);
   assert.equal(collapsedDisplay.includes("\u202e"), false);
   assert.ok(collapsedLines.length <= 7);
@@ -618,14 +642,19 @@ test("代理工具调用行显示入参，并安全折叠长消息和图片 payl
   const expandedLines = sendRenderer({
     agent_id: agentId,
     message,
-    images: [{ type: "image", data: base64Canary, mimeType: "image/png" }],
   }, RENDER_THEME, { expanded: true }).render(36);
   const expandedDisplay = expandedLines.join("\n");
   assert.match(expandedDisplay, new RegExp(messageTail));
-  assert.match(expandedDisplay, /图片 1 · image\/png ×1/);
-  assert.doesNotMatch(expandedDisplay, new RegExp(base64Canary));
   assert.equal(expandedDisplay.includes("\u001b"), false);
   assert.equal(expandedDisplay.includes("\u202e"), false);
+
+  const sendTool = registrations.find((tool) => tool.name === "send_message");
+  assert.ok(sendTool);
+  const sendParameters = sendTool.parameters as {
+    readonly properties?: Readonly<Record<string, unknown>>;
+  };
+  assert.deepEqual(Object.keys(sendParameters.properties ?? {}), ["agent_id", "message"]);
+  assert.match(String(sendTool.description), /不支持 images/);
 
   for (const line of waitLines) {
     assert.ok(displayWidth(line) <= 80, `工具调用行超出终端宽度：${line}`);
@@ -641,7 +670,7 @@ test("代理工具调用行显示入参，并安全折叠长消息和图片 payl
   }
 });
 
-test("reply_to_parent 也使用相同的入参渲染", () => {
+test("reply_to_parent 只展示文本且 schema 不暴露图片字段", () => {
   const registrations: Array<Record<string, unknown>> = [];
   registerReplyToParentTool({ registerTool: (tool) => registrations.push(tool as Record<string, unknown>) }, async () => undefined);
   const lines = toolCallRenderer(registrations, CHILD_REPLY_TOOL_NAME)(
@@ -656,14 +685,15 @@ test("reply_to_parent 也使用相同的入参渲染", () => {
 
   assert.match(lines.join("\n"), /reply_to_parent/);
   assert.match(lines.join("\n"), /正在检查调用参数展示/);
-  assert.match(lines.join("\n"), /图片 1/);
-  assert.doesNotMatch(lines.join("\n"), /DO_NOT_RENDER_REPLY_IMAGE/);
-  const parameters = registrations[0]?.parameters as {
+  assert.doesNotMatch(lines.join("\n"), /图片|DO_NOT_RENDER_REPLY_IMAGE/);
+  const registration = registrations[0];
+  const parameters = registration?.parameters as {
     readonly required?: readonly string[];
     readonly properties?: Readonly<Record<string, unknown>>;
   } | undefined;
   assert.deepEqual(parameters?.required, ["message", "requires_response"]);
-  assert.ok(parameters?.properties?.images);
+  assert.deepEqual(Object.keys(parameters?.properties ?? {}), ["message", "requires_response"]);
+  assert.match(String(registration?.description ?? ""), /不支持 images/);
 });
 
 test("get_agent_templates 直接返回安全模板数组并保留空数组", async () => {

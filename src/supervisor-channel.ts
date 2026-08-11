@@ -4,7 +4,6 @@ import {
   CHILD_REPLY_ENVELOPE_LIMITS,
   parseChildReplyEnvelope,
   type ChildReplyEnvelope,
-  type ChildReplyImage,
 } from "./child-reply-envelope.ts";
 import {
   AGENT_LIFECYCLE_EVENT_TYPES,
@@ -12,6 +11,7 @@ import {
   PUBLIC_ERROR_CODES,
   controlFailure,
   isCanonicalUuid,
+  isCanonicalUuidV4,
   type AgentFault,
   type AgentLifecycleEventType,
   type AgentSnapshot,
@@ -20,7 +20,7 @@ import {
 } from "./tree-controller.ts";
 
 /** 父子监督通道与 Pi 任务 RPC 完全隔离的固定协议版本。 */
-export const SUPERVISOR_PROTOCOL_VERSION = "pi-subagent/3";
+export const SUPERVISOR_PROTOCOL_VERSION = "pi-subagent/5";
 
 export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "hello",
@@ -29,6 +29,8 @@ export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "snapshot_request",
   "snapshot",
   "reply",
+  "task_assignment",
+  "task_started",
   "control_request",
   "control_response",
   "ack",
@@ -53,7 +55,7 @@ const SUPERVISOR_FRAME_KEYS = new Set([
  * 不能改变树的公开配额、等待或模型行为。
  */
 export const SUPERVISOR_CHANNEL_LIMITS = Object.freeze({
-  /** 可承载 8 张最大合法图片、最终文本及 JSON 转义后的完整监督帧。 */
+  /** 覆盖最大控制正文、完整快照及 JSON 转义后的监督帧。 */
   maxFrameBytes: 512 * 1024,
   maxStringBytes: CHILD_REPLY_ENVELOPE_LIMITS.maxStringBytes,
   /** 根权威向递归子控制器交付模板正文时使用的独立有界字符串预算。 */
@@ -63,9 +65,6 @@ export const SUPERVISOR_CHANNEL_LIMITS = Object.freeze({
   maxNodes: 64,
   maxReplyWindow: 32,
   maxRetiredStreams: 4,
-  maxImagesPerReply: CHILD_REPLY_ENVELOPE_LIMITS.maxImagesPerReply,
-  /** 单张 Base64 图片解码后的字节上限。 */
-  maxImageBytes: CHILD_REPLY_ENVELOPE_LIMITS.maxImageBytes,
   maxDepth: 8,
 } as const);
 
@@ -78,8 +77,6 @@ export interface SupervisorChannelLimits {
   readonly maxNodes: number;
   readonly maxReplyWindow: number;
   readonly maxRetiredStreams: number;
-  readonly maxImagesPerReply: number;
-  readonly maxImageBytes: number;
   readonly maxDepth: number;
 }
 
@@ -102,16 +99,28 @@ export interface SupervisorSnapshot {
   readonly nodes: readonly AgentSnapshot[];
 }
 
-export type SupervisorReplyImage = ChildReplyImage;
 export type SupervisorReplyKind = ChildReplyEnvelope["kind"];
 
-/** v3 wire reply：传输序号与模型可见信封保持明确分层。 */
+/** v5 wire reply：传输序号与模型可见信封保持明确分层。 */
 export interface SupervisorReply {
   readonly reply_seq: number;
   readonly envelope: ChildReplyEnvelope;
 }
 
 export type SupervisorReplyInput = ChildReplyEnvelope;
+
+/** 父端在投递正文前先下发的逻辑任务租约；正文不进入监督协议。 */
+export interface SupervisorTaskAssignment {
+  readonly message_id: string;
+  readonly task_id: string;
+  readonly mode: "prompt" | "steer";
+}
+
+/** child 在每个 Pi loop 开始时上报；自主唤醒与压缩恢复也必须发布。 */
+export interface SupervisorTaskStarted {
+  readonly task_id: string;
+  readonly turn_id: string;
+}
 
 /** 监督控制正文只允许可复制、可深冻结的纯 JSON 值。 */
 export type SupervisorJsonValue =
@@ -225,6 +234,12 @@ export interface SupervisorReceiveAccepted {
   readonly replies: readonly SupervisorReply[];
   /** child 端本次收到的累计 reply ACK；仅用于传输适配器完成本地等待。 */
   readonly reply_ack?: number;
+  /** parent 端本次收到的普通 transport ACK；用于任务租约投递栅栏。 */
+  readonly transport_ack?: number;
+  /** child 端收到并通过身份校验的任务租约。 */
+  readonly task_assignment?: SupervisorTaskAssignment;
+  /** parent 端收到的 child 任务/turn 身份事实。 */
+  readonly task_started?: SupervisorTaskStarted;
   /** 仅供本地监督器递交给 TreeController 的脱敏生命周期事实。 */
   readonly event?: SupervisorEvent;
   /** 本次接收原子替换的完整快照；调用方可直接交给树控制器。 */
@@ -318,6 +333,9 @@ const EMPTY_NODES: readonly AgentSnapshot[] = Object.freeze([]);
 const EMPTY_FRAMES: readonly SupervisorFrame[] = Object.freeze([]);
 const EMPTY_REPLIES: readonly SupervisorReply[] = Object.freeze([]);
 const PUBLIC_ERROR_CODE_SET: ReadonlySet<string> = new Set(PUBLIC_ERROR_CODES);
+const CONTROL_SAFE_FIELD_NAMES = new Set([
+  "reply_outbox_pending_count",
+]);
 const CONTROL_SENSITIVE_FIELD_TOKENS = new Set([
   "prompt",
   "reply",
@@ -345,16 +363,8 @@ function utf8Length(value: string): number {
   return new TextEncoder().encode(value).byteLength;
 }
 
-function maxEncodedBase64Bytes(decodedBytes: number): number {
-  return Math.ceil(decodedBytes / 3) * 4;
-}
-
 function maxFrameStringBytes(limits: SupervisorChannelLimits): number {
-  return Math.max(
-    limits.maxStringBytes,
-    limits.maxControlStringBytes,
-    maxEncodedBase64Bytes(limits.maxImageBytes),
-  );
+  return Math.max(limits.maxStringBytes, limits.maxControlStringBytes);
 }
 
 function replySemanticDigest(envelope: ChildReplyEnvelope): string {
@@ -525,6 +535,7 @@ function hasExactObjectKeys(value: Record<string, unknown>, expected: readonly s
 
 function isForbiddenControlFieldName(key: string): boolean {
   const lower = key.toLowerCase();
+  if (CONTROL_SAFE_FIELD_NAMES.has(lower)) return false;
   if (CONTROL_RESERVED_FIELD_NAMES.has(lower)) return true;
   const snakeCase = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
   const normalized = snakeCase.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
@@ -910,13 +921,38 @@ function parseReply(payload: Record<string, unknown>, limits: SupervisorChannelL
   }
   const envelope = parseChildReplyEnvelope(payload.envelope, {
     maxStringBytes: limits.maxStringBytes,
-    maxImagesPerReply: limits.maxImagesPerReply,
-    maxImageBytes: limits.maxImageBytes,
   });
   if (envelope === undefined) frameError("reply_invalid");
   return Object.freeze({
     reply_seq: payload.reply_seq as number,
     envelope,
+  });
+}
+
+function parseTaskAssignment(payload: Record<string, unknown>): SupervisorTaskAssignment {
+  if (
+    Object.keys(payload).some((key) => !["message_id", "task_id", "mode"].includes(key))
+    || typeof payload.message_id !== "string"
+    || !/^msg_[0-9a-f-]{36}$/.test(payload.message_id)
+    || !isCanonicalUuidV4(payload.task_id)
+    || (payload.mode !== "prompt" && payload.mode !== "steer")
+  ) frameError("invalid_frame");
+  return Object.freeze({
+    message_id: payload.message_id,
+    task_id: payload.task_id,
+    mode: payload.mode,
+  });
+}
+
+function parseTaskStarted(payload: Record<string, unknown>): SupervisorTaskStarted {
+  if (
+    Object.keys(payload).some((key) => key !== "task_id" && key !== "turn_id")
+    || !isCanonicalUuidV4(payload.task_id)
+    || !isCanonicalUuidV4(payload.turn_id)
+  ) frameError("invalid_frame");
+  return Object.freeze({
+    task_id: payload.task_id,
+    turn_id: payload.turn_id,
   });
 }
 
@@ -1083,8 +1119,6 @@ export class SupervisorChannel {
     }
     const directEnvelope = parseChildReplyEnvelope(reply, {
       maxStringBytes: this.limits.maxStringBytes,
-      maxImagesPerReply: this.limits.maxImagesPerReply,
-      maxImageBytes: this.limits.maxImageBytes,
     });
     const wireRecord = isRecord(reply) ? reply : undefined;
     const wireCandidate = directEnvelope === undefined
@@ -1109,6 +1143,27 @@ export class SupervisorChannel {
     this.outboundReplies.set(parsed.reply_seq, { reply: parsed });
     this.nextReplySeq += 1;
     return frame;
+  }
+
+  /** parent 在 prompt/steer 之前发布任务租约；普通 transport ACK 即持久接纳点。 */
+  publishTaskAssignment(assignment: SupervisorTaskAssignment): SupervisorFrame {
+    if (this.role !== "parent" || this.terminationBarrier || this.state !== "ready") {
+      throw new SupervisorProtocolError("closed");
+    }
+    const parsed = parseTaskAssignment(assignment as unknown as Record<string, unknown>);
+    return this.createFrame("task_assignment", parsed as unknown as Record<string, unknown>);
+  }
+
+  /** child 在 reply 之前发布实际 task/turn 身份，父端据此拒绝 stale final。 */
+  publishTaskStarted(started: SupervisorTaskStarted): SupervisorFrame {
+    if (
+      this.role !== "child"
+      || this.localAgentId === null
+      || this.terminationBarrier
+      || this.state !== "ready"
+    ) throw new SupervisorProtocolError("closed");
+    const parsed = parseTaskStarted(started as unknown as Record<string, unknown>);
+    return this.createFrame("task_started", parsed as unknown as Record<string, unknown>);
   }
 
   /** child 发布已绑定自身分支的内部控制请求；operation_id 不占用监督 request_id。 */
@@ -1359,6 +1414,9 @@ export class SupervisorChannel {
     let applied = false;
     let replies: readonly SupervisorReply[] = EMPTY_REPLIES;
     let replyAck: number | undefined;
+    let transportAck: number | undefined;
+    let taskAssignment: SupervisorTaskAssignment | undefined;
+    let taskStarted: SupervisorTaskStarted | undefined;
     let event: SupervisorEvent | undefined;
     let controlRequest: SupervisorControlRequest | undefined;
     let controlResponse: SupervisorControlResponse | undefined;
@@ -1386,6 +1444,14 @@ export class SupervisorChannel {
         if (result.ackReplySeq > 0) outbound.push(this.createReplyAck(result.ackReplySeq));
         break;
       }
+      case "task_assignment":
+        if (this.role !== "child" || this.state !== "ready") frameError("sequence_violation");
+        taskAssignment = parseTaskAssignment(frame.payload);
+        break;
+      case "task_started":
+        if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
+        taskStarted = parseTaskStarted(frame.payload);
+        break;
       case "control_request":
         if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
         controlRequest = parseControlRequest(frame.payload, this.peerAgentId, this.latestSnapshot, this.limits);
@@ -1399,6 +1465,7 @@ export class SupervisorChannel {
           const result = this.applyAck(frame);
           outbound.push(...result.outbound);
           replyAck = result.replyAck;
+          transportAck = result.transportAck;
         }
         break;
       case "event":
@@ -1422,6 +1489,9 @@ export class SupervisorChannel {
       outbound: Object.freeze(outbound),
       replies,
       ...(replyAck === undefined ? {} : { reply_ack: replyAck }),
+      ...(transportAck === undefined ? {} : { transport_ack: transportAck }),
+      ...(taskAssignment === undefined ? {} : { task_assignment: taskAssignment }),
+      ...(taskStarted === undefined ? {} : { task_started: taskStarted }),
       ...(event === undefined ? {} : { event }),
       ...(acceptedSnapshot === undefined ? {} : { snapshot: acceptedSnapshot }),
       ...(controlRequest === undefined ? {} : { control_request: controlRequest }),
@@ -1569,6 +1639,7 @@ export class SupervisorChannel {
   private applyAck(frame: InternalFrame): {
     readonly outbound: readonly SupervisorFrame[];
     readonly replyAck?: number;
+    readonly transportAck?: number;
   } {
     const payload = frame.payload;
     const kind = payload.kind;
@@ -1585,9 +1656,12 @@ export class SupervisorChannel {
       ) {
         this.awaitingInitialSnapshotAckSeq = undefined;
         this.state = "ready";
-        return Object.freeze({ outbound: this.replayUnacknowledgedReplies() });
+        return Object.freeze({
+          outbound: this.replayUnacknowledgedReplies(),
+          transportAck: acknowledged,
+        });
       }
-      return Object.freeze({ outbound: EMPTY_FRAMES });
+      return Object.freeze({ outbound: EMPTY_FRAMES, transportAck: acknowledged });
     }
     if (kind !== "reply" || !Number.isSafeInteger(payload.reply_seq) || (payload.reply_seq as number) < 0) {
       frameError("invalid_frame");

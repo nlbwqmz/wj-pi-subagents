@@ -5,7 +5,7 @@ import {
   normalizeRpcBridgeEvent,
 } from "../src/rpc-bridge-event.ts";
 
-test("真正 child 回复端点只公开文本和图片，明确丢弃合法 thinking 与 toolCall 内容", () => {
+test("真正 child 回复端点只公开文本，明确丢弃 thinking、toolCall 和图片内容", () => {
   const result = normalizeAssistantMessageEnd({
     type: "message_end",
     message: {
@@ -28,7 +28,6 @@ test("真正 child 回复端点只公开文本和图片，明确丢弃合法 thi
         role: "assistant",
         content: [
           { type: "text", text: "完成" },
-          { type: "image", data: "YWJj", mimeType: "image/png" },
         ],
       },
     },

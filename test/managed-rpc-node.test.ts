@@ -6,7 +6,6 @@ import {
   CHILD_REPLY_SCHEMA,
   CHILD_REPLY_VERSION,
   type ChildFinalEnvelope,
-  type ChildReplyImage,
 } from "../src/child-reply-envelope.ts";
 import { BridgeSupervisorEndpoint } from "./helpers/bridge-supervisor-endpoint.ts";
 import {
@@ -46,22 +45,24 @@ import {
 
 const TREE = Object.freeze({ kind: "tree" });
 const TURN_ID = "77777777-7777-4777-8777-777777777777";
+const TASK_ID = "77777777-7777-4777-8777-777777777778";
+const COMMIT_ID = "77777777-7777-4777-8777-777777777779";
 
 function finalReply(
   agentId: string,
   text: string,
-  images?: readonly ChildReplyImage[],
 ): ChildFinalEnvelope {
   return {
     schema: CHILD_REPLY_SCHEMA,
     version: CHILD_REPLY_VERSION,
     kind: "final",
     agent_id: agentId,
+    task_id: TASK_ID,
     turn_id: TURN_ID,
+    commit_id: COMMIT_ID,
     run_state: "settled",
     output_state: "present",
     text,
-    ...(images === undefined ? {} : { images }),
   };
 }
 
@@ -440,14 +441,15 @@ test("ManagedRpcBridgeClient 使用固定版本与长度边界传递高层命令
   await client.release();
 });
 
-test("桥接客户端分片传递全部合法的最大图片消息", async () => {
+test("桥接客户端分片传递长启动配置", async () => {
   const parentInput = new PassThrough();
   const parentOutput = new PassThrough();
+  const longConfig = "x".repeat(128 * 1024);
   const client = new ManagedRpcBridgeClient({
     stdin: parentInput,
     stdout: parentOutput,
     stderr: new PassThrough(),
-  });
+  }, { rpcOptions: { longConfig } });
   const chunks: Array<Record<string, unknown>> = [];
   let buffered = new Uint8Array(0);
   parentInput.on("data", (chunk: Uint8Array) => {
@@ -482,22 +484,13 @@ test("桥接客户端分片传递全部合法的最大图片消息", async () =>
   });
 
   await client.start();
-  const imageData = Buffer.alloc(24 * 1024, 0x31).toString("base64");
-  await client.prompt("包含全部最大图片的任务", Array.from({ length: 8 }, () => ({
-    type: "image" as const,
-    data: imageData,
-    mimeType: "image/png",
-  })));
 
   assert.ok(chunks.length > 1);
   const payloadBytes = Buffer.concat(chunks.map((frame) => Buffer.from(String(frame.chunk), "base64url")));
   const payload = JSON.parse(payloadBytes.toString("utf8")) as {
-    message: string;
-    images: Array<{ data: string; mimeType: string }>;
+    config: { rpc: { longConfig: string } };
   };
-  assert.equal(payload.message, "包含全部最大图片的任务");
-  assert.equal(payload.images.length, 8);
-  assert.equal(payload.images.every((image) => image.data === imageData && image.mimeType === "image/png"), true);
+  assert.equal(payload.config.rpc.longConfig, longConfig);
   await client.release();
 });
 
@@ -652,7 +645,9 @@ test("桥接客户端在唯一读写流上复用有界监督帧并传递启动�
       name: "受管",
       depth: 1,
       state: "starting" as const,
-      pending_message_count: 0,
+      mailbox_pending_count: 0,
+      host_pending_count: 0,
+      reply_outbox_pending_count: 0,
       revision: 1,
     }],
     initial_subtree_revision: 1,
@@ -738,7 +733,9 @@ test("桥接 child 监督端点完成 hello、首快照与双端 ready", () => {
         name: "桥接端点",
         depth: 1,
         state: "starting",
-        pending_message_count: 0,
+        mailbox_pending_count: 0,
+        host_pending_count: 0,
+        reply_outbox_pending_count: 0,
         revision: 1,
       }],
       initial_subtree_revision: 1,
@@ -784,81 +781,6 @@ class LinkedManagedNode extends FakeManagedRpcNode {
     this.endpoint?.publishReply(reply);
   }
 }
-
-class FragmentingLinkedManagedNode extends LinkedManagedNode {
-  override emitSupervisorFrame(frame: Uint8Array): void {
-    for (let offset = 0; offset < frame.byteLength; offset += MANAGED_RPC_SUPERVISOR_MAX_FRAME_BYTES) {
-      super.emitSupervisorFrame(frame.subarray(
-        offset,
-        Math.min(frame.byteLength, offset + MANAGED_RPC_SUPERVISOR_MAX_FRAME_BYTES),
-      ));
-    }
-  }
-}
-
-test("受管监督通道重组分片后的最大 final 图片回复", async () => {
-  const childId = "abababab-abab-4bab-8bab-abababababab";
-  const credential = "supervisor-credential-0123456789012345";
-  const node = new FragmentingLinkedManagedNode();
-  const delivered: Array<{ text: string; imageCount: number }> = [];
-  const channel = new ManagedRpcSupervisorChannel({
-    node,
-    rootId: "root-large-final",
-    localAgentId: null,
-    peerAgentId: childId,
-    parentAgentId: null,
-    depth: 1,
-    credential,
-    requestIdRegistry: new SupervisorRequestIdRegistry(),
-    onReply: (reply) => {
-      delivered.push({
-        text: reply.envelope.text ?? "",
-        imageCount: reply.envelope.images?.length ?? 0,
-      });
-      return true;
-    },
-  });
-  const signal = new AbortController().signal;
-  await channel.bind(signal);
-  await node.start(signal, {
-    supervisor: {
-      root_id: "root-large-final",
-      local_agent_id: childId,
-      peer_agent_id: "",
-      parent_agent_id: null,
-      depth: 1,
-      credential,
-      initial_snapshot: [{
-        agent_id: childId,
-        parent_agent_id: null,
-        template_id: "researcher",
-        name: "图片 final",
-        depth: 1,
-        state: "starting",
-        pending_message_count: 0,
-        revision: 1,
-      }],
-      initial_subtree_revision: 1,
-    },
-  });
-  await channel.waitForReady(signal);
-
-  const imageData = Buffer.alloc(24 * 1024, 0x7f).toString("base64");
-  await node.publishReply(finalReply(
-    childId,
-    "最大图片 final",
-    Array.from({ length: 8 }, () => ({
-      type: "image" as const,
-      data: imageData,
-      mimeType: "image/png",
-    })),
-  ));
-  await new Promise<void>((resolve) => setImmediate(resolve));
-
-  assert.deepEqual(delivered, [{ text: "最大图片 final", imageCount: 8 }]);
-  await channel.release();
-  await node.release();
-});
 
 test("RpcSupervisor 通过真正 child 端点完成双握手和回复 ACK", async () => {
   const id = "99999999-9999-4999-8999-999999999999";
@@ -912,7 +834,13 @@ test("RpcSupervisor 通过真正 child 端点完成双握手和回复 ACK", asyn
   assert.deepEqual(await supervisor.start(), { ok: true, agent_id: id, state: "idle" });
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(node.supervisorState(), "ready");
-  assert.deepEqual(await supervisor.prompt("触发回复"), { ok: true, accepted: true });
+  const submission = await supervisor.prompt("触发回复");
+  assert.equal(submission.ok, true);
+  if (submission.ok) {
+    assert.equal(submission.accepted, true);
+    assert.match(submission.message_id, /^msg_/);
+    assert.match(submission.task_id, /^[0-9a-f-]{36}$/);
+  }
   await node.publishReply(finalReply(id, "桥接回复"));
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(node.publishedReplies, 1);
@@ -971,6 +899,7 @@ class ReadyChannel implements RpcSupervisorChannel {
   async waitForReady(): Promise<void> {}
   isReady(): boolean { return this.ready; }
   async publishReply(): Promise<void> {}
+  async publishTaskAssignmentAndWaitForAck(): Promise<void> {}
   establishTerminationBarrier(): void {}
   async requestClose(): Promise<void> { this.ready = false; }
   async waitForClose(): Promise<RpcSupervisorChannelCloseState> { return "released"; }
@@ -999,7 +928,9 @@ test("RpcSupervisor 使用 managedNode 启动并清理，不读取独立客户�
   });
 
   assert.deepEqual(await supervisor.start(), { ok: true, agent_id: id, state: "idle" });
-  assert.deepEqual(await supervisor.prompt("hello"), { ok: true, accepted: true });
+  const submission = await supervisor.prompt("hello");
+  assert.equal(submission.ok, true);
+  if (submission.ok) assert.equal(submission.accepted, true);
   node.emitEvent({ type: "agent_settled" });
   const terminated = await supervisor.terminate();
   assert.equal(terminated.ok, true);

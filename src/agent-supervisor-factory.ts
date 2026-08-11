@@ -101,7 +101,8 @@ export function createAgentSupervisorFactory(
       ...(options.bridgeScriptPath === undefined ? {} : { bridgeScriptPath: options.bridgeScriptPath }),
     });
 
-    return new RpcSupervisor({
+    let rpcSupervisor: RpcSupervisor | undefined;
+    rpcSupervisor = new RpcSupervisor({
       controller: options.tree,
       actor: input.actor,
       reservation: input.reservation,
@@ -119,12 +120,14 @@ export function createAgentSupervisorFactory(
           credential,
           requestIdRegistry,
           onReply: (reply) => {
-            if (options.deliverReply === undefined) return false;
-            try {
-              return options.deliverReply(context.agent_id, reply.envelope) === true;
-            } catch {
-              return false;
-            }
+            if (rpcSupervisor === undefined || options.deliverReply === undefined) return false;
+            return rpcSupervisor.acceptChildReply(reply.envelope, () => {
+              try {
+                return options.deliverReply!(context.agent_id, reply.envelope) === true;
+              } catch {
+                return false;
+              }
+            });
           },
         });
         let cleanup: (() => void) | void;
@@ -168,6 +171,7 @@ export function createAgentSupervisorFactory(
       startupTimeoutMs,
       gracefulShutdownMs,
     });
+    return rpcSupervisor;
   }) as AgentSupervisorFactory;
   factory.updateTemplateSnapshot = (snapshot: TemplateDiscoverySnapshot): void => {
     templateSnapshot = snapshot;

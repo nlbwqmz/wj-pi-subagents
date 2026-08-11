@@ -5,7 +5,6 @@ import {
   CHILD_REPLY_VERSION,
   type ChildFinalEnvelope,
   type ChildMessageEnvelope,
-  type ChildReplyImage,
 } from "../src/child-reply-envelope.ts";
 import {
   SUPERVISOR_CHANNEL_LIMITS,
@@ -23,6 +22,8 @@ const CHILD_ID = "550e8400-e29b-41d4-a716-446655440000";
 const GRANDCHILD_ID = "550e8400-e29b-41d4-a716-446655440001";
 const SIBLING_ID = "550e8400-e29b-41d4-a716-446655440002";
 const TURN_ID = "550e8400-e29b-41d4-a716-446655440003";
+const TASK_ID = "450e8400-e29b-41d4-a716-446655440003";
+const COMMIT_ID = "750e8400-e29b-41d4-a716-446655440003";
 const ROOT_ID = "root-test";
 const CREDENTIAL = "test-one-time-credential";
 
@@ -32,36 +33,25 @@ function workingReply(text: string, requiresResponse = false): ChildMessageEnvel
     version: CHILD_REPLY_VERSION,
     kind: "message",
     agent_id: CHILD_ID,
+    task_id: TASK_ID,
     turn_id: TURN_ID,
     requires_response: requiresResponse,
     text,
   };
 }
 
-function finalReply(text: string, images?: readonly ChildReplyImage[]): ChildFinalEnvelope {
+function finalReply(text: string): ChildFinalEnvelope {
   return {
     schema: CHILD_REPLY_SCHEMA,
     version: CHILD_REPLY_VERSION,
     kind: "final",
     agent_id: CHILD_ID,
+    task_id: TASK_ID,
     turn_id: TURN_ID,
+    commit_id: COMMIT_ID,
     run_state: "settled",
     output_state: "present",
     text,
-    ...(images === undefined ? {} : { images }),
-  };
-}
-
-function imageOnlyFinal(images: readonly ChildReplyImage[]): ChildFinalEnvelope {
-  return {
-    schema: CHILD_REPLY_SCHEMA,
-    version: CHILD_REPLY_VERSION,
-    kind: "final",
-    agent_id: CHILD_ID,
-    turn_id: TURN_ID,
-    run_state: "settled",
-    output_state: "present",
-    images,
   };
 }
 
@@ -78,7 +68,10 @@ function node(
     name: "安全资料代理",
     depth,
     state,
-    pending_message_count: 0,
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
+    ...(state === "working" ? { activity: { phase: "processing" as const } } : {}),
     revision: 1,
   } as const;
 }
@@ -101,9 +94,48 @@ function assertProtocolError(action: () => unknown, code: SupervisorProtocolErro
   });
 }
 
+test("task assignment 与 task_started 在同一累计 ACK 顺序域传递 UUIDv4 身份", () => {
+  const pair = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+  });
+  handshake(pair);
+
+  pair.parent.send(pair.parent.publishTaskAssignment({
+    message_id: "msg_650e8400-e29b-41d4-a716-446655440005",
+    task_id: TASK_ID,
+    mode: "prompt",
+  }));
+  const assignment = pair.parent.deliverNext();
+  assert.equal(assignment?.kind, "accepted");
+  if (assignment?.kind === "accepted") {
+    assert.deepEqual(assignment.task_assignment, {
+      message_id: "msg_650e8400-e29b-41d4-a716-446655440005",
+      task_id: TASK_ID,
+      mode: "prompt",
+    });
+  }
+  pair.flush();
+
+  pair.child.send(pair.child.publishTaskStarted({ task_id: TASK_ID, turn_id: TURN_ID }));
+  const started = pair.child.deliverNext();
+  assert.equal(started?.kind, "accepted");
+  if (started?.kind === "accepted") {
+    assert.deepEqual(started.task_started, { task_id: TASK_ID, turn_id: TURN_ID });
+    assert.equal(started.outbound.some((frame) => frame.kind === "ack"), true);
+  }
+  pair.flush();
+
+  assertProtocolError(() => pair.child.publishTaskStarted({
+    task_id: TASK_ID,
+    turn_id: "550e8400-e29b-11d4-a716-446655440003",
+  }), "invalid_frame");
+});
+
 test("长度边界 UTF-8 JSON 可处理分块与拼接帧，拒绝截断/损坏载荷", () => {
   const frame: SupervisorFrame = {
-    protocol: "pi-subagent/3",
+    protocol: "pi-subagent/5",
     kind: "event",
     stream_id: "stream_test",
     sender_agent_id: CHILD_ID,
@@ -227,7 +259,7 @@ test("完整握手后快照按 subtree_revision 原子替换并分配 tree_revis
   assert.equal(pair.parent.getTreeSnapshot().nodes.length, 2);
 });
 
-test("递归快照只往返固定安全活动类别和计数", () => {
+test("递归快照只往返固定活动阶段、工具类别和计数", () => {
   const pair = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,
     childAgentId: CHILD_ID,
@@ -236,10 +268,15 @@ test("递归快照只往返固定安全活动类别和计数", () => {
   handshake(pair);
   pair.child.sendSnapshot([Object.freeze({
     ...node(CHILD_ID, null, 1, "working"),
-    activity: Object.freeze({ category: "editing" as const, active_count: 2 }),
+    activity: Object.freeze({
+      phase: "executing_tools" as const,
+      category: "editing" as const,
+      active_count: 2,
+    }),
   })], 2);
   pair.flush();
   assert.deepEqual(pair.parent.getTreeSnapshot().nodes[0]?.activity, {
+    phase: "executing_tools",
     category: "editing",
     active_count: 2,
   });
@@ -251,6 +288,7 @@ test("递归快照只往返固定安全活动类别和计数", () => {
   assertProtocolError(() => pair.child.publishSnapshot([Object.freeze({
     ...node(CHILD_ID, null, 1, "working"),
     activity: {
+      phase: "executing_tools",
       category: "editing",
       active_count: 1,
       path: "D:\\private\\secret-canary.txt",
@@ -268,7 +306,11 @@ test("递归快照只往返固定安全活动类别和计数", () => {
   assertProtocolError(() => pair.child.publishSnapshot([Object.freeze({
     ...node(CHILD_ID, null, 1),
     state: "starting" as const,
-    activity: Object.freeze({ category: "running" as const, active_count: 1 }),
+    activity: Object.freeze({
+      phase: "executing_tools" as const,
+      category: "running" as const,
+      active_count: 1,
+    }),
   })], 3), "snapshot_invalid");
   assert.doesNotMatch(JSON.stringify(pair.parent.getTreeSnapshot()), /secret-canary|private/i);
 });
@@ -378,36 +420,6 @@ test("普通回复按 reply_seq 有序注入并以累计 ACK 去重，窗口有�
   });
 });
 
-test("最大合法图片 final 以解码字节计量，并可超过单个桥接分片", () => {
-  const received: Array<{ text: string; imageCount: number }> = [];
-  const pair = createFakeSupervisorChannelPair({
-    rootId: ROOT_ID,
-    childAgentId: CHILD_ID,
-    credential: CREDENTIAL,
-    onReply: (reply) => {
-      received.push({
-        text: reply.envelope.text ?? "",
-        imageCount: reply.envelope.images?.length ?? 0,
-      });
-      return true;
-    },
-  });
-  handshake(pair);
-  const imageData = Buffer.alloc(SUPERVISOR_CHANNEL_LIMITS.maxImageBytes, 0x5a).toString("base64");
-  const images = Array.from({ length: SUPERVISOR_CHANNEL_LIMITS.maxImagesPerReply }, () => ({
-    type: "image" as const,
-    data: imageData,
-    mimeType: "image/png",
-  }));
-  const reply = pair.child.publishReply(finalReply("附带最大合法图片", images));
-  const encoded = pair.child.encode(reply);
-  assert.ok(encoded.byteLength > 64 * 1024);
-
-  const result = pair.parent.receive(encoded);
-  assert.equal(result.kind, "accepted");
-  assert.deepEqual(received, [{ text: "附带最大合法图片", imageCount: 8 }]);
-});
-
 test("工作中 message 为 final 预留窗口槽位，二者按同一 reply_seq 顺序提交", () => {
   const replies: Array<{ kind: string; text: string }> = [];
   const pair = createFakeSupervisorChannelPair({
@@ -458,7 +470,7 @@ test("工作中 message 为 final 预留窗口槽位，二者按同一 reply_seq
   assert.equal(pair.child.getPublicState().pending_reply_count, 0);
 });
 
-test("原始 v3 reply 必须携带合法 envelope，空载荷状态一致且图片 final 合法", () => {
+test("原始 v5 reply 必须携带合法 envelope，且 message/final 都拒绝图片字段", () => {
   const missingEnvelope = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,
     childAgentId: CHILD_ID,
@@ -512,15 +524,18 @@ test("原始 v3 reply 必须携带合法 envelope，空载荷状态一致且图�
     () => emptyMessage.child.publishReply(finalReply("")),
     (error: unknown) => error instanceof SupervisorProtocolError && error.code === "reply_invalid",
   );
-  const imageReply = emptyMessage.child.publishReply(imageOnlyFinal([
-    { type: "image", data: "YWJj", mimeType: "image/png" },
-  ]));
-  assert.equal((imageReply.payload.envelope as ChildFinalEnvelope).kind, "final");
-  assert.equal((imageReply.payload.envelope as ChildFinalEnvelope).text, undefined);
   assert.throws(
-    () => emptyMessage.child.publishReply(imageOnlyFinal([
-      { type: "image", data: "YWJj", mimeType: "text/plain" },
-    ])),
+    () => emptyMessage.child.publishReply({
+      ...finalReply("不得携带图片"),
+      images: [{ type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" }],
+    } as never),
+    (error: unknown) => error instanceof SupervisorProtocolError && error.code === "reply_invalid",
+  );
+  assert.throws(
+    () => emptyMessage.child.publishReply({
+      ...workingReply("不得携带图片"),
+      images: [{ type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" }],
+    } as never),
     (error: unknown) => error instanceof SupervisorProtocolError && error.code === "reply_invalid",
   );
 });
@@ -998,7 +1013,7 @@ test("生命周期 event 只携带安全事实，并可由父监督器递交给�
   const pair = createFakeSupervisorChannelPair({ rootId: ROOT_ID, childAgentId: CHILD_ID, credential: CREDENTIAL });
   handshake(pair);
   const event = pair.child.publishEvent({
-    type: "agent_settled",
+    type: "startup_ready",
     expected_generation: 4,
   });
   const result = pair.parent.receive(event);
@@ -1007,14 +1022,14 @@ test("生命周期 event 只携带安全事实，并可由父监督器递交给�
     assert.deepEqual(result.event, {
       root_id: ROOT_ID,
       agent_id: CHILD_ID,
-      type: "agent_settled",
+      type: "startup_ready",
       expected_generation: 4,
     });
   }
   assert.throws(() => pair.child.publishEvent({ type: "unknown_event" as never }), (error: unknown) => {
     return error instanceof SupervisorProtocolError && error.code === "invalid_frame";
   });
-  const unsafe = pair.child.publishEvent({ type: "agent_settled" });
+  const unsafe = pair.child.publishEvent({ type: "startup_ready" });
   const injected = {
     ...unsafe,
     payload: { ...unsafe.payload, prompt: "secret-canary" },
@@ -1030,7 +1045,7 @@ test("直接子通道伪造兄弟生命周期事件时父端进入身份故障�
   });
   handshake(pair);
   const before = pair.parent.getTreeSnapshot();
-  const valid = pair.child.publishEvent({ type: "agent_settled", expected_generation: 0 });
+  const valid = pair.child.publishEvent({ type: "startup_ready", expected_generation: 0 });
   const forged = {
     ...valid,
     payload: { ...valid.payload, agent_id: SIBLING_ID },

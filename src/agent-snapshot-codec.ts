@@ -1,9 +1,10 @@
-/** 子代理对外可观察的生命周期仅限这七种状态。 */
+/** 子代理对外可观察的生命周期状态。idle 严格表示节点已经静止。 */
 export const AGENT_LIFECYCLE_STATES = Object.freeze([
   "starting",
   "idle",
   "working",
   "interrupting",
+  "suspended",
   "failed",
   "terminating",
   "terminated",
@@ -11,7 +12,24 @@ export const AGENT_LIFECYCLE_STATES = Object.freeze([
 
 export type AgentLifecycleState = (typeof AGENT_LIFECYCLE_STATES)[number];
 
-/** 安全活动摘要只允许控制器确认的固定类别，不承载工具名或参数。 */
+/** 活动阶段与顶层生命周期正交，描述当前任务正在等待什么事实。 */
+export const AGENT_ACTIVITY_PHASES = Object.freeze([
+  "processing",
+  "executing_tools",
+  "settling",
+  "compacting",
+  "resume_pending",
+  "reconciling",
+  "finalizing",
+  "waiting_parent_ack",
+  "resume_required",
+  "maintenance_failed",
+  "delivery_uncertain",
+] as const);
+
+export type AgentActivityPhase = (typeof AGENT_ACTIVITY_PHASES)[number];
+
+/** 工具活动只允许固定安全类别，不承载工具名、参数或结果。 */
 export const AGENT_ACTIVITY_CATEGORIES = Object.freeze([
   "editing",
   "reading",
@@ -24,8 +42,26 @@ export const AGENT_ACTIVITY_CATEGORIES = Object.freeze([
 export type AgentActivityCategory = (typeof AGENT_ACTIVITY_CATEGORIES)[number];
 
 export interface AgentActivitySummary {
-  readonly category: AgentActivityCategory;
-  readonly active_count: number;
+  readonly phase: AgentActivityPhase;
+  readonly task_id?: string;
+  readonly category?: AgentActivityCategory;
+  readonly active_count?: number;
+}
+
+export const AGENT_TASK_OUTCOMES = Object.freeze([
+  "completed",
+  "failed",
+  "interrupted",
+] as const);
+
+export type AgentTaskOutcome = (typeof AGENT_TASK_OUTCOMES)[number];
+
+export interface AgentLastTask {
+  readonly task_id: string;
+  readonly turn_id: string;
+  readonly commit_id: string;
+  readonly outcome: AgentTaskOutcome;
+  readonly output_state: "present" | "absent";
 }
 
 /** 节点状态中可以保留的安全故障码，不保存底层异常文字。 */
@@ -61,13 +97,16 @@ export interface AgentSnapshot {
   readonly name: string;
   readonly depth: number;
   readonly state: AgentLifecycleState;
-  readonly pending_message_count: number;
+  readonly mailbox_pending_count: number;
+  readonly host_pending_count: number;
+  readonly reply_outbox_pending_count: number;
   readonly revision: number;
   /** 成功创建的线性化点；starting 节点没有该时间。 */
   readonly created_at?: string;
   /** 由单调时钟派生，活动节点持续累加，终态节点固定。 */
   readonly lifecycle_elapsed_ms?: number;
   readonly activity?: AgentActivitySummary;
+  readonly last_task?: AgentLastTask;
   readonly error?: AgentFault;
   /** 仅 `terminated` 携带；活动节点不得提前声称终止结果。 */
   readonly termination_result?: AgentTerminationResult;
@@ -79,19 +118,18 @@ export const AGENT_FAULT_METADATA: Readonly<Record<AgentFaultCode, Readonly<{
 }>>> = Object.freeze({
   spawn_failed: Object.freeze({ message: "代理启动失败", retryable: false }),
   spawn_timeout: Object.freeze({ message: "代理启动超时", retryable: true }),
-  message_delivery_failed: Object.freeze({ message: "消息未获确认接收", retryable: false }),
+  message_delivery_failed: Object.freeze({ message: "消息交付状态不确定", retryable: false }),
   termination_incomplete: Object.freeze({ message: "代理资源尚未完全回收", retryable: true }),
   internal_error: Object.freeze({ message: "控制器内部错误", retryable: false }),
 });
 
 export interface AgentSnapshotCodecOptions {
-  /** 协议边界可进一步收窄深度；省略时只要求正安全整数。 */
   readonly maxDepth?: number;
-  /** 协议边界可限制模板、名称和故障消息的 UTF-8 字节数。 */
   readonly maxStringBytes?: number;
 }
 
 const CANONICAL_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const CANONICAL_UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const RFC3339_MILLIS_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const SNAPSHOT_KEYS = new Set([
   "agent_id",
@@ -100,31 +138,41 @@ const SNAPSHOT_KEYS = new Set([
   "name",
   "depth",
   "state",
-  "pending_message_count",
+  "mailbox_pending_count",
+  "host_pending_count",
+  "reply_outbox_pending_count",
   "revision",
   "created_at",
   "lifecycle_elapsed_ms",
   "activity",
+  "last_task",
   "error",
   "termination_result",
 ]);
-const ACTIVITY_KEYS = new Set(["category", "active_count"]);
+const ACTIVITY_KEYS = new Set(["phase", "task_id", "category", "active_count"]);
+const LAST_TASK_KEYS = new Set([
+  "task_id",
+  "turn_id",
+  "commit_id",
+  "outcome",
+  "output_state",
+]);
 const FAULT_KEYS = new Set(["code", "message", "retryable"]);
 const UTF8_ENCODER = new TextEncoder();
 
-/** 判断输入是否为 RFC 9562 传输用的小写 canonical UUID 文本。 */
 export function isCanonicalAgentUuid(value: unknown): value is string {
   return typeof value === "string" && CANONICAL_UUID_PATTERN.test(value);
+}
+
+export function isCanonicalUuidV4Text(value: unknown): value is string {
+  return typeof value === "string" && CANONICAL_UUID_V4_PATTERN.test(value);
 }
 
 export function isRfc3339Millis(value: unknown): value is string {
   return typeof value === "string" && RFC3339_MILLIS_PATTERN.test(value);
 }
 
-/**
- * 从不可信边界逐字段重建安全快照。失败只返回 `undefined`，调用边界自行转换
- * 为协议错误、公开控制错误或 UI 安全状态。
- */
+/** 从不可信边界逐字段重建 v5 安全快照。 */
 export function parseAgentSnapshot(
   value: unknown,
   options: AgentSnapshotCodecOptions = {},
@@ -140,7 +188,9 @@ export function parseAgentSnapshot(
       || !positiveSafeInteger(record.depth)
       || (options.maxDepth !== undefined && (record.depth as number) > options.maxDepth)
       || !(AGENT_LIFECYCLE_STATES as readonly unknown[]).includes(record.state)
-      || !nonNegativeSafeInteger(record.pending_message_count)
+      || !nonNegativeSafeInteger(record.mailbox_pending_count)
+      || !nonNegativeSafeInteger(record.host_pending_count)
+      || !nonNegativeSafeInteger(record.reply_outbox_pending_count)
       || !positiveSafeInteger(record.revision)
       || (record.created_at !== undefined && !isRfc3339Millis(record.created_at))
       || (record.lifecycle_elapsed_ms !== undefined && !nonNegativeSafeInteger(record.lifecycle_elapsed_ms))
@@ -149,13 +199,22 @@ export function parseAgentSnapshot(
     const activity = record.activity === undefined
       ? undefined
       : parseAgentActivitySummary(record.activity);
+    const lastTask = record.last_task === undefined
+      ? undefined
+      : parseAgentLastTask(record.last_task);
     const fault = record.error === undefined
       ? undefined
       : parseAgentFault(record.error, options.maxStringBytes);
-    if ((record.activity !== undefined && activity === undefined) || (record.error !== undefined && fault === undefined)) {
-      return undefined;
-    }
+    if (
+      (record.activity !== undefined && activity === undefined)
+      || (record.last_task !== undefined && lastTask === undefined)
+      || (record.error !== undefined && fault === undefined)
+    ) return undefined;
+
     const state = record.state as AgentLifecycleState;
+    const mailboxPending = record.mailbox_pending_count as number;
+    const hostPending = record.host_pending_count as number;
+    const replyPending = record.reply_outbox_pending_count as number;
     const terminationResult = record.termination_result === undefined
       ? undefined
       : (AGENT_TERMINATION_RESULTS as readonly unknown[]).includes(record.termination_result)
@@ -164,18 +223,26 @@ export function parseAgentSnapshot(
     if (record.termination_result !== undefined && terminationResult === undefined) return undefined;
     if (state === "failed" && fault === undefined) return undefined;
     if (state !== "failed" && state !== "terminating" && fault !== undefined) return undefined;
-    if (["starting", "failed", "terminating", "terminated"].includes(state) && activity !== undefined) return undefined;
-    if (state === "terminated" && (
-      record.pending_message_count !== 0
-      || fault !== undefined
-      || terminationResult === undefined
-    )) return undefined;
+    if (["starting", "idle", "failed", "terminating", "terminated"].includes(state) && activity !== undefined) {
+      return undefined;
+    }
+    if ((state === "working" || state === "interrupting" || state === "suspended") && activity === undefined) {
+      return undefined;
+    }
+    if (state === "suspended" && activity !== undefined && ![
+      "resume_required",
+      "maintenance_failed",
+      "delivery_uncertain",
+    ].includes(activity.phase)) return undefined;
+    if (state === "idle" && (mailboxPending !== 0 || hostPending !== 0 || replyPending !== 0)) return undefined;
+    if (["starting", "failed", "terminating", "terminated"].includes(state)
+      && (mailboxPending !== 0 || hostPending !== 0 || replyPending !== 0)) return undefined;
+    if (state === "terminated" && (fault !== undefined || terminationResult === undefined)) return undefined;
     if (state !== "terminated" && terminationResult !== undefined) return undefined;
     if (state === "starting" && (
-      record.pending_message_count !== 0
-      || record.created_at !== undefined
+      record.created_at !== undefined
       || record.lifecycle_elapsed_ms !== undefined
-      || activity !== undefined
+      || lastTask !== undefined
       || fault !== undefined
     )) return undefined;
     if ((record.created_at === undefined) !== (record.lifecycle_elapsed_ms === undefined)) return undefined;
@@ -187,13 +254,16 @@ export function parseAgentSnapshot(
       name: record.name,
       depth: record.depth as number,
       state,
-      pending_message_count: record.pending_message_count as number,
+      mailbox_pending_count: mailboxPending,
+      host_pending_count: hostPending,
+      reply_outbox_pending_count: replyPending,
       revision: record.revision as number,
       ...(record.created_at === undefined ? {} : { created_at: record.created_at as string }),
       ...(record.lifecycle_elapsed_ms === undefined
         ? {}
         : { lifecycle_elapsed_ms: record.lifecycle_elapsed_ms as number }),
       ...(activity === undefined ? {} : { activity }),
+      ...(lastTask === undefined ? {} : { last_task: lastTask }),
       ...(fault === undefined ? {} : { error: fault }),
       ...(terminationResult === undefined ? {} : { termination_result: terminationResult }),
     });
@@ -202,20 +272,43 @@ export function parseAgentSnapshot(
   }
 }
 
-export function parseAgentActivitySummary(
-  value: unknown,
-  allowZero = false,
-): AgentActivitySummary | undefined {
+export function parseAgentActivitySummary(value: unknown): AgentActivitySummary | undefined {
   const record = plainDataRecord(value, ACTIVITY_KEYS);
   if (
     record === undefined
-    || !(AGENT_ACTIVITY_CATEGORIES as readonly unknown[]).includes(record.category)
-    || !Number.isSafeInteger(record.active_count)
-    || (record.active_count as number) < (allowZero ? 0 : 1)
+    || !(AGENT_ACTIVITY_PHASES as readonly unknown[]).includes(record.phase)
+    || (record.task_id !== undefined && !isCanonicalUuidV4Text(record.task_id))
+    || (record.category !== undefined
+      && !(AGENT_ACTIVITY_CATEGORIES as readonly unknown[]).includes(record.category))
+    || (record.active_count !== undefined && !positiveSafeInteger(record.active_count))
+    || ((record.category === undefined) !== (record.active_count === undefined))
   ) return undefined;
   return Object.freeze({
-    category: record.category as AgentActivityCategory,
-    active_count: record.active_count as number,
+    phase: record.phase as AgentActivityPhase,
+    ...(record.task_id === undefined ? {} : { task_id: record.task_id as string }),
+    ...(record.category === undefined ? {} : {
+      category: record.category as AgentActivityCategory,
+      active_count: record.active_count as number,
+    }),
+  });
+}
+
+export function parseAgentLastTask(value: unknown): AgentLastTask | undefined {
+  const record = plainDataRecord(value, LAST_TASK_KEYS);
+  if (
+    record === undefined
+    || !isCanonicalUuidV4Text(record.task_id)
+    || !isCanonicalUuidV4Text(record.turn_id)
+    || !isCanonicalUuidV4Text(record.commit_id)
+    || !(AGENT_TASK_OUTCOMES as readonly unknown[]).includes(record.outcome)
+    || (record.output_state !== "present" && record.output_state !== "absent")
+  ) return undefined;
+  return Object.freeze({
+    task_id: record.task_id,
+    turn_id: record.turn_id,
+    commit_id: record.commit_id,
+    outcome: record.outcome as AgentTaskOutcome,
+    output_state: record.output_state,
   });
 }
 
@@ -230,11 +323,7 @@ export function parseAgentFault(value: unknown, maxStringBytes?: number): AgentF
   const code = record.code as AgentFaultCode;
   const metadata = AGENT_FAULT_METADATA[code];
   if (record.message !== metadata.message || record.retryable !== metadata.retryable) return undefined;
-  return Object.freeze({
-    code,
-    message: metadata.message,
-    retryable: metadata.retryable,
-  });
+  return Object.freeze({ code, message: metadata.message, retryable: metadata.retryable });
 }
 
 function plainDataRecord(

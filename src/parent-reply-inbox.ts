@@ -16,7 +16,6 @@ import {
 } from "./child-reply-envelope.ts";
 import {
   createSafeTextComponent,
-  formatSafeImageSummary,
   sanitizeMultiline,
   type AgentToolRenderComponent,
   type AgentToolRenderTheme,
@@ -292,13 +291,9 @@ function createParentReplyMessageRenderer(
       createParentReplyMarkdownTheme(theme),
       { color: (text) => theme.fg("customMessageText", text) },
     );
-    const imageSummary = formatSafeImageSummary(content);
     return new ParentReplyMarkdownComponent(
       createSafeTextComponent(headerLines, theme, {}),
       markdown,
-      imageSummary === undefined
-        ? undefined
-        : createSafeTextComponent([{ text: imageSummary, color: "muted" }], theme, {}),
       theme,
       renderOptions.expanded === true,
       renderOptions.outputPad ?? 1,
@@ -310,7 +305,6 @@ function createParentReplyMessageRenderer(
 class ParentReplyMarkdownComponent implements AgentToolRenderComponent {
   private readonly header: AgentToolRenderComponent;
   private readonly payload: AgentToolRenderComponent;
-  private readonly footer: AgentToolRenderComponent | undefined;
   private readonly theme: ParentReplyMessageTheme;
   private readonly expanded: boolean;
   private readonly requestedPadding: number;
@@ -318,14 +312,12 @@ class ParentReplyMarkdownComponent implements AgentToolRenderComponent {
   constructor(
     header: AgentToolRenderComponent,
     payload: AgentToolRenderComponent,
-    footer: AgentToolRenderComponent | undefined,
     theme: ParentReplyMessageTheme,
     expanded: boolean,
     requestedPadding: number,
   ) {
     this.header = header;
     this.payload = payload;
-    this.footer = footer;
     this.theme = theme;
     this.expanded = expanded;
     this.requestedPadding = requestedPadding;
@@ -345,7 +337,6 @@ class ParentReplyMarkdownComponent implements AgentToolRenderComponent {
     const contentLines = [
       ...this.header.render(contentWidth),
       ...visiblePayloadLines,
-      ...(this.footer?.render(contentWidth) ?? []),
     ];
     const background = (text: string): string => this.theme.bg("customMessageBg", text);
     const blank = background(" ".repeat(availableWidth));
@@ -367,7 +358,6 @@ class ParentReplyMarkdownComponent implements AgentToolRenderComponent {
   invalidate(): void {
     this.header.invalidate();
     this.payload.invalidate();
-    this.footer?.invalidate();
   }
 }
 
@@ -396,14 +386,10 @@ function safeMessagePadding(value: number, width: number): number {
 }
 
 function messageContent(envelope: ChildReplyEnvelope): Array<Record<string, string>> {
-  const content: Array<Record<string, string>> = [{
+  return [{
     type: "text",
     text: encodeChildReplyEnvelope(envelope),
   }];
-  for (const image of envelope.images ?? []) {
-    content.push({ type: "image", data: image.data, mimeType: image.mimeType });
-  }
-  return content;
 }
 
 function customTypeFor(kind: VisibleKind): string {
@@ -465,7 +451,7 @@ function parseVisibleEnvelope(text: string, kind: VisibleKind): VisibleEnvelope 
     status: `${envelope.run_state} / ${envelope.output_state}${
       envelope.reason_code === undefined ? "" : ` / ${envelope.reason_code}`
     }`,
-    payload: envelope.text ?? (envelope.output_state === "absent" ? "无可用业务输出。" : "仅包含图片输出。"),
+    payload: envelope.text ?? "无可用业务输出。",
   });
 }
 

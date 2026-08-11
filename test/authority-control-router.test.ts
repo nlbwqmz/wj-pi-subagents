@@ -154,10 +154,20 @@ test("远程端口经请求相关器调用根权威并保留完整模板语义",
     type: "startup_ready",
     expected_generation: grant.lifecycle_generation,
   }));
-  expectSuccess(tree.updateActivity(B_ID, { category: "researching", active_count: 1 }));
+  expectSuccess(tree.applyTaskProjection(B_ID, {
+    state: "working",
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
+    activity: { phase: "executing_tools", category: "researching", active_count: 1 },
+  }));
   const admission = expectSuccess(await remote.admitControl(actor, B_ID, "get_agent_status"));
   assert.equal(admission.node.agent_id, B_ID);
-  assert.deepEqual(admission.node.activity, { category: "researching", active_count: 1 });
+  assert.deepEqual(admission.node.activity, {
+    phase: "executing_tools",
+    category: "researching",
+    active_count: 1,
+  });
   assert.equal(links.parent.protocolFaults, 0);
   assert.equal(links.child.protocolFaults, 0);
 
@@ -179,11 +189,13 @@ test("远程端口拒绝夹带未声明节点字段的权威响应", async () =>
         name: "B",
         depth: 2,
         state: "working",
-        pending_message_count: 0,
+        mailbox_pending_count: 0,
+        host_pending_count: 0,
+        reply_outbox_pending_count: 0,
         revision: 1,
         created_at: "2026-08-06T07:59:59.000Z",
         lifecycle_elapsed_ms: 1_000,
-        activity: Object.freeze({ category: "reading", active_count: 1 }),
+        activity: Object.freeze({ phase: "executing_tools", category: "reading", active_count: 1 }),
         metadata: "不属于安全快照闭集",
       }),
       tree_revision: 1,

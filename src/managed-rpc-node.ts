@@ -16,12 +16,6 @@ import {
   type ResourceObservation,
 } from "./process-tree-capability.ts";
 
-export interface ManagedRpcImage {
-  readonly type: "image";
-  readonly data: string;
-  readonly mimeType: string;
-}
-
 export type ManagedRpcReply = ChildReplyEnvelope;
 
 export type ManagedRpcTransportFault = "eof" | "protocol_fault" | "process_exit";
@@ -31,7 +25,7 @@ export const MANAGED_RPC_BRIDGE_PROTOCOL = "pi-subagent/managed-rpc/1" as const;
 export const MANAGED_RPC_BRIDGE_CREDENTIAL_ENV = "PI_SUBAGENT_MANAGED_RPC_CREDENTIAL" as const;
 /** 外层桥接 JSON 正文的硬边界。 */
 export const MANAGED_RPC_BRIDGE_MAX_FRAME_BYTES = 64 * 1024;
-/** 单个高层命令的重组边界，覆盖公开图片配额和长模板配置。 */
+/** 单个高层命令的重组边界，覆盖长模板配置和监督启动快照。 */
 export const MANAGED_RPC_BRIDGE_MAX_COMMAND_PAYLOAD_BYTES = 512 * 1024;
 /** Base64URL 分片为外层桥接 JSON 保留协议字段空间。 */
 export const MANAGED_RPC_BRIDGE_COMMAND_CHUNK_BYTES = 45 * 1024;
@@ -66,8 +60,8 @@ export interface ManagedRpcNodeStartContext {
 /** 桥接进程只暴露高层命令，不暴露 Pi JSONL 流。 */
 export interface ManagedRpcBridge {
   start(signal?: AbortSignal, context?: ManagedRpcNodeStartContext): Promise<void>;
-  prompt(message: string, images?: readonly ManagedRpcImage[]): Promise<void>;
-  steer(message: string, images?: readonly ManagedRpcImage[]): Promise<void>;
+  prompt(message: string): Promise<void>;
+  steer(message: string): Promise<void>;
   abort(): Promise<void>;
   getState(): Promise<unknown>;
   requestClose(signal: AbortSignal): Promise<void>;
@@ -167,8 +161,8 @@ export function createManagedRpcNode(options: ManagedRpcNodeAssemblyOptions): Ma
 export interface ManagedRpcNodeLike {
   readonly process_binding: "managed";
   start(signal?: AbortSignal, context?: ManagedRpcNodeStartContext): Promise<void>;
-  prompt(message: string, images?: readonly ManagedRpcImage[]): Promise<void>;
-  steer(message: string, images?: readonly ManagedRpcImage[]): Promise<void>;
+  prompt(message: string): Promise<void>;
+  steer(message: string): Promise<void>;
   abort(): Promise<void>;
   getState(): Promise<unknown>;
   onEvent(listener: (event: unknown) => void): () => void;
@@ -242,12 +236,12 @@ export class ManagedRpcNode implements ManagedRpcNodeLike {
     return this.startPromise;
   }
 
-  async prompt(message: string, images?: readonly ManagedRpcImage[]): Promise<void> {
-    return this.requireBridge().prompt(message, copyImages(images));
+  async prompt(message: string): Promise<void> {
+    return this.requireBridge().prompt(message);
   }
 
-  async steer(message: string, images?: readonly ManagedRpcImage[]): Promise<void> {
-    return this.requireBridge().steer(message, copyImages(images));
+  async steer(message: string): Promise<void> {
+    return this.requireBridge().steer(message);
   }
 
   async abort(): Promise<void> {
@@ -487,10 +481,6 @@ function treeFromLaunchError(error: unknown): ProcessTreeHandle | undefined {
   return tree === undefined ? undefined : tree;
 }
 
-function copyImages(images: readonly ManagedRpcImage[] | undefined): ManagedRpcImage[] | undefined {
-  return images?.map((image) => ({ ...image }));
-}
-
 function copyRpcOptions(value: Readonly<Record<string, unknown>>): Readonly<Record<string, unknown>> {
   return Object.freeze({
     ...value,
@@ -624,12 +614,12 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
     this.started = true;
   }
 
-  async prompt(message: string, images?: readonly ManagedRpcImage[]): Promise<void> {
-    await this.request("prompt", { message, ...(images === undefined ? {} : { images }) });
+  async prompt(message: string): Promise<void> {
+    await this.request("prompt", { message });
   }
 
-  async steer(message: string, images?: readonly ManagedRpcImage[]): Promise<void> {
-    await this.request("steer", { message, ...(images === undefined ? {} : { images }) });
+  async steer(message: string): Promise<void> {
+    await this.request("steer", { message });
   }
 
   async abort(): Promise<void> {
@@ -946,7 +936,24 @@ function isSafeBridgeEvent(value: unknown): boolean {
   switch (value.type) {
     case "agent_start":
     case "agent_settled":
+    case "compaction_start":
       return Object.keys(value).length === 1;
+    case "compaction_end":
+      return (value.reason === "manual" || value.reason === "threshold" || value.reason === "overflow")
+        && typeof value.aborted === "boolean"
+        && typeof value.willRetry === "boolean"
+        && typeof value.failed === "boolean"
+        && Object.keys(value).every((key) => [
+          "type",
+          "reason",
+          "aborted",
+          "willRetry",
+          "failed",
+        ].includes(key));
+    case "queue_update":
+      return Number.isSafeInteger(value.pendingMessageCount)
+        && (value.pendingMessageCount as number) >= 0
+        && Object.keys(value).every((key) => key === "type" || key === "pendingMessageCount");
     case "tool_execution_start":
     case "tool_execution_end":
       return typeof value.toolCallId === "string"
@@ -1022,7 +1029,14 @@ export class FakeManagedRpcNode implements ManagedRpcNodeLike {
   async prompt(): Promise<void> { this.record("prompt"); }
   async steer(): Promise<void> { this.record("steer"); }
   async abort(): Promise<void> { this.record("abort"); }
-  async getState(): Promise<unknown> { this.record("get_state"); return this.options.state ?? { isStreaming: false }; }
+  async getState(): Promise<unknown> {
+    this.record("get_state");
+    return this.options.state ?? {
+      isStreaming: false,
+      isCompacting: false,
+      pendingMessageCount: 0,
+    };
+  }
   onEvent(listener: (event: unknown) => void): () => void { this.eventListeners.add(listener); return () => this.eventListeners.delete(listener); }
   onTransportFault(listener: (fault: ManagedRpcTransportFault) => void): () => void { this.faultListeners.add(listener); return () => this.faultListeners.delete(listener); }
   async sendSupervisorFrame(_frame: Uint8Array): Promise<void> { this.record("supervisor_frame"); }

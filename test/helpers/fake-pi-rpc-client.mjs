@@ -72,7 +72,9 @@ export class RpcClient {
         name: "生产桥接 fake 子端点",
         depth,
         state: "starting",
-        pending_message_count: 0,
+        mailbox_pending_count: 0,
+        host_pending_count: 0,
+        reply_outbox_pending_count: 0,
         revision: 1,
       }],
       initialSubtreeRevision: 1,
@@ -98,12 +100,17 @@ export class RpcClient {
         },
       });
     }
+    const taskId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaac";
+    const turnId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab";
+    await this.#channel.publishTaskStarted({ task_id: taskId, turn_id: turnId });
     await this.#channel.publishReply({
       schema: CHILD_REPLY_SCHEMA,
       version: CHILD_REPLY_VERSION,
       kind: "final",
       agent_id: this.#agentId,
-      turn_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab",
+      task_id: taskId,
+      turn_id: turnId,
+      commit_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaad",
       run_state: "settled",
       output_state: "present",
       text: "真正 child 监督回复",

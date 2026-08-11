@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AgentController, type AgentSupervisor } from "../src/agent-controller.ts";
+import {
+  CHILD_REPLY_SCHEMA,
+  CHILD_REPLY_VERSION,
+  type ChildFinalEnvelope,
+} from "../src/child-reply-envelope.ts";
 import { FakeManagedRpcNode } from "../src/managed-rpc-node.ts";
 import {
   RpcSupervisor,
@@ -8,13 +13,29 @@ import {
   type RpcSupervisorChannelCloseState,
   type RpcSupervisorCommandResult,
   type RpcSupervisorEvent,
-  type RpcSupervisorImage,
   type RpcSupervisorInterruptResult,
   type RpcSupervisorStartupResult,
   type RpcSupervisorTerminationResult,
 } from "../src/rpc-supervisor.ts";
 import type { SupervisorEvent } from "../src/supervisor-channel.ts";
 import { ROOT_TREE_ACTOR, TreeController } from "../src/tree-controller.ts";
+
+const TEST_TURN_ID = "91000000-0000-4000-8000-000000000001";
+const TEST_COMMIT_ID = "91000000-0000-4000-8000-000000000002";
+
+function interruptedFinal(agentId: string, taskId: string): ChildFinalEnvelope {
+  return {
+    schema: CHILD_REPLY_SCHEMA,
+    version: CHILD_REPLY_VERSION,
+    kind: "final",
+    agent_id: agentId,
+    task_id: taskId,
+    turn_id: TEST_TURN_ID,
+    commit_id: TEST_COMMIT_ID,
+    run_state: "interrupted",
+    output_state: "absent",
+  };
+}
 
 class ReadyChannel implements RpcSupervisorChannel {
   private ready = true;
@@ -23,6 +44,7 @@ class ReadyChannel implements RpcSupervisorChannel {
   async waitForReady(): Promise<void> {}
   isReady(): boolean { return this.ready; }
   async publishReply(): Promise<void> {}
+  async publishTaskAssignmentAndWaitForAck(): Promise<void> {}
   establishTerminationBarrier(): void {}
   async requestClose(): Promise<void> { this.ready = false; }
   async waitForClose(): Promise<RpcSupervisorChannelCloseState> { return "released"; }
@@ -56,10 +78,13 @@ class ControlledSupervisor implements AgentSupervisor {
   }
 
   start(): Promise<RpcSupervisorStartupResult> { return this.startOperation(); }
-  async prompt(_message: string, _images?: readonly RpcSupervisorImage[]): Promise<RpcSupervisorCommandResult> {
+  async submit(_message: string): Promise<RpcSupervisorCommandResult> {
     return { ok: false, code: "agent_unavailable" };
   }
-  async steer(_message: string, _images?: readonly RpcSupervisorImage[]): Promise<RpcSupervisorCommandResult> {
+  async prompt(_message: string): Promise<RpcSupervisorCommandResult> {
+    return { ok: false, code: "agent_unavailable" };
+  }
+  async steer(_message: string): Promise<RpcSupervisorCommandResult> {
     return { ok: false, code: "agent_unavailable" };
   }
   async interrupt(): Promise<RpcSupervisorInterruptResult> {
@@ -105,6 +130,7 @@ test("直接父子旅程闭合 spawn、prompt、steering、wait 和协作式 int
   });
   const nodes = new Map<string, FakeManagedRpcNode>();
   let lastNode: FakeManagedRpcNode | undefined;
+  let lastSupervisor: RpcSupervisor | undefined;
   const controller = new AgentController({
     tree,
     allowUnvalidatedTemplates: true,
@@ -120,6 +146,7 @@ test("直接父子旅程闭合 spawn、prompt、steering、wait 和协作式 int
         startupTimeoutMs: 100,
         gracefulShutdownMs: 10,
       });
+      lastSupervisor = supervisor;
       return supervisor;
     },
   });
@@ -140,13 +167,13 @@ test("直接父子旅程闭合 spawn、prompt、steering、wait 和协作式 int
   assert.deepEqual(second.ok && second.data.accepted, true);
   assert.deepEqual(node.operations(), ["start", "get_state", "prompt", "steer"]);
 
-  const invalidImage = await controller.sendMessage({
+  const invalidImages = await controller.sendMessage({
     agent_id: agentId,
-    message: "拒绝超长 MIME",
-    images: [{ type: "image", data: "YWJj", mimeType: `image/${"x".repeat(123)}` }],
+    message: "拒绝图片字段",
+    images: [{ type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" }],
   });
-  assert.equal(invalidImage.ok, false);
-  if (!invalidImage.ok) assert.equal(invalidImage.error.code, "invalid_argument");
+  assert.equal(invalidImages.ok, false);
+  if (!invalidImages.ok) assert.equal(invalidImages.error.code, "invalid_argument");
 
   const waitingOne = controller.waitAgent({ agent_id: agentId });
   const waitingTwo = controller.waitAgent({ agent_id: agentId });
@@ -159,12 +186,18 @@ test("直接父子旅程闭合 spawn、prompt、steering、wait 和协作式 int
   assert.ok(node.operations().includes("abort"));
 
   node.emitEvent({ type: "agent_settled" });
+  assert.ok(lastSupervisor);
+  if (!first.ok) return;
+  assert.equal(lastSupervisor.acceptChildReply(
+    interruptedFinal(agentId, first.data.task_id),
+    () => true,
+  ), true);
   const [one, two] = await Promise.all([waitingOne, waitingTwo]);
   assert.equal(one.ok, true);
   assert.equal(two.ok, true);
   if (one.ok && two.ok) {
-    assert.equal(one.data.outcome, "settled");
-    assert.equal(two.data.outcome, "settled");
+    assert.equal(one.data.outcome, "task_interrupted");
+    assert.equal(two.data.outcome, "task_interrupted");
     assert.equal(one.data.state, "idle");
     assert.equal("observed_at" in one.data, false);
   }
@@ -174,12 +207,13 @@ test("自主 agent_start 后控制器保持 working，并按 steering、wait 和
   const id = "45454545-4545-4454-8454-454545454545";
   const tree = makeTree(id);
   let node: FakeManagedRpcNode | undefined;
+  let rpcSupervisor: RpcSupervisor | undefined;
   const controller = new AgentController({
     tree,
     allowUnvalidatedTemplates: true,
     createSupervisor: ({ actor, reservation }) => {
       node = new FakeManagedRpcNode();
-      return new RpcSupervisor({
+      rpcSupervisor = new RpcSupervisor({
         controller: tree,
         actor,
         reservation,
@@ -188,6 +222,7 @@ test("自主 agent_start 后控制器保持 working，并按 steering、wait 和
         startupTimeoutMs: 100,
         gracefulShutdownMs: 10,
       });
+      return rpcSupervisor;
     },
   });
   const spawned = await controller.spawnAgent({ template_id: "researcher", name: "自主中间代理" });
@@ -207,9 +242,15 @@ test("自主 agent_start 后控制器保持 working，并按 steering、wait 和
   assert.equal(interrupted.ok, true);
   if (interrupted.ok) assert.equal(interrupted.data.changed, true);
   node.emitEvent({ type: "agent_settled" });
+  assert.ok(rpcSupervisor);
+  if (!steered.ok) return;
+  assert.equal(rpcSupervisor.acceptChildReply(
+    interruptedFinal(id, steered.data.task_id),
+    () => true,
+  ), true);
   const result = await waiting;
   assert.equal(result.ok, true);
-  if (result.ok) assert.equal(result.data.outcome, "settled");
+  if (result.ok) assert.equal(result.data.outcome, "task_interrupted");
   await controller.shutdown();
 });
 
@@ -409,6 +450,7 @@ test("已确认工具活动只以固定类别和计数进入控制器安全树�
   const spawned = await controller.spawnAgent({ template_id: "researcher", name: "活动代理" });
   assert.equal(spawned.ok, true);
   assert.ok(node);
+  node.emitEvent({ type: "agent_start" });
 
   node.emitEvent({
     type: "tool_execution_start",
@@ -419,7 +461,9 @@ test("已确认工具活动只以固定类别和计数进入控制器安全树�
   const active = controller.getAgentTree();
   assert.equal(active.ok, true);
   if (!active.ok) return;
-  assert.deepEqual(active.data.nodes[0]?.activity, { category: "editing", active_count: 1 });
+  assert.equal(active.data.nodes[0]?.activity?.phase, "executing_tools");
+  assert.equal(active.data.nodes[0]?.activity?.category, "editing");
+  assert.equal(active.data.nodes[0]?.activity?.active_count, 1);
   assert.doesNotMatch(JSON.stringify(active.data), /secret-call-id|secret-canary|TOP_SECRET|apply_patch/i);
 
   node.emitEvent({
@@ -431,7 +475,7 @@ test("已确认工具活动只以固定类别和计数进入控制器安全树�
   });
   const settled = controller.getAgentTree();
   assert.equal(settled.ok, true);
-  if (settled.ok) assert.equal(settled.data.nodes[0]?.activity, undefined);
+  if (settled.ok) assert.equal(settled.data.nodes[0]?.activity?.phase, "processing");
 });
 
 test("等待参数越界和非直接子代理调用在启动 RPC 前稳定失败", async () => {

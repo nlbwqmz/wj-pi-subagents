@@ -1,6 +1,14 @@
 /** 桥接进程允许跨进程公开的 Pi 事件闭集。 */
 export type SafeRpcBridgeEvent =
-  | { readonly type: "agent_start" | "agent_settled" }
+  | { readonly type: "agent_start" | "agent_settled" | "compaction_start" }
+  | { readonly type: "queue_update"; readonly pendingMessageCount: number }
+  | {
+      readonly type: "compaction_end";
+      readonly reason: "manual" | "threshold" | "overflow";
+      readonly aborted: boolean;
+      readonly willRetry: boolean;
+      readonly failed: boolean;
+    }
   | {
       readonly type: "tool_execution_start" | "tool_execution_end";
       readonly toolCallId: string;
@@ -12,10 +20,7 @@ export interface SafeAssistantMessageEndEvent {
   readonly type: "message_end";
   readonly message: {
     readonly role: "assistant";
-    readonly content: readonly (
-      | { readonly type: "text"; readonly text: string }
-      | { readonly type: "image"; readonly data: string; readonly mimeType: string }
-    )[];
+    readonly content: readonly { readonly type: "text"; readonly text: string }[];
   };
 }
 
@@ -25,7 +30,6 @@ export type RpcBridgeEventNormalization =
   | { readonly kind: "invalid" };
 
 const MAX_MESSAGE_BYTES = 16 * 1024;
-const MAX_IMAGE_BYTES = 24 * 1024;
 const MAX_CONTENT_BLOCKS = 64;
 const MAX_TOOL_ID_BYTES = 256;
 
@@ -41,7 +45,28 @@ export function normalizeRpcBridgeEvent(event: unknown): RpcBridgeEventNormaliza
   switch (event.type) {
     case "agent_start":
     case "agent_settled":
+    case "compaction_start":
       return safeEvent(Object.freeze({ type: event.type }));
+    case "compaction_end":
+      if (
+        (event.reason !== "manual" && event.reason !== "threshold" && event.reason !== "overflow")
+        || typeof event.aborted !== "boolean"
+        || typeof event.willRetry !== "boolean"
+        || (event.errorMessage !== undefined && typeof event.errorMessage !== "string")
+      ) return INVALID_EVENT;
+      return safeEvent(Object.freeze({
+        type: "compaction_end",
+        reason: event.reason,
+        aborted: event.aborted,
+        willRetry: event.willRetry,
+        failed: event.aborted || event.errorMessage !== undefined,
+      }));
+    case "queue_update":
+      if (!Array.isArray(event.steering) || !Array.isArray(event.followUp)) return INVALID_EVENT;
+      return safeEvent(Object.freeze({
+        type: "queue_update",
+        pendingMessageCount: event.steering.length + event.followUp.length,
+      }));
     case "tool_execution_start":
     case "tool_execution_end":
       if (
@@ -72,14 +97,11 @@ export function normalizeAssistantMessageEnd(event: unknown): RpcBridgeEventNorm
   if (!Array.isArray(event.message.content) || event.message.content.length > MAX_CONTENT_BLOCKS) {
     return INVALID_EVENT;
   }
-  const content: Array<
-    | { readonly type: "text"; readonly text: string }
-    | { readonly type: "image"; readonly data: string; readonly mimeType: string }
-  > = [];
+  const content: Array<{ readonly type: "text"; readonly text: string }> = [];
   for (const item of event.message.content) {
     if (!isRecord(item) || typeof item.type !== "string") return INVALID_EVENT;
-    if (item.type === "thinking" || item.type === "toolCall") {
-      // 这两类是 Pi AssistantMessage 的合法内容，但不得越过桥接安全边界。
+    if (item.type === "thinking" || item.type === "toolCall" || item.type === "image") {
+      // 非文本块不得越过最终回复的安全边界。
       continue;
     }
     if (item.type === "text") {
@@ -87,21 +109,6 @@ export function normalizeAssistantMessageEnd(event: unknown): RpcBridgeEventNorm
         return INVALID_EVENT;
       }
       content.push(Object.freeze({ type: "text", text: item.text }));
-      continue;
-    }
-    if (item.type === "image") {
-      if (
-        typeof item.data !== "string"
-        || !validBase64(item.data)
-        || decodedBase64Length(item.data) > MAX_IMAGE_BYTES
-        || typeof item.mimeType !== "string"
-        || !/^image\/[a-z0-9.+-]+$/.test(item.mimeType)
-      ) return INVALID_EVENT;
-      content.push(Object.freeze({
-        type: "image",
-        data: item.data,
-        mimeType: item.mimeType,
-      }));
       continue;
     }
     return INVALID_EVENT;
@@ -131,23 +138,4 @@ function validBoundedText(value: unknown, maxBytes: number): value is string {
 
 function utf8Length(value: string): number {
   return new TextEncoder().encode(value).byteLength;
-}
-
-function validBase64(value: string): boolean {
-  if (value.length === 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return false;
-  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
-  if (padding > 0 && value.length % 4 !== 0) return false;
-  if ((value.length - padding) % 4 === 1) return false;
-  try {
-    const normalized = padding > 0 ? value : value + "=".repeat((4 - (value.length % 4)) % 4);
-    return Buffer.from(normalized, "base64").toString("base64").replace(/=+$/, "")
-      === normalized.replace(/=+$/, "");
-  } catch {
-    return false;
-  }
-}
-
-function decodedBase64Length(value: string): number {
-  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
-  return Math.floor(value.length * 3 / 4) - padding;
 }

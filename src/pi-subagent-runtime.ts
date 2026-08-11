@@ -240,10 +240,12 @@ const PARENT_COORDINATION_GUIDANCE = [
 ].join("\n");
 
 const CHILD_FINAL_REPLY_GUIDANCE = [
-  "子代理最终答复要求：",
-  "- 每次处理结束前，必须输出一条非空且可用的最终答复。",
+  "子代理任务与最终答复要求：",
+  "- reply_to_parent 只用于工作中的进度、问题或阶段性发现；发送成功后继续当前逻辑任务。",
+  "- 压缩或自动续轮后继续同一逻辑任务，不重复已经完成的副作用。",
+  "- 任务结束前必须输出一条非空且可用的最终 assistant 答复；运行时会以该文本准备 final。",
   "- 如果产物已经写入文件，仍要说明完成内容、关键结果和产物路径。",
-  "- 不要以工具调用、工具结果或空白 assistant 消息结束处理。",
+  "- 不要以工具调用、工具结果、reply_to_parent 或空白 assistant 消息结束任务。",
   "- 如果没有可用结果，请简短说明原因。",
 ].join("\n");
 
@@ -724,30 +726,29 @@ export function createPiSubagentRuntimeActivator(
     api.on("agent_end", () => {
       const current = active;
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
+      current.replyCoordinator?.observeAgentEnd();
       current.replyInbox.blockTurnTriggers();
     });
 
-    api.on("agent_settled", (_event, rawContext) => {
+    api.on("agent_settled", () => {
       const current = active;
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
-      if (!runtimeContextIsIdle(readContext(rawContext))) return;
-      const coordinator = current.replyCoordinator;
-      if (coordinator === undefined) return;
-      const turnTriggerBlock = current.replyInbox.blockTurnTriggers();
-      return coordinator.settle().then(
-        () => {
-          // 延后一拍避免当前 handler 内重入；若新轮已建立自己的收尾屏障，
-          // 旧轮令牌不能提前放行它。祖先仍通过 Pi streaming 复核迟到 settle。
-          setImmediate(() => {
-            if (!current.replyInbox.releaseTurnTriggers(turnTriggerBlock)) return;
-            void current.controller.retryPendingReplies();
-          });
-        },
-        (error: unknown) => {
-          current.replyInbox.failTurnTriggers();
-          throw error;
-        },
-      );
+      // raw settled 只建立 child coordinator 的 provisional candidate；绝不能在
+      // handler 内等待父端 ACK，否则第三方 mid-run compact 会被阻塞。
+      current.replyInbox.blockTurnTriggers();
+      current.replyCoordinator?.settle();
+    });
+
+    api.on("session_before_compact", () => {
+      const current = active;
+      if (current === undefined || !current.isChild || current.handoffPending === true) return;
+      current.replyCoordinator?.observeCompactionStart();
+    });
+
+    api.on("session_compact", () => {
+      const current = active;
+      if (current === undefined || !current.isChild || current.handoffPending === true) return;
+      current.replyCoordinator?.observeCompactionEnd();
     });
 
     const makeState = (transfer: RuntimeTransfer, context: RuntimeContextView): ActiveRuntime => {
@@ -1019,11 +1020,9 @@ export function createPiSubagentRuntimeActivator(
           if (current === undefined) throw new Error("父会话尚未就绪");
           return current.bindings.api;
         },
-        notifyMessage: (agentId) => {
-          const current = stateReference;
-          if (current === undefined) return;
-          current.controller.notifyAgentReply(agentId);
-        },
+        // wait_agent 的 reply 通知由 RpcSupervisor 已接纳事件统一登记，避免
+        // 同一 message 在注入层和监督事件层各计数一次。
+        notifyMessage: () => {},
         readSenderName: (agentId) => readDirectChildDisplayName(stateReference, agentId, false),
       });
       const replyCoordinator = upstream === undefined
@@ -1031,11 +1030,21 @@ export function createPiSubagentRuntimeActivator(
         : new ChildReplyCoordinator({
           agentId: bootstrap!.agentId,
           port: upstream.channel,
+          onFinalAccepted: () => {
+            if (!replyInbox.releaseTurnTriggers()) return;
+            const current = stateReference;
+            if (current !== undefined) void current.controller.retryPendingReplies();
+          },
           onFinalFailure: () => {
             upstream.channel.failProtocol();
             void upstream.channel.release().catch(() => {});
           },
         });
+      if (upstream !== undefined && replyCoordinator !== undefined) {
+        upstream.channel.onTaskAssignment((assignment) => {
+          replyCoordinator.observeTaskAssignment(assignment);
+        });
+      }
       const state: ActiveRuntime = {
         controller: undefined as unknown as AgentController,
         templates,

@@ -19,6 +19,8 @@ import type { AgentSnapshot } from "../src/tree-controller.ts";
 
 const CHILD_ID = "550e8400-e29b-41d4-a716-446655440000";
 const TURN_ID = "550e8400-e29b-41d4-a716-446655440001";
+const TASK_ID = "450e8400-e29b-41d4-a716-446655440001";
+const COMMIT_ID = "750e8400-e29b-41d4-a716-446655440001";
 const ROOT_ID = "root-test";
 const CREDENTIAL = "stream-test-credential";
 
@@ -28,6 +30,7 @@ function workingReply(text: string): ChildMessageEnvelope {
     version: CHILD_REPLY_VERSION,
     kind: "message",
     agent_id: CHILD_ID,
+    task_id: TASK_ID,
     turn_id: TURN_ID,
     requires_response: false,
     text,
@@ -40,7 +43,9 @@ function finalReply(text: string): ChildFinalEnvelope {
     version: CHILD_REPLY_VERSION,
     kind: "final",
     agent_id: CHILD_ID,
+    task_id: TASK_ID,
     turn_id: TURN_ID,
+    commit_id: COMMIT_ID,
     run_state: "settled",
     output_state: "present",
     text,
@@ -55,7 +60,9 @@ function snapshot(): AgentSnapshot {
     name: "流式子代理",
     depth: 1,
     state: "idle",
-    pending_message_count: 0,
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
     revision: 1,
   });
 }
@@ -126,6 +133,72 @@ test("真实字节流完成 child hello、首快照、ACK 和 ready 双握手", 
   await pair.child.release();
 });
 
+test("task assignment 和 task_started 都等待对端 transport ACK 后完成", async () => {
+  const pair = channelPair();
+  const assignments: unknown[] = [];
+  const starts: unknown[] = [];
+  pair.child.onTaskAssignment((assignment) => assignments.push(assignment));
+  pair.parent.onTaskStarted((started) => starts.push(started));
+  await pair.parent.bind(new AbortController().signal);
+  await pair.child.bind(new AbortController().signal);
+  await Promise.all([
+    pair.parent.waitForReady(new AbortController().signal),
+    pair.child.waitForReady(new AbortController().signal),
+  ]);
+
+  await pair.parent.publishTaskAssignmentAndWaitForAck({
+    message_id: "msg_650e8400-e29b-41d4-a716-446655440006",
+    task_id: TASK_ID,
+    mode: "prompt",
+  });
+  assert.deepEqual(assignments, [{
+    message_id: "msg_650e8400-e29b-41d4-a716-446655440006",
+    task_id: TASK_ID,
+    mode: "prompt",
+  }]);
+
+  await pair.child.publishTaskStarted({ task_id: TASK_ID, turn_id: TURN_ID });
+  assert.deepEqual(starts, [{ task_id: TASK_ID, turn_id: TURN_ID }]);
+  await pair.parent.release();
+  await pair.child.release();
+});
+
+test("task_started 与 final ACK 后仍可在同一流完成控制请求响应", async () => {
+  const pair = channelPair(() => true);
+  const response = new Promise<unknown>((resolve) => {
+    pair.child.onControlResponse(resolve);
+  });
+  pair.parent.onControlRequest((request) => {
+    void pair.parent.publishControlResponse({
+      operation_id: request.operation_id,
+      ok: true,
+      data: [],
+    });
+  });
+  await pair.parent.bind(new AbortController().signal);
+  await pair.child.bind(new AbortController().signal);
+  await Promise.all([
+    pair.parent.waitForReady(new AbortController().signal),
+    pair.child.waitForReady(new AbortController().signal),
+  ]);
+
+  await pair.child.publishTaskStarted({ task_id: TASK_ID, turn_id: TURN_ID });
+  await pair.child.publishReplyAndWaitForAck(finalReply("完成"));
+  await pair.child.publishControlRequest({
+    operation_id: "650e8400-e29b-41d4-a716-446655440008",
+    operation: "list_templates",
+    route: [CHILD_ID],
+    body: {},
+  });
+  assert.deepEqual(await response, {
+    operation_id: "650e8400-e29b-41d4-a716-446655440008",
+    ok: true,
+    data: [],
+  });
+  await pair.parent.release();
+  await pair.child.release();
+});
+
 test("父端在原子接受完整快照后向订阅者发布安全副本", async () => {
   const pair = channelPair();
   const snapshots: unknown[] = [];
@@ -160,14 +233,14 @@ test("回复与生命周期事件通过安全回调传递，观察者异常不�
   await pair.parent.waitForReady(new AbortController().signal);
   await pair.child.waitForReady(new AbortController().signal);
 
-  await pair.child.publishEvent({ type: "agent_settled", expected_generation: 2 });
+  await pair.child.publishEvent({ type: "startup_ready", expected_generation: 2 });
   await pair.child.publishReply(finalReply("安全回复"));
   await settleIo();
   assert.deepEqual(replies, ["安全回复"]);
   assert.deepEqual(events, [{
     root_id: ROOT_ID,
     agent_id: CHILD_ID,
-    type: "agent_settled",
+    type: "startup_ready",
     expected_generation: 2,
   }]);
   assert.equal(pair.child.getPublicState().pending_reply_count, 0);

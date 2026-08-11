@@ -21,14 +21,18 @@ import { ROOT_TREE_ACTOR, TreeController } from "../src/tree-controller.ts";
 
 const AGENT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const TURN_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const TASK_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const COMMIT_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 
-function finalReply(text: string): ChildFinalEnvelope {
+function finalReply(text: string, taskId: string): ChildFinalEnvelope {
   return {
     schema: CHILD_REPLY_SCHEMA,
     version: CHILD_REPLY_VERSION,
     kind: "final",
     agent_id: AGENT_ID,
+    task_id: taskId,
     turn_id: TURN_ID,
+    commit_id: COMMIT_ID,
     run_state: "settled",
     output_state: "present",
     text,
@@ -53,6 +57,10 @@ class LinkedFactoryNode extends FakeManagedRpcNode {
 
   override async sendSupervisorFrame(frame: Uint8Array): Promise<void> {
     this.endpoint?.receive(frame);
+  }
+
+  async publishTaskStarted(taskId: string): Promise<void> {
+    await this.endpoint?.publishTaskStarted({ task_id: taskId, turn_id: TURN_ID });
   }
 
   async publishReply(reply: ManagedRpcReply): Promise<void> {
@@ -110,7 +118,7 @@ function factoryHarness(deliverReply?: (agentId: string, reply: ManagedRpcReply)
     rootArguments: { maxDepth: 2 },
     controllerMetadata: {
       rootId: "root-factory",
-      protocolVersion: "pi-subagent/3",
+      protocolVersion: "pi-subagent/5",
     },
   });
   const options = {
@@ -239,7 +247,7 @@ test("身份预留后才建立监督上下文并追加最终子代理环境", as
   assert.equal(context.environment?.PI_SUBAGENT_AGENT_ID, AGENT_ID);
   assert.equal(context.environment?.PI_SUBAGENT_DEPTH, "1");
   assert.equal(context.environment?.PI_SUBAGENT_MAX_DEPTH, "2");
-  assert.equal(context.environment?.PI_SUBAGENT_PROTOCOL_VERSION, "pi-subagent/3");
+  assert.equal(context.environment?.PI_SUBAGENT_PROTOCOL_VERSION, "pi-subagent/5");
   await supervisor.terminate();
 });
 
@@ -251,8 +259,15 @@ test("没有安全回复投递器时父端不发送 ACK", async () => {
     template: template(),
   });
   assert.equal((await supervisor.start()).ok, true);
+  const submission = await supervisor.submit("测试任务");
+  assert.equal(submission.ok, true);
+  if (!submission.ok) return;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  node.emitEvent({ type: "agent_start" });
+  await node.publishTaskStarted(submission.task_id);
+  node.emitEvent({ type: "agent_settled" });
 
-  await node.publishReply(finalReply("未投递回复"));
+  await node.publishReply(finalReply("未投递回复", submission.task_id));
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -272,8 +287,15 @@ test("安全回复投递成功后才通过监督通道确认", async () => {
     template: template(),
   });
   assert.equal((await supervisor.start()).ok, true);
+  const submission = await supervisor.submit("测试任务");
+  assert.equal(submission.ok, true);
+  if (!submission.ok) return;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  node.emitEvent({ type: "agent_start" });
+  await node.publishTaskStarted(submission.task_id);
+  node.emitEvent({ type: "agent_settled" });
 
-  await node.publishReply(finalReply("已投递回复"));
+  await node.publishReply(finalReply("已投递回复", submission.task_id));
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
 

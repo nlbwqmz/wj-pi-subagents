@@ -10,7 +10,6 @@ import {
   parseChildReplyEnvelope,
   type ChildFinalEnvelope,
   type ChildReplyEnvelope,
-  type ChildReplyImage,
 } from "../src/child-reply-envelope.ts";
 import {
   AGENT_TOOL_NAMES,
@@ -49,23 +48,28 @@ const AGENT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const DESCENDANT_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const TURN_1 = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 const TURN_2 = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+const TASK_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const COMMIT_ID = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+const COMMIT_2 = "99999999-9999-4999-8999-999999999999";
 
 function finalReply(
   agentId: string,
   text: string,
-  images?: readonly ChildReplyImage[],
   turnId = TURN_1,
+  taskId = TASK_ID,
+  commitId = COMMIT_ID,
 ): ChildFinalEnvelope {
   return {
     schema: CHILD_REPLY_SCHEMA,
     version: CHILD_REPLY_VERSION,
     kind: "final",
     agent_id: agentId,
+    task_id: taskId,
     turn_id: turnId,
+    commit_id: commitId,
     run_state: "settled",
     output_state: "present",
     text,
-    ...(images === undefined ? {} : { images }),
   };
 }
 
@@ -147,14 +151,30 @@ class RuntimeLinkedNode extends FakeManagedRpcNode {
 
 class RuntimeBridgeNode extends FakeManagedRpcNode {
   private readonly adapter: LocalSupervisorTransportAdapter;
+  private readonly operationWaiters = new Map<string, Set<() => void>>();
   private listener: LocalSupervisorTransportListener | undefined;
   private transport: SupervisorByteTransport | undefined;
   private streaming = false;
   startContext: ManagedRpcNodeStartContext | undefined;
 
   constructor(adapter: LocalSupervisorTransportAdapter) {
-    super();
+    let notifyOperation: ((operation: string) => void) | undefined;
+    super({ onOperation: (operation) => notifyOperation?.(operation) });
     this.adapter = adapter;
+    notifyOperation = (operation) => {
+      const waiters = this.operationWaiters.get(operation);
+      if (waiters === undefined) return;
+      this.operationWaiters.delete(operation);
+      for (const resolve of waiters) resolve();
+    };
+  }
+
+  waitForNextOperation(operation: string): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const waiters = this.operationWaiters.get(operation) ?? new Set<() => void>();
+      waiters.add(resolve);
+      this.operationWaiters.set(operation, waiters);
+    });
   }
 
   override async start(signal?: AbortSignal, context?: ManagedRpcNodeStartContext): Promise<void> {
@@ -202,7 +222,7 @@ class RuntimeBridgeNode extends FakeManagedRpcNode {
 
   override async getState(): Promise<unknown> {
     await super.getState();
-    return { isStreaming: this.streaming, pendingMessageCount: 0 };
+    return { isStreaming: this.streaming, isCompacting: false, pendingMessageCount: 0 };
   }
 
   setStreaming(value: boolean): void {
@@ -242,9 +262,9 @@ class CountingLocalSupervisorTransportAdapter implements LocalSupervisorTranspor
 }
 
 async function waitForBootstrap(node: RuntimeBridgeNode): Promise<ManagedRpcNodeStartContext> {
-  for (let attempt = 0; attempt < 50; attempt += 1) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
     if (node.startContext !== undefined) return node.startContext;
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setTimeout(resolve, 1));
   }
   throw new Error("未观察到 child bootstrap");
 }
@@ -573,7 +593,7 @@ test("child bootstrap 严格要求完整临时监督字段并区分根直接子�
   );
 });
 
-test("final ACK 失败从 runtime handler 向 Pi 冒泡", async () => {
+test("final ACK 失败不阻塞 runtime settled handler，并由独立监督流收敛", async () => {
   const cwd = "C:\\workspace\\final-ack-failure";
   const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
   const localCredential = `local_${"l".repeat(32)}`;
@@ -625,10 +645,10 @@ test("final ACK 失败从 runtime handler 向 Pi 冒泡", async () => {
   await api.emit("agent_start", { type: "agent_start" }, context);
   await api.emit("agent_end", { type: "agent_end" }, context);
   const settling = api.emit("agent_settled", { type: "agent_settled" }, context);
+  await settling;
   await new Promise<void>((resolve) => setImmediate(resolve));
 
   await listener.close();
-  await assert.rejects(settling, /子代理最终回复未获父会话确认/);
   await parentChannel.release();
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
@@ -783,10 +803,15 @@ test("生产运行时闭合直接父子的创建、消息、回复、等待、�
   }, context) as { details?: Record<string, unknown> };
   assert.equal(firstMessage.details?.accepted, true);
   assert.equal(typeof firstMessage.details?.message_id, "string");
+  assert.equal(typeof firstMessage.details?.task_id, "string");
 
-  const directReply = finalReply(AGENT_ID, "直接回复", [
-    { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
-  ]);
+  node.emitEvent({ type: "agent_settled" });
+  const directReply = finalReply(
+    AGENT_ID,
+    "直接回复",
+    TURN_1,
+    String(firstMessage.details?.task_id),
+  );
   await node.publishReply(directReply);
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
@@ -799,7 +824,6 @@ test("生产运行时闭合直接父子的创建、消息、回复、等待、�
           type: "text",
           text: JSON.stringify(directReply),
         },
-        { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
       ],
       display: true,
       details: {
@@ -821,15 +845,13 @@ test("生产运行时闭合直接父子的创建、消息、回复、等待、�
     MESSAGE_RENDER_THEME,
   ).render(120).join("\n");
   assert.match(finalDisplay, new RegExp(`Sender: 运行时子代理 · ${AGENT_ID}`));
-  assert.match(finalDisplay, /Payload:[^\r\n]*\r?\n[^\r\n]*直接回复/);
-  assert.match(finalDisplay, /图片 1 · image\/png ×1/);
-  assert.doesNotMatch(finalDisplay, /aGVsbG8=/);
+  assert.match(finalDisplay, /Payload[^\r\n]*\r?\n[^\r\n]*直接回复/);
+  assert.doesNotMatch(finalDisplay, /图片|aGVsbG8=/);
 
-  node.emitEvent({ type: "agent_settled" });
   const waited = await execute(api, "wait_agent", { agent_id: AGENT_ID }, context) as {
     details?: Record<string, unknown>;
   };
-  assert.equal(waited.details?.outcome, "settled");
+  assert.equal(waited.details?.outcome, "task_completed");
   assert.equal(waited.details?.state, "idle");
 
   await execute(api, "send_message", {
@@ -920,7 +942,7 @@ test("运行时以单数 agent 命令交付只读 TUI，并在会话关闭时清
         type: "text",
         text: JSON.stringify({
           schema: "pi-subagent.terminal",
-          version: 1,
+          version: CHILD_REPLY_VERSION,
           kind: "terminal",
           agent_id: AGENT_ID,
           node_state: "failed",
@@ -1125,10 +1147,12 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
     `- ${PARENT_COORDINATION_GUIDELINES.interruptAgent}`,
   ].join("\n");
   const childFinalReplyGuidance = [
-    "子代理最终答复要求：",
-    "- 每次处理结束前，必须输出一条非空且可用的最终答复。",
+    "子代理任务与最终答复要求：",
+    "- reply_to_parent 只用于工作中的进度、问题或阶段性发现；发送成功后继续当前逻辑任务。",
+    "- 压缩或自动续轮后继续同一逻辑任务，不重复已经完成的副作用。",
+    "- 任务结束前必须输出一条非空且可用的最终 assistant 答复；运行时会以该文本准备 final。",
     "- 如果产物已经写入文件，仍要说明完成内容、关键结果和产物路径。",
-    "- 不要以工具调用、工具结果或空白 assistant 消息结束处理。",
+    "- 不要以工具调用、工具结果、reply_to_parent 或空白 assistant 消息结束任务。",
     "- 如果没有可用结果，请简短说明原因。",
   ].join("\n");
   assert.equal(await rootPromptHandler({ systemPrompt: "根会话提示" }, rootContext), undefined);
@@ -1260,6 +1284,7 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
     },
   }, childContext);
   await childApi.emit("agent_settled", { type: "agent_settled" }, childContext);
+  parentNode.emitEvent({ type: "agent_settled" });
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(rootApi.sentMessages.length, 2);
@@ -1369,15 +1394,27 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   });
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(leafSettlementFinished, false);
+  // raw settled 不等待 final ACK；回复仍被父任务的 trigger 栅栏保留在后台 outbox。
+  assert.equal(leafSettlementFinished, true);
   assert.equal(childApi.sentMessages.length, 0);
   assert.equal(rootApi.sentMessages.length, 2);
 
   releasePrecedingSettle();
   precedingSettleDelay = undefined;
-  await new Promise<void>((resolve) => setImmediate(resolve));
+  let preparedParentFinal = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const status = rootController.getAgentStatus(parentId);
+    if (status.ok && status.data.reply_outbox_pending_count === 1) {
+      preparedParentFinal = true;
+      break;
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  assert.equal(preparedParentFinal, true);
   rootApi.sendMessageBlocked = false;
+  parentNode.emitEvent({ type: "agent_settled" });
   await rootController.retryPendingReplies();
+  await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(rootApi.sentMessages.length, 3);
   const delayedParentFinal = readSentReply(rootApi.sentMessages[2]!);
   assert.equal(delayedParentFinal.kind, "final");
@@ -1387,6 +1424,9 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(parentSettlementFinished, false);
+  grandchildNode.emitEvent({ type: "agent_settled" });
+  await childController.retryPendingReplies();
+  await new Promise<void>((resolve) => setImmediate(resolve));
   await leafSettlement;
 
   assert.equal(childApi.sentMessages.length, 1);
@@ -1418,7 +1458,7 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   releaseFollowingSettle();
   followingSettleDelay = undefined;
   await parentSettlement;
-  // 旧轮 settle 在新 loop 已 streaming 后到达；祖先必须通过状态复核压住它。
+  // 新 loop 已 streaming 后到达的重复/迟到 settle 必须被宿主状态复核压住。
   parentNode.emitEvent({ type: "agent_settled" });
   await new Promise<void>((resolve) => setImmediate(resolve));
   parentStatus = rootController.getAgentStatus(parentId);
@@ -1441,12 +1481,13 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   });
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(waitFinished, false);
+  const steerObserved = parentNode.waitForNextOperation("steer");
   const steered = await execute(rootApi, "send_message", {
     agent_id: parentId,
     message: "继续整理叶节点结果",
   }, rootContext) as { details?: Record<string, unknown> };
   assert.equal(steered.details?.accepted, true);
-  assert.equal(parentNode.operations().at(-1), "steer");
+  await steerObserved;
   const interruptedNewTurn = await execute(rootApi, "interrupt_agent", {
     agent_id: parentId,
   }, rootContext) as { details?: Record<string, unknown> };
@@ -1466,7 +1507,7 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   parentNode.setStreaming(false);
   parentNode.emitEvent({ type: "agent_settled" });
   const waitedNewTurn = await waitingForNewTurn;
-  assert.equal(waitedNewTurn.details?.outcome, "settled");
+  assert.equal(waitedNewTurn.details?.outcome, "task_interrupted");
   assert.equal(waitedNewTurn.details?.state, "idle");
   assert.equal(rootApi.sentMessages.length, 4);
   const interruptedFinal = readSentReply(rootApi.sentMessages[3]!);
@@ -1572,6 +1613,11 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
   }, oldContext) as { details?: Record<string, unknown> };
   const firstId = String(first.details?.agent_id);
   assert.equal(firstId, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+  const assigned = await execute(oldApi, "send_message", {
+    agent_id: firstId,
+    message: "交接任务",
+  }, oldContext) as { details?: Record<string, unknown> };
+  const assignedTaskId = String(assigned.details?.task_id);
 
   await oldApi.emit("session_shutdown", { type: "session_shutdown", reason: "reload" }, oldContext);
   oldApi.invalidate();
@@ -1585,7 +1631,8 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
     [],
   );
 
-  const handoffReply = finalReply(firstId, "交接窗口内的回复");
+  firstNode.emitEvent({ type: "agent_settled" });
+  const handoffReply = finalReply(firstId, "交接窗口内的回复", TURN_1, assignedTaskId);
   await firstNode.publishReply(handoffReply);
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
@@ -1654,7 +1701,18 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
   }, newContext) as { details?: Record<string, unknown> };
   assert.equal(reloadedTemplate.details?.agent_id, "cccccccc-cccc-4ccc-8ccc-cccccccccccc");
 
-  await firstNode.publishReply(finalReply(firstId, "交接后的回复", undefined, TURN_2));
+  const secondAssignment = await execute(newApi, "send_message", {
+    agent_id: firstId,
+    message: "交接后任务",
+  }, newContext) as { details?: Record<string, unknown> };
+  firstNode.emitEvent({ type: "agent_settled" });
+  await firstNode.publishReply(finalReply(
+    firstId,
+    "交接后的回复",
+    TURN_2,
+    String(secondAssignment.details?.task_id),
+    COMMIT_2,
+  ));
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(oldApi.sentMessages.length, 0);
@@ -1777,6 +1835,7 @@ test("根与 child 跨实例 reload 保留同一监督连接，并让既有 chil
     },
   }, context);
   await newChildApi.emit("agent_settled", { type: "agent_settled" }, context);
+  parentNode.emitEvent({ type: "agent_settled" });
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(oldRootApi.sentMessages.length, 0);

@@ -120,7 +120,7 @@ pi install "D:\path\to\pi-subagents-wj" -l --approve
 Pi 不管理本地路径中的源码副本。请先通过你实际取得源码的方式更新该目录，然后重新按锁文件装配生产依赖。
 
 > [!IMPORTANT]
-> 监督协议主版本升级时不能热接管旧活动树。当前版本使用 `pi-subagent/3`，不兼容 v2 reply；从 v2 更新前应先退出旧 Pi 根会话并确认子树已清理，再更新源码和重启。只有协议主版本未变化的更新才可依赖 `/reload` 保留现有树。
+> 监督协议主版本升级时不能热接管旧活动树。当前版本使用 `pi-subagent/5` 和第 3 版 reply envelope，不兼容 `pi-subagent/4` 或第 2 版 reply；更新前应先退出旧 Pi 根会话并确认子树已清理，再更新源码和重启。只有协议主版本未变化的更新才可依赖 `/reload` 保留现有树。
 
 ```powershell
 Set-Location D:\path\to\pi-subagents-wj
@@ -205,14 +205,14 @@ systemPromptMode: append
 2. 根代理调用 `spawn_agent`，创建后得到唯一 `agent_id`。
 3. 根代理调用 `send_message` 发送第一项任务。
 4. 子代理需要汇报进度、提问或给出阶段性发现时，调用 `reply_to_parent`；该调用不会结束当前工作。
-5. 子代理完全 settled 后，运行时自动把最终答复提交给直接父代理。
-6. 根代理可调用 `wait_agent` 等待工作中回复、节点空闲或终态。
+5. 子代理到达 raw settlement 后，运行时先保留 provisional candidate；只有匹配任务/轮次的 final 已进入父会话并获 ACK，任务才提交为完成、失败或中断。
+6. 根代理可调用 `wait_agent` 等待工作中回复、最近任务提交、挂起或终态。
 7. 后续仍可向同一 `agent_id` 发送任务，以复用其上下文。
 8. 不再需要时调用 `terminate_agent`，递归回收该节点和所有后代。
 
 `spawn_agent` 只负责创建节点，不接受首条任务。若模型只创建了代理却没有开始工作，可以明确提醒它“继续向刚创建的代理调用 `send_message`”。
 
-交互式 TUI 会在代理工具调用行显示入参。短参数直接显示；较长的任务正文默认显示预览，展开工具行后可查看完整参数。图片参数保留类型和 MIME 信息，但 base64 数据只显示已省略的字符数，不直接输出 payload。
+交互式 TUI 会在代理工具调用行显示入参。短参数直接显示；较长的任务正文默认显示预览，展开工具行后可查看完整参数。所有子代理通信工具都只接受文本，因此调用行不会包含图片载荷。
 
 ## 代理模板
 
@@ -289,19 +289,20 @@ Markdown 正文可以为空，UTF-8 编码后最多 `64 KiB`；该边界同时�
 
 ### 工作中发送补充要求
 
-`send_message` 会根据节点状态自动选择交付方式：
+`send_message` 先在该节点的插件 mailbox 中线性化接纳，再由监督器按当前任务事实选择真实 Pi 命令：
 
-- 节点为 `idle` 时，消息作为新 prompt 开始一次处理；
-- 节点为 `working` 或 `interrupting` 时，消息作为 steering 加入当前处理；
+- 没有活动任务时，首条消息建立新的逻辑任务并最终作为 prompt 交付；
+- 同一任务处理中，后续消息作为 steering 交付；
+- 中断栅栏后的消息获得后继 `task_id`，只能在当前任务 final 提交后作为新 prompt 交付；
 - 节点为 `failed`、`terminating` 或 `terminated` 时，消息会被拒绝。
 
-工具成功只表示消息已被子 Pi 接受，不表示任务已经完成。消息被接受后，已下发任务范围在子代理给出最终答复或进入终态前由该子代理负责；父代理应等待、查询状态或发送 steering，不能以只读检查、运行相同测试、复现、评审或独立验证为名重复实施或再次委派同一任务。只有派发前已经明确拆分、产出独立、无数据依赖且无共享写资源的其他工作才适合并行。
+工具成功会返回 `message_id` 和 `task_id`。`accepted: true` 只表示插件 mailbox 已接纳消息，不表示 Pi 或模型已经读取，也不表示任务已经完成。真实 Pi 命令随后失败或连接中断时，状态会保守投影为 `suspended`/`delivery_uncertain`，不会撤销已经返回的接纳事实。消息被接受后，已下发任务范围在子代理给出最终答复或进入终态前由该子代理负责；父代理应等待、查询状态或发送 steering，不能以只读检查、运行相同测试、复现、评审或独立验证为名重复实施或再次委派同一任务。只有派发前已经明确拆分、产出独立、无数据依赖且无共享写资源的其他工作才适合并行。
 
 子代理的普通 assistant 过程输出不会自动上行：工作中汇报必须显式调用 `reply_to_parent`，最终答复则由运行时在处理结束边界自动提交。回复以结构化 JSON 进入父会话；`wait_agent` 只观察回复通知和生命周期，不会在工具结果中重复复制 final 正文。
 
 ### 等待、打断与终止
 
-- `wait_agent`：等待工作中回复、节点 settled、进入稳定终态或超时。工作中回复只结束本次等待，不会让节点停止；超时也不打断节点。
+- `wait_agent`：等待工作中回复、最近逻辑任务提交、节点挂起、进入稳定终态或超时。工作中回复只结束本次等待，不会让节点停止；超时也不打断节点。
 - `interrupt_agent`：协作式中断当前处理，保留节点、上下文和后代。它不会自动升级为终止。
 - `terminate_agent`：永久递归终止目标和全部后代，并同步等待资源回收确认。目标必须是调用者的直接子代理。
 
@@ -319,7 +320,7 @@ Markdown 正文可以为空，UTF-8 编码后最多 `64 KiB`；该边界同时�
 
 ## 查看代理树
 
-在交互式 TUI 中，编辑器上方的 `Agents` widget 会显示当前会话的直接、尚未终止的子代理，包括模板、名称、状态、活动类别、运行时长和 pending 数量。
+在交互式 TUI 中，编辑器上方的 `Agents` widget 会显示当前会话的直接、尚未终止的子代理，包括模板、名称、状态、活动阶段与类别、运行时长，以及 mailbox/宿主/reply outbox 三类队列的汇总。
 
 输入以下命令打开当前可见作用域的完整只读树：
 
@@ -337,7 +338,7 @@ Markdown 正文可以为空，UTF-8 编码后最多 `64 KiB`；该边界同时�
 | `←` / `h` | 折叠分支；已折叠时跳到父节点 |
 | `Esc` | 关闭面板 |
 
-折叠分支会显示后代数、工作中数量、故障数和 pending 汇总。`finished` 分组统计 `completed`、`failed` 和 `incomplete`。节点新进入 `failed`，或资源清理出现 `termination_incomplete` 时，TUI 还会显示聚合且脱敏的通知。
+折叠分支会显示后代数、工作中数量、故障数和三类队列汇总。`finished` 分组统计 `completed`、`failed` 和 `incomplete`。节点新进入 `failed`，或资源清理出现 `termination_incomplete` 时，TUI 还会显示聚合且脱敏的通知。
 
 `/agent` 面板只在交互式 TUI 中打开。RPC 模式可以接收 widget 的 UI 数据；print/JSON 等无 UI 模式没有文本回退，可让模型调用 `get_agent_tree` 获取结构化快照。
 
@@ -433,21 +434,7 @@ Markdown 正文可以为空，UTF-8 编码后最多 `64 KiB`；该边界同时�
 }
 ```
 
-`message` 必须非空且不超过 16 KiB UTF-8。成功结果中的 `accepted: true` 只表示对应 Pi RPC 已接受消息。可选的 `images` 最多 8 张，每张使用原始 Base64 数据（不要带 `data:` URL 前缀）、`image/*` MIME，解码后不超过 24 KiB：
-
-```json
-{
-  "agent_id": "550e8400-e29b-41d4-a716-446655440000",
-  "message": "分析这张截图。",
-  "images": [
-    {
-      "type": "image",
-      "data": "iVBORw0KGgoAAA...",
-      "mimeType": "image/png"
-    }
-  ]
-}
-```
+`message` 必须非空且不超过 16 KiB UTF-8。工具只接受文本；`images` 或其他额外载荷会返回 `invalid_argument`。成功结果包含插件分配的 `message_id`、稳定逻辑 `task_id` 和 `accepted: true`；它只证明插件 mailbox 已接纳，不证明 Pi 或模型已经读取。
 
 若返回 `message_delivery_failed`，交付状态可能无法确认。不要盲目自动重发；先查询节点状态并结合任务是否已有回复判断，以免重复执行。
 
@@ -462,7 +449,7 @@ Markdown 正文可以为空，UTF-8 编码后最多 `64 KiB`；该边界同时�
 }
 ```
 
-`message` 必须非空且不超过 16 KiB UTF-8，`requires_response` 必须由子代理显式填写：`true` 表示父代理空闲时应立即处理，`false` 表示只记录到会话。可选 `images` 最多携带 8 张经过统一 codec 校验的图片；工具不接受回复类别、序号或“完成”开关。适合发送进度、问题和阶段性发现。成功结果中的 `accepted: true` 表示直接父会话已经接纳并确认该消息，但子代理仍处于当前处理，应继续完成原任务。
+`message` 必须非空且不超过 16 KiB UTF-8，`requires_response` 必须由子代理显式填写：`true` 表示父代理空闲时应立即处理，`false` 表示只记录到会话。工具只接受文本，不支持 `images`，也不应构造或附带图片 Base64；它同样不接受回复类别、序号或“完成”开关。适合发送进度、问题和阶段性发现。成功结果中的 `accepted: true` 表示直接父会话已经接纳并确认该消息，但子代理仍处于当前处理，应继续完成原任务。
 
 不要用 `reply_to_parent` 模拟最终结果。子代理到达本轮结束边界时，运行时会自动发送一次最终答复；根会话没有该工具，叶节点和 `subagents: disabled` 的子代理仍然有该工具。
 
@@ -473,9 +460,10 @@ Markdown 正文可以为空，UTF-8 编码后最多 `64 KiB`；该边界同时�
 ```json
 {
   "schema": "pi-subagent.reply",
-  "version": 1,
+  "version": 3,
   "kind": "message",
   "agent_id": "550e8400-e29b-41d4-a716-446655440000",
+  "task_id": "450e8400-e29b-41d4-a716-446655440002",
   "turn_id": "550e8400-e29b-41d4-a716-446655440001",
   "requires_response": false,
   "text": "正在核对第二个实现分支，完成后继续汇总。"
@@ -489,26 +477,32 @@ Markdown 正文可以为空，UTF-8 编码后最多 `64 KiB`；该边界同时�
 ```json
 {
   "schema": "pi-subagent.reply",
-  "version": 1,
+  "version": 3,
   "kind": "final",
   "agent_id": "550e8400-e29b-41d4-a716-446655440000",
+  "task_id": "450e8400-e29b-41d4-a716-446655440002",
   "turn_id": "550e8400-e29b-41d4-a716-446655440001",
+  "commit_id": "750e8400-e29b-41d4-a716-446655440003",
   "run_state": "settled",
   "output_state": "present",
   "text": "已完成核对，结论如下……"
 }
 ```
 
-每次 `agent_start` 都生成一个未曾签发的随机 UUID v4 `turn_id`；同轮 message 和 final 共用该值，同轮只接纳第一条 final。父端在节点生命周期内保留已接纳信封的 SHA-256 语义摘要和 final 轮次标识，因此即使回复已经越过待 ACK 窗口，旧序号篡改仍会成为协议故障，旧轮次 final 也不会再次注入。该索引不保存业务正文，也不形成回复或追问额度。`run_state` 为 `settled`、`failed` 或 `interrupted`，`output_state` 为 `present` 或 `absent`。文本或至少一张合法图片存在时才是 `present`，所以 image-only final 合法；`absent` final 没有说明性业务正文，并通过 `reason_code` 表达 `no_output`、`provider_error` 或 `runtime_fault`。失败或中断可以保留最近的安全候选，但状态明确表示结果并非完整成功。
+一次父级任务使用随机 UUID v4 `task_id` 标识，并可跨 steering、压缩和恢复保持不变；每次实际 Pi `agent_start` 另生成 `turn_id`。同一 turn 的 message 和 final 共用 `task_id/turn_id`，恢复后的新 turn 会拒绝旧 turn final。final 还携带幂等 `commit_id`，父端只允许匹配当前任务和轮次的 commit 从 `prepared` 单调推进到 `accepted`。父端同时保留已接纳信封的 SHA-256 语义摘要和已接受 final turn，因此窗口外序号篡改会成为协议故障，重复 final 也不会再次注入；这些索引不保存业务正文。
 
-final 总会触发父代理处理。思考块、工具前说明、工具调用、工具参数、工具结果和原始错误不会进入正文。父端先接纳并确认 final，再观察节点回到 `idle`；`wait_agent` 和 `get_agent_status` 不重复携带 final 正文。child runtime 从 `agent_end` 起暂缓会启动新轮的后代 final、需响应消息和 TerminalNotice；自动续跑的 `agent_start` 会在 Pi 仍处于 streaming 时安全放行，真正结束则在本轮 final 获 ACK 后延后一拍重试。本扩展自己的 settled handler 先检查 `ExtensionContext.isIdle()`，前置 handler 延迟期间若已有新轮则丢弃旧 settle；若后续第三方 settled handler 尚未返回，新 loop 可以先启动，但祖先监督器会在收到重叠 `agent_start` 后用带代际的 `isStreaming` 查询复核，从而压住旧轮迟到 settle，不会错误进入 idle。final 发布失败会通过 Pi 的 `extension_error` 先把祖先节点标成 `failed`，并永久禁止该 child runtime 被后代回复再次唤醒。收到 `output_state: "absent"`，或判断 `present` 正文仍不可用时，父代理应向同一 `agent_id` 请求“只总结上一轮已完成工作并给出最终答复，不要重新执行任务”；运行时不会自动重跑、切换模型或创建替代代理。
+`run_state` 为 `settled`、`failed` 或 `interrupted`，`output_state` 为 `present` 或 `absent`。只有非空文本存在时才是 `present`；assistant 图片块会被忽略，图片-only 输出形成 `absent` final。`absent` final 没有说明性业务正文，并通过 `reason_code` 表达 `no_output`、`provider_error` 或 `runtime_fault`。失败或中断可以保留最近的安全文本候选，但状态明确表示结果并非完整成功。
+
+final 总会触发父代理处理。raw `agent_settled` 只建立 provisional settlement，handler 随即返回；final 发布和 ACK 在独立 outbox 中完成，不能阻塞同一事件上的第三方压缩处理。final 只有在父会话接纳与匹配 settlement 两个条件都满足时才提交并获得 reply ACK。压缩若在 provisional settlement 后发生，会撤销旧候选并等待恢复 `agent_start`；处理中压缩则保持同一任务。第三方 mid-run 压缩成功但没有恢复轮次时节点进入 `suspended/resume_required`，压缩失败进入 `suspended/maintenance_failed`，不会伪造完成。
+
+思考块、工具前说明、工具调用、工具参数、工具结果和原始错误不会进入 final 正文。`wait_agent` 和 `get_agent_status` 不重复携带 final 正文，只通过 `last_task` 保留任务身份、结果枚举和输出是否存在。收到 `output_state: "absent"`，或判断 `present` 正文仍不可用时，父代理应向同一 `agent_id` 请求“只总结上一轮已完成工作并给出最终答复，不要重新执行任务”；运行时不会自动重跑、切换模型或创建替代代理。
 
 节点控制面发生 runtime fault 时，直接父运行时另行注入通知，不伪装成 child final：
 
 ```json
 {
   "schema": "pi-subagent.terminal",
-  "version": 1,
+  "version": 3,
   "kind": "terminal",
   "agent_id": "550e8400-e29b-41d4-a716-446655440000",
   "node_state": "failed",
@@ -532,9 +526,14 @@ TerminalNotice 总会触发父代理，并在 `wait_agent` 返回 `outcome: "ter
 `timeout_ms` 可省略，合法范围为 10,000 到 600,000 毫秒。返回的 `outcome` 为：
 
 - `reply`：直接子代理发来一条工作中回复；返回快照通常仍是 `working` 或 `interrupting`，子代理会继续当前处理；
-- `settled`：观察到了正常 settled 边界，或调用时节点已经空闲；
+- `task_completed`：最近逻辑任务已提交 `completed` final；
+- `task_failed`：最近逻辑任务已提交 `failed` final；
+- `task_interrupted`：最近逻辑任务已提交 `interrupted` final；
+- `suspended`：交付或压缩恢复状态无法确认，需要先查询 `activity.phase` 再决定中断或终止；
 - `terminal`：节点已经或随后进入 `failed` / `terminated`；
-- `timeout`：本次观察到期，节点继续保持原有工作。
+- `timeout`：本次观察到期，节点继续保持原有状态。
+
+任务级结果会携带安全的 `last_task`，其中只有 `task_id`、`turn_id`、`commit_id`、`outcome` 和 `output_state`，不会复制 final 正文。
 
 ### `interrupt_agent`
 
@@ -546,7 +545,7 @@ TerminalNotice 总会触发父代理，并在 `wait_agent` 返回 `outcome: "ter
 }
 ```
 
-对工作中的节点，成功接纳后通常进入 `interrupting`；工具不等待最终 settled。对已经空闲、正在中断或已进入终态的节点是幂等操作，可能返回 `changed: false`。
+对工作中的节点，成功接纳后通常进入 `interrupting`；工具不等待 interrupted final 提交。对已经空闲、正在中断、挂起或已进入终态的节点是幂等操作，可能返回 `changed: false`。
 
 ### `terminate_agent`
 
@@ -570,7 +569,7 @@ TerminalNotice 总会触发父代理，并在 `wait_agent` 返回 `outcome: "ter
 }
 ```
 
-快照包含模板、名称、深度、状态、pending、修订和生命周期时间。故障节点仍返回成功外壳，并在 `data.error` 中携带稳定错误码。
+快照包含模板、名称、深度、八态生命周期、三类队列计数、修订和生命周期时间；活动节点还包含安全 `activity.phase`，最近已提交任务可包含 `last_task`。故障节点仍返回成功外壳，并在 `data.error` 中携带稳定错误码。
 
 ### `get_agent_tree`
 
@@ -609,23 +608,26 @@ TerminalNotice 总会触发父代理，并在 `wait_agent` 返回 `outcome: "ter
 
 ## 生命周期
 
-代理状态只有以下七种：
+代理状态只有以下八种：
 
 | 状态 | 含义 | 是否占用名额 |
 | --- | --- | --- |
 | `starting` | 已预留身份和名额，正在建立进程、监督通道和 RPC | 是 |
-| `idle` | 已就绪且当前没有活动处理，可以接收新 prompt | 是 |
-| `working` | 正在处理任务；新消息会作为 steering | 是 |
-| `interrupting` | 已接受协作式中断，等待真正 settled；仍可排入 steering | 是 |
+| `idle` | 已就绪且严格静止：没有当前任务、压缩、恢复、候选 final、未确认回复或未决命令 | 是 |
+| `working` | 正在处理、对账或提交任务；新消息由 mailbox 归入当前或后继任务 | 是 |
+| `interrupting` | 已接受协作式中断，等待当前任务形成最终结果 | 是 |
+| `suspended` | 交付或维护恢复无法确认，需要外部查询和裁决 | 是 |
 | `failed` | 发生不可自动恢复的运行或控制故障 | 是 |
 | `terminating` | 终止屏障已建立，但资源尚未全部确认回收 | 是 |
 | `terminated` | 本节点和后代均已确认回收 | 否 |
 
-`failed` 不会自动恢复或重启，但仍需显式终止才能释放名额。`terminating` 也不是“已经结束”；它可能携带 `termination_incomplete`，并继续占用名额。只有 `terminated` 会真正释放直接子代理和全树配额。
+`failed` 不会自动恢复或重启，但仍需显式终止才能释放名额。`suspended` 也不是完成：`activity.phase` 会区分 `delivery_uncertain`、`resume_required` 或 `maintenance_failed`，调用者应先查询再决定中断或终止。`terminating` 可能携带 `termination_incomplete` 并继续占用名额；只有 `terminated` 真正释放配额。
 
-`pending_message_count` 表示已经受理、但尚未开始实际处理的父消息数量，不包含当前活动 prompt。因此 `working` 节点的 pending 可以是 0。final、TerminalNotice 或 `requires_response: true` 的后代消息也可能唤醒一个原本 idle 的中间代理；任务 RPC 会把无载荷 `agent_start` 归一化为自主开始事实，使祖先树在整个处理期间保持 `working`。父命令触发的 `agent_start` 由同一监督器去重，仍以 `prompt_accepted` 作为原命令的线性化点；接纳窗口按最后到达的 start/settled 事实收束，若 prompt 接纳失败，窗口末尾的 start 会在节点仍 idle 时补交为自主 `working`，中断中的 settle-start 则不短暂经过 idle，不会随失败命令一起丢失。
+每个活动节点原子发布三类队列计数：`mailbox_pending_count` 是插件已接纳但尚未交给 Pi 的消息数，`host_pending_count` 是 Pi 报告的宿主待处理数，`reply_outbox_pending_count` 是等待 settlement/父端 ACK 的 final 数。`idle` 时三者必须全为 0 且没有 `activity`。`activity.phase` 描述处理、工具执行、压缩、对账、finalizing、等待父 ACK 或挂起原因；工具类别仍只使用脱敏闭集。
 
-一次处理中的 assistant `message_end` 只用于更新本轮最近的安全最终候选，不会直接发送给父会话。正常 `agent_settled`、provider error 和协作式中断分别形成由运行时裁决的 `settled`、`failed` 或 `interrupted` final；运行时先提交并等待父端确认该结构化事实，然后父控制器才会继续观察节点生命周期。无业务载荷的 `absent` final 是合法结果，不生成占位正文；重复结束事件不会生成第二条 final。
+父端先通过监督通道发送 `task_assignment` 并等待 transport ACK，再调用 Pi prompt/steer；child 每次实际 loop start 必须先发布有序 `task_started { task_id, turn_id }`，之后才能发布该 turn 的 reply。`task_id` 跨 steering、压缩与恢复稳定，`turn_id` 只标识一次 Pi loop；interrupt 栅栏后的消息属于后继任务。raw `agent_settled` 只建立 provisional candidate，宿主若仍 streaming 会撤销它，只有匹配 final 获父端接纳后才能原子提交 `last_task` 并在真正静止时进入 `idle`。
+
+一次处理中的 assistant `message_end` 只更新当前 turn 最近的安全最终候选，不直接发送给父会话。正常、provider error 和协作式中断分别形成 `settled`、`failed` 或 `interrupted` final；重复或旧 turn 的 final 会被隔离。无业务载荷的 `absent` final 是合法结果，不生成占位正文。
 
 ## 安全与资源边界
 
@@ -718,9 +720,10 @@ TUI warning 只显示逻辑来源、直属文件名和固定原因，不显示�
 
 `outcome: "timeout"` 不是错误，也不会停止子代理。可以查询 `get_agent_status` 或 `get_agent_tree`，然后继续等待、发送 steering、调用 `interrupt_agent`，或在确定不再需要时调用 `terminate_agent`。
 
-### 节点停在 `interrupting`、`failed` 或 `terminating`
+### 节点停在 `interrupting`、`suspended`、`failed` 或 `terminating`
 
-- `interrupting`：子 Pi 尚未报告 settled；若长期不返回，显式终止。
+- `interrupting`：当前任务尚未形成并提交 interrupted final；若长期不返回，显式终止。
+- `suspended`：检查 `activity.phase`。`delivery_uncertain` 表示 Pi 交付不可确认，`resume_required` 表示压缩后未观察到恢复轮次，`maintenance_failed` 表示压缩失败；不要把它当作完成或盲目重发。
 - `failed`：节点不会自动恢复；查询错误码后终止以释放名额。
 - `terminating`：清理尚未确认；如果错误为 `termination_incomplete`，稍后重试同一 `terminate_agent`。
 

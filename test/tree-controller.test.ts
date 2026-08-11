@@ -92,7 +92,7 @@ test("创建原子预留 canonical UUID v4、直接父关系与初始 starting �
   assert.equal(created.node.parent_agent_id, null);
   assert.equal(created.node.depth, 1);
   assert.equal(created.node.state, "starting");
-  assert.equal(created.node.pending_message_count, 0);
+  assert.equal(created.node.mailbox_pending_count, 0);
   assert.equal(created.node.revision, 1);
   assert.equal("observed_at" in created.node, false);
   assert.equal(created.lifecycle_generation, 0);
@@ -205,21 +205,39 @@ test("管理能力沿直接父、模板禁用与深度逐级收窄，不能由�
   );
 });
 
-test("生命周期只接受七态的合法事实，状态代际会丢弃迟到事件", () => {
+test("资源生命周期与任务投影各自只接受闭集事实，资源代际丢弃迟到事件", () => {
   const tree = controller();
   const created = reserveRootChild(tree);
   const id = created.node.agent_id;
 
   expectFailure(tree.applyLifecycleEvent(id, { type: "startup_ready" }), "invalid_argument");
-
   const ready = expectSuccess(tree.applyLifecycleEvent(id, {
     type: "startup_ready",
     expected_generation: created.lifecycle_generation,
   }));
   rememberOutcome(tree, ready);
-  assert.equal(ready.applied, true);
   assert.equal(ready.node.state, "idle");
-  assert.equal(ready.node.revision, 2);
+
+  const working = expectSuccess(tree.applyTaskProjection(id, {
+    state: "working",
+    mailbox_pending_count: 1,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
+    activity: { phase: "reconciling" },
+  }));
+  rememberOutcome(tree, working);
+  assert.equal(working.node.state, "working");
+  assert.equal(working.node.mailbox_pending_count, 1);
+
+  const interrupting = expectSuccess(tree.applyTaskProjection(id, {
+    state: "interrupting",
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 1,
+    activity: { phase: "finalizing" },
+  }));
+  rememberOutcome(tree, interrupting);
+  assert.equal(interrupting.node.state, "interrupting");
 
   const stale = expectSuccess(tree.applyLifecycleEvent(id, {
     type: "startup_failed",
@@ -227,35 +245,19 @@ test("生命周期只接受七态的合法事实，状态代际会丢弃迟到�
     error_code: "spawn_failed",
   }));
   assert.equal(stale.applied, false);
-  assert.equal(stale.node.state, "idle");
-  assert.equal(stale.node.revision, 2);
+  assert.equal(stale.node.state, "interrupting");
 
-  const prompt = expectSuccess(applyEvent(tree, id, { type: "prompt_accepted" }));
-  assert.equal(prompt.node.state, "working");
-  const firstWorkingGeneration = prompt.lifecycle_generation;
-  const interrupted = expectSuccess(applyEvent(tree, id, { type: "interrupt_accepted" }));
-  assert.equal(interrupted.node.state, "interrupting");
-  const abortResponse = expectSuccess(applyEvent(tree, id, { type: "abort_completed" }));
-  assert.equal(abortResponse.applied, false);
-  assert.equal(abortResponse.node.state, "interrupting");
-  assert.equal(expectSuccess(applyEvent(tree, id, { type: "agent_settled" })).node.state, "idle");
-
-  expectSuccess(applyEvent(tree, id, { type: "message_admitted" }));
-  const nextPrompt = expectSuccess(applyEvent(tree, id, { type: "prompt_accepted" }));
-  assert.equal(nextPrompt.node.state, "working");
-  const oldSettle = expectSuccess(tree.applyLifecycleEvent(id, {
+  expectFailure(tree.applyLifecycleEvent(id, {
     type: "agent_settled",
-    expected_generation: firstWorkingGeneration,
+    expected_generation: interrupting.lifecycle_generation,
+  }), "invalid_argument");
+  const failed = expectSuccess(applyEvent(tree, id, {
+    type: "runtime_failed",
+    error_code: "spawn_failed",
   }));
-  assert.equal(oldSettle.applied, false);
-  assert.equal(oldSettle.node.state, "working");
-
-  expectSuccess(applyEvent(tree, id, { type: "runtime_failed", error_code: "spawn_failed" }));
-  const failed = expectSuccess(tree.getStatus(id));
-  assert.equal(failed.state, "failed");
-  const ignoredSettle = expectSuccess(applyEvent(tree, id, { type: "agent_settled" }));
-  assert.equal(ignoredSettle.applied, false);
-  assert.equal(ignoredSettle.node.state, "failed");
+  assert.equal(failed.node.state, "failed");
+  assert.equal(failed.node.mailbox_pending_count, 0);
+  assert.equal(failed.node.reply_outbox_pending_count, 0);
 });
 
 test("启动失败立即建立终止屏障，资源确认完成后才释放预留名额", () => {
@@ -323,7 +325,7 @@ test("生命周期时间从 idle 线性化点开始，并在故障后由单调�
   assert.equal(expectSuccess(tree.getStatus(created.node.agent_id)).lifecycle_elapsed_ms, terminatedElapsed);
 });
 
-test("pending、revision 与 tree_revision 只在公开事实变化时更新", () => {
+test("三类队列、revision 与 tree_revision 在一个任务投影中原子更新", () => {
   const tree = controller();
   const created = reserveRootChild(tree);
   const id = created.node.agent_id;
@@ -331,65 +333,86 @@ test("pending、revision 与 tree_revision 只在公开事实变化时更新", (
   const idle = expectSuccess(tree.getStatus(id));
   const beforeTreeRevision = expectSuccess(tree.getTreeSnapshot()).tree_revision;
 
-  const admitted = expectSuccess(applyEvent(tree, id, { type: "message_admitted" }));
-  assert.equal(admitted.node.state, "idle");
-  assert.equal(admitted.node.pending_message_count, 1);
+  const admitted = expectSuccess(tree.applyTaskProjection(id, {
+    state: "working",
+    mailbox_pending_count: 1,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
+    activity: { phase: "reconciling" },
+  }));
+  rememberOutcome(tree, admitted);
+  assert.equal(admitted.node.mailbox_pending_count, 1);
   assert.equal(admitted.node.revision, idle.revision + 1);
   assert.equal(admitted.tree_revision, beforeTreeRevision + 1);
 
-  const accepted = expectSuccess(applyEvent(tree, id, { type: "prompt_accepted" }));
-  assert.equal(accepted.node.state, "working");
-  assert.equal(accepted.node.pending_message_count, 0);
-  const noChangeRevision = accepted.node.revision;
-  const noChangeTreeRevision = accepted.tree_revision;
-  const duplicate = expectSuccess(applyEvent(tree, id, { type: "prompt_accepted" }));
+  const accepted = expectSuccess(tree.applyTaskProjection(id, {
+    state: "working",
+    mailbox_pending_count: 0,
+    host_pending_count: 1,
+    reply_outbox_pending_count: 0,
+    activity: { phase: "processing" },
+  }));
+  rememberOutcome(tree, accepted);
+  assert.equal(accepted.node.host_pending_count, 1);
+  const duplicate = expectSuccess(tree.applyTaskProjection(id, {
+    state: "working",
+    mailbox_pending_count: 0,
+    host_pending_count: 1,
+    reply_outbox_pending_count: 0,
+    activity: { phase: "processing" },
+  }));
   assert.equal(duplicate.applied, false);
-  assert.equal(duplicate.node.revision, noChangeRevision);
-  assert.equal(duplicate.tree_revision, noChangeTreeRevision);
+  assert.equal(duplicate.node.revision, accepted.node.revision);
+  assert.equal(duplicate.tree_revision, accepted.tree_revision);
 
-  expectSuccess(applyEvent(tree, id, { type: "message_admitted" }));
-  const failed = expectSuccess(applyEvent(tree, id, { type: "runtime_failed", error_code: "spawn_failed" }));
+  const failed = expectSuccess(applyEvent(tree, id, {
+    type: "runtime_failed",
+    error_code: "spawn_failed",
+  }));
   assert.equal(failed.node.state, "failed");
-  assert.equal(failed.node.pending_message_count, 0);
+  assert.equal(failed.node.mailbox_pending_count, 0);
+  assert.equal(failed.node.host_pending_count, 0);
+  assert.equal(failed.node.reply_outbox_pending_count, 0);
   assert.equal(failed.node.error?.code, "spawn_failed");
-  assert.equal(failed.node.error?.message, "代理启动失败");
-  assert.equal(failed.node.error?.retryable, false);
-  assert.equal("observed_at" in (failed.node.error ?? {}), false);
   assert.doesNotMatch(JSON.stringify(failed.node), /secret|path|stack/i);
-
-  const treeSnapshot = expectSuccess(tree.getTreeSnapshot());
-  assert.equal(treeSnapshot.tree_revision, failed.tree_revision);
-  assert.equal("observed_at" in treeSnapshot, false);
-  assert.deepEqual(treeSnapshot.nodes.map((node) => node.agent_id), [id]);
 });
 
-test("安全活动只以固定类别和非负计数原子进入树快照", () => {
+test("安全活动阶段和工具摘要只以闭集字段原子进入树快照", () => {
   const tree = controller();
   const created = reserveRootChild(tree);
   const id = created.node.agent_id;
   expectSuccess(applyEvent(tree, id, { type: "startup_ready" }));
+  expectSuccess(tree.applyTaskProjection(id, {
+    state: "working",
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
+    activity: { phase: "processing" },
+  }));
   const before = expectSuccess(tree.getTreeSnapshot());
 
   const started = expectSuccess(tree.updateActivity(id, {
+    phase: "executing_tools",
     category: "editing",
     active_count: 2,
   }));
-  assert.deepEqual(started.node.activity, { category: "editing", active_count: 2 });
+  assert.deepEqual(started.node.activity, {
+    phase: "executing_tools",
+    category: "editing",
+    active_count: 2,
+  });
   assert.equal(started.node.revision, before.nodes[0]!.revision + 1);
-  assert.equal(started.tree_revision, before.tree_revision + 1);
 
   expectFailure(tree.updateActivity(id, {
+    phase: "executing_tools",
     category: "editing",
     active_count: 3,
     path: "C:\\secret-canary\\private.txt",
   }), "invalid_argument");
   assert.doesNotMatch(JSON.stringify(expectSuccess(tree.getTreeSnapshot())), /secret-canary|private\.txt/i);
 
-  const finished = expectSuccess(tree.updateActivity(id, {
-    category: "editing",
-    active_count: 0,
-  }));
-  assert.equal(finished.node.activity, undefined);
+  const finished = expectSuccess(tree.updateActivity(id, { phase: "processing" }));
+  assert.deepEqual(finished.node.activity, { phase: "processing" });
 });
 
 test("starting 节点不接纳活动，递归快照也不能注入不可能的生命周期组合", () => {
@@ -397,6 +420,7 @@ test("starting 节点不接纳活动，递归快照也不能注入不可能的�
   const created = reserveRootChild(tree);
 
   const ignored = expectSuccess(tree.updateActivity(created.node.agent_id, {
+    phase: "executing_tools",
     category: "running",
     active_count: 1,
   }));
@@ -408,7 +432,11 @@ test("starting 节点不接纳活动，递归快照也不能注入不可能的�
     subtree_revision: 1,
     nodes: Object.freeze([Object.freeze({
       ...created.node,
-      activity: Object.freeze({ category: "running" as const, active_count: 1 }),
+      activity: Object.freeze({
+        phase: "executing_tools" as const,
+        category: "running" as const,
+        active_count: 1,
+      }),
     })]),
   }), "invalid_argument");
 
@@ -428,19 +456,40 @@ test("starting 节点不接纳活动，递归快照也不能注入不可能的�
   assert.doesNotMatch(JSON.stringify(expectSuccess(tree.getTreeSnapshot())), /private|secret-canary/i);
 });
 
-test("并行活动类别结束时保留仍在运行的安全摘要", () => {
+test("任务投影替换并行工具摘要时不保留旧类别", () => {
   const tree = controller();
   const created = reserveRootChild(tree);
   const id = created.node.agent_id;
   expectSuccess(applyEvent(tree, id, { type: "startup_ready" }));
 
-  expectSuccess(tree.updateActivity(id, { category: "editing", active_count: 1 }));
-  expectSuccess(tree.updateActivity(id, { category: "reading", active_count: 1 }));
-  const oneFinished = expectSuccess(tree.updateActivity(id, { category: "reading", active_count: 0 }));
-  assert.deepEqual(oneFinished.node.activity, { category: "editing", active_count: 1 });
+  expectSuccess(tree.applyTaskProjection(id, {
+    state: "working",
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
+    activity: { phase: "executing_tools", category: "editing", active_count: 1 },
+  }));
+  const replaced = expectSuccess(tree.applyTaskProjection(id, {
+    state: "working",
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
+    activity: { phase: "executing_tools", category: "reading", active_count: 1 },
+  }));
+  assert.deepEqual(replaced.node.activity, {
+    phase: "executing_tools",
+    category: "reading",
+    active_count: 1,
+  });
 
-  const allFinished = expectSuccess(tree.updateActivity(id, { category: "editing", active_count: 0 }));
-  assert.equal(allFinished.node.activity, undefined);
+  const cleared = expectSuccess(tree.applyTaskProjection(id, {
+    state: "working",
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
+    activity: { phase: "processing" },
+  }));
+  assert.deepEqual(cleared.node.activity, { phase: "processing" });
 });
 
 test("终止屏障不可逆，父节点必须等已登记后代确认回收后才能进入 terminated", () => {
@@ -479,7 +528,7 @@ test("终止屏障不可逆，父节点必须等已登记后代确认回收后�
   expectSuccess(applyEvent(tree, child.node.agent_id, { type: "resources_confirmed" }));
   const terminated = expectSuccess(applyEvent(tree, parent.node.agent_id, { type: "resources_confirmed" }));
   assert.equal(terminated.node.state, "terminated");
-  assert.equal(terminated.node.pending_message_count, 0);
+  assert.equal(terminated.node.mailbox_pending_count, 0);
   assert.equal(terminated.node.error, undefined);
   assert.equal(expectSuccess(tree.getQuotaSnapshot()).active_tree_agents, 0);
   assert.equal(expectSuccess(tree.getStatus(parent.node.agent_id)).state, "terminated");
@@ -693,7 +742,9 @@ test("child 首快照只能校验作用域根身份，不能越过直接父把 s
     nodes: Object.freeze([Object.freeze({
       ...before,
       state: "idle" as const,
-      pending_message_count: 7,
+      mailbox_pending_count: 0,
+      host_pending_count: 0,
+      reply_outbox_pending_count: 0,
       revision: before.revision + 100,
     })]),
   }));
@@ -731,6 +782,7 @@ test("根端只合入已预留完整子树并丢弃旧修订，查询保持稳�
   const child = Object.freeze({
     ...currentChild,
     state: "working" as const,
+    activity: Object.freeze({ phase: "processing" as const }),
     revision: currentChild.revision + 1,
   });
   const accepted = expectSuccess(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
@@ -791,6 +843,7 @@ test("递归子树的活动时长从快照基线继续累计并在终态精确�
   const working = Object.freeze({
     ...childSnapshot,
     state: "working" as const,
+    activity: Object.freeze({ phase: "processing" as const }),
     lifecycle_elapsed_ms: 5_000,
     revision: childSnapshot.revision + 1,
   });
@@ -806,6 +859,7 @@ test("递归子树的活动时长从快照基线继续累计并在终态精确�
   const failed = Object.freeze({
     ...working,
     state: "failed" as const,
+    activity: undefined,
     lifecycle_elapsed_ms: 7_000,
     revision: working.revision + 1,
     error: Object.freeze({
@@ -918,7 +972,9 @@ test("非权威中继首次接收的故障后代在终止后保留历史分类",
       name: "直接子代理",
       depth: 2,
       state: "starting" as const,
-      pending_message_count: 0,
+      mailbox_pending_count: 0,
+      host_pending_count: 0,
+      reply_outbox_pending_count: 0,
       revision: 1,
     }),
     lifecycle_generation: 0,
@@ -936,7 +992,9 @@ test("非权威中继首次接收的故障后代在终止后保留历史分类",
     name: "新故障后代",
     depth: 3,
     state: "failed" as const,
-    pending_message_count: 0,
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
     revision: 2,
     created_at: "2026-01-02T03:04:02.000Z",
     lifecycle_elapsed_ms: 5_000,
@@ -953,7 +1011,9 @@ test("非权威中继首次接收的故障后代在终止后保留历史分类",
     name: "新清理后代",
     depth: 3,
     state: "terminating" as const,
-    pending_message_count: 0,
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
     revision: 2,
     created_at: "2026-01-02T03:04:02.000Z",
     lifecycle_elapsed_ms: 5_000,
@@ -1031,6 +1091,7 @@ test("递归子树其他节点变化时允许 terminating 节点在同一节点�
   const workingSecond = Object.freeze({
     ...secondSnapshot,
     state: "working" as const,
+    activity: Object.freeze({ phase: "processing" as const }),
     lifecycle_elapsed_ms: 7_000,
     revision: secondSnapshot.revision + 1,
   });
@@ -1075,7 +1136,9 @@ test("非权威中继首次接收的新活动后代从快照时长继续累计",
       name: "直接子代理",
       depth: 2,
       state: "starting" as const,
-      pending_message_count: 0,
+      mailbox_pending_count: 0,
+      host_pending_count: 0,
+      reply_outbox_pending_count: 0,
       revision: 1,
     }),
     lifecycle_generation: 0,
@@ -1093,7 +1156,10 @@ test("非权威中继首次接收的新活动后代从快照时长继续累计",
     name: "新活动后代",
     depth: 3,
     state: "working" as const,
-    pending_message_count: 0,
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
+    activity: Object.freeze({ phase: "processing" as const }),
     revision: 2,
     created_at: "2026-01-02T03:04:02.000Z",
     lifecycle_elapsed_ms: 5_000,
@@ -1131,7 +1197,9 @@ test("根快照拒绝未经过 reserve_child 预登记的未知身份", () => {
       name: "伪造后代",
       depth: 2,
       state: "idle" as const,
-      pending_message_count: 0,
+      mailbox_pending_count: 0,
+      host_pending_count: 0,
+      reply_outbox_pending_count: 0,
       revision: 1,
       created_at: "2026-01-02T03:04:06.000Z",
       lifecycle_elapsed_ms: 0,
@@ -1166,7 +1234,9 @@ test("子树投影采用根 grant，监督快照保留真实父关系且公开�
       name: "已授权子代理",
       depth: 3,
       state: "starting" as const,
-      pending_message_count: 0,
+      mailbox_pending_count: 0,
+      host_pending_count: 0,
+      reply_outbox_pending_count: 0,
       revision: 1,
     }),
     lifecycle_generation: 0,

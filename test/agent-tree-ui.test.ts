@@ -41,19 +41,33 @@ const PANEL_THEME = Object.freeze({
 });
 
 function node(overrides: Partial<AgentSnapshot> & Pick<AgentSnapshot, "agent_id" | "parent_agent_id">): AgentSnapshot {
-  const { agent_id, parent_agent_id, ...rest } = overrides;
+  const {
+    agent_id,
+    parent_agent_id,
+    state = "idle",
+    activity,
+    ...rest
+  } = overrides;
+  const normalizedActivity = state === "working" || state === "interrupting"
+    ? activity ?? Object.freeze({ phase: "processing" as const })
+    : state === "suspended"
+      ? activity ?? Object.freeze({ phase: "resume_required" as const })
+      : undefined;
   return Object.freeze({
     agent_id,
     parent_agent_id,
     template_id: "researcher",
     name: "资料代理",
     depth: parent_agent_id === null ? 1 : 2,
-    state: "idle",
-    pending_message_count: 0,
+    state,
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
     revision: 1,
     created_at: "2026-08-06T07:59:00.000Z",
     lifecycle_elapsed_ms: 60_000,
     ...rest,
+    ...(normalizedActivity === undefined ? {} : { activity: normalizedActivity }),
   });
 }
 
@@ -82,9 +96,8 @@ test("常驻 Agents widget 只按稳定字段顺序显示作用域直接子代�
       template_id: "研🙂e\u0301究员",
       name: "直接子代理",
       state: "failed",
-      activity: Object.freeze({ category: "editing", active_count: 2 }),
       lifecycle_elapsed_ms: 65_000,
-      pending_message_count: 3,
+      mailbox_pending_count: 0,
       error: Object.freeze({
         code: "internal_error",
         message: "控制器内部错误",
@@ -104,14 +117,14 @@ test("常驻 Agents widget 只按稳定字段顺序显示作用域直接子代�
       template_id: "finished-secret-canary",
       name: "已结束",
       state: "terminated",
-      pending_message_count: 0,
+      mailbox_pending_count: 0,
       termination_result: "completed",
     }),
   ]);
 
   assert.deepEqual(renderAgentsWidget(snapshot, 120), [
     "Agents",
-    "  研🙂e\u0301究员 · 直接子代理 · failed · editing 2 · 1m 05s · pending 3 · internal_error",
+    "  研🙂e\u0301究员 · 直接子代理 · failed · 1m 05s · internal_error",
   ]);
   assert.deepEqual(renderAgentsWidget(snapshot, 8), ["Agents", "  研🙂e\u0301…"]);
   assert.doesNotMatch(renderAgentsWidget(snapshot, 120).join("\n"), /secret-canary|terminate|interrupt|reload/i);
@@ -181,7 +194,7 @@ test("代理树面板默认展开直接子代理、折叠深层分支并优先�
       name: "工作后代",
       depth: 4,
       state: "working",
-      pending_message_count: 2,
+      mailbox_pending_count: 2,
     }),
     node({
       agent_id: FAILED_ID,
@@ -203,7 +216,7 @@ test("代理树面板默认展开直接子代理、折叠深层分支并优先�
       name: "待清理后代",
       depth: 4,
       state: "terminating",
-      pending_message_count: 1,
+      mailbox_pending_count: 1,
       error: Object.freeze({
         code: "termination_incomplete",
         message: "代理资源尚未完全回收",
@@ -216,7 +229,7 @@ test("代理树面板默认展开直接子代理、折叠深层分支并优先�
       template_id: "done",
       name: "已结束",
       state: "terminated",
-      pending_message_count: 0,
+      mailbox_pending_count: 0,
       termination_result: "completed",
     }),
     node({
@@ -225,7 +238,7 @@ test("代理树面板默认展开直接子代理、折叠深层分支并优先�
       template_id: "failed-done",
       name: "故障后终止",
       state: "terminated",
-      pending_message_count: 0,
+      mailbox_pending_count: 0,
       termination_result: "failed",
     }),
     node({
@@ -234,7 +247,7 @@ test("代理树面板默认展开直接子代理、折叠深层分支并优先�
       template_id: "cleanup-done",
       name: "重试后终止",
       state: "terminated",
-      pending_message_count: 0,
+      mailbox_pending_count: 0,
       termination_result: "incomplete",
     }),
   ], 7);
@@ -323,7 +336,7 @@ test("代理树面板支持上下滚动、左右展开折叠和 Esc 关闭", () 
   assert.deepEqual(model.render(80), [
     "Agent tree · revision 8",
     "    ▾ deep · 深层分支 · idle · 1m 00s",
-    "›     · runner · 工作后代 · working · 1m 00s",
+    "›     · runner · 工作后代 · working · processing · 1m 00s",
     "↑↓ scroll · ←→ fold · Esc close",
   ]);
 
@@ -365,8 +378,9 @@ test("新树修订原子刷新全部事实并保留展开集合与滚动位置",
       ...item,
       agent_id: item.agent_id,
       parent_agent_id: item.parent_agent_id,
-      state: "idle",
-      pending_message_count: 4,
+      state: "working",
+      activity: Object.freeze({ phase: "reconciling" }),
+      mailbox_pending_count: 4,
       lifecycle_elapsed_ms: 125_000,
       revision: item.revision + 1,
     });
@@ -377,7 +391,7 @@ test("新树修订原子刷新全部事实并保留展开集合与滚动位置",
     template_id: "done",
     name: "已结束",
     state: "terminated",
-    pending_message_count: 0,
+    mailbox_pending_count: 0,
     termination_result: "completed",
   })), 9);
 
@@ -390,7 +404,7 @@ test("新树修订原子刷新全部事实并保留展开集合与滚动位置",
     expanded_agent_ids: [ACTIVE_PARENT_ID, DEEP_BRANCH_ID],
     finished_expanded: false,
   });
-  assert.match(model.render(100).join("\n"), /runner · 工作后代 · idle · 2m 05s · pending 4/);
+  assert.match(model.render(100).join("\n"), /runner · 工作后代 · working · reconciling · 2m 05s · queues 4\/0\/0/);
   assert.equal(model.handleInput("\x1b[B"), "changed");
   assert.match(model.render(100).join("\n"), /finished · completed 1/);
   assert.equal(model.update(initial), "ignored");
@@ -426,7 +440,7 @@ test("同一树修订只刷新控制器确认的生命周期时长", () => {
         agent_id: item.agent_id,
         parent_agent_id: item.parent_agent_id,
         state: "working",
-        pending_message_count: 99,
+        mailbox_pending_count: 99,
       })
     : item), 5);
   assert.equal(model.refreshElapsed(forged), "error");
@@ -492,7 +506,7 @@ test("面板拒绝控制器不可能产生的生命周期组合与非父先拓�
           agent_id: item.agent_id,
           parent_agent_id: item.parent_agent_id,
           state: "terminated",
-          pending_message_count: 1,
+          mailbox_pending_count: 1,
           termination_result: "completed",
         })
       : item),

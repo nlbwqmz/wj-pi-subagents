@@ -7,6 +7,7 @@ import {
   type SupervisorReply,
   type SupervisorReplyInput,
   type SupervisorSnapshot,
+  type SupervisorTaskStarted,
 } from "../../src/supervisor-channel.ts";
 import {
   MANAGED_RPC_SUPERVISOR_MAX_BODY_BYTES,
@@ -81,6 +82,10 @@ export class BridgeSupervisorEndpoint {
 
   publishReply(reply: SupervisorReplyInput | SupervisorReply): void {
     this.send(this.protocol.publishReply(reply));
+  }
+
+  publishTaskStarted(started: SupervisorTaskStarted): void {
+    this.send(this.protocol.publishTaskStarted(started));
   }
 
   publishEvent(event: Omit<SupervisorEvent, "root_id" | "agent_id">): void {
