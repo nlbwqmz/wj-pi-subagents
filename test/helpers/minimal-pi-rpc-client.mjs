@@ -38,6 +38,14 @@ export class RpcClient {
 
   async steer() {}
 
+  async send(command) {
+    this.#state = { ...this.#state, lastWireCommand: command };
+    if (command?.type !== "prompt" || command?.streamingBehavior !== "steer") {
+      return { type: "response", command: "prompt", success: false };
+    }
+    return { type: "response", command: "prompt", success: true };
+  }
+
   async abort() {}
 
   async getState() {

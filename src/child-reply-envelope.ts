@@ -2,7 +2,7 @@ import { isCanonicalUuid, isCanonicalUuidV4 } from "./tree-controller.ts";
 
 export const CHILD_REPLY_SCHEMA = "pi-subagent.reply" as const;
 export const CHILD_TERMINAL_SCHEMA = "pi-subagent.terminal" as const;
-/** v6 监督协议使用第四版 reply 信封；旧版不可在活动树上热接管。 */
+/** v7 监督协议沿用第四版 reply 信封；旧监督主版本不可热接管。 */
 export const CHILD_REPLY_VERSION = 4 as const;
 
 export const CHILD_REPLY_ENVELOPE_LIMITS = Object.freeze({
@@ -55,7 +55,7 @@ export interface ChildReplyEnvelopeLimits {
   readonly maxStringBytes: number;
 }
 
-/** 校验并按字段闭集重建 v6 child reply。 */
+/** 校验并按字段闭集重建 v7 child reply。 */
 export function parseChildReplyEnvelope(
   value: unknown,
   limits: ChildReplyEnvelopeLimits = CHILD_REPLY_ENVELOPE_LIMITS,

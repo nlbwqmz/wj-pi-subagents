@@ -66,19 +66,19 @@ function receiveAndAck(
   return result;
 }
 
-test("v6 reply wire payload contains only reply_seq and envelope", () => {
+test("v7 reply wire payload contains only reply_seq and envelope", () => {
   const pair = readyPair();
   const value = envelope();
   const frame = pair.child.publishReply(value);
-  assert.equal(frame.protocol, "pi-subagent/6");
+  assert.equal(frame.protocol, "pi-subagent/7");
   assert.deepEqual(frame.payload, { reply_seq: 1, envelope: value });
 });
 
-test("v6 rejects v5 frames and reply envelopes with a forged agent identity", () => {
+test("v7 rejects v6 frames and reply envelopes with a forged agent identity", () => {
   const legacyPair = readyPair();
   const valid = legacyPair.child.publishReply(envelope());
-  const v5 = { ...valid, protocol: "pi-subagent/5" } as unknown as SupervisorFrame;
-  assert.deepEqual(legacyPair.parent.receive(v5), {
+  const v6 = { ...valid, protocol: "pi-subagent/6" } as unknown as SupervisorFrame;
+  assert.deepEqual(legacyPair.parent.receive(v6), {
     kind: "protocol_fault",
     error: "protocol_mismatch",
   });

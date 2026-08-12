@@ -594,6 +594,84 @@ test("child bootstrap 严格要求完整临时监督字段并区分根直接子�
   );
 });
 
+test("child runtime 在压缩后发布 generation-scoped resume 事实", async () => {
+  const cwd = "C:\\workspace\\compaction-resume-runtime";
+  const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
+  const localCredential = `local_${"l".repeat(32)}`;
+  const supervisorCredential = `supervisor_${"s".repeat(32)}`;
+  const listener = await transportAdapter.listen({ agentId: AGENT_ID, credential: localCredential });
+  const api = new FakeExtensionApi();
+  const activate = createPiSubagentRuntimeActivator({
+    environment: childBootstrapEnvironment({
+      [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorEndpoint]: listener.endpoint,
+      [RUNTIME_EPHEMERAL_ENV_KEYS.localSupervisorCredential]: localCredential,
+      [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorCredential]: supervisorCredential,
+    }),
+    localSupervisorTransportAdapter: transportAdapter,
+    templateFileSystem: templateFileSystem(cwd),
+  });
+  await activate(api as never, {
+    ok: true,
+    nodeVersion: process.versions.node,
+    piVersion: "0.83.0",
+    platform: "win32",
+    processTreeAdapter: {} as never,
+  });
+  const context = extensionContext(cwd);
+  let idle = true;
+  context.isIdle = () => idle;
+  const sessionStart = api.emit("session_start", { type: "session_start", reason: "startup" }, context);
+  const transport = await listener.waitForConnection();
+  const facts: unknown[] = [];
+  const starts: unknown[] = [];
+  const parentChannel = new StreamSupervisorChannel({
+    role: "parent",
+    rootId: "root-bootstrap",
+    localAgentId: null,
+    peerAgentId: AGENT_ID,
+    parentAgentId: null,
+    depth: 1,
+    credential: supervisorCredential,
+    requestIdRegistry: new SupervisorRequestIdRegistry(),
+    transport,
+    onReply: () => true,
+  });
+  parentChannel.onCompactionResume((resume) => facts.push(resume));
+  parentChannel.onTaskStarted((started) => starts.push(started));
+  const bindingAbort = new AbortController();
+  await parentChannel.bind(bindingAbort.signal);
+  await Promise.all([parentChannel.waitForReady(bindingAbort.signal), sessionStart]);
+
+  await api.emit("agent_start", { type: "agent_start" }, context);
+  await api.emit("agent_end", { type: "agent_end" }, context);
+  await api.emit("agent_settled", { type: "agent_settled" }, context);
+  await api.emit("session_before_compact", { type: "session_before_compact" }, context);
+  await api.emit("session_compact", { type: "session_compact" }, context);
+  await new Promise<void>((resolve) => setImmediate(() => setImmediate(resolve)));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(facts, [{ generation: 1, decision: "host_idle" }]);
+
+  idle = false;
+  await api.emit("agent_start", { type: "agent_start" }, context);
+  await api.emit("agent_end", { type: "agent_end" }, context);
+  await api.emit("agent_settled", { type: "agent_settled" }, context);
+  await api.emit("session_before_compact", { type: "session_before_compact" }, context);
+  await api.emit("session_compact", { type: "session_compact" }, context);
+  await api.emit("input", { type: "input", source: "extension", streamingBehavior: "steer" }, context);
+  await api.emit("agent_start", { type: "agent_start" }, context);
+  await new Promise<void>((resolve) => setImmediate(() => setImmediate(resolve)));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(facts, [
+    { generation: 1, decision: "host_idle" },
+    { generation: 2, decision: "continuation_pending" },
+  ]);
+  assert.equal(starts.length, 3);
+
+  await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
+  await parentChannel.release();
+  await listener.close();
+});
+
 test("final ACK 失败不阻塞 runtime settled handler，并由独立监督流收敛", async () => {
   const cwd = "C:\\workspace\\final-ack-failure";
   const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
@@ -1465,10 +1543,20 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   await parentSettlement;
   // 新 loop 已 streaming 后到达的重复/迟到 settle 必须被宿主状态复核压住。
   parentNode.emitEvent({ type: "agent_settled" });
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  parentStatus = rootController.getAgentStatus(parentId);
-  assert.equal(parentStatus.ok, true);
-  if (parentStatus.ok) assert.equal(parentStatus.data.state, "working");
+  let reconciledStreaming = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    parentStatus = rootController.getAgentStatus(parentId);
+    if (
+      parentStatus.ok
+      && parentStatus.data.state === "working"
+      && parentStatus.data.activity?.phase === "processing"
+    ) {
+      reconciledStreaming = true;
+      break;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 1));
+  }
+  assert.equal(reconciledStreaming, true);
 
   const queuedProgress = await execute(rootApi, "wait_agent", {
     agent_ids: [parentId],
@@ -1486,7 +1574,7 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   });
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(waitFinished, false);
-  const steerObserved = parentNode.waitForNextOperation("steer");
+  const steerObserved = parentNode.waitForNextOperation("submit_steer");
   const steered = await execute(rootApi, "send_message", {
     agent_id: parentId,
     message: "继续整理叶节点结果",

@@ -11,6 +11,7 @@ import {
   SupervisorChannel,
   SupervisorFrameDecoder,
   type SupervisorChannelOptions,
+  type SupervisorCompactionResume,
   type SupervisorControlRequest,
   type SupervisorControlResponse,
   type SupervisorEvent,
@@ -53,6 +54,7 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
   private readonly controlResponses = new Set<(response: SupervisorControlResponse) => void>();
   private readonly replies = new Set<(reply: SupervisorReply) => void>();
   private readonly taskStarted = new Set<(started: SupervisorTaskStarted) => void>();
+  private readonly compactionResume = new Set<(resume: SupervisorCompactionResume) => void>();
   private readonly transportAcknowledgements = new Map<number, ReturnType<typeof createDeferred<void>>>();
   private readonly unsubscribeFrame: () => void;
   private readonly unsubscribeTransport: () => void;
@@ -251,6 +253,11 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
     return () => this.taskStarted.delete(listener);
   }
 
+  onCompactionResume(listener: (resume: SupervisorCompactionResume) => void): () => void {
+    this.compactionResume.add(listener);
+    return () => this.compactionResume.delete(listener);
+  }
+
   /** 路由相关性或 operation_id 复用违约时固定为监督协议故障。 */
   failProtocol(): void {
     this.protocol.markProtocolFault();
@@ -321,6 +328,9 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
     }
     if (result.kind === "accepted" && result.task_started !== undefined) {
       notifySupervisorListeners(this.taskStarted, result.task_started);
+    }
+    if (result.kind === "accepted" && result.compaction_resume !== undefined) {
+      notifySupervisorListeners(this.compactionResume, result.compaction_resume);
     }
     if (result.kind === "accepted" && result.transport_ack !== undefined) {
       for (const [sequence, waiter] of this.transportAcknowledgements) {

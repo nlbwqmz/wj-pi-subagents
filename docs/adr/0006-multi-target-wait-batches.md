@@ -2,6 +2,8 @@
 
 Status: accepted
 
+> 当前监督协议已由 [ADR-0007](./0007-generation-scoped-compaction-resume.md) 硬切换为 `pi-subagent/7`；本 ADR 的 `/6` 版本号保留为历史决策。
+
 ## 背景
 
 Pi 会把 OpenAI、Anthropic、Google 等 provider 的原始响应归一为统一的 assistant `ToolCall`：每个调用具有 `id`、`name` 和 `arguments`，工具执行回调收到相同的 `toolCallId`。一条最终 assistant message 中可以包含多个同名 `wait_agent`。如果插件把它们当作独立顺序工具，各自等待完整 timeout，会让一个 assistant 工具批次的总等待时间累加；父端已接纳的 steering 也可能等到整批 Promise 结束后才被模型消费。

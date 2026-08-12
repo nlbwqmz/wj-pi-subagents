@@ -162,6 +162,27 @@ test("task assignment 和 task_started 都等待对端 transport ACK 后完成",
   await pair.child.release();
 });
 
+test("compaction_resume 经过严格协议校验并等待父端 transport ACK", async () => {
+  const pair = channelPair();
+  const resumes: unknown[] = [];
+  pair.parent.onCompactionResume((resume) => resumes.push(resume));
+  await pair.parent.bind(new AbortController().signal);
+  await pair.child.bind(new AbortController().signal);
+  await Promise.all([
+    pair.parent.waitForReady(new AbortController().signal),
+    pair.child.waitForReady(new AbortController().signal),
+  ]);
+
+  await pair.child.publishCompactionResume({ generation: 1, decision: "continuation_pending" });
+  await pair.child.publishCompactionResume({ generation: 2, decision: "host_idle" });
+  assert.deepEqual(resumes, [
+    { generation: 1, decision: "continuation_pending" },
+    { generation: 2, decision: "host_idle" },
+  ]);
+  await pair.parent.release();
+  await pair.child.release();
+});
+
 test("task_started 与 final ACK 后仍可在同一流完成控制请求响应", async () => {
   const pair = channelPair(() => true);
   const response = new Promise<unknown>((resolve) => {

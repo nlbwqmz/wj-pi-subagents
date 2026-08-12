@@ -25,8 +25,12 @@ export interface AgentHostDelivery {
   readonly task_id: string;
   readonly message: string;
   readonly mode: "prompt" | "steer";
+  readonly submission: "prompt" | "adaptive_steer";
   readonly start_epoch: number;
 }
+
+export type AgentCompactionResumeDecision = "continuation_pending" | "host_idle";
+export type AgentCompactionResumeObservation = "accepted" | "stale" | "conflict";
 
 export interface AgentTaskProjection {
   readonly state: Extract<AgentLifecycleState, "idle" | "working" | "interrupting" | "suspended">;
@@ -76,6 +80,15 @@ export class AgentTaskMailbox {
   private settlementObserved = false;
   private compactionActive = false;
   private compactionRequiresResume = false;
+  private compactionGeneration = 0;
+  private activeCompactionGeneration: number | undefined;
+  private resumeGeneration: number | undefined;
+  private resumeDecision: AgentCompactionResumeDecision | undefined;
+  private resumeFactObserved = false;
+  private resumeStartObserved = false;
+  private resumeResolved = false;
+  private resumeConflict = false;
+  private resumeIdleApproved = false;
   private startEpoch = 0;
   private nextDeliveryId = 1;
 
@@ -116,14 +129,22 @@ export class AgentTaskMailbox {
     }
     if (this.state === "suspended") this.state = "working";
     this.phase = "reconciling";
+    const adaptiveResume = this.resumeIdleApproved;
     const delivery = Object.freeze({
       delivery_id: this.nextDeliveryId++,
       message_id: entry.messageId,
       task_id: entry.taskId,
       message: entry.message,
       mode: task.hostStarted ? "steer" as const : "prompt" as const,
+      submission: task.hostStarted || adaptiveResume
+        ? "adaptive_steer" as const
+        : "prompt" as const,
       start_epoch: this.startEpoch,
     });
+    if (adaptiveResume) {
+      this.resumeResolved = true;
+      this.resumeIdleApproved = false;
+    }
     this.inFlight = delivery;
     return delivery;
   }
@@ -182,9 +203,9 @@ export class AgentTaskMailbox {
       current.turnId = turnId;
       current.hostStarted = true;
     }
-    if (!this.settlementObserved && !this.compactionActive) {
-      if (!this.interruptBarrier) this.state = "working";
-      this.phase = this.toolCounts.size > 0 ? "executing_tools" : "processing";
+    if (!this.settlementObserved && !this.compactionActive && !this.resumeConflict) {
+      if (this.resumeGeneration !== undefined) this.resumeStartObserved = true;
+      this.applyResumeState();
     }
     return true;
   }
@@ -201,12 +222,14 @@ export class AgentTaskMailbox {
       this.currentTask.hostStarted = true;
     }
     this.compactionActive = false;
+    this.compactionRequiresResume = false;
+    this.activeCompactionGeneration = undefined;
+    if (this.resumeGeneration !== undefined) this.resumeStartObserved = true;
     this.settlementObserved = false;
     this.preparedFinal = undefined;
     this.replyOutboxPendingCount = 0;
     this.hostPendingCount = Math.max(0, this.hostPendingCount - 1);
-    if (!this.interruptBarrier) this.state = "working";
-    this.phase = this.toolCounts.size > 0 ? "executing_tools" : "processing";
+    this.applyResumeState();
   }
 
   /** raw settled 只形成 candidate；没有 final commit 时绝不进入 idle。 */
@@ -230,13 +253,28 @@ export class AgentTaskMailbox {
       return "superseded";
     }
     this.settlementObserved = true;
-    if (this.state === "idle" || this.state === "suspended") this.state = "working";
     this.replyOutboxPendingCount = 1;
+    if (this.finalCommitBlocked()) {
+      if (this.resumeBarrierActive()) this.applyResumeState();
+      return "candidate";
+    }
+    if (this.state === "idle" || this.state === "suspended") this.state = "working";
     this.phase = this.preparedFinal === undefined ? "finalizing" : "waiting_parent_ack";
     return "candidate";
   }
 
   observeCompactionStart(): void {
+    // raw 事件和 settled 后的 get_state 对账可能观察到同一次压缩；重复事实
+    // 不得重置 provisional-settlement 恢复要求或重新初始化 generation。
+    if (this.compactionActive) return;
+    this.activeCompactionGeneration = this.compactionGeneration + 1;
+    this.resumeGeneration = undefined;
+    this.resumeDecision = undefined;
+    this.resumeFactObserved = false;
+    this.resumeStartObserved = false;
+    this.resumeResolved = false;
+    this.resumeConflict = false;
+    this.resumeIdleApproved = false;
     if (this.currentTask === undefined) {
       this.currentTask = {
         taskId: this.allocateTaskId(),
@@ -254,25 +292,71 @@ export class AgentTaskMailbox {
   }
 
   observeCompactionEnd(aborted: boolean): boolean {
+    const generation = this.activeCompactionGeneration;
+    this.activeCompactionGeneration = undefined;
     this.compactionActive = false;
     if (aborted) {
       this.compactionRequiresResume = false;
+      this.resumeGeneration = undefined;
+      this.resumeDecision = undefined;
+      this.resumeFactObserved = false;
+      this.resumeStartObserved = false;
+      this.resumeResolved = false;
+      this.resumeIdleApproved = false;
       this.state = "suspended";
       this.phase = "maintenance_failed";
       return false;
     }
     const requiresResume = this.compactionRequiresResume;
     this.compactionRequiresResume = false;
-    this.state = "working";
-    this.phase = requiresResume ? "resume_pending" : "processing";
-    return requiresResume;
+    if (generation !== undefined) this.compactionGeneration = generation;
+    if (!requiresResume || generation === undefined) {
+      if (this.resumeFactObserved) {
+        this.resumeGeneration = generation;
+        this.markResumeConflict();
+        return false;
+      }
+      this.resumeGeneration = undefined;
+      this.resumeDecision = undefined;
+      this.resumeFactObserved = false;
+      this.resumeStartObserved = false;
+      this.resumeResolved = false;
+      this.resumeIdleApproved = false;
+      if (!this.interruptBarrier) this.state = "working";
+      this.phase = this.toolCounts.size > 0 ? "executing_tools" : "processing";
+      return false;
+    }
+    this.resumeGeneration = generation;
+    this.resumeResolved = false;
+    this.resumeIdleApproved = false;
+    this.applyResumeState();
+    return true;
   }
 
-  observeResumeTimeout(): boolean {
-    if (this.phase !== "resume_pending" || this.state !== "working") return false;
-    this.state = "suspended";
-    this.phase = "resume_required";
-    return true;
+  /**
+   * 只接受当前压缩代际的 child 裁决。晚到或矛盾事实绝不触发 prompt/steer；
+   * 当前恢复尚未被实际 agent_start 证明时，保持 suspended 以等待人工裁决。
+   */
+  observeCompactionResume(
+    generation: number,
+    decision: AgentCompactionResumeDecision,
+  ): AgentCompactionResumeObservation {
+    if (!Number.isSafeInteger(generation) || generation < 1) return this.markResumeConflict();
+    const expected = this.activeCompactionGeneration ?? this.resumeGeneration;
+    if (expected === undefined || generation !== expected) {
+      if (this.resumeGeneration !== undefined || this.activeCompactionGeneration !== undefined) {
+        return this.markResumeConflict();
+      }
+      return "stale";
+    }
+    if (this.resumeFactObserved) {
+      if (this.resumeDecision !== decision) return this.markResumeConflict();
+      return "accepted";
+    }
+    this.resumeDecision = decision;
+    this.resumeFactObserved = true;
+    this.applyResumeState();
+    return "accepted";
   }
 
   /** settled 后宿主仍在同一外层 run 时撤销 provisional candidate，不签发新 turn。 */
@@ -284,6 +368,10 @@ export class AgentTaskMailbox {
     this.preparedFinal = undefined;
     this.replyOutboxPendingCount = 0;
     if (this.currentTask !== undefined) this.currentTask.hostStarted = true;
+    if (this.resumeBarrierActive()) {
+      this.applyResumeState();
+      return true;
+    }
     if (!this.interruptBarrier) this.state = "working";
     this.phase = this.toolCounts.size > 0 ? "executing_tools" : "processing";
     return true;
@@ -321,6 +409,10 @@ export class AgentTaskMailbox {
     }
     this.preparedFinal = final;
     this.replyOutboxPendingCount = 1;
+    if (this.finalCommitBlocked()) {
+      if (this.resumeBarrierActive()) this.applyResumeState();
+      return false;
+    }
     if (this.state === "idle") this.state = "working";
     this.phase = this.settlementObserved ? "waiting_parent_ack" : "finalizing";
     return this.canCommitPreparedFinal();
@@ -334,7 +426,7 @@ export class AgentTaskMailbox {
       && final.task_id === task.taskId
       && (task.turnId === undefined || final.turn_id === task.turnId)
       && this.settlementObserved
-      && !this.compactionActive
+      && !this.finalCommitBlocked()
       && this.inFlight === undefined
       && !this.mailbox.some((entry) => entry.taskId === task.taskId);
   }
@@ -357,6 +449,16 @@ export class AgentTaskMailbox {
     this.currentTask = undefined;
     this.settlementObserved = false;
     this.interruptBarrier = false;
+    this.compactionActive = false;
+    this.compactionRequiresResume = false;
+    this.activeCompactionGeneration = undefined;
+    this.resumeGeneration = undefined;
+    this.resumeDecision = undefined;
+    this.resumeFactObserved = false;
+    this.resumeStartObserved = false;
+    this.resumeResolved = false;
+    this.resumeConflict = false;
+    this.resumeIdleApproved = false;
     this.hostPendingCount = 0;
     this.replyOutboxPendingCount = 0;
     this.toolCounts.clear();
@@ -448,11 +550,75 @@ export class AgentTaskMailbox {
   }
 
   private deliveryAllowed(): boolean {
-    if (this.interruptBarrier || this.compactionActive) return false;
+    if (this.interruptBarrier || this.compactionActive || this.resumeConflict) return false;
+    if (this.resumeGeneration !== undefined && !this.resumeResolved && !this.resumeIdleApproved) return false;
     if (this.phase === "finalizing" || this.phase === "waiting_parent_ack" || this.phase === "resume_pending") {
       return false;
     }
+    if (this.phase === "resume_required" && !this.resumeIdleApproved) return false;
     return this.state === "working" || this.state === "suspended";
+  }
+
+  private applyResumeState(): void {
+    if (this.compactionActive) return;
+    if (this.resumeConflict) {
+      this.resumeIdleApproved = false;
+      this.state = "suspended";
+      this.phase = "resume_required";
+      return;
+    }
+    if (this.resumeGeneration === undefined || this.resumeResolved) {
+      if (!this.interruptBarrier) this.state = "working";
+      const taskId = this.currentTask?.taskId;
+      const hasMailboxWork = taskId !== undefined && (
+        this.mailbox.some((entry) => entry.taskId === taskId)
+        || this.inFlight?.task_id === taskId
+      );
+      this.phase = this.settlementObserved
+        ? hasMailboxWork
+          ? "reconciling"
+          : this.preparedFinal === undefined ? "finalizing" : "waiting_parent_ack"
+        : this.toolCounts.size > 0 ? "executing_tools" : "processing";
+      return;
+    }
+    if (this.resumeDecision === "host_idle") {
+      if (this.resumeStartObserved) {
+        this.markResumeConflict();
+        return;
+      }
+      this.resumeIdleApproved = true;
+      this.state = "suspended";
+      this.phase = "resume_required";
+      return;
+    }
+    if (this.resumeDecision === "continuation_pending" && this.resumeStartObserved) {
+      this.resumeResolved = true;
+      this.resumeIdleApproved = false;
+      if (!this.interruptBarrier) this.state = "working";
+      this.phase = this.toolCounts.size > 0 ? "executing_tools" : "processing";
+      return;
+    }
+    this.resumeIdleApproved = false;
+    this.state = "suspended";
+    this.phase = this.resumeDecision === "continuation_pending" ? "resume_pending" : "resume_required";
+  }
+
+  private resumeBarrierActive(): boolean {
+    return this.resumeConflict || (this.resumeGeneration !== undefined && !this.resumeResolved);
+  }
+
+  private finalCommitBlocked(): boolean {
+    return this.compactionActive || this.resumeBarrierActive() || this.phase === "maintenance_failed";
+  }
+
+  private markResumeConflict(): AgentCompactionResumeObservation {
+    this.resumeConflict = true;
+    this.resumeIdleApproved = false;
+    if (!this.compactionActive) {
+      this.state = "suspended";
+      this.phase = "resume_required";
+    }
+    return "conflict";
   }
 
   private promoteSuccessorIfPossible(): void {

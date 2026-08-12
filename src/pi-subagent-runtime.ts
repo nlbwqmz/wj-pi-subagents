@@ -345,15 +345,6 @@ function readContext(value: unknown): RuntimeContextView {
   return isRecord(value) ? value as RuntimeContextView : {};
 }
 
-function runtimeContextIsIdle(context: RuntimeContextView): boolean {
-  if (typeof context.isIdle !== "function") return false;
-  try {
-    return context.isIdle() === true;
-  } catch {
-    return false;
-  }
-}
-
 function environmentValue(
   environment: EnvironmentInput,
   key: string,
@@ -530,6 +521,16 @@ function applyAgentToolVisibility(
       : Object.freeze([...new Set([...business, ...system])]));
   } catch {
     // 工具可见性失败不能提升服务端授权；控制器仍会重复裁决。
+  }
+}
+
+function runtimeContextIdleFact(context: RuntimeContextView): boolean | undefined {
+  if (typeof context.isIdle !== "function") return undefined;
+  try {
+    const value = context.isIdle();
+    return typeof value === "boolean" ? value : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -749,16 +750,22 @@ export function createPiSubagentRuntimeActivator(
       current.replyCoordinator?.settle();
     });
 
+    api.on("input", () => {
+      const current = active;
+      if (current === undefined || !current.isChild || current.handoffPending === true) return;
+      current.replyCoordinator?.observeInput();
+    });
+
     api.on("session_before_compact", () => {
       const current = active;
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
       current.replyCoordinator?.observeCompactionStart();
     });
 
-    api.on("session_compact", () => {
+    api.on("session_compact", (_event, context) => {
       const current = active;
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
-      current.replyCoordinator?.observeCompactionEnd();
+      current.replyCoordinator?.observeCompactionEnd(() => runtimeContextIdleFact(readContext(context)));
     });
 
     const makeState = (transfer: RuntimeTransfer, context: RuntimeContextView): ActiveRuntime => {

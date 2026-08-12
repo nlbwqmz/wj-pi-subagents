@@ -64,6 +64,16 @@ class TaskStartedBarrierPort implements ChildReplyPort {
   }
 }
 
+class CompactionResumePort implements ChildReplyPort {
+  readonly resumes: Array<{ readonly generation: number; readonly decision: "continuation_pending" | "host_idle" }> = [];
+
+  async publishReplyAndWaitForAck(): Promise<void> {}
+
+  async publishCompactionResume(resume: { readonly generation: number; readonly decision: "continuation_pending" | "host_idle" }): Promise<void> {
+    this.resumes.push(resume);
+  }
+}
+
 class RejectingPort implements ChildReplyPort {
   calls = 0;
 
@@ -152,6 +162,67 @@ test("Pi 自动重试在 settled 前启动新轮时沿用同一逻辑任务", as
     { kind: "started", task_id: assignedTaskId, turn_id: TURN_1 },
     { kind: "started", task_id: assignedTaskId, turn_id: TURN_2 },
   ]);
+});
+
+test("压缩恢复跨两阶段屏障裁决 continuation，并按成功压缩单调提交 generation", async () => {
+  const scheduled: Array<() => void> = [];
+  const port = new CompactionResumePort();
+  const turns = [TURN_1, TURN_2];
+  const value = new ChildReplyCoordinator({
+    agentId: AGENT_ID,
+    port,
+    turnIdFactory: () => turns.shift()!,
+    taskIdFactory: () => TASK_1,
+    commitIdFactory: () => COMMIT_1,
+    scheduleCompactionResume: (callback) => scheduled.push(callback),
+  });
+
+  value.observeAgentStart();
+  value.observeAgentEnd();
+  value.settle();
+  value.observeCompactionStart();
+  value.observeCompactionEnd(() => true);
+  assert.equal(scheduled.length, 1);
+  value.observeInput();
+  value.observeAgentStart();
+  scheduled.shift()?.();
+  await nextTask();
+  assert.deepEqual(port.resumes, [{ generation: 1, decision: "continuation_pending" }]);
+
+  value.observeAgentEnd();
+  value.settle();
+  value.observeCompactionStart();
+  // 一次未产生 session_compact 的失败前置，不得消耗 generation。
+  value.observeCompactionStart();
+  value.observeCompactionEnd(() => true);
+  scheduled.shift()?.();
+  await nextTask();
+  assert.deepEqual(port.resumes, [
+    { generation: 1, decision: "continuation_pending" },
+    { generation: 2, decision: "host_idle" },
+  ]);
+});
+
+test("压缩恢复缺少明确 idle 事实时不猜测 host_idle", async () => {
+  const scheduled: Array<() => void> = [];
+  const port = new CompactionResumePort();
+  const value = new ChildReplyCoordinator({
+    agentId: AGENT_ID,
+    port,
+    turnIdFactory: () => TURN_1,
+    taskIdFactory: () => TASK_1,
+    commitIdFactory: () => COMMIT_1,
+    scheduleCompactionResume: (callback) => scheduled.push(callback),
+  });
+
+  value.observeAgentStart();
+  value.observeAgentEnd();
+  value.settle();
+  value.observeCompactionStart();
+  value.observeCompactionEnd(() => undefined);
+  scheduled.shift()?.();
+  await nextTask();
+  assert.deepEqual(port.resumes, []);
 });
 
 test("task_started 获 transport ACK 前同一 turn 的业务 reply 不得越过身份事实", async () => {

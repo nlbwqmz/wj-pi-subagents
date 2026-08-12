@@ -3,6 +3,7 @@ import {
   SupervisorChannel,
   SupervisorFrameDecoder,
   type SupervisorChannelOptions,
+  type SupervisorCompactionResume,
   type SupervisorControlRequest,
   type SupervisorControlResponse,
   type SupervisorFrame,
@@ -63,6 +64,7 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
   private readonly transportAcknowledgements = new Map<number, Deferred<void>>();
   private readonly taskAssignmentListeners = new Set<(assignment: SupervisorTaskAssignment) => void>();
   private readonly taskStartedListeners = new Set<(started: SupervisorTaskStarted) => void>();
+  private readonly compactionResumeListeners = new Set<(resume: SupervisorCompactionResume) => void>();
   private readonly faults = new Set<(fault: RpcSupervisorChannelFault) => void>();
   private readonly eventListeners = new Set<(event: SupervisorEvent) => void>();
   private readonly snapshotListeners = new Set<(snapshot: SupervisorSnapshot) => void>();
@@ -213,6 +215,26 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
   onTaskStarted(listener: (started: SupervisorTaskStarted) => void): () => void {
     this.taskStartedListeners.add(listener);
     return () => this.taskStartedListeners.delete(listener);
+  }
+
+  async publishCompactionResume(resume: SupervisorCompactionResume): Promise<void> {
+    const frame = this.protocol.publishCompactionResume(resume);
+    const waiter = createDeferred<void>();
+    void waiter.promise.catch(() => {});
+    this.transportAcknowledgements.set(frame.seq, waiter);
+    try {
+      await this.send(frame);
+      await waiter.promise;
+    } finally {
+      if (this.transportAcknowledgements.get(frame.seq) === waiter) {
+        this.transportAcknowledgements.delete(frame.seq);
+      }
+    }
+  }
+
+  onCompactionResume(listener: (resume: SupervisorCompactionResume) => void): () => void {
+    this.compactionResumeListeners.add(listener);
+    return () => this.compactionResumeListeners.delete(listener);
   }
 
   /** child 端发布已经由 SupervisorChannel 校验的生命周期事实。 */
@@ -366,6 +388,9 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     }
     if (result.kind === "accepted" && result.task_started !== undefined) {
       notifySupervisorListeners(this.taskStartedListeners, result.task_started);
+    }
+    if (result.kind === "accepted" && result.compaction_resume !== undefined) {
+      notifySupervisorListeners(this.compactionResumeListeners, result.compaction_resume);
     }
     if (result.kind === "accepted" && result.close_requested === true) {
       this.handleCloseRequested();

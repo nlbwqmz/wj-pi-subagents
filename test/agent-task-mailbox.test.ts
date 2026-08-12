@@ -127,11 +127,136 @@ test("处理中原生压缩保持 task/turn；settled 后压缩必须等待恢�
   resumed.observeAgentSettled();
   resumed.observeCompactionStart();
   assert.equal(resumed.observeCompactionEnd(false), true);
+  assert.equal(resumed.projection().activity?.phase, "resume_required");
+  assert.equal(resumed.observeCompactionResume(1, "continuation_pending"), "accepted");
   assert.equal(resumed.projection().activity?.phase, "resume_pending");
   resumed.observeAgentStart();
   assert.equal(resumed.observeTaskStarted(AUTO_TASK, TURN_2), true);
   assert.equal(resumed.currentTurnId(), TURN_2);
   assert.equal(resumed.projection().activity?.phase, "processing");
+});
+
+test("同一次压缩的重复 start 不重置 settlement 恢复要求或消耗 generation", () => {
+  const value = mailbox([PLACEHOLDER_TASK]);
+  value.observeAgentStart();
+  value.observeTaskStarted(AUTO_TASK, TURN_1);
+  value.observeAgentSettled();
+  value.observeCompactionStart();
+  value.observeCompactionStart();
+  assert.equal(value.observeCompactionEnd(false), true);
+  assert.equal(value.observeCompactionResume(1, "continuation_pending"), "accepted");
+  assert.equal(value.projection().activity?.phase, "resume_pending");
+});
+
+test("compaction_resume 先于 compaction_end 到达时仍保留当前 generation 事实", () => {
+  const value = mailbox([PLACEHOLDER_TASK]);
+  value.observeAgentStart();
+  value.observeTaskStarted(AUTO_TASK, TURN_1);
+  value.observeAgentSettled();
+  value.observeCompactionStart();
+  assert.equal(value.observeCompactionResume(1, "continuation_pending"), "accepted");
+  assert.equal(value.observeCompactionEnd(false), true);
+  assert.equal(value.projection().state, "suspended");
+  assert.equal(value.projection().activity?.phase, "resume_pending");
+  value.observeAgentStart();
+  assert.equal(value.projection().state, "working");
+  assert.equal(value.projection().activity?.phase, "processing");
+});
+
+test("continuation 的恢复事实与 agent_start 任一先到都必须等待另一半", () => {
+  const startFirst = mailbox([PLACEHOLDER_TASK]);
+  startFirst.observeAgentStart();
+  startFirst.observeTaskStarted(AUTO_TASK, TURN_1);
+  startFirst.observeAgentSettled();
+  startFirst.observeCompactionStart();
+  assert.equal(startFirst.observeCompactionEnd(false), true);
+  startFirst.observeAgentStart();
+  assert.equal(startFirst.projection().state, "suspended");
+  assert.equal(startFirst.projection().activity?.phase, "resume_required");
+  assert.equal(startFirst.observeCompactionResume(1, "continuation_pending"), "accepted");
+  assert.equal(startFirst.projection().state, "working");
+  assert.equal(startFirst.projection().activity?.phase, "processing");
+
+  const decisionFirst = mailbox([PLACEHOLDER_TASK]);
+  decisionFirst.observeAgentStart();
+  decisionFirst.observeTaskStarted(AUTO_TASK, TURN_1);
+  decisionFirst.observeAgentSettled();
+  decisionFirst.observeCompactionStart();
+  assert.equal(decisionFirst.observeCompactionEnd(false), true);
+  assert.equal(decisionFirst.observeCompactionResume(1, "continuation_pending"), "accepted");
+  assert.equal(decisionFirst.projection().state, "suspended");
+  assert.equal(decisionFirst.projection().activity?.phase, "resume_pending");
+  decisionFirst.observeAgentStart();
+  assert.equal(decisionFirst.projection().state, "working");
+  assert.equal(decisionFirst.projection().activity?.phase, "processing");
+});
+
+test("当前 generation 的重复同值事实幂等，矛盾事实保持 suspended", () => {
+  const value = mailbox([PLACEHOLDER_TASK]);
+  value.observeAgentStart();
+  value.observeTaskStarted(AUTO_TASK, TURN_1);
+  value.observeAgentSettled();
+  value.observeCompactionStart();
+  value.observeCompactionEnd(false);
+  assert.equal(value.observeCompactionResume(1, "continuation_pending"), "accepted");
+  value.observeAgentStart();
+  assert.equal(value.observeCompactionResume(1, "continuation_pending"), "accepted");
+  assert.equal(value.observeCompactionResume(1, "host_idle"), "conflict");
+  assert.equal(value.projection().state, "suspended");
+  assert.equal(value.projection().activity?.phase, "resume_required");
+});
+
+test("迟到或矛盾 compaction_resume 绝不唤醒 mailbox", () => {
+  const value = mailbox([PLACEHOLDER_TASK]);
+  value.observeAgentStart();
+  value.observeTaskStarted(AUTO_TASK, TURN_1);
+  value.observeAgentSettled();
+  value.observeCompactionStart();
+  value.observeCompactionEnd(false);
+  value.submit("保持积压");
+
+  assert.equal(value.observeCompactionResume(2, "continuation_pending"), "conflict");
+  assert.equal(value.takeNextDelivery(), undefined);
+  assert.equal(value.projection().state, "suspended");
+  assert.equal(value.projection().activity?.phase, "resume_required");
+});
+
+test("未解决或冲突的恢复 generation 阻止迟到 settlement 与 final 提交", () => {
+  const value = mailbox([PLACEHOLDER_TASK]);
+  value.observeAgentStart();
+  value.observeTaskStarted(AUTO_TASK, TURN_1);
+  value.observeAgentSettled();
+  value.observeCompactionStart();
+  assert.equal(value.observeCompactionEnd(false), true);
+
+  value.observeAgentSettled();
+  const candidate = final(AUTO_TASK, TURN_1, COMMIT_1);
+  assert.equal(value.prepareFinal(candidate), false);
+  assert.equal(value.commitPreparedFinal(COMMIT_1), false);
+  assert.equal(value.projection().state, "suspended");
+  assert.equal(value.projection().activity?.phase, "resume_required");
+
+  assert.equal(value.observeCompactionResume(1, "host_idle"), "accepted");
+  assert.equal(value.observeCompactionResume(1, "continuation_pending"), "conflict");
+  assert.equal(value.prepareFinal(candidate), false);
+  assert.equal(value.commitPreparedFinal(COMMIT_1), false);
+  assert.equal(value.projection().state, "suspended");
+  assert.equal(value.projection().activity?.phase, "resume_required");
+});
+
+test("未解决恢复 generation 遇到迟到 streaming 对账仍保持 suspended", () => {
+  const value = mailbox([PLACEHOLDER_TASK]);
+  value.observeAgentStart();
+  value.observeTaskStarted(AUTO_TASK, TURN_1);
+  value.observeAgentSettled();
+  value.observeCompactionStart();
+  assert.equal(value.observeCompactionEnd(false), true);
+
+  value.observeAgentSettled();
+  assert.equal(value.observeHostStillStreaming(0), true);
+  assert.equal(value.projection().state, "suspended");
+  assert.equal(value.projection().activity?.phase, "resume_required");
+  assert.equal(value.takeNextDelivery(), undefined);
 });
 
 test("midrun 压缩失败与成功后无恢复分别稳定为 suspended", () => {
@@ -153,9 +278,28 @@ test("midrun 压缩失败与成功后无恢复分别稳定为 suspended", () => 
   missingResume.observeAgentSettled();
   missingResume.observeCompactionStart();
   assert.equal(missingResume.observeCompactionEnd(false), true);
-  assert.equal(missingResume.observeResumeTimeout(), true);
   assert.equal(missingResume.projection().state, "suspended");
   assert.equal(missingResume.projection().activity?.phase, "resume_required");
+});
+
+test("host_idle 首条消息原子恢复，后续 FIFO 消息继续原子 steering", () => {
+  const value = mailbox([PLACEHOLDER_TASK]);
+  value.observeAgentStart();
+  value.observeTaskStarted(AUTO_TASK, TURN_1);
+  value.observeAgentSettled();
+  value.observeCompactionStart();
+  value.submit("恢复第一条");
+  value.submit("恢复第二条");
+  assert.equal(value.observeCompactionEnd(false), true);
+  assert.equal(value.observeCompactionResume(1, "host_idle"), "accepted");
+
+  const first = value.takeNextDelivery();
+  assert.equal(first?.mode, "prompt");
+  assert.equal(first?.submission, "adaptive_steer");
+  assert.equal(value.hostAccepted(first!.delivery_id), true);
+  const second = value.takeNextDelivery();
+  assert.equal(second?.mode, "steer");
+  assert.equal(second?.submission, "adaptive_steer");
 });
 
 test("恢复 turn 拒绝旧 turn final，并只提交匹配 task/turn/commit 的 final", () => {
@@ -165,6 +309,7 @@ test("恢复 turn 拒绝旧 turn final，并只提交匹配 task/turn/commit 的
   value.observeAgentSettled();
   value.observeCompactionStart();
   value.observeCompactionEnd(false);
+  value.observeCompactionResume(1, "continuation_pending");
   value.observeAgentStart();
   value.observeTaskStarted(AUTO_TASK, TURN_2);
   value.observeAgentSettled();

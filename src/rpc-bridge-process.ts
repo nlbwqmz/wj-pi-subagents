@@ -39,6 +39,12 @@ interface BridgeClient {
   prompt(message: string): Promise<void>;
   steer(message: string): Promise<void>;
   abort(): Promise<void>;
+  /** RpcClient 的内部 wire sender；用于暴露公共 API 尚未提供的原子提交参数。 */
+  send?(command: {
+    readonly type: "prompt";
+    readonly message: string;
+    readonly streamingBehavior: "steer";
+  }): Promise<unknown>;
   getState(): Promise<unknown>;
   onEvent(listener: (event: unknown) => void): () => void;
 }
@@ -481,7 +487,7 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
     || command.id <= 0
     || command.id <= lastCommandId
     || typeof command.command !== "string"
-    || !["start", "prompt", "steer", "abort", "get_state", "close"].includes(command.command)
+    || !["start", "prompt", "steer", "submit_steer", "abort", "get_state", "close"].includes(command.command)
   ) {
     failAndExit("protocol_fault");
     return;
@@ -550,7 +556,7 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
       return;
     }
     const current = await ensureClient();
-    if (command.command === "prompt" || command.command === "steer") {
+    if (command.command === "prompt" || command.command === "steer" || command.command === "submit_steer") {
       if (!isRecord(command.payload) || typeof command.payload.message !== "string"
         || command.payload.message.length === 0
         || new TextEncoder().encode(command.payload.message).byteLength > MAX_MESSAGE_BYTES
@@ -559,7 +565,8 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
         return;
       }
       if (command.command === "prompt") await current.prompt(command.payload.message);
-      else await current.steer(command.payload.message);
+      else if (command.command === "steer") await current.steer(command.payload.message);
+      else await submitAdaptiveSteer(current, command.payload.message);
       response(command.id, true);
       return;
     }
@@ -597,6 +604,18 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
   }
 }
 
+async function submitAdaptiveSteer(current: BridgeClient, message: string): Promise<void> {
+  if (typeof current.send !== "function") throw new Error("Pi RPC 不支持原子 steering 提交");
+  const responseValue = await current.send({
+    type: "prompt",
+    message,
+    streamingBehavior: "steer",
+  });
+  if (!isRecord(responseValue) || responseValue.success !== true || responseValue.command !== "prompt") {
+    throw new Error("Pi RPC 原子 steering 提交失败");
+  }
+}
+
 function enqueueCommand(command: BridgeCommand): void {
   commandQueue = commandQueue
     .then(() => handleCommand(command))
@@ -609,7 +628,7 @@ function acceptCommandChunk(value: Record<string, unknown>): boolean {
     || !Number.isSafeInteger(value.id)
     || (value.id as number) <= 0
     || typeof value.command !== "string"
-    || !["start", "prompt", "steer", "abort", "get_state", "close"].includes(value.command)
+    || !["start", "prompt", "steer", "submit_steer", "abort", "get_state", "close"].includes(value.command)
     || !Number.isSafeInteger(value.chunk_index)
     || (value.chunk_index as number) < 0
     || !Number.isSafeInteger(value.chunk_count)

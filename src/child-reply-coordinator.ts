@@ -10,6 +10,7 @@ import {
 } from "./child-reply-envelope.ts";
 import { normalizeAssistantMessageEnd } from "./rpc-bridge-event.ts";
 import type {
+  SupervisorCompactionResume,
   SupervisorTaskAssignment,
   SupervisorTaskStarted,
 } from "./supervisor-channel.ts";
@@ -34,6 +35,7 @@ export interface ChildReplyPort {
     signal?: AbortSignal,
   ): Promise<void>;
   publishTaskStarted?(started: SupervisorTaskStarted): Promise<void>;
+  publishCompactionResume?(resume: SupervisorCompactionResume): Promise<void>;
 }
 
 export interface ChildReplyCoordinatorOptions {
@@ -43,6 +45,8 @@ export interface ChildReplyCoordinatorOptions {
   readonly taskIdFactory?: () => string;
   readonly commitIdFactory?: () => string;
   readonly scheduleQuarantine?: (operation: () => void) => void;
+  /** 压缩后等待其他 extension 的 continuation dispatch 显现；默认跨两个 check turn。 */
+  readonly scheduleCompactionResume?: (operation: () => void) => void;
   /** parent 已同步接纳 final 后释放本轮 child reply trigger 栅栏。 */
   readonly onFinalAccepted?: () => void;
   readonly onFinalFailure?: () => void;
@@ -64,6 +68,7 @@ export class ChildReplyCoordinator {
   private readonly taskIdFactory: () => string;
   private readonly commitIdFactory: () => string;
   private readonly scheduleQuarantine: (operation: () => void) => void;
+  private readonly scheduleCompactionResume: (operation: () => void) => void;
   private readonly issuedIds = new Set<string>();
   private readonly onFinalAccepted: (() => void) | undefined;
   private readonly onFinalFailure: (() => void) | undefined;
@@ -79,6 +84,11 @@ export class ChildReplyCoordinator {
   private compactionActive = false;
   private compactionAfterSettlement = false;
   private resumePending = false;
+  private compactionGeneration = 0;
+  private pendingResumeGeneration: number | undefined;
+  private continuationInputObserved = false;
+  private resumeDecisionPublished = false;
+  private resumePublish: Promise<void> | undefined;
   private settlementEpoch = 0;
   private finalSubmitted = false;
   private terminalFailure = false;
@@ -92,6 +102,9 @@ export class ChildReplyCoordinator {
     this.taskIdFactory = options.taskIdFactory ?? randomUUID;
     this.commitIdFactory = options.commitIdFactory ?? randomUUID;
     this.scheduleQuarantine = options.scheduleQuarantine ?? ((operation) => setImmediate(operation));
+    this.scheduleCompactionResume = options.scheduleCompactionResume ?? ((operation) => {
+      setImmediate(() => setImmediate(operation));
+    });
     this.onFinalAccepted = options.onFinalAccepted;
     this.onFinalFailure = options.onFinalFailure;
   }
@@ -99,12 +112,19 @@ export class ChildReplyCoordinator {
   /** 监督租约先于 prompt/steer 到达；正文和任务标识始终分离。 */
   observeTaskAssignment(assignment: SupervisorTaskAssignment): void {
     if (this.terminalFailure) return;
-    if (assignment.mode === "steer" && this.currentTaskId === assignment.task_id) return;
+    if (
+      (assignment.mode === "steer" || assignment.mode === "adaptive_steer")
+      && this.currentTaskId === assignment.task_id
+    ) return;
     // suspended/失败压缩后的新 prompt 必须取代旧逻辑任务，不能被误判为 resume。
     if (assignment.mode === "prompt" && assignment.task_id !== this.currentTaskId) {
       this.compactionActive = false;
       this.compactionAfterSettlement = false;
       this.resumePending = false;
+      this.pendingResumeGeneration = undefined;
+      this.continuationInputObserved = false;
+      this.resumeDecisionPublished = false;
+      this.resumePublish = undefined;
       this.finalSubmitted = false;
     }
     this.pendingPromptTaskId = assignment.task_id;
@@ -132,7 +152,14 @@ export class ChildReplyCoordinator {
     this.currentTurnId = turnId;
     this.runActive = true;
     this.compactionActive = false;
+    if (this.resumePending && this.pendingResumeGeneration !== undefined) {
+      this.continuationInputObserved = true;
+      if (!this.resumeDecisionPublished) {
+        this.publishCompactionResume(this.pendingResumeGeneration, "continuation_pending");
+      }
+    }
     this.resumePending = false;
+    this.pendingResumeGeneration = undefined;
     this.finalSubmitted = false;
     this.candidate = undefined;
     this.finalState = "normal";
@@ -141,8 +168,13 @@ export class ChildReplyCoordinator {
     const publishTaskStarted = this.port.publishTaskStarted;
     if (publishTaskStarted !== undefined) {
       const started = Object.freeze({ task_id: taskId, turn_id: turnId });
-      void this.enqueue(() => publishTaskStarted.call(this.port, started)).catch(() => this.failFinal());
+      const resumePublish = this.resumePublish;
+      void this.enqueue(async () => {
+        if (resumePublish !== undefined) await resumePublish;
+        await publishTaskStarted.call(this.port, started);
+      }).catch(() => this.failFinal());
     }
+    this.resumePublish = undefined;
   }
 
   /** agent_end 先记录本次 Pi loop；迟到的 settled handler 不能结算后继 turn。 */
@@ -219,17 +251,31 @@ export class ChildReplyCoordinator {
     this.compactionAfterSettlement = !this.runActive;
     this.compactionActive = true;
     this.resumePending = false;
+    this.pendingResumeGeneration = undefined;
+    this.continuationInputObserved = false;
+    this.resumeDecisionPublished = false;
     this.finalSubmitted = false;
     this.settlementEpoch += 1;
   }
 
-  /** 成功压缩若发生在 provisional settled 之后，必须等待恢复的新 agent_start。 */
-  observeCompactionEnd(): void {
+  /** 成功压缩若发生在 provisional settled 之后，必须明确裁决 continuation 所有权。 */
+  observeCompactionEnd(readHostIdle?: () => boolean | undefined): void {
     if (!this.compactionActive) return;
     this.compactionActive = false;
+    this.compactionGeneration += 1;
+    const generation = this.compactionGeneration;
     this.resumePending = this.compactionAfterSettlement;
     this.compactionAfterSettlement = false;
     this.settlementEpoch += 1;
+    if (!this.resumePending) return;
+    this.pendingResumeGeneration = generation;
+    this.scheduleCompactionResume(() => this.settleCompactionResume(generation, readHostIdle));
+  }
+
+  /** 压缩完成后进入 Pi preflight 的任何输入都证明已有 continuation 获得恢复所有权。 */
+  observeInput(): void {
+    if (!this.resumePending || this.pendingResumeGeneration === undefined || this.resumeDecisionPublished) return;
+    this.continuationInputObserved = true;
   }
 
   /**
@@ -288,6 +334,47 @@ export class ChildReplyCoordinator {
     return this.currentTaskId;
   }
 
+  private settleCompactionResume(
+    generation: number,
+    readHostIdle: (() => boolean | undefined) | undefined,
+  ): void {
+    if (
+      this.terminalFailure
+      || !this.resumePending
+      || this.pendingResumeGeneration !== generation
+      || this.resumeDecisionPublished
+    ) return;
+    if (this.continuationInputObserved || this.runActive) {
+      this.publishCompactionResume(generation, "continuation_pending");
+      return;
+    }
+    let hostIdle: boolean | undefined;
+    try {
+      hostIdle = readHostIdle?.();
+    } catch {
+      hostIdle = undefined;
+    }
+    if (hostIdle === undefined) return;
+    this.publishCompactionResume(generation, hostIdle ? "host_idle" : "continuation_pending");
+  }
+
+  private publishCompactionResume(
+    generation: number,
+    decision: SupervisorCompactionResume["decision"],
+  ): void {
+    const publish = this.port.publishCompactionResume;
+    if (publish === undefined) {
+      this.failFinal();
+      return;
+    }
+    this.resumeDecisionPublished = true;
+    const publication = Promise.resolve(publish.call(this.port, Object.freeze({ generation, decision })));
+    this.resumePublish = publication;
+    void publication.catch(() => {
+      this.failFinal();
+    });
+  }
+
   private createFinal(): ChildFinalEnvelope | undefined {
     const taskId = this.currentTaskId;
     const turnId = this.currentTurnId;
@@ -336,6 +423,8 @@ export class ChildReplyCoordinator {
     this.runActive = false;
     this.currentTaskId = undefined;
     this.currentTurnId = undefined;
+    this.pendingResumeGeneration = undefined;
+    this.resumePending = false;
     this.candidate = undefined;
     this.notifyFinalFailure();
   }

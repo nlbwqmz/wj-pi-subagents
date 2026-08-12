@@ -38,6 +38,7 @@ class ReadyRpcClient {
   getStderr() {}
   prompt() {}
   steer() {}
+  send() {}
   abort() {}
   getState() {}
   waitForIdle() {}
@@ -225,6 +226,23 @@ test("RpcClient 缺失监督方法时拒绝激活", async () => {
   }
 });
 
+test("RpcClient 缺失原子 prompt sender 时拒绝激活", async () => {
+  class RpcClientWithoutSend extends ReadyRpcClient {}
+  Object.defineProperty(RpcClientWithoutSend.prototype, "send", { value: undefined });
+  const result = await checkHostCapabilities({
+    extensionApi: readyApi(),
+    ...readyOverrides({
+      loadPiModule: async () => ({ VERSION: MIN_PI_VERSION, RpcClient: RpcClientWithoutSend }),
+    }),
+  });
+
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.diagnostic.reason, "host_api_unavailable");
+    assert.ok(result.diagnostic.missingApi?.includes("RpcClient.send"));
+  }
+});
+
 test("缺失 EventBus 方法时拒绝激活", async () => {
   const api = readyApi();
   api.events = { emit: () => {} };
@@ -405,11 +423,11 @@ test("扩展 factory 探针期间保持 reload lease，成功时交接、失败�
   let cleanupCalls = 0;
   const common = {
     timeoutMs: 20,
-    activationIdentity: { isChild: false, protocolVersion: "pi-subagent/6" } as const,
+    activationIdentity: { isChild: false, protocolVersion: "pi-subagent/7" } as const,
     isTransfer: (value: unknown): value is Transfer =>
       typeof value === "object" && value !== null && "runtime" in value,
-    identityOfRuntime: () => ({ isChild: false, protocolVersion: "pi-subagent/6" } as const),
-    identityOfTransfer: () => ({ isChild: false, protocolVersion: "pi-subagent/6" } as const),
+    identityOfRuntime: () => ({ isChild: false, protocolVersion: "pi-subagent/7" } as const),
+    identityOfTransfer: () => ({ isChild: false, protocolVersion: "pi-subagent/7" } as const),
     createTransfer: (current: Runtime): Transfer => ({ runtime: current }),
     restoreTransfer: (transfer: Transfer): Runtime => transfer.runtime,
     setHandoffPending: (current: Runtime, pending: boolean) => {

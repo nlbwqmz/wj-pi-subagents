@@ -165,7 +165,7 @@ test("直接父子旅程闭合 spawn、prompt、steering、wait 和协作式 int
 
   const second = await controller.sendMessage({ agent_id: agentId, message: "补充" });
   assert.deepEqual(second.ok && second.data.accepted, true);
-  assert.deepEqual(node.operations(), ["start", "get_state", "prompt", "steer"]);
+  assert.deepEqual(node.operations(), ["start", "get_state", "prompt", "submit_steer"]);
 
   const invalidImages = await controller.sendMessage({
     agent_id: agentId,
@@ -236,7 +236,7 @@ test("自主 agent_start 后控制器保持 working，并按 steering、wait 和
   const waiting = controller.waitAgents({ agent_ids: [id] });
   const steered = await controller.sendMessage({ agent_id: id, message: "继续整理孙代理结果" });
   assert.equal(steered.ok, true);
-  assert.equal(node.operations().at(-1), "steer");
+  assert.equal(node.operations().at(-1), "submit_steer");
 
   const interrupted = await controller.interruptAgent(id);
   assert.equal(interrupted.ok, true);

@@ -7,6 +7,7 @@ import type {
 import type {
   SupervisorControlRequest,
   SupervisorControlResponse,
+  SupervisorCompactionResume,
   SupervisorEvent,
   SupervisorReply,
   SupervisorReplyInput,
@@ -112,7 +113,7 @@ export interface FakeRpcClientOptions {
   readonly state?: unknown;
 }
 
-export type FakeRpcControlledOperation = "prompt" | "steer" | "abort" | "get_state";
+export type FakeRpcControlledOperation = "prompt" | "steer" | "submit_steer" | "abort" | "get_state";
 
 export interface FakeRpcCommandGate {
   readonly started: Promise<void>;
@@ -181,6 +182,11 @@ export class FakeRpcClient implements RpcSupervisorClient {
   async steer(_message: string): Promise<void> {
     this.record("steer");
     await this.waitForGate("steer");
+  }
+
+  async submitSteer(_message: string): Promise<void> {
+    this.record("submit_steer");
+    await this.waitForGate("submit_steer");
   }
 
   async abort(): Promise<void> {
@@ -323,6 +329,10 @@ export interface RpcSupervisorChannel {
   onTaskStarted?(listener: (started: SupervisorTaskStarted) => void): () => void;
   /** child 发布实际启动的 task/turn 身份；必须先于该 turn 的 reply。 */
   publishTaskStarted?(started: SupervisorTaskStarted): Promise<void>;
+  /** parent 端观察 child 对当前 compaction generation 的恢复裁决。 */
+  onCompactionResume?(listener: (resume: SupervisorCompactionResume) => void): () => void;
+  /** child 发布恢复裁决；真正流式通道会等待 transport ACK。 */
+  publishCompactionResume?(resume: SupervisorCompactionResume): Promise<void>;
   /** 父端在 reload 后重新尝试注入已接收但尚未确认的回复。 */
   retryPendingReplies?(): Promise<void>;
   establishTerminationBarrier(): void;
@@ -551,7 +561,7 @@ export class RpcSupervisor {
   private unsubscribeChannelEvent: (() => void) | undefined;
   private unsubscribeChannelSnapshot: (() => void) | undefined;
   private unsubscribeTaskStarted: (() => void) | undefined;
-  private compactionResumeTimer: ReturnType<typeof setTimeout> | undefined;
+  private unsubscribeCompactionResume: (() => void) | undefined;
   private finalQuarantineTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly commandQueue: QueuedCommand[] = [];
   private activeCommand: QueuedCommand | undefined;
@@ -691,7 +701,6 @@ export class RpcSupervisor {
       this.lifecycleState === "working" ||
       this.lifecycleState === "interrupting";
     this.cancelFinalQuarantine();
-    this.cancelCompactionResumeTimer();
     this.applyLifecycle({ type: "termination_requested" });
     this.phase = "terminating";
     this.channel?.establishTerminationBarrier();
@@ -888,6 +897,19 @@ export class RpcSupervisor {
         this.receiveTaskStarted(started);
       });
     }
+    const onCompactionResume = channel.onCompactionResume;
+    if (typeof onCompactionResume === "function") {
+      this.unsubscribeCompactionResume = onCompactionResume.call(channel, (resume) => {
+        this.receiveCompactionResume(resume);
+      });
+    }
+  }
+
+  private receiveCompactionResume(resume: SupervisorCompactionResume): void {
+    if (this.phase !== "ready") return;
+    const observation = this.mailbox.observeCompactionResume(resume.generation, resume.decision);
+    this.commitTaskProjection();
+    if (observation === "accepted") this.drainCommandQueue();
   }
 
   private receiveTaskStarted(started: SupervisorTaskStarted): void {
@@ -909,16 +931,16 @@ export class RpcSupervisor {
     switch (event.type) {
       case "agent_start":
         this.cancelFinalQuarantine();
-        this.cancelCompactionResumeTimer();
         this.mailbox.observeAgentStart();
         this.commitTaskProjection();
+        // 压缩期间接纳的消息必须等恢复 run 先建立，再作为 steering 进入该 run。
+        this.drainCommandQueue();
         return;
       case "agent_settled":
         this.observeProvisionalSettlement();
         return;
       case "compaction_start":
         this.cancelFinalQuarantine();
-        this.cancelCompactionResumeTimer();
         this.mailbox.observeCompactionStart();
         this.commitTaskProjection();
         return;
@@ -932,9 +954,11 @@ export class RpcSupervisor {
           this.failRuntime("invalid_rpc_event");
           return;
         }
-        const requiresResume = this.mailbox.observeCompactionEnd(event.failed);
+        this.mailbox.observeCompactionEnd(event.failed);
         this.commitTaskProjection();
-        if (!event.failed && requiresResume) this.scheduleCompactionResumeCheck();
+        // compaction_resume 可能经监督流先到；结束事件重新驱动一次，由 mailbox
+        // generation 栅栏决定是否已经具备安全投递条件。
+        if (!event.failed) this.drainCommandQueue();
         return;
       case "queue_update":
         if (!Number.isSafeInteger(event.pendingMessageCount) || (event.pendingMessageCount as number) < 0) {
@@ -1085,7 +1109,6 @@ export class RpcSupervisor {
     this.applyLifecycle({ type: "runtime_failed", error_code: "internal_error" });
     this.phase = "failed";
     this.cancelFinalQuarantine();
-    this.cancelCompactionResumeTimer();
     this.activeTools.clear();
     this.activeToolCounts.clear();
     while (this.commandQueue.length > 0) {
@@ -1142,11 +1165,11 @@ export class RpcSupervisor {
       await publishAssignment.call(channel, {
         message_id: delivery.message_id,
         task_id: delivery.task_id,
-        mode: delivery.mode,
+        mode: delivery.submission === "adaptive_steer" ? "adaptive_steer" : delivery.mode,
       });
       if (!this.mailbox.isDeliveryActive(delivery.delivery_id)) return;
-      if (delivery.mode === "prompt") await this.commandClient().prompt(delivery.message);
-      else await this.commandClient().steer(delivery.message);
+      if (delivery.submission === "prompt") await this.commandClient().prompt(delivery.message);
+      else await this.commandClient().submitSteer(delivery.message);
       this.mailbox.hostAccepted(delivery.delivery_id);
       this.commitTaskProjection();
     } catch {
@@ -1212,24 +1235,10 @@ export class RpcSupervisor {
     }
   }
 
-  private scheduleCompactionResumeCheck(): void {
-    this.cancelCompactionResumeTimer();
-    this.compactionResumeTimer = setTimeout(() => {
-      this.compactionResumeTimer = undefined;
-      if (this.mailbox.observeResumeTimeout()) this.commitTaskProjection();
-    }, 25);
-  }
-
   private cancelFinalQuarantine(): void {
     if (this.finalQuarantineTimer === undefined) return;
     clearTimeout(this.finalQuarantineTimer);
     this.finalQuarantineTimer = undefined;
-  }
-
-  private cancelCompactionResumeTimer(): void {
-    if (this.compactionResumeTimer === undefined) return;
-    clearTimeout(this.compactionResumeTimer);
-    this.compactionResumeTimer = undefined;
   }
 
   private cancelQueuedCommands(): void {
@@ -1512,13 +1521,13 @@ export class RpcSupervisor {
 
   private unsubscribeDependencies(): void {
     this.cancelFinalQuarantine();
-    this.cancelCompactionResumeTimer();
     this.unsubscribeRpcEvent?.();
     this.unsubscribeRpcFault?.();
     this.unsubscribeChannelFault?.();
     this.unsubscribeChannelEvent?.();
     this.unsubscribeChannelSnapshot?.();
     this.unsubscribeTaskStarted?.();
+    this.unsubscribeCompactionResume?.();
     this.channelBindingCleanup?.();
     this.unsubscribeRpcEvent = undefined;
     this.unsubscribeRpcFault = undefined;
@@ -1526,6 +1535,7 @@ export class RpcSupervisor {
     this.unsubscribeChannelEvent = undefined;
     this.unsubscribeChannelSnapshot = undefined;
     this.unsubscribeTaskStarted = undefined;
+    this.unsubscribeCompactionResume = undefined;
     this.channelBindingCleanup = undefined;
   }
 }

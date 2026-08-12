@@ -2,7 +2,7 @@
 
 Status: accepted
 
-> 当前监督协议已经由 [ADR-0006](./0006-multi-target-wait-batches.md) 破坏性升级为 `pi-subagent/6`，reply envelope 升为第 4 版。下文的 v5/v3 版本号保留为本 ADR 作出时的历史记录。
+> 当前监督协议已经由 [ADR-0007](./0007-generation-scoped-compaction-resume.md) 破坏性升级为 `pi-subagent/7`；reply envelope 仍为第 4 版。下文的 v5/v3 版本号保留为本 ADR 作出时的历史记录。
 
 Pi 任务 RPC、父子监督流和第三方 mid-run 压缩会以不同顺序报告 prompt、`agent_start`、raw `agent_settled`、自动重试、压缩与 reply；第三方压缩又不能提供可预先获取的 maintenance lease。监督协议因此破坏性升级为 `pi-subagent/5`，reply envelope 升级为第 3 版：每个节点使用单写者任务 mailbox 线性化消息接纳、中断、宿主交付、生命周期、reply 和 ACK；稳定 `task_id` 与单次 Pi loop 的 `turn_id` 分离，父端先发布并确认 `task_assignment`，child 每次实际 loop 先发布有序 `task_started`，之后才允许该 turn 的 reply。
 

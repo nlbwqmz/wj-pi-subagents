@@ -117,6 +117,18 @@ test("task assignment 与 task_started 在同一累计 ACK 顺序域传递 UUIDv
   }
   pair.flush();
 
+  pair.parent.send(pair.parent.publishTaskAssignment({
+    message_id: "msg_650e8400-e29b-41d4-a716-446655440006",
+    task_id: TASK_ID,
+    mode: "adaptive_steer",
+  }));
+  const adaptive = pair.parent.deliverNext();
+  assert.equal(adaptive?.kind, "accepted");
+  if (adaptive?.kind === "accepted") {
+    assert.equal(adaptive.task_assignment?.mode, "adaptive_steer");
+  }
+  pair.flush();
+
   pair.child.send(pair.child.publishTaskStarted({ task_id: TASK_ID, turn_id: TURN_ID }));
   const started = pair.child.deliverNext();
   assert.equal(started?.kind, "accepted");
@@ -132,9 +144,33 @@ test("task assignment 与 task_started 在同一累计 ACK 顺序域传递 UUIDv
   }), "invalid_frame");
 });
 
+test("compaction_resume 只允许 child 发布正 generation 与闭集 decision", () => {
+  const pair = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+  });
+  handshake(pair);
+
+  pair.child.send(pair.child.publishCompactionResume({ generation: 1, decision: "host_idle" }));
+  const result = pair.child.deliverNext();
+  assert.equal(result?.kind, "accepted");
+  if (result?.kind === "accepted") {
+    assert.deepEqual(result.compaction_resume, { generation: 1, decision: "host_idle" });
+  }
+  pair.flush();
+
+  assertProtocolError(() => pair.parent.publishCompactionResume({ generation: 1, decision: "host_idle" }), "closed");
+  assertProtocolError(() => pair.child.publishCompactionResume({ generation: 0, decision: "host_idle" }), "invalid_frame");
+  assertProtocolError(() => pair.child.publishCompactionResume({
+    generation: 2,
+    decision: "unknown" as never,
+  }), "invalid_frame");
+});
+
 test("长度边界 UTF-8 JSON 可处理分块与拼接帧，拒绝截断/损坏载荷", () => {
   const frame: SupervisorFrame = {
-    protocol: "pi-subagent/6",
+    protocol: "pi-subagent/7",
     kind: "event",
     stream_id: "stream_test",
     sender_agent_id: CHILD_ID,
@@ -469,7 +505,7 @@ test("工作中 message 为 final 预留窗口槽位，二者按同一 reply_seq
   assert.equal(pair.child.getPublicState().pending_reply_count, 0);
 });
 
-test("原始 v6 reply 必须携带合法 envelope，且 message/final 都拒绝图片字段", () => {
+test("原始 v7 reply 必须携带合法 envelope，且 message/final 都拒绝图片字段", () => {
   const missingEnvelope = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,
     childAgentId: CHILD_ID,

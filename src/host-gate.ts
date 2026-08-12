@@ -181,6 +181,7 @@ const REQUIRED_RPC_CLIENT_METHODS = [
   "getStderr",
   "prompt",
   "steer",
+  "send",
   "abort",
   "getState",
   "waitForIdle",
