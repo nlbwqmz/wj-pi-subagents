@@ -139,6 +139,10 @@ class RuntimeLinkedNode extends FakeManagedRpcNode {
     await this.channel?.publishReply(reply);
   }
 
+  async publishTaskStarted(taskId: string, turnId: string): Promise<void> {
+    await this.channel?.publishTaskStarted({ task_id: taskId, turn_id: turnId });
+  }
+
   pendingReplyCount(): number {
     return this.channel?.getPublicState().pending_reply_count ?? 0;
   }
@@ -594,12 +598,15 @@ test("child bootstrap 严格要求完整临时监督字段并区分根直接子�
   );
 });
 
-test("child runtime 在压缩后发布 generation-scoped resume 事实", async () => {
-  const cwd = "C:\\workspace\\compaction-resume-runtime";
+test("child runtime 按真实 threshold 压缩顺序保留候选并只在最终 settled 后发布", async () => {
+  const cwd = "C:\\workspace\\child-threshold-compaction";
   const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
   const localCredential = `local_${"l".repeat(32)}`;
   const supervisorCredential = `supervisor_${"s".repeat(32)}`;
-  const listener = await transportAdapter.listen({ agentId: AGENT_ID, credential: localCredential });
+  const listener = await transportAdapter.listen({
+    agentId: AGENT_ID,
+    credential: localCredential,
+  });
   const api = new FakeExtensionApi();
   const activate = createPiSubagentRuntimeActivator({
     environment: childBootstrapEnvironment({
@@ -607,6 +614,7 @@ test("child runtime 在压缩后发布 generation-scoped resume 事实", async (
       [RUNTIME_EPHEMERAL_ENV_KEYS.localSupervisorCredential]: localCredential,
       [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorCredential]: supervisorCredential,
     }),
+    agentIdFactory: () => DESCENDANT_ID,
     localSupervisorTransportAdapter: transportAdapter,
     templateFileSystem: templateFileSystem(cwd),
   });
@@ -618,12 +626,10 @@ test("child runtime 在压缩后发布 generation-scoped resume 事实", async (
     processTreeAdapter: {} as never,
   });
   const context = extensionContext(cwd);
-  let idle = true;
-  context.isIdle = () => idle;
   const sessionStart = api.emit("session_start", { type: "session_start", reason: "startup" }, context);
   const transport = await listener.waitForConnection();
-  const facts: unknown[] = [];
-  const starts: unknown[] = [];
+  const delivered: ChildReplyEnvelope[] = [];
+  const started: Array<{ readonly task_id: string; readonly turn_id: string }> = [];
   const parentChannel = new StreamSupervisorChannel({
     role: "parent",
     rootId: "root-bootstrap",
@@ -634,38 +640,131 @@ test("child runtime 在压缩后发布 generation-scoped resume 事实", async (
     credential: supervisorCredential,
     requestIdRegistry: new SupervisorRequestIdRegistry(),
     transport,
-    onReply: () => true,
+    onReply: (reply) => {
+      delivered.push(reply.envelope);
+      return true;
+    },
   });
-  parentChannel.onCompactionResume((resume) => facts.push(resume));
-  parentChannel.onTaskStarted((started) => starts.push(started));
+  parentChannel.onTaskStarted((event) => started.push(event));
   const bindingAbort = new AbortController();
   await parentChannel.bind(bindingAbort.signal);
   await Promise.all([parentChannel.waitForReady(bindingAbort.signal), sessionStart]);
 
   await api.emit("agent_start", { type: "agent_start" }, context);
+  await api.emit("message_end", {
+    type: "message_end",
+    message: {
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: "阈值压缩前的安全最终候选" }],
+    },
+  }, context);
   await api.emit("agent_end", { type: "agent_end" }, context);
-  await api.emit("agent_settled", { type: "agent_settled" }, context);
-  await api.emit("session_before_compact", { type: "session_before_compact" }, context);
-  await api.emit("session_compact", { type: "session_compact" }, context);
-  await new Promise<void>((resolve) => setImmediate(() => setImmediate(resolve)));
+  await api.emit("session_before_compact", {
+    type: "session_before_compact",
+    reason: "threshold",
+    willRetry: false,
+  }, context);
+  await api.emit("session_compact", {
+    type: "session_compact",
+    reason: "threshold",
+    willRetry: false,
+  }, context);
   await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.deepEqual(facts, [{ generation: 1, decision: "host_idle" }]);
+  assert.equal(started.length, 1);
+  assert.equal(delivered.length, 0);
 
-  idle = false;
-  await api.emit("agent_start", { type: "agent_start" }, context);
-  await api.emit("agent_end", { type: "agent_end" }, context);
   await api.emit("agent_settled", { type: "agent_settled" }, context);
-  await api.emit("session_before_compact", { type: "session_before_compact" }, context);
-  await api.emit("session_compact", { type: "session_compact" }, context);
-  await api.emit("input", { type: "input", source: "extension", streamingBehavior: "steer" }, context);
-  await api.emit("agent_start", { type: "agent_start" }, context);
-  await new Promise<void>((resolve) => setImmediate(() => setImmediate(resolve)));
   await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.deepEqual(facts, [
-    { generation: 1, decision: "host_idle" },
-    { generation: 2, decision: "continuation_pending" },
-  ]);
-  assert.equal(starts.length, 3);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0]?.kind, "final");
+  if (delivered[0]?.kind === "final") {
+    assert.equal(delivered[0].task_id, started[0]?.task_id);
+    assert.equal(delivered[0].turn_id, started[0]?.turn_id);
+    assert.equal(delivered[0].text, "阈值压缩前的安全最终候选");
+  }
+
+  await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
+  await parentChannel.release();
+  await listener.close();
+});
+
+test("managed child 收到 manual 压缩事件时关闭监督通道且不发布 replacement final", async () => {
+  const cwd = "C:\\workspace\\child-manual-compaction-fault";
+  const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
+  const localCredential = `local_${"l".repeat(32)}`;
+  const supervisorCredential = `supervisor_${"s".repeat(32)}`;
+  const listener = await transportAdapter.listen({
+    agentId: AGENT_ID,
+    credential: localCredential,
+  });
+  const api = new FakeExtensionApi();
+  const activate = createPiSubagentRuntimeActivator({
+    environment: childBootstrapEnvironment({
+      [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorEndpoint]: listener.endpoint,
+      [RUNTIME_EPHEMERAL_ENV_KEYS.localSupervisorCredential]: localCredential,
+      [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorCredential]: supervisorCredential,
+    }),
+    agentIdFactory: () => DESCENDANT_ID,
+    localSupervisorTransportAdapter: transportAdapter,
+    templateFileSystem: templateFileSystem(cwd),
+  });
+  await activate(api as never, {
+    ok: true,
+    nodeVersion: process.versions.node,
+    piVersion: "0.83.0",
+    platform: "win32",
+    processTreeAdapter: {} as never,
+  });
+  const context = extensionContext(cwd);
+  const sessionStart = api.emit("session_start", { type: "session_start", reason: "startup" }, context);
+  const transport = await listener.waitForConnection();
+  const delivered: ChildReplyEnvelope[] = [];
+  const faults: string[] = [];
+  const parentChannel = new StreamSupervisorChannel({
+    role: "parent",
+    rootId: "root-bootstrap",
+    localAgentId: null,
+    peerAgentId: AGENT_ID,
+    parentAgentId: null,
+    depth: 1,
+    credential: supervisorCredential,
+    requestIdRegistry: new SupervisorRequestIdRegistry(),
+    transport,
+    onReply: (reply) => {
+      delivered.push(reply.envelope);
+      return true;
+    },
+  });
+  parentChannel.onFault((fault) => faults.push(fault));
+  const bindingAbort = new AbortController();
+  await parentChannel.bind(bindingAbort.signal);
+  await Promise.all([parentChannel.waitForReady(bindingAbort.signal), sessionStart]);
+
+  await api.emit("agent_start", { type: "agent_start" }, context);
+  await api.emit("message_end", {
+    type: "message_end",
+    message: {
+      role: "assistant",
+      stopReason: "aborted",
+      content: [{ type: "text", text: "不得转换为人工压缩 replacement final" }],
+    },
+  }, context);
+  await api.emit("agent_end", { type: "agent_end" }, context);
+  await api.emit("session_before_compact", {
+    type: "session_before_compact",
+    reason: "manual",
+    willRetry: false,
+  }, context);
+  await api.emit("agent_settled", { type: "agent_settled" }, context);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(parentChannel.isReady(), false);
+  assert.equal(await parentChannel.waitForClose(Date.now() + 100), "released");
+  assert.deepEqual(faults, ["eof"]);
+  assert.deepEqual(delivered, []);
 
   await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
   await parentChannel.release();
@@ -884,12 +983,15 @@ test("生产运行时闭合直接父子的创建、消息、回复、等待、�
   assert.equal(typeof firstMessage.details?.message_id, "string");
   assert.equal(typeof firstMessage.details?.task_id, "string");
 
+  const firstTaskId = String(firstMessage.details?.task_id);
+  node.emitEvent({ type: "agent_start" });
+  await node.publishTaskStarted(firstTaskId, TURN_1);
   node.emitEvent({ type: "agent_settled" });
   const directReply = finalReply(
     AGENT_ID,
     "直接回复",
     TURN_1,
-    String(firstMessage.details?.task_id),
+    firstTaskId,
   );
   await node.publishReply(directReply);
   await new Promise<void>((resolve) => setImmediate(resolve));
@@ -933,10 +1035,12 @@ test("生产运行时闭合直接父子的创建、消息、回复、等待、�
   assert.equal(waited.details?.outcome, "task_completed");
   assert.equal(waited.details?.state, "idle");
 
-  await execute(api, "send_message", {
+  const secondMessage = await execute(api, "send_message", {
     agent_id: AGENT_ID,
     message: "第二段任务",
-  }, context);
+  }, context) as { details?: Record<string, unknown> };
+  node.emitEvent({ type: "agent_start" });
+  await node.publishTaskStarted(String(secondMessage.details?.task_id), TURN_2);
   const interrupted = await execute(api, "interrupt_agent", { agent_id: AGENT_ID }, context) as {
     details?: Record<string, unknown>;
   };
@@ -1495,20 +1599,24 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   }
   assert.equal(preparedParentFinal, true);
   rootApi.sendMessageBlocked = false;
+
+  // RPC agent_settled 只会在所有 Pi extension handler 返回后出现。
+  assert.equal(parentSettlementFinished, false);
+  releaseFollowingSettle();
+  followingSettleDelay = undefined;
+  await parentSettlement;
   parentNode.emitEvent({ type: "agent_settled" });
   await rootController.retryPendingReplies();
+  await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(rootApi.sentMessages.length, 3);
   const delayedParentFinal = readSentReply(rootApi.sentMessages[2]!);
   assert.equal(delayedParentFinal.kind, "final");
   if (delayedParentFinal.kind === "final") assert.equal(delayedParentFinal.text, "中间代理旧轮结果");
 
-  // 本扩展之后的第三方 settled handler 仍未返回，但成功路径已经尝试放行。
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(parentSettlementFinished, false);
   grandchildNode.emitEvent({ type: "agent_settled" });
   await childController.retryPendingReplies();
+  await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
   await leafSettlement;
 
@@ -1530,33 +1638,13 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   });
   assert.deepEqual(childApi.sentMessages[0]!.options, { triggerTurn: true, deliverAs: "steer" });
 
-  // fake Pi 不会因 sendMessage 自动启动 loop，这里按生产事件顺序公开重叠新轮。
-  parentNode.setStreaming(true);
+  // 父端接纳旧轮 final 后释放 trigger；fake Pi 不会因 sendMessage 自动启动 loop，
+  // 因而显式发布 successor loop 的真实 start 事实。
   await childApi.emit("agent_start", { type: "agent_start" }, childContext);
   parentNode.emitEvent({ type: "agent_start" });
-  let parentStatus = rootController.getAgentStatus(parentId);
+  const parentStatus = rootController.getAgentStatus(parentId);
   assert.equal(parentStatus.ok, true);
   if (parentStatus.ok) assert.equal(parentStatus.data.state, "working");
-
-  releaseFollowingSettle();
-  followingSettleDelay = undefined;
-  await parentSettlement;
-  // 新 loop 已 streaming 后到达的重复/迟到 settle 必须被宿主状态复核压住。
-  parentNode.emitEvent({ type: "agent_settled" });
-  let reconciledStreaming = false;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    parentStatus = rootController.getAgentStatus(parentId);
-    if (
-      parentStatus.ok
-      && parentStatus.data.state === "working"
-      && parentStatus.data.activity?.phase === "processing"
-    ) {
-      reconciledStreaming = true;
-      break;
-    }
-    await new Promise<void>((resolve) => setTimeout(resolve, 1));
-  }
-  assert.equal(reconciledStreaming, true);
 
   const queuedProgress = await execute(rootApi, "wait_agent", {
     agent_ids: [parentId],
@@ -1574,7 +1662,7 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   });
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(waitFinished, false);
-  const steerObserved = parentNode.waitForNextOperation("submit_steer");
+  const steerObserved = parentNode.waitForNextOperation("steer");
   const steered = await execute(rootApi, "send_message", {
     agent_id: parentId,
     message: "继续整理叶节点结果",
@@ -1711,6 +1799,8 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
     message: "交接任务",
   }, oldContext) as { details?: Record<string, unknown> };
   const assignedTaskId = String(assigned.details?.task_id);
+  firstNode.emitEvent({ type: "agent_start" });
+  await firstNode.publishTaskStarted(assignedTaskId, TURN_1);
 
   await oldApi.emit("session_shutdown", { type: "session_shutdown", reason: "reload" }, oldContext);
   oldApi.invalidate();
@@ -1798,12 +1888,15 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
     agent_id: firstId,
     message: "交接后任务",
   }, newContext) as { details?: Record<string, unknown> };
+  const secondTaskId = String(secondAssignment.details?.task_id);
+  firstNode.emitEvent({ type: "agent_start" });
+  await firstNode.publishTaskStarted(secondTaskId, TURN_2);
   firstNode.emitEvent({ type: "agent_settled" });
   await firstNode.publishReply(finalReply(
     firstId,
     "交接后的回复",
     TURN_2,
-    String(secondAssignment.details?.task_id),
+    secondTaskId,
     COMMIT_2,
   ));
   await new Promise<void>((resolve) => setImmediate(resolve));

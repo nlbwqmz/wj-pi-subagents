@@ -20,7 +20,7 @@ export type ManagedRpcReply = ChildReplyEnvelope;
 
 export type ManagedRpcTransportFault = "eof" | "protocol_fault" | "process_exit";
 
-export const MANAGED_RPC_BRIDGE_PROTOCOL = "pi-subagent/managed-rpc/2" as const;
+export const MANAGED_RPC_BRIDGE_PROTOCOL = "pi-subagent/managed-rpc/3" as const;
 /** 只用于节点启动事务的一次性本地认证，不进入公开控制面。 */
 export const MANAGED_RPC_BRIDGE_CREDENTIAL_ENV = "PI_SUBAGENT_MANAGED_RPC_CREDENTIAL" as const;
 /** 外层桥接 JSON 正文的硬边界。 */
@@ -62,8 +62,6 @@ export interface ManagedRpcBridge {
   start(signal?: AbortSignal, context?: ManagedRpcNodeStartContext): Promise<void>;
   prompt(message: string): Promise<void>;
   steer(message: string): Promise<void>;
-  /** 原子地在 streaming 时 steer、idle 时启动 prompt。 */
-  submitSteer(message: string): Promise<void>;
   abort(): Promise<void>;
   getState(): Promise<unknown>;
   requestClose(signal: AbortSignal): Promise<void>;
@@ -165,7 +163,6 @@ export interface ManagedRpcNodeLike {
   start(signal?: AbortSignal, context?: ManagedRpcNodeStartContext): Promise<void>;
   prompt(message: string): Promise<void>;
   steer(message: string): Promise<void>;
-  submitSteer(message: string): Promise<void>;
   abort(): Promise<void>;
   getState(): Promise<unknown>;
   onEvent(listener: (event: unknown) => void): () => void;
@@ -245,10 +242,6 @@ export class ManagedRpcNode implements ManagedRpcNodeLike {
 
   async steer(message: string): Promise<void> {
     return this.requireBridge().steer(message);
-  }
-
-  async submitSteer(message: string): Promise<void> {
-    return this.requireBridge().submitSteer(message);
   }
 
   async abort(): Promise<void> {
@@ -629,10 +622,6 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
     await this.request("steer", { message });
   }
 
-  async submitSteer(message: string): Promise<void> {
-    await this.request("submit_steer", { message });
-  }
-
   async abort(): Promise<void> {
     await this.request("abort", undefined);
   }
@@ -933,7 +922,6 @@ const BRIDGE_COMMAND_NAMES = new Set([
   "start",
   "prompt",
   "steer",
-  "submit_steer",
   "abort",
   "get_state",
   "close",
@@ -948,8 +936,10 @@ function isSafeBridgeEvent(value: unknown): boolean {
   switch (value.type) {
     case "agent_start":
     case "agent_settled":
-    case "compaction_start":
       return Object.keys(value).length === 1;
+    case "compaction_start":
+      return (value.reason === "manual" || value.reason === "threshold" || value.reason === "overflow")
+        && Object.keys(value).every((key) => key === "type" || key === "reason");
     case "compaction_end":
       return (value.reason === "manual" || value.reason === "threshold" || value.reason === "overflow")
         && typeof value.aborted === "boolean"
@@ -1040,7 +1030,6 @@ export class FakeManagedRpcNode implements ManagedRpcNodeLike {
 
   async prompt(): Promise<void> { this.record("prompt"); }
   async steer(): Promise<void> { this.record("steer"); }
-  async submitSteer(): Promise<void> { this.record("submit_steer"); }
   async abort(): Promise<void> { this.record("abort"); }
   async getState(): Promise<unknown> {
     this.record("get_state");

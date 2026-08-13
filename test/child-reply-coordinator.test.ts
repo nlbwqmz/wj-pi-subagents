@@ -64,16 +64,6 @@ class TaskStartedBarrierPort implements ChildReplyPort {
   }
 }
 
-class CompactionResumePort implements ChildReplyPort {
-  readonly resumes: Array<{ readonly generation: number; readonly decision: "continuation_pending" | "host_idle" }> = [];
-
-  async publishReplyAndWaitForAck(): Promise<void> {}
-
-  async publishCompactionResume(resume: { readonly generation: number; readonly decision: "continuation_pending" | "host_idle" }): Promise<void> {
-    this.resumes.push(resume);
-  }
-}
-
 class RejectingPort implements ChildReplyPort {
   calls = 0;
 
@@ -164,65 +154,69 @@ test("Pi 自动重试在 settled 前启动新轮时沿用同一逻辑任务", as
   ]);
 });
 
-test("压缩恢复跨两阶段屏障裁决 continuation，并按成功压缩单调提交 generation", async () => {
-  const scheduled: Array<() => void> = [];
-  const port = new CompactionResumePort();
-  const turns = [TURN_1, TURN_2];
-  const value = new ChildReplyCoordinator({
-    agentId: AGENT_ID,
-    port,
-    turnIdFactory: () => turns.shift()!,
-    taskIdFactory: () => TASK_1,
-    commitIdFactory: () => COMMIT_1,
-    scheduleCompactionResume: (callback) => scheduled.push(callback),
+test("threshold 压缩按真实顺序保留 assistant 候选并只在最终 settled 后发布", async () => {
+  const port = new RecordingPort();
+  const value = coordinator(port);
+  value.observeAgentStart();
+  value.observeAssistantMessageEnd({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: "阈值压缩前已完成" }],
+    },
   });
-
-  value.observeAgentStart();
   value.observeAgentEnd();
-  value.settle();
-  value.observeCompactionStart();
-  value.observeCompactionEnd(() => true);
-  assert.equal(scheduled.length, 1);
-  value.observeInput();
-  value.observeAgentStart();
-  scheduled.shift()?.();
+  value.observeCompactionStart("threshold", false);
+  value.observeCompactionEnd("threshold");
   await nextTask();
-  assert.deepEqual(port.resumes, [{ generation: 1, decision: "continuation_pending" }]);
+  assert.deepEqual(port.replies, []);
 
-  value.observeAgentEnd();
   value.settle();
-  value.observeCompactionStart();
-  // 一次未产生 session_compact 的失败前置，不得消耗 generation。
-  value.observeCompactionStart();
-  value.observeCompactionEnd(() => true);
-  scheduled.shift()?.();
   await nextTask();
-  assert.deepEqual(port.resumes, [
-    { generation: 1, decision: "continuation_pending" },
-    { generation: 2, decision: "host_idle" },
-  ]);
+  assert.deepEqual(port.replies, [finalEnvelope("阈值压缩前已完成")]);
+  port.acknowledgeAll();
 });
 
-test("压缩恢复缺少明确 idle 事实时不猜测 host_idle", async () => {
-  const scheduled: Array<() => void> = [];
-  const port = new CompactionResumePort();
-  const value = new ChildReplyCoordinator({
-    agentId: AGENT_ID,
-    port,
-    turnIdFactory: () => TURN_1,
-    taskIdFactory: () => TASK_1,
-    commitIdFactory: () => COMMIT_1,
-    scheduleCompactionResume: (callback) => scheduled.push(callback),
+test("overflow willRetry 撤销旧候选并等待下一真实 turn", async () => {
+  const port = new RecordingPort();
+  const value = coordinator(port);
+  value.observeAgentStart();
+  value.observeAssistantMessageEnd({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      stopReason: "length",
+      content: [{ type: "text", text: "不得提交的溢出候选" }],
+    },
   });
+  value.observeAgentEnd();
+  value.observeCompactionStart("overflow", true);
+  value.observeCompactionEnd("overflow");
+  value.settle();
+  await nextTask();
+  assert.deepEqual(port.replies, []);
 
   value.observeAgentStart();
+  await nextTask();
+  assert.deepEqual(port.replies, []);
+
+  value.observeAssistantMessageEnd({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: "重试后的结果" }],
+    },
+  });
   value.observeAgentEnd();
   value.settle();
-  value.observeCompactionStart();
-  value.observeCompactionEnd(() => undefined);
-  scheduled.shift()?.();
   await nextTask();
-  assert.deepEqual(port.resumes, []);
+  assert.deepEqual(port.replies, [{
+    ...finalEnvelope("重试后的结果"),
+    turn_id: TURN_2,
+  }]);
+  port.acknowledgeAll();
 });
 
 test("task_started 获 transport ACK 前同一 turn 的业务 reply 不得越过身份事实", async () => {

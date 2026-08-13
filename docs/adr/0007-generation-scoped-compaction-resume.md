@@ -1,6 +1,8 @@
 # 以 generation 恢复事实和原子自适应提交处理压缩续跑
 
-Status: accepted
+Status: superseded by ADR-0008
+
+> [ADR-0008](./0008-native-compaction-lifecycle-and-root-manual-boundary.md) 移除了本文的 generation 恢复事实、`compaction_resume` 和 `adaptive_steer`。本文仅保留为历史决策。
 
 父子监督协议硬切换到 `pi-subagent/7`，managed RPC bridge 硬切换到 `pi-subagent/managed-rpc/2`。child runtime 为每次成功压缩提交单调 generation，并在跨两个事件循环阶段观察其他扩展输入后，通过有 ACK 的 `compaction_resume` 发布 `continuation_pending` 或 `host_idle`；父端只消费当前 generation，前者还必须与实际 `agent_start` 同时成立，后者才授权 mailbox 恢复。缺失、迟到或矛盾事实保持 `suspended`，不再使用固定毫秒窗口猜测 continuation。
 

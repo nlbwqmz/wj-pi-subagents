@@ -162,10 +162,12 @@ test("task assignment 和 task_started 都等待对端 transport ACK 后完成",
   await pair.child.release();
 });
 
-test("compaction_resume 经过严格协议校验并等待父端 transport ACK", async () => {
-  const pair = channelPair();
-  const resumes: unknown[] = [];
-  pair.parent.onCompactionResume((resume) => resumes.push(resume));
+test("同 turn 的后续 final 只推进 ACK，不覆盖首个已接纳 final", async () => {
+  const received: string[] = [];
+  const pair = channelPair((reply) => {
+    if (reply.envelope.kind === "final") received.push(reply.envelope.text ?? "");
+    return true;
+  });
   await pair.parent.bind(new AbortController().signal);
   await pair.child.bind(new AbortController().signal);
   await Promise.all([
@@ -173,12 +175,13 @@ test("compaction_resume 经过严格协议校验并等待父端 transport ACK", 
     pair.child.waitForReady(new AbortController().signal),
   ]);
 
-  await pair.child.publishCompactionResume({ generation: 1, decision: "continuation_pending" });
-  await pair.child.publishCompactionResume({ generation: 2, decision: "host_idle" });
-  assert.deepEqual(resumes, [
-    { generation: 1, decision: "continuation_pending" },
-    { generation: 2, decision: "host_idle" },
-  ]);
+  await pair.child.publishReplyAndWaitForAck(finalReply("首个 final"));
+  await pair.child.publishReplyAndWaitForAck({
+    ...finalReply("不得覆盖"),
+    commit_id: "850e8400-e29b-41d4-a716-446655440001",
+  });
+  assert.deepEqual(received, ["首个 final"]);
+  assert.equal(pair.child.getPublicState().pending_reply_count, 0);
   await pair.parent.release();
   await pair.child.release();
 });

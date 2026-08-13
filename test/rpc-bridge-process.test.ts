@@ -211,14 +211,13 @@ test("bridge 通过首个分片 start 配置长模板，并在 Pi 启动后清�
   assert.equal(state.args.includes(templateBody), false);
   assert.equal(state.args.includes("--append-system-prompt"), true);
 
-  await bridge.submitSteer("压缩后原子恢复");
-  const adaptiveState = await bridge.getState() as {
-    lastWireCommand?: { type?: string; message?: string; streamingBehavior?: string };
+  await bridge.steer("运行中追加");
+  const steerState = await bridge.getState() as {
+    lastCommand?: { type?: string; message?: string };
   };
-  assert.deepEqual(adaptiveState.lastWireCommand, {
-    type: "prompt",
-    message: "压缩后原子恢复",
-    streamingBehavior: "steer",
+  assert.deepEqual(steerState.lastCommand, {
+    type: "steer",
+    message: "运行中追加",
   });
 
   const closeObservation = once(child, "close") as Promise<[number | null, NodeJS.Signals | null]>;
@@ -342,7 +341,6 @@ function bridgeBackedNode(bridge: ManagedRpcBridgeClient): ManagedRpcNodeLike {
     start: (signal?: AbortSignal, startContext?: ManagedRpcNodeStartContext) => bridge.start(signal, startContext),
     prompt: (message: string) => bridge.prompt(message),
     steer: (message: string) => bridge.steer(message),
-    submitSteer: (message: string) => bridge.submitSteer(message),
     abort: () => bridge.abort(),
     getState: () => bridge.getState(),
     onEvent: (listener: (event: unknown) => void) => bridge.onEvent(listener),

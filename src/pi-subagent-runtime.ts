@@ -117,7 +117,6 @@ interface RuntimeContextView extends AgentTreeUiContext {
   readonly modelRegistry?: unknown;
   readonly scopedModels?: unknown;
   readonly isProjectTrusted?: unknown;
-  readonly isIdle?: unknown;
 }
 
 interface RuntimeSessionStartEvent {
@@ -524,16 +523,6 @@ function applyAgentToolVisibility(
   }
 }
 
-function runtimeContextIdleFact(context: RuntimeContextView): boolean | undefined {
-  if (typeof context.isIdle !== "function") return undefined;
-  try {
-    const value = context.isIdle();
-    return typeof value === "boolean" ? value : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 function splitModelReference(value: string | undefined): readonly [string, string] | undefined {
   if (value === undefined) return undefined;
   const separator = value.indexOf("/");
@@ -744,28 +733,41 @@ export function createPiSubagentRuntimeActivator(
     api.on("agent_settled", () => {
       const current = active;
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
-      // raw settled 只建立 child coordinator 的 provisional candidate；绝不能在
-      // handler 内等待父端 ACK，否则第三方 mid-run compact 会被阻塞。
+      // raw settled 只建立 child coordinator 的 provisional candidate；发布和父端
+      // ACK 均由独立 outbox 完成，不阻塞同一 lifecycle 事件上的其他 handler。
       current.replyInbox.blockTurnTriggers();
       current.replyCoordinator?.settle();
     });
 
-    api.on("input", () => {
+    const failChildCompactionInvariant = (current: ActiveRuntime): void => {
+      current.replyInbox.failTurnTriggers();
+      current.upstream?.channel.failProtocol();
+      void current.upstream?.channel.release().catch(() => {});
+    };
+
+    api.on("session_before_compact", (event) => {
       const current = active;
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
-      current.replyCoordinator?.observeInput();
+      const reason = isRecord(event) ? event.reason : undefined;
+      const willRetry = isRecord(event) ? event.willRetry : undefined;
+      if (reason === "manual") {
+        failChildCompactionInvariant(current);
+        return;
+      }
+      if ((reason !== "threshold" && reason !== "overflow") || typeof willRetry !== "boolean") return;
+      current.replyCoordinator?.observeCompactionStart(reason, willRetry);
     });
 
-    api.on("session_before_compact", () => {
+    api.on("session_compact", (event) => {
       const current = active;
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
-      current.replyCoordinator?.observeCompactionStart();
-    });
-
-    api.on("session_compact", (_event, context) => {
-      const current = active;
-      if (current === undefined || !current.isChild || current.handoffPending === true) return;
-      current.replyCoordinator?.observeCompactionEnd(() => runtimeContextIdleFact(readContext(context)));
+      const reason = isRecord(event) ? event.reason : undefined;
+      if (reason === "manual") {
+        failChildCompactionInvariant(current);
+        return;
+      }
+      if (reason !== "threshold" && reason !== "overflow") return;
+      current.replyCoordinator?.observeCompactionEnd(reason);
     });
 
     const makeState = (transfer: RuntimeTransfer, context: RuntimeContextView): ActiveRuntime => {

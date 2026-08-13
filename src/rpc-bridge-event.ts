@@ -1,6 +1,10 @@
 /** 桥接进程允许跨进程公开的 Pi 事件闭集。 */
 export type SafeRpcBridgeEvent =
-  | { readonly type: "agent_start" | "agent_settled" | "compaction_start" }
+  | { readonly type: "agent_start" | "agent_settled" }
+  | {
+      readonly type: "compaction_start";
+      readonly reason: "manual" | "threshold" | "overflow";
+    }
   | { readonly type: "queue_update"; readonly pendingMessageCount: number }
   | {
       readonly type: "compaction_end";
@@ -45,8 +49,12 @@ export function normalizeRpcBridgeEvent(event: unknown): RpcBridgeEventNormaliza
   switch (event.type) {
     case "agent_start":
     case "agent_settled":
-    case "compaction_start":
       return safeEvent(Object.freeze({ type: event.type }));
+    case "compaction_start":
+      if (event.reason !== "manual" && event.reason !== "threshold" && event.reason !== "overflow") {
+        return INVALID_EVENT;
+      }
+      return safeEvent(Object.freeze({ type: "compaction_start", reason: event.reason }));
     case "compaction_end":
       if (
         (event.reason !== "manual" && event.reason !== "threshold" && event.reason !== "overflow")

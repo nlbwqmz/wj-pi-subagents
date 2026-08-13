@@ -25,12 +25,10 @@ export interface AgentHostDelivery {
   readonly task_id: string;
   readonly message: string;
   readonly mode: "prompt" | "steer";
-  readonly submission: "prompt" | "adaptive_steer";
   readonly start_epoch: number;
 }
 
-export type AgentCompactionResumeDecision = "continuation_pending" | "host_idle";
-export type AgentCompactionResumeObservation = "accepted" | "stale" | "conflict";
+export type AgentCompactionReason = "threshold" | "overflow";
 
 export interface AgentTaskProjection {
   readonly state: Extract<AgentLifecycleState, "idle" | "working" | "interrupting" | "suspended">;
@@ -79,16 +77,12 @@ export class AgentTaskMailbox {
   private interruptBarrier = false;
   private settlementObserved = false;
   private compactionActive = false;
-  private compactionRequiresResume = false;
-  private compactionGeneration = 0;
-  private activeCompactionGeneration: number | undefined;
-  private resumeGeneration: number | undefined;
-  private resumeDecision: AgentCompactionResumeDecision | undefined;
-  private resumeFactObserved = false;
-  private resumeStartObserved = false;
-  private resumeResolved = false;
-  private resumeConflict = false;
-  private resumeIdleApproved = false;
+  private awaitingNativeCompactionOutcome = false;
+  private awaitingRetryStart = false;
+  private awaitingPromptStart = false;
+  private deliveryUncertain = false;
+  private maintenanceFailed = false;
+  private readonly staleFinalTurns = new Set<string>();
   private startEpoch = 0;
   private nextDeliveryId = 1;
 
@@ -127,24 +121,15 @@ export class AgentTaskMailbox {
       this.replyOutboxPendingCount = 0;
       task.hostStarted = false;
     }
-    if (this.state === "suspended") this.state = "working";
     this.phase = "reconciling";
-    const adaptiveResume = this.resumeIdleApproved;
     const delivery = Object.freeze({
       delivery_id: this.nextDeliveryId++,
       message_id: entry.messageId,
       task_id: entry.taskId,
       message: entry.message,
       mode: task.hostStarted ? "steer" as const : "prompt" as const,
-      submission: task.hostStarted || adaptiveResume
-        ? "adaptive_steer" as const
-        : "prompt" as const,
       start_epoch: this.startEpoch,
     });
-    if (adaptiveResume) {
-      this.resumeResolved = true;
-      this.resumeIdleApproved = false;
-    }
     this.inFlight = delivery;
     return delivery;
   }
@@ -158,8 +143,34 @@ export class AgentTaskMailbox {
     if (delivery === undefined) return false;
     this.removeMailboxEntry(delivery.message_id);
     const task = this.currentTask;
-    if (task !== undefined && task.taskId === delivery.task_id) task.hostStarted = true;
-    if (delivery.start_epoch === this.startEpoch) this.hostPendingCount += 1;
+    const taskMatches = task?.taskId === delivery.task_id;
+    const startsSinceDelivery = this.startEpoch - delivery.start_epoch;
+    if (
+      !taskMatches
+      || startsSinceDelivery < 0
+      || (delivery.mode === "steer" && (
+        startsSinceDelivery !== 0
+        || !task.hostStarted
+        || this.settlementObserved
+      ))
+      || (delivery.mode === "prompt" && (
+        startsSinceDelivery > 1
+        || this.settlementObserved
+      ))
+    ) {
+      this.markDeliveryUncertain();
+      return true;
+    }
+    if (delivery.mode === "prompt") {
+      // RPC 成功只证明 Pi 接纳了命令。agent_start 可能先于这个响应到达；
+      // 只有尚未观察到真实 start 时才保留 prompt-start 栅栏。
+      this.awaitingPromptStart = !task.hostStarted;
+      this.state = "working";
+      this.phase = this.awaitingPromptStart
+        ? "reconciling"
+        : this.toolCounts.size > 0 ? "executing_tools" : "processing";
+      return true;
+    }
     this.state = "working";
     this.phase = this.toolCounts.size > 0 ? "executing_tools" : "processing";
     return true;
@@ -170,13 +181,11 @@ export class AgentTaskMailbox {
     const delivery = this.claimDelivery(deliveryId);
     if (delivery === undefined) return false;
     this.removeMailboxEntry(delivery.message_id);
-    this.hostPendingCount = Math.max(1, this.hostPendingCount);
-    this.state = "suspended";
-    this.phase = "delivery_uncertain";
+    this.markDeliveryUncertain();
     return true;
   }
 
-  /** child 监督事实把自主/恢复轮次的实际身份与父端占位任务对齐。 */
+  /** child 监督事实把实际轮次身份与父端占位任务对齐。 */
   observeTaskStarted(taskId: string, turnId: string): boolean {
     if (!isCanonicalUuidV4Text(taskId) || !isCanonicalUuidV4Text(turnId)) return false;
     const current = this.currentTask;
@@ -188,6 +197,7 @@ export class AgentTaskMailbox {
         origin: "automatic",
       };
     } else if (current.taskId !== taskId) {
+      if (current.turnId !== undefined) this.rememberStaleFinalTurn(current.turnId);
       const ownsAssignedWork = current.origin === "assigned"
         || this.mailbox.some((entry) => entry.taskId === current.taskId)
         || this.inFlight?.task_id === current.taskId;
@@ -197,15 +207,21 @@ export class AgentTaskMailbox {
       current.hostStarted = true;
     } else {
       if (current.turnId !== undefined && current.turnId !== turnId) {
+        this.rememberStaleFinalTurn(current.turnId);
         this.preparedFinal = undefined;
         this.replyOutboxPendingCount = 0;
       }
       current.turnId = turnId;
       current.hostStarted = true;
     }
-    if (!this.settlementObserved && !this.compactionActive && !this.resumeConflict) {
-      if (this.resumeGeneration !== undefined) this.resumeStartObserved = true;
-      this.applyResumeState();
+    if (
+      !this.settlementObserved
+      && !this.compactionActive
+      && !this.deliveryUncertain
+      && !this.maintenanceFailed
+    ) {
+      if (!this.interruptBarrier) this.state = "working";
+      this.phase = this.toolCounts.size > 0 ? "executing_tools" : "processing";
     }
     return true;
   }
@@ -222,18 +238,46 @@ export class AgentTaskMailbox {
       this.currentTask.hostStarted = true;
     }
     this.compactionActive = false;
-    this.compactionRequiresResume = false;
-    this.activeCompactionGeneration = undefined;
-    if (this.resumeGeneration !== undefined) this.resumeStartObserved = true;
+    this.awaitingNativeCompactionOutcome = false;
+    this.awaitingRetryStart = false;
+    this.awaitingPromptStart = false;
     this.settlementObserved = false;
     this.preparedFinal = undefined;
     this.replyOutboxPendingCount = 0;
-    this.hostPendingCount = Math.max(0, this.hostPendingCount - 1);
-    this.applyResumeState();
+    if (this.deliveryUncertain || this.maintenanceFailed) {
+      this.applySuspendedBarrier();
+      return;
+    }
+    if (!this.interruptBarrier) this.state = "working";
+    this.phase = this.toolCounts.size > 0 ? "executing_tools" : "processing";
   }
 
   /** raw settled 只形成 candidate；没有 final commit 时绝不进入 idle。 */
   observeAgentSettled(): "candidate" | "superseded" {
+    if (this.awaitingRetryStart) {
+      this.settlementObserved = false;
+      this.preparedFinal = undefined;
+      this.replyOutboxPendingCount = 0;
+      if (this.deliveryUncertain || this.maintenanceFailed) this.applySuspendedBarrier();
+      else {
+        if (!this.interruptBarrier) this.state = "working";
+        this.phase = "reconciling";
+      }
+      return "superseded";
+    }
+    this.awaitingNativeCompactionOutcome = false;
+    const promptStartUnconfirmed = this.awaitingPromptStart;
+    this.awaitingPromptStart = false;
+    if (promptStartUnconfirmed) {
+      this.preparedFinal = undefined;
+      this.replyOutboxPendingCount = 0;
+      this.markDeliveryUncertain();
+      return "superseded";
+    }
+    if (this.deliveryUncertain || this.maintenanceFailed) {
+      this.applySuspendedBarrier();
+      return "superseded";
+    }
     if (this.currentTask === undefined) {
       this.currentTask = {
         taskId: this.allocateTaskId(),
@@ -241,8 +285,15 @@ export class AgentTaskMailbox {
         origin: "automatic",
       };
     }
-    this.hostPendingCount = 0;
     this.currentTask.hostStarted = false;
+    if (this.hostPendingCount > 0) {
+      this.settlementObserved = false;
+      this.preparedFinal = undefined;
+      this.replyOutboxPendingCount = 0;
+      this.markDeliveryUncertain();
+      return "superseded";
+    }
+    this.hostPendingCount = 0;
     const hasEarlierMailboxWork = this.mailbox.some((entry) => entry.taskId === this.currentTask?.taskId)
       || this.inFlight?.task_id === this.currentTask.taskId;
     if (hasEarlierMailboxWork) {
@@ -254,127 +305,53 @@ export class AgentTaskMailbox {
     }
     this.settlementObserved = true;
     this.replyOutboxPendingCount = 1;
-    if (this.finalCommitBlocked()) {
-      if (this.resumeBarrierActive()) this.applyResumeState();
-      return "candidate";
-    }
+    if (this.finalCommitBlocked()) return "candidate";
     if (this.state === "idle" || this.state === "suspended") this.state = "working";
     this.phase = this.preparedFinal === undefined ? "finalizing" : "waiting_parent_ack";
     return "candidate";
   }
 
-  observeCompactionStart(): void {
-    // raw 事件和 settled 后的 get_state 对账可能观察到同一次压缩；重复事实
-    // 不得重置 provisional-settlement 恢复要求或重新初始化 generation。
+  /** 子代理只接受 Pi 原生阈值或溢出压缩；逻辑任务身份保持不变。 */
+  observeCompactionStart(_reason: AgentCompactionReason): void {
     if (this.compactionActive) return;
-    this.activeCompactionGeneration = this.compactionGeneration + 1;
-    this.resumeGeneration = undefined;
-    this.resumeDecision = undefined;
-    this.resumeFactObserved = false;
-    this.resumeStartObserved = false;
-    this.resumeResolved = false;
-    this.resumeConflict = false;
-    this.resumeIdleApproved = false;
-    if (this.currentTask === undefined) {
-      this.currentTask = {
-        taskId: this.allocateTaskId(),
-        hostStarted: true,
-        origin: "automatic",
-      };
-    }
-    this.compactionRequiresResume = this.settlementObserved;
     this.compactionActive = true;
-    this.settlementObserved = false;
-    this.preparedFinal = undefined;
-    this.replyOutboxPendingCount = 0;
-    this.state = "working";
-    this.phase = "compacting";
+    this.awaitingNativeCompactionOutcome = false;
+    this.awaitingRetryStart = false;
+    this.awaitingPromptStart = false;
+    if (this.deliveryUncertain || this.maintenanceFailed) {
+      this.applySuspendedBarrier();
+    } else {
+      this.state = "working";
+      this.phase = "compacting";
+    }
   }
 
-  observeCompactionEnd(aborted: boolean): boolean {
-    const generation = this.activeCompactionGeneration;
-    this.activeCompactionGeneration = undefined;
+  /** 原生压缩结束后等待真实 agent_start 或 agent_settled 决定后续投递方式。 */
+  observeCompactionEnd(_reason: AgentCompactionReason, failed: boolean, willRetry = false): void {
     this.compactionActive = false;
-    if (aborted) {
-      this.compactionRequiresResume = false;
-      this.resumeGeneration = undefined;
-      this.resumeDecision = undefined;
-      this.resumeFactObserved = false;
-      this.resumeStartObserved = false;
-      this.resumeResolved = false;
-      this.resumeIdleApproved = false;
-      this.state = "suspended";
-      this.phase = "maintenance_failed";
-      return false;
+    this.awaitingRetryStart = !failed && willRetry;
+    if (failed || willRetry) {
+      this.settlementObserved = false;
+      this.preparedFinal = undefined;
+      this.replyOutboxPendingCount = 0;
     }
-    const requiresResume = this.compactionRequiresResume;
-    this.compactionRequiresResume = false;
-    if (generation !== undefined) this.compactionGeneration = generation;
-    if (!requiresResume || generation === undefined) {
-      if (this.resumeFactObserved) {
-        this.resumeGeneration = generation;
-        this.markResumeConflict();
-        return false;
-      }
-      this.resumeGeneration = undefined;
-      this.resumeDecision = undefined;
-      this.resumeFactObserved = false;
-      this.resumeStartObserved = false;
-      this.resumeResolved = false;
-      this.resumeIdleApproved = false;
-      if (!this.interruptBarrier) this.state = "working";
-      this.phase = this.toolCounts.size > 0 ? "executing_tools" : "processing";
-      return false;
+    if (failed) {
+      this.maintenanceFailed = true;
+      this.applySuspendedBarrier();
+      return;
     }
-    this.resumeGeneration = generation;
-    this.resumeResolved = false;
-    this.resumeIdleApproved = false;
-    this.applyResumeState();
-    return true;
-  }
-
-  /**
-   * 只接受当前压缩代际的 child 裁决。晚到或矛盾事实绝不触发 prompt/steer；
-   * 当前恢复尚未被实际 agent_start 证明时，保持 suspended 以等待人工裁决。
-   */
-  observeCompactionResume(
-    generation: number,
-    decision: AgentCompactionResumeDecision,
-  ): AgentCompactionResumeObservation {
-    if (!Number.isSafeInteger(generation) || generation < 1) return this.markResumeConflict();
-    const expected = this.activeCompactionGeneration ?? this.resumeGeneration;
-    if (expected === undefined || generation !== expected) {
-      if (this.resumeGeneration !== undefined || this.activeCompactionGeneration !== undefined) {
-        return this.markResumeConflict();
-      }
-      return "stale";
+    if (this.currentTask === undefined) {
+      this.state = "idle";
+      this.phase = undefined;
+      return;
     }
-    if (this.resumeFactObserved) {
-      if (this.resumeDecision !== decision) return this.markResumeConflict();
-      return "accepted";
-    }
-    this.resumeDecision = decision;
-    this.resumeFactObserved = true;
-    this.applyResumeState();
-    return "accepted";
-  }
-
-  /** settled 后宿主仍在同一外层 run 时撤销 provisional candidate，不签发新 turn。 */
-  observeHostStillStreaming(pendingMessageCount: number): boolean {
-    if (!Number.isSafeInteger(pendingMessageCount) || pendingMessageCount < 0) return false;
-    this.hostPendingCount = pendingMessageCount;
-    if (!this.settlementObserved) return false;
-    this.settlementObserved = false;
-    this.preparedFinal = undefined;
-    this.replyOutboxPendingCount = 0;
-    if (this.currentTask !== undefined) this.currentTask.hostStarted = true;
-    if (this.resumeBarrierActive()) {
-      this.applyResumeState();
-      return true;
+    this.awaitingNativeCompactionOutcome = true;
+    if (this.deliveryUncertain || this.maintenanceFailed) {
+      this.applySuspendedBarrier();
+      return;
     }
     if (!this.interruptBarrier) this.state = "working";
-    this.phase = this.toolCounts.size > 0 ? "executing_tools" : "processing";
-    return true;
+    this.phase = "reconciling";
   }
 
   reconcileHostPending(pendingMessageCount: number): boolean {
@@ -409,10 +386,7 @@ export class AgentTaskMailbox {
     }
     this.preparedFinal = final;
     this.replyOutboxPendingCount = 1;
-    if (this.finalCommitBlocked()) {
-      if (this.resumeBarrierActive()) this.applyResumeState();
-      return false;
-    }
+    if (this.finalCommitBlocked()) return false;
     if (this.state === "idle") this.state = "working";
     this.phase = this.settlementObserved ? "waiting_parent_ack" : "finalizing";
     return this.canCommitPreparedFinal();
@@ -450,15 +424,11 @@ export class AgentTaskMailbox {
     this.settlementObserved = false;
     this.interruptBarrier = false;
     this.compactionActive = false;
-    this.compactionRequiresResume = false;
-    this.activeCompactionGeneration = undefined;
-    this.resumeGeneration = undefined;
-    this.resumeDecision = undefined;
-    this.resumeFactObserved = false;
-    this.resumeStartObserved = false;
-    this.resumeResolved = false;
-    this.resumeConflict = false;
-    this.resumeIdleApproved = false;
+    this.awaitingNativeCompactionOutcome = false;
+    this.awaitingRetryStart = false;
+    this.awaitingPromptStart = false;
+    this.deliveryUncertain = false;
+    this.maintenanceFailed = false;
     this.hostPendingCount = 0;
     this.replyOutboxPendingCount = 0;
     this.toolCounts.clear();
@@ -532,6 +502,23 @@ export class AgentTaskMailbox {
     return this.preparedFinal?.commit_id;
   }
 
+  hasPendingMessage(messageId: string): boolean {
+    return this.mailbox.some((entry) => entry.messageId === messageId);
+  }
+
+  hasObservedSettlement(): boolean {
+    return this.settlementObserved;
+  }
+
+  isSupersededFinal(final: ChildFinalEnvelope): boolean {
+    return this.staleFinalTurns.has(final.turn_id);
+  }
+
+  /** 已作废 final 只允许完成其传输 ACK；它从不成为任务结果。 */
+  shouldAcknowledgeSupersededFinal(final: ChildFinalEnvelope): boolean {
+    return this.isSupersededFinal(final);
+  }
+
   acceptsReplyTask(taskId: string, turnId?: string): boolean {
     return this.currentTask?.taskId === taskId
       && (turnId === undefined || this.currentTask.turnId === undefined || this.currentTask.turnId === turnId);
@@ -550,75 +537,48 @@ export class AgentTaskMailbox {
   }
 
   private deliveryAllowed(): boolean {
-    if (this.interruptBarrier || this.compactionActive || this.resumeConflict) return false;
-    if (this.resumeGeneration !== undefined && !this.resumeResolved && !this.resumeIdleApproved) return false;
-    if (this.phase === "finalizing" || this.phase === "waiting_parent_ack" || this.phase === "resume_pending") {
-      return false;
-    }
-    if (this.phase === "resume_required" && !this.resumeIdleApproved) return false;
-    return this.state === "working" || this.state === "suspended";
-  }
-
-  private applyResumeState(): void {
-    if (this.compactionActive) return;
-    if (this.resumeConflict) {
-      this.resumeIdleApproved = false;
-      this.state = "suspended";
-      this.phase = "resume_required";
-      return;
-    }
-    if (this.resumeGeneration === undefined || this.resumeResolved) {
-      if (!this.interruptBarrier) this.state = "working";
-      const taskId = this.currentTask?.taskId;
-      const hasMailboxWork = taskId !== undefined && (
-        this.mailbox.some((entry) => entry.taskId === taskId)
-        || this.inFlight?.task_id === taskId
-      );
-      this.phase = this.settlementObserved
-        ? hasMailboxWork
-          ? "reconciling"
-          : this.preparedFinal === undefined ? "finalizing" : "waiting_parent_ack"
-        : this.toolCounts.size > 0 ? "executing_tools" : "processing";
-      return;
-    }
-    if (this.resumeDecision === "host_idle") {
-      if (this.resumeStartObserved) {
-        this.markResumeConflict();
-        return;
-      }
-      this.resumeIdleApproved = true;
-      this.state = "suspended";
-      this.phase = "resume_required";
-      return;
-    }
-    if (this.resumeDecision === "continuation_pending" && this.resumeStartObserved) {
-      this.resumeResolved = true;
-      this.resumeIdleApproved = false;
-      if (!this.interruptBarrier) this.state = "working";
-      this.phase = this.toolCounts.size > 0 ? "executing_tools" : "processing";
-      return;
-    }
-    this.resumeIdleApproved = false;
-    this.state = "suspended";
-    this.phase = this.resumeDecision === "continuation_pending" ? "resume_pending" : "resume_required";
-  }
-
-  private resumeBarrierActive(): boolean {
-    return this.resumeConflict || (this.resumeGeneration !== undefined && !this.resumeResolved);
+    if (
+      this.interruptBarrier
+      || this.compactionActive
+      || this.awaitingNativeCompactionOutcome
+      || this.awaitingPromptStart
+      || this.deliveryUncertain
+      || this.maintenanceFailed
+      || this.state !== "working"
+    ) return false;
+    return this.phase !== "finalizing"
+      && this.phase !== "waiting_parent_ack"
+      && this.phase !== "maintenance_failed"
+      && this.phase !== "delivery_uncertain";
   }
 
   private finalCommitBlocked(): boolean {
-    return this.compactionActive || this.resumeBarrierActive() || this.phase === "maintenance_failed";
+    return this.compactionActive
+      || this.awaitingNativeCompactionOutcome
+      || this.deliveryUncertain
+      || this.maintenanceFailed
+      || this.phase === "maintenance_failed"
+      || this.phase === "delivery_uncertain";
   }
 
-  private markResumeConflict(): AgentCompactionResumeObservation {
-    this.resumeConflict = true;
-    this.resumeIdleApproved = false;
-    if (!this.compactionActive) {
-      this.state = "suspended";
-      this.phase = "resume_required";
+  private markDeliveryUncertain(): void {
+    this.awaitingPromptStart = false;
+    this.deliveryUncertain = true;
+    this.applySuspendedBarrier();
+  }
+
+  private applySuspendedBarrier(): void {
+    this.state = "suspended";
+    this.phase = this.deliveryUncertain ? "delivery_uncertain" : "maintenance_failed";
+  }
+
+  private rememberStaleFinalTurn(turnId: string): void {
+    this.staleFinalTurns.add(turnId);
+    while (this.staleFinalTurns.size > 32) {
+      const oldest = this.staleFinalTurns.values().next().value;
+      if (oldest === undefined) return;
+      this.staleFinalTurns.delete(oldest);
     }
-    return "conflict";
   }
 
   private promoteSuccessorIfPossible(): void {

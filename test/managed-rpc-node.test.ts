@@ -123,9 +123,6 @@ class RecordingBridge implements ManagedRpcBridge {
     this.operations.push("bridge:steer");
   }
 
-  async submitSteer(): Promise<void> {
-    this.operations.push("bridge:submit_steer");
-  }
 
   async abort(): Promise<void> {
     this.operations.push("bridge:abort");
@@ -299,7 +296,7 @@ test("ManagedRpcNode 以单一启动事务绑定 launch 返回的树和桥接，
   assert.deepEqual(observed, [{ type: "agent_settled" }]);
   await node.prompt("hello");
   await node.steer("next");
-  await node.submitSteer("adaptive");
+  await node.steer("steering");
   await node.abort();
   assert.deepEqual(await node.getState(), { isStreaming: false });
   await node.requestGracefulClose(new AbortController().signal);
@@ -313,7 +310,7 @@ test("ManagedRpcNode 以单一启动事务绑定 launch 返回的树和桥接，
     "bridge:start",
     "bridge:prompt",
     "bridge:steer",
-    "bridge:submit_steer",
+    "bridge:steer",
     "bridge:abort",
     "bridge:get_state",
     "bridge:close",
@@ -436,7 +433,7 @@ test("ManagedRpcBridgeClient 使用固定版本与长度边界传递高层命令
 
   await client.start();
   await client.prompt("hello");
-  await client.submitSteer("adaptive");
+  await client.steer("steering");
   assert.deepEqual(await client.getState(), { isStreaming: false });
   parentOutput.write(encodeFrame({ protocol: MANAGED_RPC_BRIDGE_PROTOCOL, kind: "event", event: { type: "agent_start" } }));
   parentOutput.write(encodeFrame({ protocol: MANAGED_RPC_BRIDGE_PROTOCOL, kind: "event", event: { type: "agent_settled" } }));
@@ -444,7 +441,7 @@ test("ManagedRpcBridgeClient 使用固定版本与长度边界传递高层命令
   parentOutput.end();
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.deepEqual(faults, ["eof"]);
-  assert.deepEqual(requests.map((request) => request.command), ["start", "prompt", "submit_steer", "get_state"]);
+  assert.deepEqual(requests.map((request) => request.command), ["start", "prompt", "steer", "get_state"]);
   await client.release();
 });
 

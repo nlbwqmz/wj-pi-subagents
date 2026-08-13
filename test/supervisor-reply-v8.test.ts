@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   CHILD_REPLY_SCHEMA,
   CHILD_REPLY_VERSION,
+  type ChildFinalEnvelope,
   type ChildMessageEnvelope,
 } from "../src/child-reply-envelope.ts";
 import {
@@ -66,19 +67,19 @@ function receiveAndAck(
   return result;
 }
 
-test("v7 reply wire payload contains only reply_seq and envelope", () => {
+test("v8 reply wire payload contains only reply_seq and envelope", () => {
   const pair = readyPair();
   const value = envelope();
   const frame = pair.child.publishReply(value);
-  assert.equal(frame.protocol, "pi-subagent/7");
+  assert.equal(frame.protocol, "pi-subagent/8");
   assert.deepEqual(frame.payload, { reply_seq: 1, envelope: value });
 });
 
-test("v7 rejects v6 frames and reply envelopes with a forged agent identity", () => {
+test("v8 rejects v7 frames and reply envelopes with a forged agent identity", () => {
   const legacyPair = readyPair();
   const valid = legacyPair.child.publishReply(envelope());
-  const v6 = { ...valid, protocol: "pi-subagent/6" } as unknown as SupervisorFrame;
-  assert.deepEqual(legacyPair.parent.receive(v6), {
+  const v7 = { ...valid, protocol: "pi-subagent/7" } as unknown as SupervisorFrame;
+  assert.deepEqual(legacyPair.parent.receive(v7), {
     kind: "protocol_fault",
     error: "protocol_mismatch",
   });
@@ -193,21 +194,25 @@ test("only the first final for a turn is injected while later finals are acknowl
     revision: 1,
   }], 1);
   pair.flush();
-  const firstFinal = {
+  const firstFinal: ChildFinalEnvelope = {
     schema: CHILD_REPLY_SCHEMA,
     version: CHILD_REPLY_VERSION,
-    kind: "final" as const,
+    kind: "final",
     agent_id: CHILD_ID,
     task_id: TASK_ID,
     turn_id: TURN_ID,
     commit_id: COMMIT_ID,
-    run_state: "settled" as const,
-    output_state: "present" as const,
+    run_state: "settled",
+    output_state: "present",
     text: "第一份最终答复",
   };
-  const secondFinal = { ...firstFinal, text: "迟到的最终答复" };
+  const laterFinal: ChildFinalEnvelope = {
+    ...firstFinal,
+    commit_id: "850e8400-e29b-41d4-a716-446655440001",
+    text: "不得覆盖的迟到 final",
+  };
   const firstResult = pair.parent.receive(pair.child.publishReply(firstFinal));
-  const secondResult = pair.parent.receive(pair.child.publishReply(secondFinal));
+  const secondResult = pair.parent.receive(pair.child.publishReply(laterFinal));
   assert.equal(firstResult.kind, "accepted");
   assert.equal(secondResult.kind, "accepted");
   assert.deepEqual(received, ["第一份最终答复"]);
@@ -227,16 +232,16 @@ test("final turn dedupe remains exact beyond the pending reply window", () => {
       return true;
     },
   });
-  const makeFinal = (turnId: string, text: string) => ({
+  const makeFinal = (turnId: string, text: string, commitId: string): ChildFinalEnvelope => ({
     schema: CHILD_REPLY_SCHEMA,
     version: CHILD_REPLY_VERSION,
-    kind: "final" as const,
+    kind: "final",
     agent_id: CHILD_ID,
     task_id: TASK_ID,
     turn_id: turnId,
-    commit_id: turnId,
-    run_state: "settled" as const,
-    output_state: "present" as const,
+    commit_id: commitId,
+    run_state: "settled",
+    output_state: "present",
     text,
   });
   const turns = [
@@ -245,14 +250,19 @@ test("final turn dedupe remains exact beyond the pending reply window", () => {
     "550e8400-e29b-41d4-a716-446655440003",
   ];
   for (const [index, turnId] of turns.entries()) {
+    const commitId = `750e8400-e29b-41d4-a716-44665544000${index + 1}`;
     assert.equal(
-      receiveAndAck(pair, pair.child.publishReply(makeFinal(turnId, `final-${index + 1}`))).kind,
+      receiveAndAck(pair, pair.child.publishReply(makeFinal(turnId, `final-${index + 1}`, commitId))).kind,
       "accepted",
     );
   }
   const duplicate = receiveAndAck(
     pair,
-    pair.child.publishReply(makeFinal(TURN_ID, "迟到的旧轮次 final")),
+    pair.child.publishReply(makeFinal(
+      TURN_ID,
+      "不得注入的旧 turn final",
+      "750e8400-e29b-41d4-a716-446655440004",
+    )),
   );
   assert.equal(duplicate.kind, "accepted");
   if (duplicate.kind === "accepted") assert.equal(duplicate.replies.length, 0);

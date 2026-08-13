@@ -272,7 +272,7 @@ thinking: medium
 | `idle` | 双通道可通信，且没有当前任务、压缩、恢复、候选 final、未决命令或未确认 reply | 是，建立新任务 | 是 |
 | `working` | 已有当前逻辑任务，可能正在投递、处理、压缩、对账或提交 final | 是，归入当前任务或 mailbox | 是 |
 | `interrupting` | 中断栅栏已生效，等待当前任务形成 interrupted final | 是，但只能分配给后继任务 | 是 |
-| `suspended` | 交付或维护恢复不可确认，需要调用者裁决 | 是，由 mailbox 保守接纳 | 是 |
+| `suspended` | 交付不可确认或维护失败，需要调用者裁决 | 是，由 mailbox 保守接纳但不自动投递 | 是 |
 | `failed` | 终止屏障前发生不可自动恢复的运行或控制故障 | 否 | 是 |
 | `terminating` | 终止屏障已生效，但子树资源未全部确认回收 | 否 | 是 |
 | `terminated` | 本节点和全部后代的终止及资源回收已确认 | 否 | 否 |
@@ -293,17 +293,15 @@ thinking: medium
 | `working`/`interrupting` | raw `agent_settled` | 保持非 idle，进入 `finalizing` | 只建立 provisional candidate |
 | 非终态 | 匹配 final 已 prepare | `finalizing` 或 `waiting_parent_ack` | `reply_outbox_pending_count = 1` |
 | 非终态 | settlement 与父会话接纳均满足，commit 成功 | `idle` 或 `working/reconciling` | 记录 `last_task`；仅全静止时 idle |
-| `working` | 处理中压缩开始/结束 | `working/compacting` 后恢复当前阶段 | 保持同一 `task_id` |
-| provisional settlement | 压缩开始 | 撤销旧 candidate，`resume_pending` | 成功恢复必须出现新 `turn_id` |
-| 活动节点 | Pi command rejection/EOF 后交付不可证明 | `suspended/delivery_uncertain` | 不倒写 mailbox accepted |
-| `resume_pending` | 成功压缩后未观察到恢复 start | `suspended/resume_required` | 不猜测完成 |
-| 压缩活动 | 压缩失败 | `suspended/maintenance_failed` | 不自动重跑 |
+| `working`，已观察 `agent_end` | Pi 原生自动压缩开始/结束 | `working/compacting` 后进入 `working/reconciling` | 保持同一 `task_id`；threshold 可保留候选，overflow `willRetry` 撤销候选；等待真实 start 或 settled |
+| 活动节点 | Pi command rejection/EOF 后交付不可证明 | `suspended/delivery_uncertain` | 不倒写 mailbox accepted；屏障粘性 |
+| 自动压缩活动 | 压缩失败或取消 | `suspended/maintenance_failed` | 不自动重跑；屏障粘性 |
 | 非 `terminated` | 终止屏障被接纳 | `terminating` | 不可逆，固定已登记子树 |
 | 非终态 | 进程、RPC 或协议不可可信恢复 | `failed` | 不自动重启 |
 | `terminating` | 后代及本节点资源均确认 | `terminated` | 父节点后于后代 |
 | `terminated` | 任意迟到事件或重复终止 | `terminated` | 身份不复用 |
 
-进程退出和终止屏障并发时，以同一顺序域中先线性化者决定。终止屏障优先于普通命令、reply、快照和 ACK；迟到事件不得跨越屏障恢复节点。Pi `get_state` 只可用于启动同步、事件缺口后的异常重同步、provisional settlement 的宿主 streaming 复核和诊断，不得覆盖已提交任务结果或恢复公开 `failed`。
+进程退出和终止屏障并发时，以同一顺序域中先线性化者决定。终止屏障优先于普通命令、reply、快照和 ACK；迟到事件不得跨越屏障恢复节点。Pi `get_state` 只可用于启动同步、事件缺口后的异常重同步和诊断，不得参与普通消息投递、压缩 continuation 或 provisional settlement 裁决，也不得覆盖已提交任务结果或恢复公开 `failed`。
 
 ### 6.3 任务、队列、修订与时间
 
@@ -430,7 +428,7 @@ thinking: medium
 }
 ```
 
-`accepted: true` 只证明插件 mailbox 接纳，不表示 Pi 或模型已经读取。assignment 或 Pi command 随后 rejection/EOF 时不得倒写工具结果、不得自动重发，而应将节点投影为 `suspended/delivery_uncertain`；调用者需结合状态和 reply 判断。`failed`、`terminating`、`terminated` 返回 `agent_unavailable`；`suspended` 可继续保守接纳到 mailbox，但不承诺自动恢复。
+`accepted: true` 只证明插件 mailbox 接纳，不表示 Pi 或模型已经读取。assignment 或 Pi command 随后 rejection/EOF 时不得倒写工具结果、不得自动重发，而应将节点投影为粘性的 `suspended/delivery_uncertain`；后续 lifecycle 不得静默清除该屏障，调用者需结合状态和 reply 人工裁决。`failed`、`terminating`、`terminated` 返回 `agent_unavailable`；`suspended` 可继续保守接纳到 mailbox，但不自动投递或恢复。
 
 父会话向下发送的任务消息与子代理向上 reply 是两条独立语义；mailbox accepted、三类队列变化、raw settlement 或 timeout 都不得被误当成已经收到业务结果。
 
@@ -630,7 +628,7 @@ Unix 使用本地 Unix socket，Windows 使用命名管道。上层必须用带�
 
 ```json
 {
-  "protocol": "pi-subagent/6",
+  "protocol": "pi-subagent/8",
   "kind": "hello|hello_ack|event|snapshot_request|snapshot|reply|task_assignment|task_started|control_request|control_response|ack|close",
   "stream_id": "stream_...",
   "sender_agent_id": "550e8400-e29b-41d4-a716-446655440000",
@@ -680,9 +678,11 @@ Unix 使用本地 Unix socket，Windows 使用命名管道。上层必须用带�
 
 final 到达父端后先 prepare。仅当 task/turn 匹配、provisional settlement 可提交、压缩未活动、当前任务 mailbox 已排空且父会话成功接纳 final 时，`commit_id` 才从 prepared 单调推进到 accepted；随后记录 `last_task`、发送 reply ACK 并在真正静止时进入 `idle`。final 先到时监督通道保留并在 settlement 或 `task_started` 后重试；settlement 先到时保持 `working/finalizing`。任一单独事实都不得制造完成。
 
-压缩若在 provisional settlement 后开始，必须撤销旧 candidate/final 并等待同一 `task_id` 的新 `turn_id`；处理中压缩保持当前 task。压缩失败或成功后未观察到必要恢复分别进入 `suspended/maintenance_failed`、`suspended/resume_required`。第三方 settled handler 不得因本扩展等待 final ACK 而阻塞。
+Pi 原生自动压缩发生在 `agent_end` 与最终的单次 `agent_settled` 之间。threshold 压缩可以保留已完成的 assistant candidate；overflow 且 `willRetry:true` 必须撤销旧 candidate，并等待下一次真实 `agent_start` 建立新 turn。压缩结束后只以真实 `agent_start` 或 `agent_settled` 决定 mailbox 使用公开 `steer()` 或 `prompt()`，在两者出现前保持 `working/reconciling`。不得发布 continuation 恢复帧、使用固定延迟、读取状态后再命令或依赖私有 Pi RPC，也不承诺协调第三方压缩扩展的续跑所有权。自动压缩失败进入粘性的 `suspended/maintenance_failed`。
 
-父控制器按 `reply_seq` 接纳并累计 ACK；同 seq 同 envelope 重放幂等，同 seq 不同语义是协议故障。过期 task/turn reply 可确认后隔离，不能再次注入；匹配 final 未满足双条件时不能 ACK。message 以 `triggerTurn: true` 注入并通知所有包含该节点的 waiter，final 注入触发父会话处理；wait/status 不复制正文。
+人工 `/compact` 只属于根会话宿主生命周期，不属于 managed child 的 coordinator、mailbox 或 supervisor。child 只接纳 `threshold` 与 `overflow` 压缩原因；child 侧出现 `manual` 压缩事件是协议故障，不创建 successor task、interrupted replacement final 或同 turn 第二个 final。协作式中断产生的 interrupted final 与压缩无关。桥接层仍须严格规范化 Pi 公共压缩原因闭集。
+
+父控制器按 `reply_seq` 接纳并累计 ACK；同 seq 同 envelope 重放幂等，同 seq 不同语义是协议故障。每个 turn 的首个已接纳 final 单调生效，同 turn 后续 final 只推进 ACK，不得再次注入或覆盖结果。过期或已作废 task/turn reply 可确认后隔离，不能再次注入；匹配 final 未满足双条件时不能 ACK。message 以 `triggerTurn: true` 注入并通知所有包含该节点的 waiter，final 注入触发父会话处理；wait/status 不复制正文。
 
 ### 7.5 有界状态与安全
 
@@ -772,14 +772,14 @@ interface ProcessTreeAdapter {
 
 - 启动失败走 `starting -> failed -> terminating -> terminated`；清理不完整时停在 `terminating` 并返回 `termination_incomplete`；
 - 运行期进程退出、一般 RPC EOF、非法事件、身份篡改、序号/快照无法重同步在屏障前进入稳定 `failed`，不自动重启或恢复；
-- 已 mailbox-accepted 消息的 Pi command rejection/EOF 若只影响该次交付证明，进入 `suspended/delivery_uncertain`；压缩恢复不确定进入对应 suspended phase；
+- 已 mailbox-accepted 消息的 Pi command rejection/EOF 若只影响该次交付证明，进入粘性的 `suspended/delivery_uncertain`；原生自动压缩失败进入粘性的 `suspended/maintenance_failed`；child 侧 `manual` 压缩事件属于协议故障；
 - final 构造或 ACK 永久失败使 child reply 协调器进入 terminal failure，并通过监督故障让祖先节点失败关闭，不能伪造 `last_task`；
 - 中间父节点故障时先保留 `failed`，立即对其已登记后代建立防孤儿屏障；故障父节点继续占名额，直到直接父显式终止并确认子树回收；
 - 部分级联失败时已确认节点先 `terminated`，兄弟继续清理，未确认节点和父节点保持 `terminating`；
 - 根退出、`new`、`resume`、`fork` 或 runtime 真正关闭时自动清理全部直接子树；内部期限超期只产生 UI-only 错误并允许根流程退出，不无限阻塞、不提前释放未确认名额；
 - 成功 reload 保留树，reload 激活失败按 REQ-017 清理。
 
-实现必须注入 `FakeRpcClient`、`FakeProcessTreeAdapter` 和 `FakeSupervisorChannel`，用于确定性复现 mailbox submit、assignment/start ACK、prompt/steering、interrupt 栅栏、raw settlement/final commit、压缩恢复、重入出站顺序、孙进程残留、部分回收、重复/断序帧、reload、EOF 和协议损坏。
+实现必须注入 `FakeRpcClient`、`FakeProcessTreeAdapter` 和 `FakeSupervisorChannel`，用于确定性复现 mailbox submit、assignment/start ACK、公开 prompt/steering、prompt-start 屏障、interrupt 栅栏、raw settlement/final commit、threshold 候选保留、overflow 重试候选撤销、child manual 事件拒绝、重入出站顺序、孙进程残留、部分回收、重复/断序帧、reload、EOF 和协议损坏。
 
 ## 9. 可观测性与 UI
 
@@ -866,7 +866,7 @@ Windows 执行两个锁定宿主组合：
 5. 根能只读看整树但不能越级控制 A-1；A 只能看自身子树并直接控制 A-1；revision、三类队列、activity、last_task 和父关系一致。
 6. 创建兄弟节点并行处理，验证不同节点并行、同节点 mailbox 串行。
 7. 中断工作节点，验证 raw settlement 后仍非 idle，匹配 interrupted final commit 后返回 `task_interrupted` 并可复用。
-8. 在 leaf raw settled 后运行第三方 mid-run compact，验证 handler 不被 final ACK 阻塞、同一 task 以新 turn 恢复、旧 turn final 隔离；压缩失败/未恢复投影 suspended。
+8. 覆盖 Pi 原生自动压缩：按 `agent_end -> compaction -> retry start 或单次 settled` 建模；threshold 保留安全候选，overflow `willRetry` 撤销旧候选；只由后续真实 start/settled 选择 steer/prompt，不生成恢复帧；自动压缩失败投影 maintenance_failed，child manual 事件固定为协议故障。
 9. 终止 A，验证 A-1 后代优先、整树资源确认、幂等终止和两类名额释放。
 10. 成功根 `/reload` 后，根和 A 的模板查询立即看到同一新目录；活动 task/mailbox、未确认 reply、递归控制响应和 UI 状态保持，v4 活动树明确拒绝热接管。
 
@@ -880,7 +880,7 @@ Windows 执行两个锁定宿主组合：
 - 启动超时/提前退出、一般 RPC 断开、mailbox accepted 后 Pi command rejection、delivery uncertainty、中断-final 竞态、suspension、屏障后迟到事件、部分级联失败、中间父故障和根关闭；
 - 重复帧、断序、旧 revision、旧/非法 stream、损坏快照、ACK 丢失、reset 快照和回复去重；reply 缺 task/turn/commit、旧 turn final、final 先于 settlement、settlement 先于 final、message/final 混排和 final 槽位预留；
 - receive listener 同步发送 control/reply 的确定性交错，证明协议生成低 seq ACK 先入写队列；同一交错覆盖 Stream 与 Managed RPC；
-- raw settled handler 后的第三方 compact、处理中 compact、settlement 后 compact、失败 compact、恢复 start 缺失及跨实例 reload；证明不修改第三方插件、不阻塞 handler、不误提交旧 final；
+- `agent_end` 后的 threshold/overflow 自动压缩、start/settled 尚未出现、threshold 候选保留、overflow `willRetry` 候选撤销、自动压缩失败、child manual 事件拒绝、同 turn 重复 final 的 ACK 与跨实例 reload；证明不阻塞 handler、不猜测第三方 continuation 所有权、不误提交或覆盖旧 final；
 - assistant 思考、工具前说明、工具调用、参数、结果、错误和中止内容不能泄漏到父会话；重复/stale settlement 不得重复 final commit；
 - 模板目录为空时直接返回 `[]`，无效候选和来源诊断不枚举，非空项字段闭合且不泄露运行配置，模板业务 `tools` 不混入八个管理工具或 `reply_to_parent`；
 - 未信任项目资源不加载、模板不能扩权、叶节点不能绕过管理能力和深度、根不能越级控制；
@@ -934,10 +934,10 @@ Windows 执行两个锁定宿主组合：
 | `AC-017` | 状态和树查询 | 直接状态权限、根/子树裁剪、原子 tree revision、安全字段 |
 | `AC-018` | 公开错误码闭集 | 非法 UUID 与未注册 UUID 分流；每个错误码、retryable 和无副作用；无额外阶段错误码 |
 | `AC-019` | 监督握手和快照 | 身份/版本/凭据、初始快照、subtree replacement、原子根修订 |
-| `AC-020` | v6 seq、ACK、重同步与出站屏障 | assignment/start、reply dedupe、final 槽位、ACK 失败、listener 重入时协议 outbound 优先 |
+| `AC-020` | v8 seq、ACK、重同步与出站屏障 | assignment/start、reply_seq 去重、同 turn 首 final 单调提交、final 槽位、ACK 失败、listener 重入时协议 outbound 优先 |
 | `AC-021` | mailbox 与监督器命令顺序 | 先挂接 OS 树、双通道就绪、接纳/宿主交付分离、终止和中断栅栏、迟到丢弃 |
 | `AC-022` | Windows 原生进程树回收 | Windows Job Object、资源确认和孙进程整树回收；Unix 原生部分延期 |
-| `AC-023` | 父故障、mid-run 压缩、根关闭与 reload | 防孤儿、provisional settlement 撤销、同 task 新 turn、suspension、跨实例保留、失败 reload 清树 |
+| `AC-023` | 父故障、原生压缩、根关闭与 reload | 防孤儿、真实 lifecycle、threshold/overflow 候选规则、child manual 拒绝、粘性 suspension、跨实例保留、失败 reload 清树 |
 | `AC-024` | 常驻 widget | 只显示直接子代理、稳定行字段、activity、三类队列、计时、suspension 和故障码 |
 | `AC-025` | `/agent` 遮罩 | 作用域、折叠/滚动/展开/Esc、finished、修订保持交互状态 |
 | `AC-026` | UI-only 与秘密 canary | 诊断/通知不进上下文，所有公开面不泄露正文和秘密 |

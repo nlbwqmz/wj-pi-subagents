@@ -20,7 +20,7 @@ import {
 } from "./tree-controller.ts";
 
 /** 父子监督通道与 Pi 任务 RPC 完全隔离的固定协议版本。 */
-export const SUPERVISOR_PROTOCOL_VERSION = "pi-subagent/7";
+export const SUPERVISOR_PROTOCOL_VERSION = "pi-subagent/8";
 
 export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "hello",
@@ -31,7 +31,6 @@ export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "reply",
   "task_assignment",
   "task_started",
-  "compaction_resume",
   "control_request",
   "control_response",
   "ack",
@@ -102,7 +101,7 @@ export interface SupervisorSnapshot {
 
 export type SupervisorReplyKind = ChildReplyEnvelope["kind"];
 
-/** v7 wire reply：传输序号与模型可见信封保持明确分层。 */
+/** v8 wire reply：传输序号与模型可见信封保持明确分层。 */
 export interface SupervisorReply {
   readonly reply_seq: number;
   readonly envelope: ChildReplyEnvelope;
@@ -114,22 +113,13 @@ export type SupervisorReplyInput = ChildReplyEnvelope;
 export interface SupervisorTaskAssignment {
   readonly message_id: string;
   readonly task_id: string;
-  readonly mode: "prompt" | "steer" | "adaptive_steer";
+  readonly mode: "prompt" | "steer";
 }
 
-/** child 在每个 Pi loop 开始时上报；自主唤醒与压缩恢复也必须发布。 */
+/** child 在每个 Pi loop 开始时上报；自动重试和 Pi 原生续轮沿用 task_id。 */
 export interface SupervisorTaskStarted {
   readonly task_id: string;
   readonly turn_id: string;
-}
-
-/**
- * child 在压缩后明确裁决恢复所有权。generation 只在当前 child runtime 内单调
- * 递增，父端必须与其正在等待的 compaction generation 精确匹配。
- */
-export interface SupervisorCompactionResume {
-  readonly generation: number;
-  readonly decision: "continuation_pending" | "host_idle";
 }
 
 /** 监督控制正文只允许可复制、可深冻结的纯 JSON 值。 */
@@ -250,8 +240,6 @@ export interface SupervisorReceiveAccepted {
   readonly task_assignment?: SupervisorTaskAssignment;
   /** parent 端收到的 child 任务/turn 身份事实。 */
   readonly task_started?: SupervisorTaskStarted;
-  /** parent 端收到的 child 压缩恢复裁决。 */
-  readonly compaction_resume?: SupervisorCompactionResume;
   /** 仅供本地监督器递交给 TreeController 的脱敏生命周期事实。 */
   readonly event?: SupervisorEvent;
   /** 本次接收原子替换的完整快照；调用方可直接交给树控制器。 */
@@ -947,7 +935,7 @@ function parseTaskAssignment(payload: Record<string, unknown>): SupervisorTaskAs
     || typeof payload.message_id !== "string"
     || !/^msg_[0-9a-f-]{36}$/.test(payload.message_id)
     || !isCanonicalUuidV4(payload.task_id)
-    || (payload.mode !== "prompt" && payload.mode !== "steer" && payload.mode !== "adaptive_steer")
+    || (payload.mode !== "prompt" && payload.mode !== "steer")
   ) frameError("invalid_frame");
   return Object.freeze({
     message_id: payload.message_id,
@@ -965,19 +953,6 @@ function parseTaskStarted(payload: Record<string, unknown>): SupervisorTaskStart
   return Object.freeze({
     task_id: payload.task_id,
     turn_id: payload.turn_id,
-  });
-}
-
-function parseCompactionResume(payload: Record<string, unknown>): SupervisorCompactionResume {
-  if (
-    Object.keys(payload).some((key) => key !== "generation" && key !== "decision")
-    || !Number.isSafeInteger(payload.generation)
-    || (payload.generation as number) < 1
-    || (payload.decision !== "continuation_pending" && payload.decision !== "host_idle")
-  ) frameError("invalid_frame");
-  return Object.freeze({
-    generation: payload.generation as number,
-    decision: payload.decision as SupervisorCompactionResume["decision"],
   });
 }
 
@@ -1189,18 +1164,6 @@ export class SupervisorChannel {
     ) throw new SupervisorProtocolError("closed");
     const parsed = parseTaskStarted(started as unknown as Record<string, unknown>);
     return this.createFrame("task_started", parsed as unknown as Record<string, unknown>);
-  }
-
-  /** child 在 compaction generation 完成后明确声明 continuation 或 idle 恢复所有权。 */
-  publishCompactionResume(resume: SupervisorCompactionResume): SupervisorFrame {
-    if (
-      this.role !== "child"
-      || this.localAgentId === null
-      || this.terminationBarrier
-      || this.state !== "ready"
-    ) throw new SupervisorProtocolError("closed");
-    const parsed = parseCompactionResume(resume as unknown as Record<string, unknown>);
-    return this.createFrame("compaction_resume", parsed as unknown as Record<string, unknown>);
   }
 
   /** child 发布已绑定自身分支的内部控制请求；operation_id 不占用监督 request_id。 */
@@ -1454,7 +1417,6 @@ export class SupervisorChannel {
     let transportAck: number | undefined;
     let taskAssignment: SupervisorTaskAssignment | undefined;
     let taskStarted: SupervisorTaskStarted | undefined;
-    let compactionResume: SupervisorCompactionResume | undefined;
     let event: SupervisorEvent | undefined;
     let controlRequest: SupervisorControlRequest | undefined;
     let controlResponse: SupervisorControlResponse | undefined;
@@ -1489,10 +1451,6 @@ export class SupervisorChannel {
       case "task_started":
         if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
         taskStarted = parseTaskStarted(frame.payload);
-        break;
-      case "compaction_resume":
-        if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
-        compactionResume = parseCompactionResume(frame.payload);
         break;
       case "control_request":
         if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
@@ -1534,7 +1492,6 @@ export class SupervisorChannel {
       ...(transportAck === undefined ? {} : { transport_ack: transportAck }),
       ...(taskAssignment === undefined ? {} : { task_assignment: taskAssignment }),
       ...(taskStarted === undefined ? {} : { task_started: taskStarted }),
-      ...(compactionResume === undefined ? {} : { compaction_resume: compactionResume }),
       ...(event === undefined ? {} : { event }),
       ...(acceptedSnapshot === undefined ? {} : { snapshot: acceptedSnapshot }),
       ...(controlRequest === undefined ? {} : { control_request: controlRequest }),
@@ -1657,12 +1614,13 @@ export class SupervisorChannel {
         }
       }
       // 注入失败时保留当前 reply；传输 ACK 仍可推进，但 reply ACK 必须等待
-      // 当前或 reload 后的新父会话真正接纳正文。
+      // 当前或 reload 后的新父会话真正接纳正文。同一 turn 的后续 final 只作为
+      // 已完成提交的幂等重放处理，不得覆盖首个已接纳 final。
       if (!accepted) break;
       this.bufferedReplies.delete(current.reply_seq);
       if (!duplicateFinal) {
         delivered.push(current);
-        if (current.envelope.kind === "final") this.rememberFinalTurn(current.envelope.turn_id);
+        if (current.envelope.kind === "final") this.acceptedFinalTurns.add(current.envelope.turn_id);
       }
       this.highestReplyAck = current.reply_seq;
       this.nextExpectedReplySeq += 1;
@@ -1673,10 +1631,6 @@ export class SupervisorChannel {
 
   private rememberReplySemantics(replySeq: number, semantics: string): void {
     this.receivedReplyDigests.set(replySeq, semantics);
-  }
-
-  private rememberFinalTurn(turnId: string): void {
-    this.acceptedFinalTurns.add(turnId);
   }
 
   private applyAck(frame: InternalFrame): {

@@ -51,7 +51,7 @@ function node(overrides: Partial<AgentSnapshot> & Pick<AgentSnapshot, "agent_id"
   const normalizedActivity = state === "working" || state === "interrupting"
     ? activity ?? Object.freeze({ phase: "processing" as const })
     : state === "suspended"
-      ? activity ?? Object.freeze({ phase: "resume_required" as const })
+      ? activity ?? Object.freeze({ phase: "maintenance_failed" as const })
       : undefined;
   return Object.freeze({
     agent_id,

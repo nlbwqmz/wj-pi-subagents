@@ -45,6 +45,79 @@ test("任务桥接公开无载荷 agent_start 事实并剥离其余字段", () =
   });
 });
 
+test("桥接严格规范化 Pi 的完整压缩原因闭集，非法原因拒绝", () => {
+  for (const reason of ["manual", "threshold", "overflow"] as const) {
+    assert.deepEqual(normalizeRpcBridgeEvent({
+      type: "compaction_start",
+      reason,
+      privateState: "不得透传",
+    }), {
+      kind: "event",
+      event: { type: "compaction_start", reason },
+    });
+  }
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "compaction_start",
+    reason: "third_party",
+  }), { kind: "invalid" });
+});
+
+test("compaction_end 只公开完成裁决，失败由 aborted 或 errorMessage 推导", () => {
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "compaction_end",
+    reason: "threshold",
+    aborted: false,
+    willRetry: false,
+    result: { summary: "不得透传" },
+  }), {
+    kind: "event",
+    event: {
+      type: "compaction_end",
+      reason: "threshold",
+      aborted: false,
+      willRetry: false,
+      failed: false,
+    },
+  });
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "compaction_end",
+    reason: "overflow",
+    aborted: false,
+    willRetry: false,
+    errorMessage: "TOP_SECRET_PROVIDER_ERROR",
+  }), {
+    kind: "event",
+    event: {
+      type: "compaction_end",
+      reason: "overflow",
+      aborted: false,
+      willRetry: false,
+      failed: true,
+    },
+  });
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "compaction_end",
+    reason: "manual",
+    aborted: true,
+    willRetry: false,
+  }), {
+    kind: "event",
+    event: {
+      type: "compaction_end",
+      reason: "manual",
+      aborted: true,
+      willRetry: false,
+      failed: true,
+    },
+  });
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "compaction_end",
+    reason: "threshold",
+    aborted: "false",
+    willRetry: false,
+  }), { kind: "invalid" });
+});
+
 test("任务桥接忽略全部 message_end，真正 child 回复端点仍拒绝未知内容块", () => {
   assert.deepEqual(normalizeRpcBridgeEvent({ type: "message_update", delta: "忽略" }), {
     kind: "ignored",

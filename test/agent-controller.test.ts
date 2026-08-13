@@ -17,7 +17,7 @@ import {
   type RpcSupervisorStartupResult,
   type RpcSupervisorTerminationResult,
 } from "../src/rpc-supervisor.ts";
-import type { SupervisorEvent } from "../src/supervisor-channel.ts";
+import type { SupervisorEvent, SupervisorTaskStarted } from "../src/supervisor-channel.ts";
 import { ROOT_TREE_ACTOR, TreeController } from "../src/tree-controller.ts";
 
 const TEST_TURN_ID = "91000000-0000-4000-8000-000000000001";
@@ -40,6 +40,7 @@ function interruptedFinal(agentId: string, taskId: string): ChildFinalEnvelope {
 class ReadyChannel implements RpcSupervisorChannel {
   private ready = true;
   private readonly eventListeners = new Set<(event: SupervisorEvent) => void>();
+  private readonly taskStartedListeners = new Set<(event: SupervisorTaskStarted) => void>();
   async bind(): Promise<void> {}
   async waitForReady(): Promise<void> {}
   isReady(): boolean { return this.ready; }
@@ -56,6 +57,13 @@ class ReadyChannel implements RpcSupervisorChannel {
   }
   emitEvent(event: SupervisorEvent): void {
     for (const listener of this.eventListeners) listener(event);
+  }
+  onTaskStarted(listener: (event: SupervisorTaskStarted) => void): () => void {
+    this.taskStartedListeners.add(listener);
+    return () => this.taskStartedListeners.delete(listener);
+  }
+  emitTaskStarted(event: SupervisorTaskStarted): void {
+    for (const listener of this.taskStartedListeners) listener(event);
   }
 }
 
@@ -130,6 +138,7 @@ test("直接父子旅程闭合 spawn、prompt、steering、wait 和协作式 int
   });
   const nodes = new Map<string, FakeManagedRpcNode>();
   let lastNode: FakeManagedRpcNode | undefined;
+  let lastChannel: ReadyChannel | undefined;
   let lastSupervisor: RpcSupervisor | undefined;
   const controller = new AgentController({
     tree,
@@ -137,12 +146,14 @@ test("直接父子旅程闭合 spawn、prompt、steering、wait 和协作式 int
     createSupervisor: ({ actor, reservation }) => {
       const node = new FakeManagedRpcNode();
       lastNode = node;
+      const channel = new ReadyChannel();
+      lastChannel = channel;
       const supervisor = new RpcSupervisor({
         controller: tree,
         actor,
         reservation,
         managedNode: node,
-        channel: new ReadyChannel(),
+        channel,
         startupTimeoutMs: 100,
         gracefulShutdownMs: 10,
       });
@@ -162,10 +173,14 @@ test("直接父子旅程闭合 spawn、prompt、steering、wait 和协作式 int
   const first = await controller.sendMessage({ agent_id: agentId, message: "开始" });
   assert.deepEqual(first.ok && first.data.accepted, true);
   assert.deepEqual(node.operations(), ["start", "get_state", "prompt"]);
+  assert.ok(lastChannel);
+  if (!first.ok) return;
+  node.emitEvent({ type: "agent_start" });
+  lastChannel.emitTaskStarted({ task_id: first.data.task_id, turn_id: TEST_TURN_ID });
 
   const second = await controller.sendMessage({ agent_id: agentId, message: "补充" });
   assert.deepEqual(second.ok && second.data.accepted, true);
-  assert.deepEqual(node.operations(), ["start", "get_state", "prompt", "submit_steer"]);
+  assert.deepEqual(node.operations(), ["start", "get_state", "prompt", "steer"]);
 
   const invalidImages = await controller.sendMessage({
     agent_id: agentId,
@@ -236,7 +251,7 @@ test("自主 agent_start 后控制器保持 working，并按 steering、wait 和
   const waiting = controller.waitAgents({ agent_ids: [id] });
   const steered = await controller.sendMessage({ agent_id: id, message: "继续整理孙代理结果" });
   assert.equal(steered.ok, true);
-  assert.equal(node.operations().at(-1), "submit_steer");
+  assert.equal(node.operations().at(-1), "steer");
 
   const interrupted = await controller.interruptAgent(id);
   assert.equal(interrupted.ok, true);

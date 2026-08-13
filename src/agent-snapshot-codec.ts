@@ -18,11 +18,9 @@ export const AGENT_ACTIVITY_PHASES = Object.freeze([
   "executing_tools",
   "settling",
   "compacting",
-  "resume_pending",
   "reconciling",
   "finalizing",
   "waiting_parent_ack",
-  "resume_required",
   "maintenance_failed",
   "delivery_uncertain",
 ] as const);
@@ -230,7 +228,6 @@ export function parseAgentSnapshot(
       return undefined;
     }
     if (state === "suspended" && activity !== undefined && ![
-      "resume_required",
       "maintenance_failed",
       "delivery_uncertain",
     ].includes(activity.phase)) return undefined;

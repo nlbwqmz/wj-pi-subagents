@@ -31,13 +31,13 @@ _避免使用_：代理网络、对等代理组
 _避免使用_：全局控制台、跨层控制面板
 
 **父子消息**：
-父会话向直接子代理发送的任务通信；消息先由插件接纳到节点 mailbox，同一活动任务内可作为 steering，协作式中断栅栏后的消息则属于后继任务。压缩期间接纳的消息要等当前压缩代际的恢复所有权明确后才可出队；恢复 run 已建立时进入该 run，宿主已空闲时由原子自适应提交恢复同一逻辑任务。
+父会话向直接子代理发送的任务通信；消息先由插件接纳到节点 mailbox，同一活动任务内可作为 steering，协作式中断栅栏后的消息属于后继任务。Pi 原生自动压缩期间接纳的消息只有在后续真实处理轮次开始或宿主真实静止后才可出队，压缩结束本身不证明消息已交付或模型已读取。
 _避免使用_：对等消息、广播消息、Pi 已读取确认、压缩结束即已恢复
 
 每条父子消息由控制器分配一个在根会话生命周期内唯一且不复用的消息标识；调用者不能自定义该标识，它只用于关联控制面事件，不表达消息内容或处理结果。
 
 **逻辑任务**：
-由稳定 `task_id` 标识的一段父子工作所有权；它可跨自动重试续轮、多条 steering、压缩与恢复保持不变，直到匹配的 final 提交或节点进入终态。中断栅栏后的新消息使用后继任务标识，不得并入正在取消的任务。
+由稳定 `task_id` 标识的一段父子工作所有权；它可跨自动重试续轮、多条 steering 和 Pi 原生自动压缩保持不变，直到匹配的 final 提交或节点进入终态。协作式中断栅栏后的新消息使用后继任务标识，不得并入正在结束的任务。
 _避免使用_：单次 prompt、处理轮次、消息标识
 
 **子代理回复**：
@@ -61,7 +61,7 @@ Pi 最终持久化的一条 assistant message 及其中全部直接工具调用�
 _避免使用_：时间窗口批次、供应商原始协议、全局任意回复唤醒
 
 **处理轮次**：
-一次实际 Pi agent loop，由随机 UUID v4 `turn_id` 标识；同一逻辑任务可以因自动重试、自动续轮或压缩恢复包含多个处理轮次，旧轮次 final 不能提交到新轮次。
+一次实际 Pi agent loop，由随机 UUID v4 `turn_id` 标识；同一逻辑任务可以因自动重试、自动续轮或 Pi 原生自动压缩包含多个处理轮次，旧轮次 final 不能提交到新轮次。
 _避免使用_：逻辑任务、会话标识、消息标识
 
 **结构化回复信封**：
@@ -77,7 +77,7 @@ _避免使用_：工作中汇报、重复 final、raw settlement 即完成、说
 _避免使用_：raw settlement、传输 ACK、父会话已看到正文
 
 **收尾唤醒屏障**：
-child runtime 在当前任务收尾时暂缓会触发新模型轮次的后代回复；raw settlement 只建立 candidate 并立即返回，final 在后台 outbox 等待直接父会话 ACK。期间发生压缩或新轮会撤销旧 candidate；真正 final 提交后才放行，无法形成或确认时进入失败态。
+child runtime 在当前任务收尾时暂缓会触发新模型轮次的后代回复；raw settlement 只建立 candidate 并立即返回，final 在后台 outbox 等待直接父会话 ACK。新轮或 `overflow` 且 `willRetry` 的原生自动压缩会撤销旧 candidate；阈值压缩可以保留安全候选。真正 final 提交后才放行，无法形成或确认时进入失败态。
 _避免使用_：settled handler 内等待 ACK、提前放行、失败后自动续跑
 
 **终止通知**：
@@ -113,11 +113,11 @@ _避免使用_：自动重启、孤儿代理、子树静默删除
 _避免使用_：整批原子成功、失败即重启、忽略未回收节点
 
 **生命周期状态**：
-子代理对外可观察的八种阶段：`starting`、严格静止的 `idle`、有当前任务的 `working`、中断栅栏已生效的 `interrupting`、交付或维护恢复不可确认的 `suspended`、控制面故障的 `failed`、资源回收中的 `terminating` 和已确认回收的 `terminated`。顶层状态与任务活动阶段正交；raw settlement、队列变化或 Pi 命令响应都不能单独伪造 `idle`。
+子代理对外可观察的八种阶段：`starting`、严格静止的 `idle`、有当前任务的 `working`、中断栅栏已生效的 `interrupting`、交付不可确认或维护失败的 `suspended`、控制面故障的 `failed`、资源回收中的 `terminating` 和已确认回收的 `terminated`。顶层状态与任务活动阶段正交；raw settlement、队列变化或 Pi 命令响应都不能单独伪造 `idle`。
 _避免使用_：把队列当状态、把 raw settlement 当完成、把 suspended 当终态
 
 **任务活动阶段**：
-活动节点当前等待的安全事实，例如处理、工具执行、压缩、对账、finalizing、父端 ACK、恢复或不确定交付；它不包含 prompt、业务正文、路径、工具参数或结果。
+活动节点当前等待的安全事实，例如处理、工具执行、压缩、对账、finalizing、父端 ACK、维护失败或不确定交付；它不包含 prompt、业务正文、路径、工具参数或结果。
 _避免使用_：生命周期状态、工具日志、任务正文摘要
 
 **任务队列投影**：
@@ -231,7 +231,7 @@ _避免使用_：原始工具结果 JSON、工具日志
 _避免使用_：工具最大集合、工具尽力集合、父工具子集校验
 
 **运行时重载**：
-Pi 在不重建子代理节点的情况下重新加载扩展与动态资源；同一监督主版本内，已认领的控制器、任务 mailbox、未确认 reply 和直接父子所有权继续保留。监督协议主版本变化不是普通重载：`pi-subagent/6` 及更早活动树不能由 v7 运行时接管，更新前必须结束旧树并以同版本端点重建。
+Pi 在不重建子代理节点的情况下重新加载扩展与动态资源；同一监督主版本内，已认领的控制器、任务 mailbox、未确认 reply 和直接父子所有权继续保留。监督协议主版本变化不是普通重载：`pi-subagent/7` 及更早活动树不能由 `/8` 运行时接管，更新前必须结束旧树并以同版本端点重建。
 _避免使用_：重新创建、模板再次准入、向失效父 API 确认回复、跨协议热接管
 
 **显式工具声明**：
@@ -275,19 +275,19 @@ _避免使用_：诊断消息、上下文注入、持久化警告
 _避免使用_：子代理、代理实例
 
 **父子监督通道**：
-每个子控制器与直接父控制器之间独立于 Pi 任务 RPC 的本地双向控制通道；当前主版本为 `pi-subagent/7`。它在一个累计 ACK 顺序域中承载握手、生命周期、子树快照、任务 assignment/start、压缩恢复事实、第四版结构化 reply、逐跳权威请求与关闭通知；业务 reply 不能越过对应 `task_started`，压缩恢复事实必须与当前 generation 匹配，应用回调产生的帧也不能越过协议先生成的 ACK。
+每个子控制器与直接父控制器之间独立于 Pi 任务 RPC 的本地双向控制通道；当前监督主版本为 `pi-subagent/8`，内部受管 bridge 主版本为 `pi-subagent/managed-rpc/3`。它在一个累计 ACK 顺序域中承载握手、生命周期、子树快照、任务 assignment/start、第四版结构化 reply、逐跳权威请求与关闭通知；业务 reply 不能越过对应 `task_started`，应用回调产生的帧也不能越过协议先生成的 ACK。
 _避免使用_：模型消息通道、共享事件总线、Pi 任务 RPC 控制帧、旧协议活动树
 
-**压缩恢复事实**：
-child runtime 针对一次成功压缩的单调 generation 发布的单次监督事实；`continuation_pending` 表示已有 Pi 输入取得恢复所有权，仍要等待实际 `agent_start` 才能放行 mailbox，`host_idle` 表示宿主明确空闲，可由 mailbox 使用原子自适应提交恢复。缺失、迟到或矛盾事实保持 `suspended`，不得用固定毫秒窗口猜测。
-_避免使用_：压缩完成通知、continuation marker、定时恢复、Pi 已读取确认
+**原生压缩边界**：
+Pi 因阈值或上下文溢出执行的原生自动压缩边界；它不转移逻辑任务所有权。压缩后的真实 `agent_start` 证明后续消息可进入当前处理轮次，真实 `agent_settled` 证明宿主已静止；在两者出现前，控制器不猜测 continuation 所有权或投递模式。
+_避免使用_：压缩恢复租约、第三方 continuation marker、定时恢复、状态读取竞态
 
-**原子自适应提交**：
-受管 RPC bridge 向 Pi 提交带 steering 行为的 prompt；Pi 在已有 streaming run 时把正文加入该 run，在宿主 idle 时启动新 run，且同一 RPC 响应是唯一接纳点。监督任务租约使用 `adaptive_steer` 表示这一原子提交意图，不预先声称实际结果一定是 prompt 或 steer。
-_避免使用_：先查询状态再 steer、follow-up、fire-and-forget 输入、固定投递模式
+**根会话人工压缩边界**：
+人工 `/compact` 只属于根 Pi 会话的宿主生命周期，不是 managed child 的任务、mailbox 或 supervisor 事件。child 只处理 `threshold` 与 `overflow` 自动压缩；若 child 侧出现 `manual` 压缩事实，则视为运行时不变量违约，而不是任务中断或 replacement final。
+_避免使用_：child 人工压缩、压缩中断任务、同轮 replacement final
 
 **监督帧闭集**：
-父子监督通道唯一允许的十三类帧：`hello`、`hello_ack`、`event`、`snapshot_request`、`snapshot`、`reply`、`task_assignment`、`task_started`、`compaction_resume`、`control_request`、`control_response`、`ack` 和 `close`；闭集之外的控制语义必须拒绝。
+父子监督通道唯一允许的十二类帧：`hello`、`hello_ack`、`event`、`snapshot_request`、`snapshot`、`reply`、`task_assignment`、`task_started`、`control_request`、`control_response`、`ack` 和 `close`；闭集之外的控制语义必须拒绝。
 _避免使用_：开放事件总线、自定义控制消息、任务 RPC 控制帧
 
 **代理树权威**：
