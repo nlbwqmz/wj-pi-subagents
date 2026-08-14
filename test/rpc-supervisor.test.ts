@@ -8,6 +8,7 @@ import {
   CHILD_REPLY_VERSION,
   type ChildFinalEnvelope,
 } from "../src/child-reply-envelope.ts";
+import { ParentReplyInbox } from "../src/parent-reply-inbox.ts";
 import {
   FakeRpcClient,
   PiRpcClientAdapter,
@@ -387,6 +388,7 @@ class RecordingSupervisorChannel implements RpcSupervisorChannel {
   private readonly compactionResponses: Array<SupervisorCompactionPrepared | SupervisorCompactionCompleted> = [];
   private readonly trace: string[];
   private readonly readyPromise: Promise<void> | undefined;
+  private replyRetryCount = 0;
 
   constructor(
     trace: string[],
@@ -412,6 +414,14 @@ class RecordingSupervisorChannel implements RpcSupervisorChannel {
   async publishReply(reply: SupervisorReplyInput | SupervisorReply): Promise<void> {
     this.trace.push("channel:reply");
     this.replies.push(reply);
+  }
+
+  async retryPendingReplies(): Promise<void> {
+    this.replyRetryCount += 1;
+  }
+
+  pendingReplyRetries(): number {
+    return this.replyRetryCount;
   }
 
   async publishTaskAssignmentAndWaitForAck(assignment: SupervisorTaskAssignment): Promise<void> {
@@ -1182,6 +1192,64 @@ test("prompt、raw settled 与父端 final 接纳按双条件提交后才进入 
   }
 });
 
+test("final 外部注入后本地提交遇到压缩屏障，重试只提交而不重复注入", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "final 两阶段提交" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+  const submission = await supervisor.prompt("完成后触发父会话压缩");
+  assert.equal(submission.ok, true);
+  if (!submission.ok) return;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  rpcClient.emitEvent({ type: "agent_start" });
+  channel.emitTaskStarted({ task_id: submission.task_id, turn_id: TURN_ID });
+  rpcClient.emitEvent({ type: "agent_settled" });
+
+  const sent: unknown[] = [];
+  const inbox = new ParentReplyInbox({
+    readApi: () => ({ sendMessage: (message) => sent.push(message) }),
+    notifyMessage: () => {},
+  });
+  const final = finalEnvelope(submission.task_id);
+  assert.equal(supervisor.acceptChildReply(final, () => {
+    const accepted = inbox.accept(FIRST_AGENT_ID, final);
+    rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
+    return accepted;
+  }), false);
+  assert.equal(sent.length, 1);
+
+  const retriesBeforeEnd = channel.pendingReplyRetries();
+  rpcClient.emitEvent({
+    type: "compaction_end",
+    reason: "manual",
+    aborted: false,
+    willRetry: false,
+    failed: false,
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(channel.pendingReplyRetries(), retriesBeforeEnd + 1);
+  assert.equal(supervisor.acceptChildReply(
+    final,
+    () => inbox.accept(FIRST_AGENT_ID, final),
+  ), true);
+  assert.equal(sent.length, 1);
+  const status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "idle");
+    assert.equal(status.data.last_task?.commit_id, COMMIT_ID);
+  }
+});
+
 test("Pi 命令 rejection 不撤销 mailbox 接纳，并投影为 delivery_uncertain", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
@@ -1226,6 +1294,49 @@ test("Pi 命令 rejection 不撤销 mailbox 接纳，并投影为 delivery_uncer
     assert.equal(status.data.activity?.phase, "delivery_uncertain");
     assert.equal(status.data.reply_outbox_pending_count, 0);
   }
+});
+
+test("Pi 命令 rejection 后由匹配 task_started 对账，且不会重复发送正文", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "交付不确定对账" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+  const promptGate = rpcClient.deferNext("prompt");
+  const submission = await supervisor.prompt("可能已进入 Pi 的任务");
+  assert.equal(submission.ok, true);
+  if (!submission.ok) return;
+  await promptGate.started;
+
+  rpcClient.emitEvent({ type: "agent_start" });
+  promptGate.reject();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  let status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) assert.equal(status.data.state, "suspended");
+
+  channel.emitTaskStarted({ task_id: submission.task_id, turn_id: TURN_ID });
+  status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "working");
+    assert.equal(status.data.activity?.phase, "processing");
+  }
+  assert.equal(rpcClient.operations().filter((operation) => operation === "prompt").length, 1);
+
+  rpcClient.emitEvent({ type: "agent_settled" });
+  assert.equal(supervisor.acceptChildReply(finalEnvelope(submission.task_id), () => true), true);
+  status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) assert.equal(status.data.state, "idle");
 });
 
 test("命令结果与队列释放之间到达 agent_start 后的 rejection 仍保持 delivery_uncertain", async () => {
@@ -1860,6 +1971,59 @@ test("Pi 任务 RPC 只归一化生命周期和安全活动，assistant 回复�
   }
 });
 
+test("轮次边界清理缺失结束事件的 delegating 活动并忽略迟到结束", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "工具活动收敛" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+  });
+  const events: RpcSupervisorEvent[] = [];
+  supervisor.onEvent((event) => events.push(event));
+  assert.equal((await supervisor.start()).ok, true);
+  const submission = await supervisor.prompt("运行子任务");
+  assert.equal(submission.ok, true);
+  if (!submission.ok) return;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  rpcClient.emitEvent({ type: "agent_start" });
+  channel.emitTaskStarted({ task_id: submission.task_id, turn_id: TURN_ID });
+  rpcClient.emitEvent({
+    type: "tool_execution_start",
+    toolCallId: "delegating-call",
+    toolName: "spawn_agent",
+  });
+
+  let status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.activity?.category, "delegating");
+    assert.equal(status.data.activity?.active_count, 1);
+  }
+
+  rpcClient.emitEvent({ type: "agent_end", messages: [], willRetry: false });
+  status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "working");
+    assert.equal(status.data.activity?.phase, "processing");
+    assert.equal(status.data.activity?.category, undefined);
+  }
+
+  rpcClient.emitEvent({
+    type: "tool_execution_end",
+    toolCallId: "delegating-call",
+    toolName: "spawn_agent",
+    isError: false,
+  });
+  assert.deepEqual(events.filter((event) => event.kind === "fault"), []);
+});
+
 test("直接边 prepare 同步安装令牌，并等待旧 RPC、prompt start 与 Pi 队列静止", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
@@ -2218,7 +2382,7 @@ for (const nativeReason of ["threshold", "overflow"] as const) {
   });
 }
 
-test("not_started 在 manual start 前后分别处理授权，重复 manual end 进入故障", async () => {
+test("not_started 在 manual start 前后都允许接管外部生命周期，重复 end 仍进入故障", async () => {
   for (const timing of ["before_start", "after_start"] as const) {
     const tree = createController();
     const rpcClient = new FakeRpcClient();
@@ -2244,16 +2408,13 @@ test("not_started 在 manual start 前后分别处理授权，重复 manual end 
     if (timing === "before_start") {
       channel.emitCompactionComplete(transactionId, "not_started");
       await new Promise<void>((resolve) => setImmediate(resolve));
-      rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
-      const status = tree.getStatus(FIRST_AGENT_ID);
-      assert.equal(status.ok, true);
-      if (status.ok) assert.equal(status.data.state, "failed");
-      continue;
     }
 
     rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
-    channel.emitCompactionComplete(transactionId, "not_started");
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (timing === "after_start") {
+      channel.emitCompactionComplete(transactionId, "not_started");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
     rpcClient.emitEvent({
       type: "compaction_end",
       reason: "manual",
@@ -2318,8 +2479,8 @@ test("监督传输故障释放同一直接边上的全部叠加压缩事务", as
   secondProbe.resolve();
 });
 
-test("非法 Pi 事件、未经协调的 child manual compaction、extension_error 和运行期 EOF 归一化为稳定故障", async () => {
-  for (const scenario of ["invalid_event", "manual_compaction", "extension_error", "eof"] as const) {
+test("非法 Pi 事件、重复 manual compaction、extension_error 和运行期 EOF 归一化为稳定故障", async () => {
+  for (const scenario of ["invalid_event", "duplicate_manual_compaction", "extension_error", "eof"] as const) {
     const tree = createController();
     const rpcClient = new FakeRpcClient();
     const managedNode = new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter());
@@ -2338,7 +2499,8 @@ test("非法 Pi 事件、未经协调的 child manual compaction、extension_err
 
     if (scenario === "invalid_event") {
       rpcClient.emitEvent({ type: "unknown_pi_event", error: "TOP_SECRET_STACK" });
-    } else if (scenario === "manual_compaction") {
+    } else if (scenario === "duplicate_manual_compaction") {
+      rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
       rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
     } else if (scenario === "extension_error") {
       rpcClient.emitEvent({ type: "extension_error", error: "TOP_SECRET_STACK" });

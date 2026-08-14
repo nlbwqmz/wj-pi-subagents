@@ -626,10 +626,12 @@ export class RpcSupervisor {
   private readonly eventListeners = new Set<(event: RpcSupervisorEvent) => void>();
   private readonly activeTools = new Map<string, RpcSupervisorActivityCategory>();
   private readonly activeToolCounts = new Map<RpcSupervisorActivityCategory, number>();
+  private readonly retiredToolCallIds = new Set<string>();
   private readonly coordinatedCompactions = new Map<string, CoordinatedCompactionState>();
   private readonly closedCoordinatedCompactions = new Map<string, boolean>();
   private readonly manualCompactionAuthorizations = new Set<string>();
   private activeManualCompactionTransactionId: string | undefined;
+  private uncoordinatedManualCompactionActive = false;
   private readonly compactionStateWaiters = new Set<CompactionStateWaiter>();
   private compactionStateVersion = 0;
   private terminationPromise: Promise<RpcSupervisorTerminationResult> | undefined;
@@ -1247,6 +1249,24 @@ export class RpcSupervisor {
     return true;
   }
 
+  /** 无协调事务时接管外部 manual 生命周期，避免把合法压缩误判为协议损坏。 */
+  private beginUncoordinatedManualCompaction(): boolean {
+    if (
+      this.activeManualCompactionTransactionId !== undefined
+      || this.uncoordinatedManualCompactionActive
+      || this.manualCompactionAuthorizations.size > 0
+      || this.coordinatedCompactions.size > 0
+    ) return false;
+    this.uncoordinatedManualCompactionActive = true;
+    return true;
+  }
+
+  private completeUncoordinatedManualCompaction(): boolean {
+    if (!this.uncoordinatedManualCompactionActive) return false;
+    this.uncoordinatedManualCompactionActive = false;
+    return true;
+  }
+
   /** 自动压缩撤销全部尚未消费的授权；active manual 独立保留到 compaction_end。 */
   private revokePendingManualCompactionAuthorizations(): void {
     this.manualCompactionAuthorizations.clear();
@@ -1270,18 +1290,30 @@ export class RpcSupervisor {
     }
     switch (event.type) {
       case "agent_start":
+        this.resetToolActivity();
         this.mailbox.observeAgentStart();
         this.commitTaskProjection();
         // 压缩期间接纳的消息必须等后续真实 run 先建立，再作为 steering 进入该 run。
         this.drainCommandQueue();
         return;
+      case "agent_end":
+        // agent_end/agent_settled 都是工具调用已经离开活动集合的轮次边界。
+        // 若 Pi 缺失了单个 tool_execution_end，不能让 delegating 等摘要永久残留。
+        this.resetToolActivity();
+        this.commitTaskProjection();
+        return;
       case "agent_settled":
         this.observeProvisionalSettlement();
         return;
       case "compaction_start": {
+        if (!isCompactionReason(event.reason)) {
+          this.failRuntime("invalid_rpc_event");
+          return;
+        }
         if (
-          !isCompactionReason(event.reason)
-          || (event.reason === "manual" && !this.beginAuthorizedManualCompaction())
+          event.reason === "manual"
+          && !this.beginAuthorizedManualCompaction()
+          && !this.beginUncoordinatedManualCompaction()
         ) {
           this.failRuntime("invalid_rpc_event");
           return;
@@ -1292,9 +1324,14 @@ export class RpcSupervisor {
         return;
       }
       case "compaction_end":
+        if (!isCompactionReason(event.reason)) {
+          this.failRuntime("invalid_rpc_event");
+          return;
+        }
         if (
-          !isCompactionReason(event.reason)
-          || (event.reason === "manual" && !this.completeAuthorizedManualCompaction())
+          (event.reason === "manual"
+            && !this.completeAuthorizedManualCompaction()
+            && !this.completeUncoordinatedManualCompaction())
           || typeof event.aborted !== "boolean"
           || typeof event.willRetry !== "boolean"
           || typeof event.failed !== "boolean"
@@ -1305,6 +1342,7 @@ export class RpcSupervisor {
         this.mailbox.observeCompactionEnd(event.reason, event.failed, event.willRetry);
         this.commitTaskProjection();
         this.drainCommandQueue();
+        void this.retryPendingReplies();
         return;
       case "queue_update":
         if (!Number.isSafeInteger(event.pendingMessageCount) || (event.pendingMessageCount as number) < 0) {
@@ -1423,6 +1461,7 @@ export class RpcSupervisor {
       this.failRuntime("invalid_rpc_event");
       return;
     }
+    this.retiredToolCallIds.delete(event.toolCallId);
     const category = activityCategory(event.toolName);
     this.activeTools.set(event.toolCallId, category);
     const activeCount = (this.activeToolCounts.get(category) ?? 0) + 1;
@@ -1442,6 +1481,7 @@ export class RpcSupervisor {
     }
     const category = this.activeTools.get(event.toolCallId);
     if (category === undefined) {
+      if (this.retiredToolCallIds.has(event.toolCallId)) return;
       this.failRuntime("invalid_rpc_event");
       return;
     }
@@ -1457,6 +1497,23 @@ export class RpcSupervisor {
     }));
   }
 
+  private resetToolActivity(): void {
+    if (this.activeTools.size === 0 && this.activeToolCounts.size === 0) return;
+    for (const toolCallId of this.activeTools.keys()) {
+      this.retiredToolCallIds.add(toolCallId);
+    }
+    while (this.retiredToolCallIds.size > 128) {
+      const oldest = this.retiredToolCallIds.values().next().value;
+      if (oldest === undefined) break;
+      this.retiredToolCallIds.delete(oldest);
+    }
+    for (const category of this.activeToolCounts.keys()) {
+      this.mailbox.observeToolActivity(category, 0);
+    }
+    this.activeTools.clear();
+    this.activeToolCounts.clear();
+  }
+
   private failRuntime(code: RpcSupervisorFaultCode): void {
     if (this.phase !== "ready") return;
     this.applyLifecycle({ type: "runtime_failed", error_code: "internal_error" });
@@ -1464,6 +1521,7 @@ export class RpcSupervisor {
     this.releaseCoordinatedCompactions();
     this.activeTools.clear();
     this.activeToolCounts.clear();
+    this.retiredToolCallIds.clear();
     while (this.commandQueue.length > 0) {
       this.resolveUnavailableCommand(this.commandQueue.shift()!);
     }
@@ -1478,6 +1536,7 @@ export class RpcSupervisor {
     this.closedCoordinatedCompactions.clear();
     this.manualCompactionAuthorizations.clear();
     this.activeManualCompactionTransactionId = undefined;
+    this.uncoordinatedManualCompactionActive = false;
     this.signalCompactionStateChange();
   }
 
@@ -1571,6 +1630,7 @@ export class RpcSupervisor {
   }
 
   private observeProvisionalSettlement(): void {
+    this.resetToolActivity();
     this.mailbox.observeAgentSettled();
     this.commitTaskProjection();
     // Pi 保证 agent_settled 已位于其自动重试、自动压缩和队列续轮之后。

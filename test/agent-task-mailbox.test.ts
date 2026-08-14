@@ -275,6 +275,27 @@ test("automatic compaction failure 与 delivery uncertainty 都不自动重投�
   assert.equal(uncertain.takeNextDelivery(), undefined);
 });
 
+test("delivery uncertainty 只由匹配任务的真实 task_started 收敛", () => {
+  const value = mailbox([TASK_1]);
+  const submission = value.submit("可能已被 Pi 接纳");
+  const delivery = value.takeNextDelivery();
+  assert.ok(delivery);
+  assert.equal(value.hostDeliveryUncertain(delivery!.delivery_id), true);
+  assert.equal(value.projection().state, "suspended");
+
+  assert.equal(value.observeTaskStarted(TASK_2, TURN_1), false);
+  assert.equal(value.projection().state, "suspended");
+  assert.equal(value.observeTaskStarted(submission.task_id, TURN_1), true);
+  assert.deepEqual(value.projection(), {
+    state: "working",
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
+    activity: { phase: "processing", task_id: TASK_1 },
+  });
+  assert.equal(value.takeNextDelivery(), undefined);
+});
+
 test("final 在 settlement 前只能 prepare，父端接纳与 settlement 都满足后才能 commit", () => {
   const value = mailbox([PLACEHOLDER_TASK]);
   value.observeAgentStart();

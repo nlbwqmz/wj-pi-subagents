@@ -723,7 +723,7 @@ test("child runtime 按真实 threshold 压缩顺序保留候选并只在最终 
   await listener.close();
 });
 
-test("managed child 收到未经协调的 manual 压缩事件时关闭监督通道且不发布 replacement final", async () => {
+test("managed child 接管未经协调的 manual 压缩并在结束后发布原任务 final", async () => {
   const cwd = "C:\\workspace\\child-manual-compaction-fault";
   const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
   const localCredential = `local_${"l".repeat(32)}`;
@@ -781,7 +781,7 @@ test("managed child 收到未经协调的 manual 压缩事件时关闭监督通�
     message: {
       role: "assistant",
       stopReason: "aborted",
-      content: [{ type: "text", text: "不得转换为人工压缩 replacement final" }],
+      content: [{ type: "text", text: "外部 manual 压缩后仍应收敛原任务" }],
     },
   }, context);
   await api.emit("agent_end", { type: "agent_end" }, context);
@@ -792,12 +792,25 @@ test("managed child 收到未经协调的 manual 压缩事件时关闭监督通�
   }, context);
   await api.emit("agent_settled", { type: "agent_settled" }, context);
   await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(parentChannel.isReady(), true);
+  assert.equal(delivered.length, 0);
+
+  await api.emit("session_compact", {
+    type: "session_compact",
+    reason: "manual",
+    willRetry: false,
+  }, context);
+  await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
 
-  assert.equal(parentChannel.isReady(), false);
-  assert.equal(await parentChannel.waitForClose(Date.now() + 100), "released");
-  assert.deepEqual(faults, ["eof"]);
-  assert.deepEqual(delivered, []);
+  assert.equal(parentChannel.isReady(), true);
+  assert.deepEqual(faults, []);
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0]?.kind, "final");
+  if (delivered[0]?.kind === "final") {
+    assert.equal(delivered[0].run_state, "interrupted");
+    assert.equal(delivered[0].output_state, "absent");
+  }
 
   await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
   await parentChannel.release();
@@ -938,8 +951,8 @@ for (const nativeReason of ["threshold", "overflow"] as const) {
     await parentChannel.release();
     await listener.close();
 
-    assert.equal(readyAfterManual, false);
-    assert.deepEqual(faultsAfterManual, ["eof"]);
+    assert.equal(readyAfterManual, true);
+    assert.deepEqual(faultsAfterManual, []);
   });
 }
 

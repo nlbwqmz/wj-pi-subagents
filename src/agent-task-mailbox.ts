@@ -83,6 +83,7 @@ export class AgentTaskMailbox {
   private awaitingRetryStart = false;
   private awaitingPromptStart = false;
   private deliveryUncertain = false;
+  private deliveryUncertainTaskId: string | undefined;
   private maintenanceFailed = false;
   private readonly staleFinalTurns = new Set<string>();
   private startEpoch = 0;
@@ -160,7 +161,7 @@ export class AgentTaskMailbox {
         || this.settlementObserved
       ))
     ) {
-      this.markDeliveryUncertain();
+      this.markDeliveryUncertain(delivery.task_id);
       return true;
     }
     if (delivery.mode === "prompt") {
@@ -183,7 +184,7 @@ export class AgentTaskMailbox {
     const delivery = this.claimDelivery(deliveryId);
     if (delivery === undefined) return false;
     this.removeMailboxEntry(delivery.message_id);
-    this.markDeliveryUncertain();
+    this.markDeliveryUncertain(delivery.task_id);
     return true;
   }
 
@@ -191,6 +192,15 @@ export class AgentTaskMailbox {
   observeTaskStarted(taskId: string, turnId: string): boolean {
     if (!isCanonicalUuidV4Text(taskId) || !isCanonicalUuidV4Text(turnId)) return false;
     const current = this.currentTask;
+    const reconcilesUncertainDelivery = this.deliveryUncertain
+      && this.deliveryUncertainTaskId === taskId
+      && current?.taskId === taskId;
+    if (reconcilesUncertainDelivery) {
+      // task_started 是 Pi 已建立该任务轮次的强事实；它允许收敛此前
+      // prompt/steer Promise 拒绝留下的交付不确定屏障，但不会重新发送正文。
+      this.deliveryUncertain = false;
+      this.deliveryUncertainTaskId = undefined;
+    }
     if (current === undefined) {
       this.currentTask = {
         taskId,
@@ -466,6 +476,7 @@ export class AgentTaskMailbox {
     this.awaitingRetryStart = false;
     this.awaitingPromptStart = false;
     this.deliveryUncertain = false;
+    this.deliveryUncertainTaskId = undefined;
     this.maintenanceFailed = false;
     this.hostPendingCount = 0;
     this.replyOutboxPendingCount = 0;
@@ -601,9 +612,10 @@ export class AgentTaskMailbox {
       || this.phase === "delivery_uncertain";
   }
 
-  private markDeliveryUncertain(): void {
+  private markDeliveryUncertain(taskId?: string): void {
     this.awaitingPromptStart = false;
     this.deliveryUncertain = true;
+    this.deliveryUncertainTaskId = taskId ?? this.currentTask?.taskId;
     this.applySuspendedBarrier();
   }
 

@@ -673,6 +673,7 @@ export function createPiSubagentRuntimeActivator(
     let active: ActiveRuntime | undefined;
     let lifecycle: Promise<void> = Promise.resolve();
     let coordinationParticipant: AutoCompactCoordinationParticipant | undefined;
+    let uncoordinatedManualCompactionActive = false;
     let runtimeUi: { readonly runtime: ActiveRuntime; readonly binding: AgentTreeUiBinding } | undefined;
     const bootstrapAtActivation = readChildRuntimeBootstrap(options.environment);
 
@@ -770,6 +771,7 @@ export function createPiSubagentRuntimeActivator(
     api.on("agent_start", () => {
       const current = active;
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
+      coordinationParticipant?.observeAgentStart();
       try {
         current.replyCoordinator?.observeAgentStart();
       } catch (error) {
@@ -819,9 +821,16 @@ export function createPiSubagentRuntimeActivator(
       const reason = isRecord(event) ? event.reason : undefined;
       const willRetry = isRecord(event) ? event.willRetry : undefined;
       if (reason === "manual") {
-        if (!coordinationParticipant?.beginManualCompaction()) {
-          failChildCompactionInvariant(current);
-          return;
+        const coordinated = coordinationParticipant?.beginManualCompaction() === true;
+        if (!coordinated) {
+          const adopted = coordinationParticipant === undefined
+            ? !uncoordinatedManualCompactionActive
+            : coordinationParticipant.beginUncoordinatedManualCompaction();
+          if (!adopted) {
+            failChildCompactionInvariant(current);
+            return;
+          }
+          if (coordinationParticipant === undefined) uncoordinatedManualCompactionActive = true;
         }
         current.replyCoordinator?.observeCompactionStart("manual", false);
         return;
@@ -837,9 +846,16 @@ export function createPiSubagentRuntimeActivator(
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
       const reason = isRecord(event) ? event.reason : undefined;
       if (reason === "manual") {
-        if (!coordinationParticipant?.completeManualCompaction()) {
-          failChildCompactionInvariant(current);
-          return;
+        const coordinated = coordinationParticipant?.completeManualCompaction() === true;
+        if (!coordinated) {
+          const adopted = coordinationParticipant === undefined
+            ? uncoordinatedManualCompactionActive
+            : coordinationParticipant.completeUncoordinatedManualCompaction();
+          if (!adopted) {
+            failChildCompactionInvariant(current);
+            return;
+          }
+          if (coordinationParticipant === undefined) uncoordinatedManualCompactionActive = false;
         }
         current.replyCoordinator?.observeCompactionEnd("manual");
         return;
@@ -962,6 +978,7 @@ export function createPiSubagentRuntimeActivator(
     const closeCoordinationParticipant = async (): Promise<void> => {
       const participant = coordinationParticipant;
       coordinationParticipant = undefined;
+      uncoordinatedManualCompactionActive = false;
       if (participant !== undefined) await participant.close();
     };
     ensureCoordinationParticipant();

@@ -305,6 +305,47 @@ test("子会话只协调本地入口、自己的 reply 边和直接父边", asyn
   await participant.close();
 });
 
+test("协调 manual 失败即使没有 session_compact 也会解除本地压缩屏障", async () => {
+  const bus = new TestEventBus();
+  const replies: unknown[] = [];
+  const replyCoordinator = new ChildReplyCoordinator({
+    agentId: CHILD_ID,
+    port: { publishReplyAndWaitForAck: async (reply) => { replies.push(reply); } },
+    taskIdFactory: () => TASK_ID,
+    turnIdFactory: () => TURN_ID,
+    commitIdFactory: () => COMMIT_ID,
+  });
+  replyCoordinator.observeAgentStart();
+  replyCoordinator.observeAssistantMessageEnd({
+    type: "message_end",
+    message: { role: "assistant", stopReason: "aborted", content: [] },
+  });
+  const value = createRuntime({ replyCoordinator });
+  const participant = new AutoCompactCoordinationParticipant({
+    eventBus: bus,
+    readRuntime: () => value.runtime,
+    participantId: "participant-failed-manual",
+  });
+
+  emitPrepare(bus, "participant-failed-manual", "compact-failed-manual");
+  await settle();
+  assert.equal(participant.beginManualCompaction(), true);
+  replyCoordinator.observeCompactionStart("manual");
+  replyCoordinator.observeAgentEnd();
+  replyCoordinator.settle();
+  await settle();
+  assert.deepEqual(replies, []);
+
+  emitComplete(bus, "participant-failed-manual", "compact-failed-manual", "failed");
+  await settle();
+  await settle();
+  assert.equal(replies.length, 1);
+  assert.equal((replies[0] as { kind?: unknown } | undefined)?.kind, "final");
+  assert.equal(participant.completeManualCompaction(), true);
+  assert.equal(participant.completeManualCompaction(), false);
+  await participant.close();
+});
+
 test("重复 prepare 共用首次等待，重复 complete 重放首次 terminal ACK", async () => {
   const bus = new TestEventBus();
   const upstream = new FakeUpstreamChannel();
@@ -357,6 +398,29 @@ test("重复 prepare 共用首次等待，重复 complete 重放首次 terminal 
     [true, true, true],
   );
   assert.equal(participant.beginManualCompaction(), false);
+  await participant.close();
+});
+
+test("无协调事务时可接管外部 manual 生命周期，并拒绝重入和并发 prepare", async () => {
+  const bus = new TestEventBus();
+  const value = createRuntime();
+  const participant = new AutoCompactCoordinationParticipant({
+    eventBus: bus,
+    readRuntime: () => value.runtime,
+    participantId: "participant-external-manual",
+  });
+
+  assert.equal(participant.beginUncoordinatedManualCompaction(), true);
+  assert.equal(participant.beginUncoordinatedManualCompaction(), false);
+  emitPrepare(bus, "participant-external-manual", "compact-during-external-manual");
+  await settle();
+  assert.equal(acknowledgement(
+    bus,
+    AUTO_COMPACT_COORDINATION_CHANNELS.prepared,
+    "compact-during-external-manual",
+  )?.prepared, false);
+  assert.equal(participant.completeUncoordinatedManualCompaction(), true);
+  assert.equal(participant.completeUncoordinatedManualCompaction(), false);
   await participant.close();
 });
 

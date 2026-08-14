@@ -83,6 +83,8 @@ export class AutoCompactCoordinationParticipant {
   private readonly unsubscribers: Array<() => void> = [];
   private readonly pendingManualCompactionAuthorizations = new Set<string>();
   private activeManualCompactionTransactionId: string | undefined;
+  private completedManualCompactionTransactionId: string | undefined;
+  private uncoordinatedManualCompactionActive = false;
   private completedLocalSuccess:
     | { readonly requestId: string; readonly runtime: AutoCompactCoordinationRuntime }
     | undefined;
@@ -136,6 +138,8 @@ export class AutoCompactCoordinationParticipant {
       this.transactions.clear();
       this.pendingManualCompactionAuthorizations.clear();
       this.activeManualCompactionTransactionId = undefined;
+      this.completedManualCompactionTransactionId = undefined;
+      this.uncoordinatedManualCompactionActive = false;
     })();
     return this.closePromise;
   }
@@ -149,10 +153,17 @@ export class AutoCompactCoordinationParticipant {
     return this.barriers.size > 0;
   }
 
+  /** 新轮开始后不再可能收到上一轮失败压缩的成功 session_compact。 */
+  observeAgentStart(): void {
+    this.completedManualCompactionTransactionId = undefined;
+    this.pruneTransactionHistory();
+  }
+
   /** Pi 的真实 before_compact 消费授权；活动授权独立于消息屏障保留。 */
   beginManualCompaction(): boolean {
     if (
       this.closed
+      || this.completedManualCompactionTransactionId !== undefined
       || this.activeManualCompactionTransactionId !== undefined
       || this.pendingManualCompactionAuthorizations.size !== 1
     ) return false;
@@ -169,11 +180,37 @@ export class AutoCompactCoordinationParticipant {
     this.pruneTransactionHistory();
   }
 
-  /** 只有匹配活动 manual 生命周期的真实 compact end 才撤销已消费授权。 */
+  /** 真实 compact end 或非成功事务的迟到 compact end 都只消费一次。 */
   completeManualCompaction(): boolean {
-    if (this.activeManualCompactionTransactionId === undefined) return false;
-    this.activeManualCompactionTransactionId = undefined;
+    if (this.activeManualCompactionTransactionId !== undefined) {
+      this.activeManualCompactionTransactionId = undefined;
+      this.pruneTransactionHistory();
+      return true;
+    }
+    if (this.completedManualCompactionTransactionId === undefined) return false;
+    this.completedManualCompactionTransactionId = undefined;
     this.pruneTransactionHistory();
+    return true;
+  }
+
+  /** 没有协调事务时接管用户或其他扩展发起的 manual 生命周期。 */
+  beginUncoordinatedManualCompaction(): boolean {
+    if (
+      this.closed
+      || this.completedManualCompactionTransactionId !== undefined
+      || this.activeManualCompactionTransactionId !== undefined
+      || this.uncoordinatedManualCompactionActive
+      || this.pendingManualCompactionAuthorizations.size > 0
+      || this.pending.size > 0
+      || this.barriers.size > 0
+    ) return false;
+    this.uncoordinatedManualCompactionActive = true;
+    return true;
+  }
+
+  completeUncoordinatedManualCompaction(): boolean {
+    if (!this.uncoordinatedManualCompactionActive) return false;
+    this.uncoordinatedManualCompactionActive = false;
     return true;
   }
 
@@ -220,7 +257,12 @@ export class AutoCompactCoordinationParticipant {
   }
 
   private async establishBarrier(requestId: string): Promise<boolean> {
-    if (this.closed || this.barriers.has(requestId) || this.pending.has(requestId)) return false;
+    if (
+      this.closed
+      || this.uncoordinatedManualCompactionActive
+      || this.barriers.has(requestId)
+      || this.pending.has(requestId)
+    ) return false;
     if (this.barriers.size > 0 || this.pending.size > 0) return false;
     const runtime = this.readRuntime();
     if (runtime === undefined || runtime.handoffPending === true) return false;
@@ -320,6 +362,14 @@ export class AutoCompactCoordinationParticipant {
 
     this.barriers.delete(request.requestId);
     const accepted = await this.releaseBarrier(request.requestId, barrier, request.outcome);
+    if (
+      request.outcome !== "succeeded"
+      && this.activeManualCompactionTransactionId === request.requestId
+    ) {
+      this.activeManualCompactionTransactionId = undefined;
+      this.completedManualCompactionTransactionId = request.requestId;
+      barrier.runtime.replyCoordinator?.observeCompactionEnd("manual");
+    }
     record.terminal = { outcome: request.outcome, accepted };
     if (request.outcome === "not_started") {
       this.pendingManualCompactionAuthorizations.delete(request.requestId);
@@ -346,6 +396,7 @@ export class AutoCompactCoordinationParticipant {
           || this.completedLocalSuccess?.requestId === requestId
           || this.pendingManualCompactionAuthorizations.has(requestId)
           || this.activeManualCompactionTransactionId === requestId
+          || this.completedManualCompactionTransactionId === requestId
         ) continue;
         this.transactions.delete(requestId);
         removed = true;

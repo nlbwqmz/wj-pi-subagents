@@ -92,6 +92,7 @@ export class ParentReplyInbox {
   private turnTriggerBlockToken = Symbol("turn-trigger-block");
   private readonly sessionCompactionBarriers = new Set<string>();
   private readonly childCompactionBarriers = new Map<string, Set<string>>();
+  private readonly injectedFinalTurns = new Map<string, string>();
 
   constructor(options: ParentReplyInboxOptions) {
     this.rebind(options);
@@ -159,13 +160,18 @@ export class ParentReplyInbox {
   accept(agentId: string, reply: ManagedRpcReply): boolean {
     const envelope = parseChildReplyEnvelope(reply);
     if (envelope === undefined || envelope.agent_id !== agentId) return false;
+    const content = messageContent(envelope);
+    const finalTurnKey = envelope.kind === "final" ? `${agentId}:${envelope.turn_id}` : undefined;
+    if (finalTurnKey !== undefined) {
+      const injected = this.injectedFinalTurns.get(finalTurnKey);
+      if (injected !== undefined) return injected === content[0]!.text;
+    }
     const triggerTurn = true;
     if (
       this.turnTriggerState !== "open"
       || this.sessionCompactionBarriers.size > 0
       || (this.childCompactionBarriers.get(agentId)?.size ?? 0) > 0
     ) return false;
-    const content = messageContent(envelope);
     const senderName = this.safeReadSenderName(agentId);
     try {
       this.readApi().sendMessage({
@@ -192,6 +198,13 @@ export class ParentReplyInbox {
         this.notifyMessage(agentId);
       } catch {
         // 会话消息已经被接纳，等待观察者失败不能导致重复注入。
+      }
+    } else {
+      this.injectedFinalTurns.set(finalTurnKey!, content[0]!.text);
+      while (this.injectedFinalTurns.size > 128) {
+        const oldest = this.injectedFinalTurns.keys().next().value;
+        if (oldest === undefined) break;
+        this.injectedFinalTurns.delete(oldest);
       }
     }
     return true;
@@ -424,7 +437,7 @@ function safeMessagePadding(value: number, width: number): number {
   return Math.min(value, Math.floor(Math.max(0, width - 1) / 2));
 }
 
-function messageContent(envelope: ChildReplyEnvelope): Array<Record<string, string>> {
+function messageContent(envelope: ChildReplyEnvelope): Array<{ readonly type: string; readonly text: string }> {
   return [{
     type: "text",
     text: encodeChildReplyEnvelope(envelope),

@@ -793,6 +793,21 @@ test("父端 inbox 对所有工作中回复和 final 使用完整唤醒矩阵", 
   });
 });
 
+test("父端 inbox 对已注入 final 的精确重试只确认而不重复触发会话", () => {
+  const sent: unknown[] = [];
+  const inbox = new ParentReplyInbox({
+    readApi: () => ({ sendMessage: (message) => sent.push(message) }),
+    notifyMessage: () => {},
+  });
+  const final = finalEnvelope("只注入一次");
+  const conflicting = finalEnvelope("同 turn 的冲突正文");
+
+  assert.equal(inbox.accept(AGENT_ID, final), true);
+  assert.equal(inbox.accept(AGENT_ID, final), true);
+  assert.equal(inbox.accept(AGENT_ID, conflicting), false);
+  assert.equal(sent.length, 1);
+});
+
 test("单个 child 压缩屏障只冻结目标 child，不污染 sibling 回复", () => {
   const sent: unknown[] = [];
   const inbox = new ParentReplyInbox({
