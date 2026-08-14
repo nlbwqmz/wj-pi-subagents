@@ -11,6 +11,10 @@ import {
   SupervisorChannel,
   SupervisorFrameDecoder,
   type SupervisorChannelOptions,
+  type SupervisorCompactionComplete,
+  type SupervisorCompactionCompleted,
+  type SupervisorCompactionPrepare,
+  type SupervisorCompactionPrepared,
   type SupervisorControlRequest,
   type SupervisorControlResponse,
   type SupervisorEvent,
@@ -51,6 +55,10 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
   private readonly snapshots = new Set<(snapshot: SupervisorSnapshot) => void>();
   private readonly controlRequests = new Set<(request: SupervisorControlRequest) => void>();
   private readonly controlResponses = new Set<(response: SupervisorControlResponse) => void>();
+  private readonly compactionPrepare = new Set<(request: SupervisorCompactionPrepare) => void>();
+  private readonly compactionComplete = new Set<(request: SupervisorCompactionComplete) => void>();
+  private readonly compactionPrepared = new Map<string, ReturnType<typeof createDeferred<boolean>>>();
+  private readonly compactionCompleted = new Map<string, ReturnType<typeof createDeferred<boolean>>>();
   private readonly replies = new Set<(reply: SupervisorReply) => void>();
   private readonly taskStarted = new Set<(started: SupervisorTaskStarted) => void>();
   private readonly transportAcknowledgements = new Map<number, ReturnType<typeof createDeferred<void>>>();
@@ -205,6 +213,7 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
     this.unsubscribeTransport();
     for (const waiter of this.transportAcknowledgements.values()) waiter.reject(new Error("监督通道已关闭"));
     this.transportAcknowledgements.clear();
+    this.rejectCompactionWaiters("监督通道已关闭");
     this.closed.resolve();
   }
 
@@ -239,6 +248,46 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
   onControlResponse(listener: (response: SupervisorControlResponse) => void): () => void {
     this.controlResponses.add(listener);
     return () => this.controlResponses.delete(listener);
+  }
+
+  async requestCompactionPrepare(transactionId: string, signal?: AbortSignal): Promise<boolean> {
+    return this.requestCompactionAcknowledgement(
+      transactionId,
+      this.compactionPrepared,
+      this.protocol.publishCompactionPrepare({ transaction_id: transactionId }),
+      signal,
+    );
+  }
+
+  async respondCompactionPrepared(response: SupervisorCompactionPrepared): Promise<void> {
+    await this.send(this.protocol.publishCompactionPrepared(response));
+  }
+
+  onCompactionPrepare(listener: (request: SupervisorCompactionPrepare) => void): () => void {
+    this.compactionPrepare.add(listener);
+    return () => this.compactionPrepare.delete(listener);
+  }
+
+  async requestCompactionComplete(
+    transactionId: string,
+    outcome: SupervisorCompactionComplete["outcome"],
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    return this.requestCompactionAcknowledgement(
+      transactionId,
+      this.compactionCompleted,
+      this.protocol.publishCompactionComplete({ transaction_id: transactionId, outcome }),
+      signal,
+    );
+  }
+
+  async respondCompactionCompleted(response: SupervisorCompactionCompleted): Promise<void> {
+    await this.send(this.protocol.publishCompactionCompleted(response));
+  }
+
+  onCompactionComplete(listener: (request: SupervisorCompactionComplete) => void): () => void {
+    this.compactionComplete.add(listener);
+    return () => this.compactionComplete.delete(listener);
   }
 
   onReply(listener: (reply: SupervisorReply) => void): () => void {
@@ -316,6 +365,18 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
     if (result.kind === "accepted" && result.control_response !== undefined) {
       notifySupervisorListeners(this.controlResponses, result.control_response);
     }
+    if (result.kind === "accepted" && result.compaction_prepare !== undefined) {
+      notifySupervisorListeners(this.compactionPrepare, result.compaction_prepare);
+    }
+    if (result.kind === "accepted" && result.compaction_prepared !== undefined) {
+      this.resolveCompactionAcknowledgement(this.compactionPrepared, result.compaction_prepared);
+    }
+    if (result.kind === "accepted" && result.compaction_complete !== undefined) {
+      notifySupervisorListeners(this.compactionComplete, result.compaction_complete);
+    }
+    if (result.kind === "accepted" && result.compaction_completed !== undefined) {
+      this.resolveCompactionAcknowledgement(this.compactionCompleted, result.compaction_completed);
+    }
     if (result.kind === "accepted") {
       for (const reply of result.replies) notifySupervisorListeners(this.replies, reply);
     }
@@ -376,12 +437,50 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
     for (const item of pending) item.completion.reject(new Error("监督通道不可用"));
   }
 
+  private async requestCompactionAcknowledgement(
+    transactionId: string,
+    waiters: Map<string, ReturnType<typeof createDeferred<boolean>>>,
+    frame: SupervisorFrame,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    if (waiters.has(transactionId)) throw new Error("压缩协调事务已存在");
+    const waiter = createDeferred<boolean>();
+    void waiter.promise.catch(() => {});
+    waiters.set(transactionId, waiter);
+    try {
+      await this.send(frame);
+      return signal === undefined
+        ? await waiter.promise
+        : await raceSupervisorAbort(waiter.promise, signal);
+    } finally {
+      if (waiters.get(transactionId) === waiter) waiters.delete(transactionId);
+    }
+  }
+
+  private resolveCompactionAcknowledgement(
+    waiters: Map<string, ReturnType<typeof createDeferred<boolean>>>,
+    response: SupervisorCompactionPrepared | SupervisorCompactionCompleted,
+  ): void {
+    const waiter = waiters.get(response.transaction_id);
+    if (waiter === undefined) return;
+    waiters.delete(response.transaction_id);
+    waiter.resolve(response.accepted);
+  }
+
+  private rejectCompactionWaiters(message: string): void {
+    for (const waiter of this.compactionPrepared.values()) waiter.reject(new Error(message));
+    this.compactionPrepared.clear();
+    for (const waiter of this.compactionCompleted.values()) waiter.reject(new Error(message));
+    this.compactionCompleted.clear();
+  }
+
   private fail(fault: RpcSupervisorChannelFault): void {
     if (this.released || this.faultNotified) return;
     this.faultNotified = true;
     if (!this.ready.settled()) this.ready.reject(new Error("监督通道不可用"));
     for (const waiter of this.transportAcknowledgements.values()) waiter.reject(new Error("监督通道不可用"));
     this.transportAcknowledgements.clear();
+    this.rejectCompactionWaiters("监督通道不可用");
     for (const listener of this.faults) {
       try {
         listener(fault);

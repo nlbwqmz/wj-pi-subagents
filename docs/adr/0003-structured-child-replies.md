@@ -2,7 +2,7 @@
 
 Status: accepted
 
-> 当前原生压缩生命周期、根会话人工压缩边界与 `pi-subagent/8` 硬切换由 [ADR-0008](./0008-native-compaction-lifecycle-and-root-manual-boundary.md) 覆盖；多目标等待、工作中 message 固定唤醒和 reply envelope 第 4 版由 [ADR-0006](./0006-multi-target-wait-batches.md) 覆盖。下文关于 `requires_response`、宿主状态复核和旧协议版本的内容只记录历史决策，不再是当前契约。
+> 当前会话本地、直接父边压缩协调和 `pi-subagent/10` 硬切换由 [ADR-0010](./0010-session-local-direct-edge-compaction.md) 覆盖；历史递归 `/9` 方案由 [ADR-0009](./0009-generic-recursive-compaction-barrier.md) 记录；原生压缩生命周期及历史 `/8` 边界由 [ADR-0008](./0008-native-compaction-lifecycle-and-root-manual-boundary.md) 记录；多目标等待、工作中 message 固定唤醒和 reply envelope 第 4 版由 [ADR-0006](./0006-multi-target-wait-batches.md) 覆盖。下文关于 `requires_response`、宿主状态复核和旧协议版本的内容只记录历史决策，不再是当前契约。
 
 > 图片载荷决策已由 [ADR-0004](./0004-text-only-subagent-messaging.md) 覆盖；任务身份、生命周期与当前协议版本已由 [ADR-0005](./0005-task-mailbox-and-delayed-final-commit.md) 覆盖。本文其余结构化回复和唤醒语义继续有效。
 

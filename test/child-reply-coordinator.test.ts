@@ -505,6 +505,155 @@ test("协作式中断保留安全候选且不生成说明性业务正文", async
   await settled;
 });
 
+test("协调压缩成功冻结旧中断 final，并由下一真实轮沿用逻辑任务", async () => {
+  const port = new RecordingPort();
+  const value = coordinator(port);
+  value.observeAgentStart();
+  assert.equal(value.getCurrentTaskId(), TASK_1);
+  assert.equal(value.beginCoordinationBarrier("compact-success"), true);
+  value.observeAssistantMessageEnd({
+    type: "message_end",
+    message: { role: "assistant", stopReason: "aborted", content: [] },
+  });
+  value.observeAgentEnd();
+  value.settle();
+  await nextTask();
+  assert.deepEqual(port.replies, []);
+
+  assert.equal(value.completeCoordinationBarrier("compact-success", "succeeded"), true);
+  await nextTask();
+  assert.deepEqual(port.replies, []);
+  value.observeAgentStart();
+  assert.equal(value.getCurrentTaskId(), TASK_1);
+  assert.equal(value.getCurrentTurnId(), TURN_2);
+  value.observeAssistantMessageEnd({
+    type: "message_end",
+    message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "续轮完成" }] },
+  });
+  value.observeAgentEnd();
+  value.settle();
+  await nextTask();
+  assert.deepEqual(port.replies, [{
+    ...finalEnvelope("续轮完成"),
+    turn_id: TURN_2,
+  }]);
+  port.acknowledgeAll();
+});
+
+test("child reply 协调令牌可叠加，释放一个不解除另一个", () => {
+  const value = coordinator(new RecordingPort());
+  assert.equal(value.beginCoordinationBarrier("compact-token-a"), true);
+  assert.equal(value.beginCoordinationBarrier("compact-token-b"), true);
+  assert.equal(value.hasCoordinationBarrier(), true);
+
+  assert.equal(value.completeCoordinationBarrier("compact-token-a", "not_started"), true);
+  assert.equal(value.hasCoordinationBarrier(), true);
+  assert.equal(value.completeCoordinationBarrier("compact-token-b", "not_started"), true);
+  assert.equal(value.hasCoordinationBarrier(), false);
+});
+
+test("协调 complete 先于 raw settled 到达时仍冻结被中断旧轮", async () => {
+  const port = new RecordingPort();
+  const value = coordinator(port);
+  value.observeAgentStart();
+  assert.equal(value.beginCoordinationBarrier("compact-complete-first"), true);
+  value.observeAssistantMessageEnd({
+    type: "message_end",
+    message: { role: "assistant", stopReason: "aborted", content: [] },
+  });
+  value.observeAgentEnd();
+
+  assert.equal(value.completeCoordinationBarrier("compact-complete-first", "succeeded"), true);
+  value.settle();
+  await nextTask();
+  assert.deepEqual(port.replies, []);
+
+  value.observeAgentStart();
+  assert.equal(value.getCurrentTaskId(), TASK_1);
+  assert.equal(value.getCurrentTurnId(), TURN_2);
+  value.observeAssistantMessageEnd({
+    type: "message_end",
+    message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "新轮" }] },
+  });
+  value.observeAgentEnd();
+  value.settle();
+  await nextTask();
+  assert.deepEqual(port.replies, [{
+    ...finalEnvelope("新轮"),
+    turn_id: TURN_2,
+  }]);
+  port.acknowledgeAll();
+});
+
+test("协调成功后等待本地 continuation 时拒绝第二个物理压缩，补偿可释放旧中断轮", async () => {
+  const port = new RecordingPort();
+  const value = coordinator(port);
+  value.observeAgentStart();
+  assert.equal(value.beginCoordinationBarrier("compact-compensated"), true);
+  value.observeAssistantMessageEnd({
+    type: "message_end",
+    message: { role: "assistant", stopReason: "aborted", content: [] },
+  });
+  value.observeAgentEnd();
+  value.settle();
+  assert.equal(value.completeCoordinationBarrier("compact-compensated", "succeeded"), true);
+  assert.equal(value.awaitsCoordinationContinuation("compact-compensated"), true);
+  // 令牌集合本身允许叠加；此处拒绝的是尚未出现 successor turn 的第二次物理压缩。
+  assert.equal(value.beginCoordinationBarrier("compact-overlap"), false);
+
+  assert.equal(value.completeCoordinationBarrier("compact-compensated", "not_started"), true);
+  await nextTask();
+  assert.deepEqual(port.replies, [finalEnvelope(undefined, {
+    run_state: "interrupted",
+    reason_code: undefined,
+  })]);
+  port.acknowledgeAll();
+});
+
+test("协调成功先于 raw settled 时同事务补偿仍释放旧中断轮", async () => {
+  const port = new RecordingPort();
+  const value = coordinator(port);
+  value.observeAgentStart();
+  assert.equal(value.beginCoordinationBarrier("compact-compensated-first"), true);
+  value.observeAssistantMessageEnd({
+    type: "message_end",
+    message: { role: "assistant", stopReason: "aborted", content: [] },
+  });
+  value.observeAgentEnd();
+  assert.equal(value.completeCoordinationBarrier("compact-compensated-first", "succeeded"), true);
+  assert.equal(value.completeCoordinationBarrier("compact-compensated-first", "not_started"), true);
+  value.settle();
+  await nextTask();
+  assert.deepEqual(port.replies, [finalEnvelope(undefined, {
+    run_state: "interrupted",
+    reason_code: undefined,
+  })]);
+  port.acknowledgeAll();
+});
+
+test("协调压缩失败释放旧轮并发布 interrupted final", async () => {
+  const port = new RecordingPort();
+  const value = coordinator(port);
+  value.observeAgentStart();
+  assert.equal(value.beginCoordinationBarrier("compact-failed"), true);
+  value.observeAssistantMessageEnd({
+    type: "message_end",
+    message: { role: "assistant", stopReason: "aborted", content: [] },
+  });
+  value.observeAgentEnd();
+  value.settle();
+  await nextTask();
+  assert.deepEqual(port.replies, []);
+
+  assert.equal(value.completeCoordinationBarrier("compact-failed", "failed"), true);
+  await nextTask();
+  assert.deepEqual(port.replies, [finalEnvelope(undefined, {
+    run_state: "interrupted",
+    reason_code: undefined,
+  })]);
+  port.acknowledgeAll();
+});
+
 test("正常无输出与运行时故障均发送无正文结构化 final", async () => {
   const normalPort = new RecordingPort();
   const normal = coordinator(normalPort);
@@ -642,6 +791,26 @@ test("父端 inbox 对所有工作中回复和 final 使用完整唤醒矩阵", 
     node_state: "failed",
     reason_code: "runtime_fault",
   });
+});
+
+test("单个 child 压缩屏障只冻结目标 child，不污染 sibling 回复", () => {
+  const sent: unknown[] = [];
+  const inbox = new ParentReplyInbox({
+    readApi: () => ({ sendMessage: (message) => sent.push(message) }),
+    notifyMessage: () => {},
+  });
+  const siblingMessage = {
+    ...messageEnvelope("兄弟回复"),
+    agent_id: OTHER_AGENT_ID,
+  };
+
+  assert.equal(inbox.beginChildCompactionBarrier(AGENT_ID, "compact-child"), true);
+  assert.equal(inbox.accept(AGENT_ID, messageEnvelope("目标回复暂缓")), false);
+  assert.equal(inbox.accept(OTHER_AGENT_ID, siblingMessage), true);
+  assert.equal(sent.length, 1);
+  assert.equal(inbox.completeChildCompactionBarrier(AGENT_ID, "compact-child"), true);
+  assert.equal(inbox.accept(AGENT_ID, messageEnvelope("目标回复放行")), true);
+  assert.equal(sent.length, 2);
 });
 
 test("settling gate 暂缓所有工作中回复、final 和 TerminalNotice", () => {

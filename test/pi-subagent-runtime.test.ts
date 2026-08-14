@@ -19,6 +19,9 @@ import {
   SubagentToolError,
 } from "../src/agent-tools.ts";
 import {
+  AUTO_COMPACT_COORDINATION_CHANNELS,
+} from "../src/auto-compact-coordination.ts";
+import {
   FakeManagedRpcNode,
   type ManagedRpcNodeStartContext,
   type ManagedRpcReply,
@@ -52,6 +55,16 @@ const TURN_2 = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 const TASK_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const COMMIT_ID = "ffffffff-ffff-4fff-8fff-ffffffffffff";
 const COMMIT_2 = "99999999-9999-4999-8999-999999999999";
+const COORDINATION_PARTICIPANT_INPUT_CHANNELS = [
+  AUTO_COMPACT_COORDINATION_CHANNELS.discover,
+  AUTO_COMPACT_COORDINATION_CHANNELS.prepare,
+  AUTO_COMPACT_COORDINATION_CHANNELS.complete,
+] as const;
+const COORDINATION_PARTICIPANT_OUTPUT_CHANNELS = [
+  AUTO_COMPACT_COORDINATION_CHANNELS.discovered,
+  AUTO_COMPACT_COORDINATION_CHANNELS.prepared,
+  AUTO_COMPACT_COORDINATION_CHANNELS.completed,
+] as const;
 
 function finalReply(
   agentId: string,
@@ -279,6 +292,10 @@ class FakeEventBus {
 
   emit(channel: string, value: unknown): void {
     for (const handler of this.handlers.get(channel) ?? []) handler(value);
+  }
+
+  listenerCount(channel: string): number {
+    return this.handlers.get(channel)?.size ?? 0;
   }
 
   on(channel: string, handler: (value: unknown) => void): () => void {
@@ -584,7 +601,7 @@ test("child bootstrap 严格要求完整临时监督字段并区分根直接子�
   await activate(api as never, {
     ok: true,
     nodeVersion: process.versions.node,
-    piVersion: "0.83.0",
+    piVersion: "0.84.1",
     platform: "win32",
     processTreeAdapter: {} as never,
   });
@@ -621,7 +638,7 @@ test("child runtime 按真实 threshold 压缩顺序保留候选并只在最终 
   await activate(api as never, {
     ok: true,
     nodeVersion: process.versions.node,
-    piVersion: "0.83.0",
+    piVersion: "0.84.1",
     platform: "win32",
     processTreeAdapter: {} as never,
   });
@@ -690,7 +707,7 @@ test("child runtime 按真实 threshold 压缩顺序保留候选并只在最终 
   await listener.close();
 });
 
-test("managed child 收到 manual 压缩事件时关闭监督通道且不发布 replacement final", async () => {
+test("managed child 收到未经协调的 manual 压缩事件时关闭监督通道且不发布 replacement final", async () => {
   const cwd = "C:\\workspace\\child-manual-compaction-fault";
   const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
   const localCredential = `local_${"l".repeat(32)}`;
@@ -713,7 +730,7 @@ test("managed child 收到 manual 压缩事件时关闭监督通道且不发布 
   await activate(api as never, {
     ok: true,
     nodeVersion: process.versions.node,
-    piVersion: "0.83.0",
+    piVersion: "0.84.1",
     platform: "win32",
     processTreeAdapter: {} as never,
   });
@@ -796,7 +813,7 @@ test("final ACK 失败不阻塞 runtime settled handler，并由独立监督流�
   await activate(api as never, {
     ok: true,
     nodeVersion: process.versions.node,
-    piVersion: "0.83.0",
+    piVersion: "0.84.1",
     platform: "win32",
     processTreeAdapter: {} as never,
   });
@@ -863,7 +880,7 @@ test("前置 settled handler 延迟期间启动的新轮不会被旧 settle 提�
   await activate(api as never, {
     ok: true,
     nodeVersion: process.versions.node,
-    piVersion: "0.83.0",
+    piVersion: "0.84.1",
     platform: "win32",
     processTreeAdapter: {} as never,
   });
@@ -950,7 +967,7 @@ test("生产运行时闭合直接父子的创建、消息、回复、等待、�
   await activate(api as never, {
     ok: true,
     nodeVersion: process.versions.node,
-    piVersion: "0.83.0",
+    piVersion: "0.84.1",
     platform: "win32",
     processTreeAdapter: {} as never,
   });
@@ -1081,7 +1098,7 @@ test("运行时以单数 agent 命令交付只读 TUI，并在会话关闭时清
   await activate(api as never, {
     ok: true,
     nodeVersion: process.versions.node,
-    piVersion: "0.83.0",
+    piVersion: "0.84.1",
     platform: "win32",
     processTreeAdapter: {} as never,
   });
@@ -1170,7 +1187,7 @@ test("根会话 new、resume、fork 与 quit 都按同一有界关闭语义清�
     await activate(api as never, {
       ok: true,
       nodeVersion: process.versions.node,
-      piVersion: "0.83.0",
+      piVersion: "0.84.1",
       platform: "win32",
       processTreeAdapter: {} as never,
     });
@@ -1203,7 +1220,7 @@ test("预检遵循 Pi thinking 支持集合并拒绝被模型显式禁用的 off
   await activate(api as never, {
     ok: true,
     nodeVersion: process.versions.node,
-    piVersion: "0.83.0",
+    piVersion: "0.84.1",
     platform: "win32",
     processTreeAdapter: {} as never,
   });
@@ -1260,7 +1277,7 @@ test("根会话 max 场景允许模板请求父活动工具之外的已注册业
   await activate(api as never, {
     ok: true,
     nodeVersion: process.versions.node,
-    piVersion: "0.83.0",
+    piVersion: "0.84.1",
     platform: "win32",
     processTreeAdapter: {} as never,
   });
@@ -1293,7 +1310,7 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   const hostCapabilities = {
     ok: true as const,
     nodeVersion: process.versions.node,
-    piVersion: "0.83.0",
+    piVersion: "0.84.1",
     platform: "win32" as const,
     processTreeAdapter: {} as never,
   };
@@ -1763,7 +1780,7 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
   const capabilities = {
     ok: true as const,
     nodeVersion: process.versions.node,
-    piVersion: "0.83.0",
+    piVersion: "0.84.1",
     platform: "win32" as const,
     processTreeAdapter: {} as never,
   };
@@ -1788,6 +1805,12 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
   });
   await oldActivate(oldApi as never, capabilities);
   await oldApi.emit("session_start", { type: "session_start", reason: "startup" }, oldContext);
+  for (const channel of COORDINATION_PARTICIPANT_INPUT_CHANNELS) {
+    assert.equal(eventBus.listenerCount(channel), 1);
+  }
+  for (const channel of COORDINATION_PARTICIPANT_OUTPUT_CHANNELS) {
+    assert.equal(eventBus.listenerCount(channel), 0);
+  }
   const first = await execute(oldApi, "spawn_agent", {
     template_id: "researcher",
     name: "交接前节点",
@@ -1803,6 +1826,9 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
   await firstNode.publishTaskStarted(assignedTaskId, TURN_1);
 
   await oldApi.emit("session_shutdown", { type: "session_shutdown", reason: "reload" }, oldContext);
+  for (const channel of Object.values(AUTO_COMPACT_COORDINATION_CHANNELS)) {
+    assert.equal(eventBus.listenerCount(channel), 0);
+  }
   oldApi.invalidate();
   assert.equal(oldUi.widgetCalls.at(-1)?.content, undefined);
   assert.deepEqual(
@@ -1833,6 +1859,12 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
   });
   await newActivate(newApi as never, capabilities);
   await newApi.emit("session_start", { type: "session_start", reason: "reload" }, newContext);
+  for (const channel of COORDINATION_PARTICIPANT_INPUT_CHANNELS) {
+    assert.equal(eventBus.listenerCount(channel), 1);
+  }
+  for (const channel of COORDINATION_PARTICIPANT_OUTPUT_CHANNELS) {
+    assert.equal(eventBus.listenerCount(channel), 0);
+  }
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(typeof newUi.widgetCalls.at(-1)?.content, "function");
@@ -1941,7 +1973,7 @@ test("根与 child 跨实例 reload 保留同一监督连接，并让既有 chil
   const capabilities = {
     ok: true as const,
     nodeVersion: process.versions.node,
-    piVersion: "0.83.0",
+    piVersion: "0.84.1",
     platform: "win32" as const,
     processTreeAdapter: {} as never,
   };
@@ -2112,7 +2144,7 @@ test("reload lease 未被新实例提交时在有界期限后清理旧树", asyn
   await activate(api as never, {
     ok: true,
     nodeVersion: process.versions.node,
-    piVersion: "0.83.0",
+    piVersion: "0.84.1",
     platform: "win32",
     processTreeAdapter: {} as never,
   });
@@ -2144,7 +2176,7 @@ test("新实例认领 lease 后可等待迟到的 reload start，不沿用 outgo
   const capabilities = {
     ok: true as const,
     nodeVersion: process.versions.node,
-    piVersion: "0.83.0",
+    piVersion: "0.84.1",
     platform: "win32" as const,
     processTreeAdapter: {} as never,
   };
@@ -2201,7 +2233,7 @@ test("同一 activator 的 reload 也提交自身 lease，不会被 watchdog 误
   await activate(api as never, {
     ok: true,
     nodeVersion: process.versions.node,
-    piVersion: "0.83.0",
+    piVersion: "0.84.1",
     platform: "win32",
     processTreeAdapter: {} as never,
   });

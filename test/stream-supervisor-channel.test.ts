@@ -162,6 +162,92 @@ test("task assignment 和 task_started 都等待对端 transport ACK 后完成",
   await pair.child.release();
 });
 
+test("协调压缩请求只允许 child 发起，并等待 parent 业务响应", async () => {
+  const pair = channelPair();
+  await pair.parent.bind(new AbortController().signal);
+  await pair.child.bind(new AbortController().signal);
+  await Promise.all([
+    pair.parent.waitForReady(new AbortController().signal),
+    pair.child.waitForReady(new AbortController().signal),
+  ]);
+
+  const parentPrepareRequests: unknown[] = [];
+  pair.parent.onCompactionPrepare((request) => parentPrepareRequests.push(request));
+  const childPrepare = pair.child.requestCompactionPrepare("compact-child-request");
+  await settleIo();
+  assert.deepEqual(parentPrepareRequests, [{ transaction_id: "compact-child-request" }]);
+  let childPrepareSettled = false;
+  void childPrepare.then(() => { childPrepareSettled = true; });
+  await settleIo();
+  assert.equal(childPrepareSettled, false);
+  await pair.parent.respondCompactionPrepared({ transaction_id: "compact-child-request", accepted: true });
+  assert.equal(await childPrepare, true);
+
+  const parentCompleteRequests: unknown[] = [];
+  pair.parent.onCompactionComplete((request) => parentCompleteRequests.push(request));
+  const childComplete = pair.child.requestCompactionComplete("compact-child-request", "failed");
+  await settleIo();
+  assert.deepEqual(parentCompleteRequests, [{
+    transaction_id: "compact-child-request",
+    outcome: "failed",
+  }]);
+  await pair.parent.respondCompactionCompleted({ transaction_id: "compact-child-request", accepted: false });
+  assert.equal(await childComplete, false);
+
+  await assert.rejects(pair.parent.requestCompactionPrepare("invalid-parent-request"));
+  await assert.rejects(pair.parent.requestCompactionComplete("invalid-parent-request", "failed"));
+  await assert.rejects(pair.child.respondCompactionPrepared({
+    transaction_id: "invalid-child-response",
+    accepted: true,
+  }));
+  await assert.rejects(pair.child.respondCompactionCompleted({
+    transaction_id: "invalid-child-response",
+    accepted: true,
+  }));
+
+  await pair.parent.release();
+  await pair.child.release();
+});
+
+test("complete 等待取消后允许同一事务发送 not_started 补偿", async () => {
+  const pair = channelPair();
+  await pair.parent.bind(new AbortController().signal);
+  await pair.child.bind(new AbortController().signal);
+  await Promise.all([
+    pair.parent.waitForReady(new AbortController().signal),
+    pair.child.waitForReady(new AbortController().signal),
+  ]);
+
+  const requests: unknown[] = [];
+  pair.parent.onCompactionComplete((request) => requests.push(request));
+  const firstController = new AbortController();
+  const firstResult = pair.child
+    .requestCompactionComplete("compact-retry-after-abort", "succeeded", firstController.signal)
+    .then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+  await settleIo();
+  firstController.abort();
+  const firstError = await firstResult;
+  assert.equal(firstError instanceof Error ? firstError.name : undefined, "AbortError");
+
+  const cleanup = pair.child.requestCompactionComplete("compact-retry-after-abort", "not_started");
+  await settleIo();
+  assert.deepEqual(requests, [
+    { transaction_id: "compact-retry-after-abort", outcome: "succeeded" },
+    { transaction_id: "compact-retry-after-abort", outcome: "not_started" },
+  ]);
+  await pair.parent.respondCompactionCompleted({
+    transaction_id: "compact-retry-after-abort",
+    accepted: false,
+  });
+  assert.equal(await cleanup, false);
+
+  await pair.parent.release();
+  await pair.child.release();
+});
+
 test("同 turn 的后续 final 只推进 ACK，不覆盖首个已接纳 final", async () => {
   const received: string[] = [];
   const pair = channelPair((reply) => {

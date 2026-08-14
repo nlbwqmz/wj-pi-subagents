@@ -90,6 +90,8 @@ export class ParentReplyInbox {
   private readSenderName: ((agentId: string) => string | undefined) | undefined;
   private turnTriggerState: "open" | "blocked" | "failed" = "open";
   private turnTriggerBlockToken = Symbol("turn-trigger-block");
+  private readonly sessionCompactionBarriers = new Set<string>();
+  private readonly childCompactionBarriers = new Map<string, Set<string>>();
 
   constructor(options: ParentReplyInboxOptions) {
     this.rebind(options);
@@ -126,11 +128,43 @@ export class ParentReplyInbox {
     this.turnTriggerState = "failed";
   }
 
+  beginSessionCompactionBarrier(transactionId: string): boolean {
+    if (!validCompactionTransactionId(transactionId)) return false;
+    if (this.sessionCompactionBarriers.has(transactionId)) return true;
+    this.sessionCompactionBarriers.add(transactionId);
+    return true;
+  }
+
+  completeSessionCompactionBarrier(transactionId: string): boolean {
+    if (!validCompactionTransactionId(transactionId)) return false;
+    return this.sessionCompactionBarriers.delete(transactionId);
+  }
+
+  beginChildCompactionBarrier(agentId: string, transactionId: string): boolean {
+    if (!isCanonicalUuid(agentId) || !validCompactionTransactionId(transactionId)) return false;
+    const barriers = this.childCompactionBarriers.get(agentId) ?? new Set<string>();
+    barriers.add(transactionId);
+    this.childCompactionBarriers.set(agentId, barriers);
+    return true;
+  }
+
+  completeChildCompactionBarrier(agentId: string, transactionId: string): boolean {
+    if (!isCanonicalUuid(agentId) || !validCompactionTransactionId(transactionId)) return false;
+    const barriers = this.childCompactionBarriers.get(agentId);
+    if (barriers === undefined || !barriers.delete(transactionId)) return false;
+    if (barriers.size === 0) this.childCompactionBarriers.delete(agentId);
+    return true;
+  }
+
   accept(agentId: string, reply: ManagedRpcReply): boolean {
     const envelope = parseChildReplyEnvelope(reply);
     if (envelope === undefined || envelope.agent_id !== agentId) return false;
     const triggerTurn = true;
-    if (this.turnTriggerState !== "open") return false;
+    if (
+      this.turnTriggerState !== "open"
+      || this.sessionCompactionBarriers.size > 0
+      || (this.childCompactionBarriers.get(agentId)?.size ?? 0) > 0
+    ) return false;
     const content = messageContent(envelope);
     const senderName = this.safeReadSenderName(agentId);
     try {
@@ -165,7 +199,12 @@ export class ParentReplyInbox {
 
   /** 节点故障通知由直接父运行时生成，不伪装成 child final。 */
   acceptTerminal(agentId: string, turnId?: string): boolean {
-    if (!isCanonicalUuid(agentId) || this.turnTriggerState !== "open") return false;
+    if (
+      !isCanonicalUuid(agentId)
+      || this.turnTriggerState !== "open"
+      || this.sessionCompactionBarriers.size > 0
+      || (this.childCompactionBarriers.get(agentId)?.size ?? 0) > 0
+    ) return false;
     const notice: TerminalNotice = {
       schema: CHILD_TERMINAL_SCHEMA,
       version: CHILD_REPLY_VERSION,
@@ -466,6 +505,10 @@ function readMessageText(value: unknown): string {
     if (type === "text" && typeof text === "string") texts.push(text);
   }
   return texts.join("\n");
+}
+
+function validCompactionTransactionId(value: string): boolean {
+  return typeof value === "string" && value.length > 0 && value.length <= 256;
 }
 
 function readRecord(value: unknown): Record<string, unknown> | undefined {

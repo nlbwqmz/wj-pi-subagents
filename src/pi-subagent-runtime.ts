@@ -18,6 +18,7 @@ import {
   type AgentToolRegistrationApi,
 } from "./agent-tools.ts";
 import { ChildReplyCoordinator } from "./child-reply-coordinator.ts";
+import { AutoCompactCoordinationParticipant } from "./auto-compact-coordination.ts";
 import { ParentWaitBatchCoordinator } from "./parent-wait-batch-coordinator.ts";
 import type {
   AvailableHostCapabilities,
@@ -605,6 +606,7 @@ export function createPiSubagentRuntimeActivator(
     const api = asRuntimeApi(extensionApi);
     let active: ActiveRuntime | undefined;
     let lifecycle: Promise<void> = Promise.resolve();
+    let coordinationParticipant: AutoCompactCoordinationParticipant | undefined;
     let runtimeUi: { readonly runtime: ActiveRuntime; readonly binding: AgentTreeUiBinding } | undefined;
     const bootstrapAtActivation = readChildRuntimeBootstrap(options.environment);
 
@@ -751,7 +753,11 @@ export function createPiSubagentRuntimeActivator(
       const reason = isRecord(event) ? event.reason : undefined;
       const willRetry = isRecord(event) ? event.willRetry : undefined;
       if (reason === "manual") {
-        failChildCompactionInvariant(current);
+        if (!coordinationParticipant?.hasPreparedBarrier()) {
+          failChildCompactionInvariant(current);
+          return;
+        }
+        current.replyCoordinator?.observeCompactionStart("manual", false);
         return;
       }
       if ((reason !== "threshold" && reason !== "overflow") || typeof willRetry !== "boolean") return;
@@ -763,7 +769,11 @@ export function createPiSubagentRuntimeActivator(
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
       const reason = isRecord(event) ? event.reason : undefined;
       if (reason === "manual") {
-        failChildCompactionInvariant(current);
+        if (!coordinationParticipant?.hasPreparedBarrier()) {
+          failChildCompactionInvariant(current);
+          return;
+        }
+        current.replyCoordinator?.observeCompactionEnd("manual");
         return;
       }
       if (reason !== "threshold" && reason !== "overflow") return;
@@ -862,9 +872,35 @@ export function createPiSubagentRuntimeActivator(
     const reloadEventBus = bootstrapAtActivation.kind === "invalid"
       ? undefined
       : readRuntimeReloadEventBus(api.events);
+    const ensureCoordinationParticipant = (): void => {
+      if (coordinationParticipant !== undefined || reloadEventBus === undefined) return;
+      coordinationParticipant = new AutoCompactCoordinationParticipant({
+        eventBus: reloadEventBus,
+        readRuntime: () => {
+          const current = active;
+          if (current === undefined) return undefined;
+          return {
+            ...(current.handoffPending === undefined ? {} : { handoffPending: current.handoffPending }),
+            replyInbox: current.replyInbox,
+            ...(current.replyCoordinator === undefined ? {} : { replyCoordinator: current.replyCoordinator }),
+            ...(current.upstream === undefined ? {} : { upstream: { channel: current.upstream.channel } }),
+            retryPendingReplies: () => current.handoffPending === true
+              ? Promise.resolve()
+              : current.controller.retryPendingReplies(),
+          };
+        },
+      });
+    };
+    const closeCoordinationParticipant = async (): Promise<void> => {
+      const participant = coordinationParticipant;
+      coordinationParticipant = undefined;
+      if (participant !== undefined) await participant.close();
+    };
+    ensureCoordinationParticipant();
     let reloadCoordinator: RuntimeReloadCoordinator<ActiveRuntime, RuntimeTransfer>;
 
     const startSession = async (event: unknown, rawContext: unknown): Promise<void> => {
+      ensureCoordinationParticipant();
       const context = readContext(rawContext);
       const sessionEvent = isRecord(event) ? event as RuntimeSessionStartEvent : {};
       const bootstrapResult = readChildRuntimeBootstrap(options.environment);
@@ -1095,6 +1131,13 @@ export function createPiSubagentRuntimeActivator(
         currentModel: () => currentModelReference(state.bindings.context),
         currentThinking: () => currentThinking(state.bindings.context),
         deliverReply: (agentId, reply) => state.replyInbox.accept(agentId, reply),
+        onCompactionPrepare: (agentId, transactionId) =>
+          state.replyInbox.beginChildCompactionBarrier(agentId, transactionId),
+        onCompactionComplete: (agentId, transactionId) => {
+          const completed = state.replyInbox.completeChildCompactionBarrier(agentId, transactionId);
+          if (completed) void state.controller.retryPendingReplies();
+          return completed;
+        },
         requestIdRegistry,
         bindControlServer: (_agentId, channel) => {
           const server = new SupervisorControlServer(channel, controlHandler);
@@ -1153,14 +1196,16 @@ export function createPiSubagentRuntimeActivator(
     const shutdownSession = async (event: unknown): Promise<void> => {
       waitBatchCoordinator.clear();
       const current = active;
-      if (current === undefined) {
-        await reloadCoordinator.cleanupIncoming();
-        return;
-      }
       const reason = isRecord(event) ? event.reason : undefined;
-      if (reason === "reload" && reloadCoordinator.beginHandoff(current)) {
+      if (current !== undefined && reason === "reload" && reloadCoordinator.beginHandoff(current)) {
+        await closeCoordinationParticipant();
         disposeRuntimeUi(current);
         applyAgentToolVisibility(api, false, false);
+        return;
+      }
+      await closeCoordinationParticipant();
+      if (current === undefined) {
+        await reloadCoordinator.cleanupIncoming();
         return;
       }
       reloadCoordinator.cancelHandoff(current);

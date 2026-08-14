@@ -17,7 +17,10 @@ import {
   type RpcSupervisorStartupResult,
   type RpcSupervisorTerminationResult,
 } from "../src/rpc-supervisor.ts";
-import type { SupervisorEvent, SupervisorTaskStarted } from "../src/supervisor-channel.ts";
+import type {
+  SupervisorEvent,
+  SupervisorTaskStarted,
+} from "../src/supervisor-channel.ts";
 import { ROOT_TREE_ACTOR, TreeController } from "../src/tree-controller.ts";
 
 const TEST_TURN_ID = "91000000-0000-4000-8000-000000000001";

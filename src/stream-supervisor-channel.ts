@@ -3,6 +3,10 @@ import {
   SupervisorChannel,
   SupervisorFrameDecoder,
   type SupervisorChannelOptions,
+  type SupervisorCompactionComplete,
+  type SupervisorCompactionCompleted,
+  type SupervisorCompactionPrepare,
+  type SupervisorCompactionPrepared,
   type SupervisorControlRequest,
   type SupervisorControlResponse,
   type SupervisorFrame,
@@ -61,6 +65,10 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
   private readonly closed = createDeferred<void>();
   private readonly replyAcknowledgements = new Map<number, Deferred<void>>();
   private readonly transportAcknowledgements = new Map<number, Deferred<void>>();
+  private readonly compactionPrepared = new Map<string, Deferred<boolean>>();
+  private readonly compactionCompleted = new Map<string, Deferred<boolean>>();
+  private readonly compactionPrepareListeners = new Set<(request: SupervisorCompactionPrepare) => void>();
+  private readonly compactionCompleteListeners = new Set<(request: SupervisorCompactionComplete) => void>();
   private readonly taskAssignmentListeners = new Set<(assignment: SupervisorTaskAssignment) => void>();
   private readonly taskStartedListeners = new Set<(started: SupervisorTaskStarted) => void>();
   private readonly faults = new Set<(fault: RpcSupervisorChannelFault) => void>();
@@ -235,6 +243,46 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     await this.send(this.protocol.publishControlResponse(response));
   }
 
+  async requestCompactionPrepare(transactionId: string, signal?: AbortSignal): Promise<boolean> {
+    return this.requestCompactionAcknowledgement(
+      transactionId,
+      this.compactionPrepared,
+      this.protocol.publishCompactionPrepare({ transaction_id: transactionId }),
+      signal,
+    );
+  }
+
+  async respondCompactionPrepared(response: SupervisorCompactionPrepared): Promise<void> {
+    await this.send(this.protocol.publishCompactionPrepared(response));
+  }
+
+  onCompactionPrepare(listener: (request: SupervisorCompactionPrepare) => void): () => void {
+    this.compactionPrepareListeners.add(listener);
+    return () => this.compactionPrepareListeners.delete(listener);
+  }
+
+  async requestCompactionComplete(
+    transactionId: string,
+    outcome: SupervisorCompactionComplete["outcome"],
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    return this.requestCompactionAcknowledgement(
+      transactionId,
+      this.compactionCompleted,
+      this.protocol.publishCompactionComplete({ transaction_id: transactionId, outcome }),
+      signal,
+    );
+  }
+
+  async respondCompactionCompleted(response: SupervisorCompactionCompleted): Promise<void> {
+    await this.send(this.protocol.publishCompactionCompleted(response));
+  }
+
+  onCompactionComplete(listener: (request: SupervisorCompactionComplete) => void): () => void {
+    this.compactionCompleteListeners.add(listener);
+    return () => this.compactionCompleteListeners.delete(listener);
+  }
+
   establishTerminationBarrier(): void {
     this.protocol.establishTerminationBarrier();
   }
@@ -266,6 +314,7 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     this.replyAcknowledgements.clear();
     for (const waiter of this.transportAcknowledgements.values()) waiter.reject(new Error("监督通道已关闭"));
     this.transportAcknowledgements.clear();
+    this.rejectCompactionWaiters("监督通道已关闭");
     try {
       if (!this.transport.stdin.destroyed) this.transport.stdin.destroy();
       if (!this.transport.stdout.destroyed) this.transport.stdout.destroy();
@@ -354,6 +403,18 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     }
     if (result.kind === "accepted" && result.control_response !== undefined) {
       notifySupervisorListeners(this.controlResponseListeners, result.control_response);
+    }
+    if (result.kind === "accepted" && result.compaction_prepare !== undefined) {
+      notifySupervisorListeners(this.compactionPrepareListeners, result.compaction_prepare);
+    }
+    if (result.kind === "accepted" && result.compaction_prepared !== undefined) {
+      this.resolveCompactionAcknowledgement(this.compactionPrepared, result.compaction_prepared);
+    }
+    if (result.kind === "accepted" && result.compaction_complete !== undefined) {
+      notifySupervisorListeners(this.compactionCompleteListeners, result.compaction_complete);
+    }
+    if (result.kind === "accepted" && result.compaction_completed !== undefined) {
+      this.resolveCompactionAcknowledgement(this.compactionCompleted, result.compaction_completed);
     }
     if (result.kind === "accepted" && result.reply_ack !== undefined) {
       this.resolveReplyAcknowledgements(result.reply_ack);
@@ -454,6 +515,43 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     }
   }
 
+  private async requestCompactionAcknowledgement(
+    transactionId: string,
+    waiters: Map<string, Deferred<boolean>>,
+    frame: SupervisorFrame,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    if (waiters.has(transactionId)) throw new Error("压缩协调事务已存在");
+    const waiter = createDeferred<boolean>();
+    void waiter.promise.catch(() => {});
+    waiters.set(transactionId, waiter);
+    try {
+      await this.send(frame);
+      return signal === undefined
+        ? await waiter.promise
+        : await raceSupervisorAbort(waiter.promise, signal);
+    } finally {
+      if (waiters.get(transactionId) === waiter) waiters.delete(transactionId);
+    }
+  }
+
+  private resolveCompactionAcknowledgement(
+    waiters: Map<string, Deferred<boolean>>,
+    response: SupervisorCompactionPrepared | SupervisorCompactionCompleted,
+  ): void {
+    const waiter = waiters.get(response.transaction_id);
+    if (waiter === undefined) return;
+    waiters.delete(response.transaction_id);
+    waiter.resolve(response.accepted);
+  }
+
+  private rejectCompactionWaiters(message: string): void {
+    for (const waiter of this.compactionPrepared.values()) waiter.reject(new Error(message));
+    this.compactionPrepared.clear();
+    for (const waiter of this.compactionCompleted.values()) waiter.reject(new Error(message));
+    this.compactionCompleted.clear();
+  }
+
   private onEof(): void {
     if (this.released) return;
     if (this.endpointClosed) return;
@@ -493,6 +591,7 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     this.replyAcknowledgements.clear();
     for (const waiter of this.transportAcknowledgements.values()) waiter.reject(new Error("监督通道不可用"));
     this.transportAcknowledgements.clear();
+    this.rejectCompactionWaiters("监督通道不可用");
     if (!this.ready.settled()) this.ready.reject(new Error("监督通道不可用"));
     for (const listener of this.faults) {
       try {

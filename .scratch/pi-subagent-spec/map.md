@@ -44,7 +44,7 @@ Status: active
 - [确定中断、失败与级联清理语义](issues/08-define-failure-cancellation-and-cleanup.md) — 中断先建立 mailbox 栅栏，后继消息不能进入正在取消的 task；raw settlement 只准备 interrupted final，commit 后才可复用。终止仍不可逆、后代优先，suspended/failed 节点继续占名额直到显式回收。
 - [确定 RPC 监督器与跨平台进程回收架构](issues/12-prototype-rpc-supervisor.md) — `ManagedRpcNode` 继续独占 Pi RPC 与平台树；`RpcSupervisor` 以 `AgentTaskMailbox` 线性化接纳、assignment、Pi command、压缩、settlement、final/ACK 和终止，不拼接客户端、不猜测不确定交付。
 - [预构资源确认边界与可注入进程树替身](issues/17-process-tree-resource-boundary.md) — 固定不透明 `ProcessTreeAdapter` 句柄与进程树三态观察；仅退出和整树资源释放同时确认才得到进程树级 `confirmed_exited`，生命周期与配额仍由后续控制器结合监督端点、本节点和全部后代裁决，fake 以场景序列稳定复现优雅超时、孙进程残留、部分回收、重复回收和句柄释放。
-- [确定发布、安装与 Pi 兼容性边界](issues/09-define-packaging-and-compatibility.md) — 以只声明唯一扩展入口的标准 Pi package 发布，npm 为规范渠道并支持等版本 git tag 与完整 commit；代码目标覆盖 Windows/macOS/Linux，当前里程碑只验证 Windows，版本、平台或必需宿主 API 不满足时原子失活、仅作 UI-only 诊断而不阻断宿主 Pi，会话 reload 失败时清理既有代理树。
+- [确定发布、安装与 Pi 兼容性边界](issues/09-define-packaging-and-compatibility.md) — 以只声明唯一扩展入口的标准 Pi package 发布，npm 为规范渠道并支持等版本 git tag 与完整 commit；当前最低宿主为 Node `>=22.19.0`、Pi `>=0.84.1`，代码目标覆盖 Windows/macOS/Linux，当前里程碑只验证 Windows，版本、平台或必需宿主 API 不满足时原子失活、仅作 UI-only 诊断而不阻断宿主 Pi，会话 reload 失败时清理既有代理树。
 - [确定首版验收标准与规格交付结构](issues/10-define-acceptance-and-spec-delivery.md) — `spec.md` 仍是唯一行为入口；当前里程碑收敛为 Windows 最低/当前两个宿主组合，跨平台代码可先写但 macOS/Linux 原生验收与支持证据延期到独立计划，性能和正式发布证明仍不在本轮。
 - [统一代理标识值域](issues/02-define-parent-control-tools.md) — `agent_id` 字段值使用 UUID，控制器新分配值采用随机 UUID v4，并使用 RFC 9562 canonical 小写格式且不带 `agent_` 前缀；格式错误返回 `invalid_argument`，格式正确但未注册返回 `agent_not_found`，其他消息/请求/流标识保持独立命名空间。
 - [冻结根工作基础、环境、信任与配置](issues/18-root-runtime-context-config.md) — 根会话一次冻结规范化 `cwd`、project trust、环境和逐字段配额配置；后代只能从根环境投影并接收控制器追加的固定元数据，配置只读取可信项目与用户的规范路径，错误仅以脱敏 UI-only 诊断呈现。
@@ -55,6 +55,7 @@ Status: active
 - [采用任务 mailbox 与延迟 final 提交](../../docs/adr/0005-task-mailbox-and-delayed-final-commit.md) — 稳定 `task_id` 与 Pi `turn_id` 分离；raw settlement 形成 provisional candidate，父会话接纳与 settlement 双条件 commit；第三方 mid-run compact 无 lease 时以撤销候选、恢复新 turn 和 `suspended` 保守表达。
 - [实现 Windows Job Object 进程树适配器](issues/22-windows-job-object-adapter.md) — Windows 启动路径使用 `CREATE_SUSPENDED`，先完成节点专用 Job Object 分配并正确写入 `KILL_ON_JOB_CLOSE` 的 native 结构布局，再恢复目标线程；强制回收只调用 Job Object，资源确认使用进程 ID 列表的 `present`/`released`/`unknown` 三态。原生测试以 `detached`/`unref` 孙进程证明后代仍在 Job 内并可整树回收；句柄释放或观察失败时保留 `unknown`，不伪造终止确认。宿主门禁已在 Windows 标准入口加载该适配器，Unix 平台在对应适配器交付前继续失败关闭。
 - [实现 macOS/Linux process group 进程树适配器](issues/23-unix-process-tree-adapter.md) — Unix 代码和宿主接入已保留，但本里程碑只在 Windows 做平台原生验证；macOS/Linux 原生 runner、资源回收证据和支持结论延期到独立计划。
+- [迁移会话本地直接边压缩协调](issues/28-session-local-direct-edge-compaction.md) — 监督协议 `/10` 只允许 child 向唯一直接 parent 请求压缩边界；每个会话独立管理本地入口和直接边，parent 以 mailbox 与 Pi 队列静止确认 prepared，并保留补偿、叠加令牌、reload 清理和跨流 manual 生命周期顺序保护。
 
 ## Fog
 

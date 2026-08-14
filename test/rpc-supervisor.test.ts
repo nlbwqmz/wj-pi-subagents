@@ -21,6 +21,10 @@ import type {
   SupervisorReplyInput,
   SupervisorTaskAssignment,
   SupervisorTaskStarted,
+  SupervisorCompactionComplete,
+  SupervisorCompactionCompleted,
+  SupervisorCompactionPrepare,
+  SupervisorCompactionPrepared,
 } from "../src/supervisor-channel.ts";
 import type {
   ManagedRpcNodeLike,
@@ -377,6 +381,9 @@ class RecordingSupervisorChannel implements RpcSupervisorChannel {
   private readonly replies: Array<SupervisorReplyInput | SupervisorReply> = [];
   private readonly taskAssignments: SupervisorTaskAssignment[] = [];
   private readonly taskStartedListeners = new Set<(started: SupervisorTaskStarted) => void>();
+  private readonly compactionPrepareListeners = new Set<(request: SupervisorCompactionPrepare) => void>();
+  private readonly compactionCompleteListeners = new Set<(request: SupervisorCompactionComplete) => void>();
+  private readonly compactionResponses: Array<SupervisorCompactionPrepared | SupervisorCompactionCompleted> = [];
   private readonly trace: string[];
   private readonly readyPromise: Promise<void> | undefined;
 
@@ -418,6 +425,41 @@ class RecordingSupervisorChannel implements RpcSupervisorChannel {
 
   emitTaskStarted(started: SupervisorTaskStarted): void {
     for (const listener of this.taskStartedListeners) listener(started);
+  }
+
+  onCompactionPrepare(listener: (request: SupervisorCompactionPrepare) => void): () => void {
+    this.compactionPrepareListeners.add(listener);
+    return () => this.compactionPrepareListeners.delete(listener);
+  }
+
+  onCompactionComplete(listener: (request: SupervisorCompactionComplete) => void): () => void {
+    this.compactionCompleteListeners.add(listener);
+    return () => this.compactionCompleteListeners.delete(listener);
+  }
+
+  emitCompactionPrepare(transactionId: string): void {
+    for (const listener of this.compactionPrepareListeners) listener({ transaction_id: transactionId });
+  }
+
+  emitCompactionComplete(
+    transactionId: string,
+    outcome: SupervisorCompactionComplete["outcome"],
+  ): void {
+    for (const listener of this.compactionCompleteListeners) {
+      listener({ transaction_id: transactionId, outcome });
+    }
+  }
+
+  async respondCompactionPrepared(response: SupervisorCompactionPrepared): Promise<void> {
+    this.compactionResponses.push(response);
+  }
+
+  async respondCompactionCompleted(response: SupervisorCompactionCompleted): Promise<void> {
+    this.compactionResponses.push(response);
+  }
+
+  publishedCompactionResponses(): readonly (SupervisorCompactionPrepared | SupervisorCompactionCompleted)[] {
+    return Object.freeze([...this.compactionResponses]);
   }
 
   establishTerminationBarrier(): void {
@@ -1765,7 +1807,398 @@ test("Pi 任务 RPC 只归一化生命周期和安全活动，assistant 回复�
   }
 });
 
-test("非法 Pi 事件、child manual compaction、extension_error 和运行期 EOF 归一化为稳定故障", async () => {
+test("直接边 prepare 同步安装令牌，并等待旧 RPC、prompt start 与 Pi 队列静止", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const edgeOperations: string[] = [];
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "直接边静止" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+    onCompactionPrepare: (transactionId) => {
+      edgeOperations.push(`begin:${transactionId}`);
+      return true;
+    },
+    onCompactionComplete: (transactionId, outcome) => {
+      edgeOperations.push(`complete:${transactionId}:${outcome}`);
+      return true;
+    },
+  });
+  assert.equal((await supervisor.start()).ok, true);
+
+  const promptGate = rpcClient.deferNext("prompt");
+  const first = await supervisor.prompt("线性化点前的消息");
+  assert.equal(first.ok, true);
+  await promptGate.started;
+
+  channel.emitCompactionPrepare("compact-edge");
+  assert.deepEqual(edgeOperations, ["begin:compact-edge"]);
+  const queued = await supervisor.steer("屏障后的消息");
+  assert.equal(queued.ok, true);
+  assert.equal(rpcClient.operations().filter((operation) => operation === "steer").length, 0);
+  assert.deepEqual(channel.publishedCompactionResponses(), []);
+
+  promptGate.resolve();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(channel.publishedCompactionResponses(), []);
+
+  rpcClient.setState({ pendingMessageCount: 1 });
+  rpcClient.emitEvent({ type: "agent_start" });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(channel.publishedCompactionResponses(), []);
+  let status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) assert.equal(status.data.host_pending_count, 1);
+
+  rpcClient.setState({ pendingMessageCount: 0 });
+  rpcClient.emitEvent({ type: "queue_update", pendingMessageCount: 0 });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(channel.publishedCompactionResponses(), [
+    { transaction_id: "compact-edge", accepted: true },
+  ]);
+  assert.equal(rpcClient.operations().filter((operation) => operation === "steer").length, 0);
+
+  channel.emitCompactionComplete("compact-edge", "not_started");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(edgeOperations, [
+    "begin:compact-edge",
+    "complete:compact-edge:not_started",
+  ]);
+  assert.deepEqual(channel.publishedCompactionResponses(), [
+    { transaction_id: "compact-edge", accepted: true },
+    { transaction_id: "compact-edge", accepted: true },
+  ]);
+  assert.equal(rpcClient.operations().filter((operation) => operation === "steer").length, 1);
+  status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) assert.equal(status.data.mailbox_pending_count, 0);
+});
+
+test("早到 not_started 取消等待中的 prepare，重复 complete 由事务墓碑幂等确认", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const edgeOperations: string[] = [];
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "直接边取消" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+    onCompactionPrepare: (transactionId) => {
+      edgeOperations.push(`begin:${transactionId}`);
+      return true;
+    },
+    onCompactionComplete: (transactionId, outcome) => {
+      edgeOperations.push(`complete:${transactionId}:${outcome}`);
+      return true;
+    },
+  });
+  assert.equal((await supervisor.start()).ok, true);
+  const stateGate = rpcClient.deferNext("get_state");
+
+  channel.emitCompactionPrepare("compact-cancelled");
+  await stateGate.started;
+  channel.emitCompactionComplete("compact-cancelled", "not_started");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(edgeOperations, [
+    "begin:compact-cancelled",
+    "complete:compact-cancelled:not_started",
+  ]);
+  assert.deepEqual(
+    channel.publishedCompactionResponses()
+      .filter((response) => response.transaction_id === "compact-cancelled")
+      .map((response) => response.accepted)
+      .sort(),
+    [false, true],
+  );
+
+  channel.emitCompactionComplete("compact-cancelled", "not_started");
+  channel.emitCompactionPrepare("compact-cancelled");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(edgeOperations, [
+    "begin:compact-cancelled",
+    "complete:compact-cancelled:not_started",
+  ]);
+  assert.deepEqual(
+    channel.publishedCompactionResponses()
+      .filter((response) => response.transaction_id === "compact-cancelled")
+      .map((response) => response.accepted)
+      .sort(),
+    [false, false, true, true],
+  );
+  stateGate.resolve();
+});
+
+test("业务 complete 与补偿先于 manual start/end 到达时仍保留生命周期授权", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "manual 结束重排" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+    onCompactionPrepare: () => true,
+    onCompactionComplete: () => true,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+
+  channel.emitCompactionPrepare("compact-manual-reordered");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(channel.publishedCompactionResponses(), [
+    { transaction_id: "compact-manual-reordered", accepted: true },
+  ]);
+
+  channel.emitCompactionComplete("compact-manual-reordered", "succeeded");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  channel.emitCompactionComplete("compact-manual-reordered", "not_started");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
+  rpcClient.emitEvent({
+    type: "compaction_end",
+    reason: "manual",
+    aborted: false,
+    willRetry: false,
+    failed: false,
+  });
+
+  const status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) assert.notEqual(status.data.state, "failed");
+  assert.equal((await supervisor.prompt("manual 后仍可用")).ok, true);
+});
+
+test("多个 prepared manual 授权按 FIFO 消费并可分别结束", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "manual 授权 FIFO" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+    onCompactionPrepare: () => true,
+    onCompactionComplete: () => true,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+
+  channel.emitCompactionPrepare("manual-fifo-a");
+  channel.emitCompactionPrepare("manual-fifo-b");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(
+    channel.publishedCompactionResponses().filter((response) => response.accepted),
+    [
+      { transaction_id: "manual-fifo-a", accepted: true },
+      { transaction_id: "manual-fifo-b", accepted: true },
+    ],
+  );
+
+  rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
+  rpcClient.emitEvent({
+    type: "compaction_end",
+    reason: "manual",
+    aborted: false,
+    willRetry: false,
+    failed: false,
+  });
+  rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
+  rpcClient.emitEvent({
+    type: "compaction_end",
+    reason: "manual",
+    aborted: false,
+    willRetry: false,
+    failed: false,
+  });
+  channel.emitCompactionComplete("manual-fifo-a", "succeeded");
+  channel.emitCompactionComplete("manual-fifo-b", "succeeded");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) assert.notEqual(status.data.state, "failed");
+});
+
+test("automatic compaction 不会消费正在进行的 manual 授权", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "manual 与 automatic 交错" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+    onCompactionPrepare: () => true,
+    onCompactionComplete: () => true,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+
+  channel.emitCompactionPrepare("manual-active");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
+
+  channel.emitCompactionComplete("manual-active", "succeeded");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  channel.emitCompactionPrepare("manual-pending");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  rpcClient.emitEvent({ type: "compaction_start", reason: "threshold" });
+  rpcClient.emitEvent({
+    type: "compaction_end",
+    reason: "threshold",
+    aborted: false,
+    willRetry: false,
+    failed: false,
+  });
+  rpcClient.emitEvent({
+    type: "compaction_end",
+    reason: "manual",
+    aborted: false,
+    willRetry: false,
+    failed: false,
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  let status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) assert.notEqual(status.data.state, "failed");
+
+  // automatic start 已消费等待中的 manual-pending，但不得碰 active 的 manual-active。
+  rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
+  status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) assert.equal(status.data.state, "failed");
+});
+
+test("not_started 在 manual start 前后分别处理授权，重复 manual end 进入故障", async () => {
+  for (const timing of ["before_start", "after_start"] as const) {
+    const tree = createController();
+    const rpcClient = new FakeRpcClient();
+    const channel = new RecordingSupervisorChannel([]);
+    const transactionId = `manual-not-started-${timing}`;
+    const supervisor = new RpcSupervisor({
+      controller: tree,
+      actor: ROOT_TREE_ACTOR,
+      reservation: { templateId: "researcher", name: `manual ${timing}` },
+      managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+      channel,
+      startupTimeoutMs: 100,
+      gracefulShutdownMs: 5,
+      onCompactionPrepare: () => true,
+      onCompactionComplete: () => true,
+    });
+    assert.equal((await supervisor.start()).ok, true);
+
+    channel.emitCompactionPrepare(transactionId);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    if (timing === "before_start") {
+      channel.emitCompactionComplete(transactionId, "not_started");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
+      const status = tree.getStatus(FIRST_AGENT_ID);
+      assert.equal(status.ok, true);
+      if (status.ok) assert.equal(status.data.state, "failed");
+      continue;
+    }
+
+    rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
+    channel.emitCompactionComplete(transactionId, "not_started");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    rpcClient.emitEvent({
+      type: "compaction_end",
+      reason: "manual",
+      aborted: false,
+      willRetry: false,
+      failed: false,
+    });
+    let status = tree.getStatus(FIRST_AGENT_ID);
+    assert.equal(status.ok, true);
+    if (status.ok) assert.notEqual(status.data.state, "failed");
+
+    rpcClient.emitEvent({
+      type: "compaction_end",
+      reason: "manual",
+      aborted: false,
+      willRetry: false,
+      failed: false,
+    });
+    status = tree.getStatus(FIRST_AGENT_ID);
+    assert.equal(status.ok, true);
+    if (status.ok) assert.equal(status.data.state, "failed");
+  }
+});
+
+test("监督传输故障释放同一直接边上的全部叠加压缩事务", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const releases: Array<{ readonly transactionId: string; readonly outcome: string }> = [];
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "故障释放直接边" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+    onCompactionPrepare: () => true,
+    onCompactionComplete: (transactionId, outcome) => {
+      releases.push({ transactionId, outcome });
+      return true;
+    },
+  });
+  assert.equal((await supervisor.start()).ok, true);
+  const firstProbe = rpcClient.deferNext("get_state");
+  const secondProbe = rpcClient.deferNext("get_state");
+
+  channel.emitCompactionPrepare("compact-a");
+  channel.emitCompactionPrepare("compact-b");
+  await Promise.all([firstProbe.started, secondProbe.started]);
+  channel.emitFault("eof");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(releases, [
+    { transactionId: "compact-a", outcome: "not_started" },
+    { transactionId: "compact-b", outcome: "not_started" },
+  ]);
+  const status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) assert.equal(status.data.state, "failed");
+  firstProbe.resolve();
+  secondProbe.resolve();
+});
+
+test("非法 Pi 事件、未经协调的 child manual compaction、extension_error 和运行期 EOF 归一化为稳定故障", async () => {
   for (const scenario of ["invalid_event", "manual_compaction", "extension_error", "eof"] as const) {
     const tree = createController();
     const rpcClient = new FakeRpcClient();

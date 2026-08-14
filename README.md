@@ -30,6 +30,7 @@
 - 同一个子代理可以连续接收多轮任务，适合需要保留上下文的长期分工。
 - 不同节点可以并行工作；同一个节点上的控制命令按顺序处理。
 - 子代理可以继续创建自己的子代理，形成受深度和名额限制的树。
+- 可选参与通用自动压缩协调，在压缩前冻结当前会话入口和唯一直接父子消息边，并以业务 ACK 确认释放；不同会话可并行压缩。
 - 父代理只能控制自己的直接子代理，不能越级操纵更深层后代。
 - 子代理只在遇到必须由直接父代理处理或裁决的阻塞问题，或父代理明确要求过程回报时调用 `reply_to_parent`；处理到达结束边界后，运行时再向直接父代理自动提交一次最终答复。
 - 会话关闭时，扩展会递归清理受监督的子进程树。
@@ -41,7 +42,7 @@
 | 项目 | 要求 |
 | --- | --- |
 | Node.js | `>= 22.19.0` |
-| Pi | `>= 0.83.0`，包名为 `@earendil-works/pi-coding-agent` |
+| Pi | `>= 0.84.1`，包名为 `@earendil-works/pi-coding-agent` |
 | 平台 | 代码门禁仅接受 Windows、macOS 和 Linux |
 | Windows | Pi 需要可用的 Bash（推荐随 Git for Windows 安装的 Git Bash）；扩展使用 Job Object 管理子进程树，并默认调用 `powershell.exe` |
 | macOS / Linux | 已实现 process group/session 适配器，但尚未完成独立原生验收 |
@@ -120,7 +121,7 @@ pi install "D:\path\to\pi-subagents-wj" -l --approve
 Pi 不管理本地路径中的源码副本。请先通过你实际取得源码的方式更新该目录，然后重新按锁文件装配生产依赖。
 
 > [!IMPORTANT]
-> 监督协议主版本升级时不能热接管旧活动树。当前版本只接受 `pi-subagent/8` 和 managed bridge `pi-subagent/managed-rpc/3`，不兼容 supervisor `/7`、bridge `/2` 或更早活动树；更新前应先退出旧 Pi 根会话并确认子树已清理，再更新源码、执行 `npm run build:bridge` 并重启。只有协议主版本未变化的更新才可依赖 `/reload` 保留现有树。
+> 监督协议主版本升级时不能热接管旧活动树。当前版本只接受 `pi-subagent/10` 和 managed bridge `pi-subagent/managed-rpc/3`，不兼容 supervisor `/9` 或更早活动树；更新前应先退出旧 Pi 根会话并确认子树已清理，再更新源码、执行 `npm run build:bridge` 并重启。managed bridge `/3` 未变化，但不能让旧 supervisor 活动树跨 `/reload` 混用。只有监督协议主版本未变化的更新才可依赖 `/reload` 保留现有树。
 
 ```powershell
 Set-Location D:\path\to\pi-subagents-wj
@@ -294,7 +295,7 @@ Markdown 正文可以为空，UTF-8 编码后最多 `64 KiB`；该边界同时�
 - 没有活动任务时，首条消息建立新的逻辑任务，并通过公开 `prompt()` 交付；`prompt()` 返回成功后仍要等真实 `agent_start` 才确认 Pi loop 已启动；
 - 同一任务已有真实活动轮次时，后续消息通过公开 `steer()` 进入当前 run；如果真实 `agent_settled` 已先到，则消息等待当前 final 提交后以 `prompt()` 继续；
 - Pi 原生阈值或溢出压缩期间，消息保留在 mailbox。压缩结束后只有真实 `agent_start` 才允许 `steer()`，真实 `agent_settled` 才允许 `prompt()`；两者出现前不读取状态或猜测 continuation 所有权；
-- 人工 `/compact` 只发生在根会话，不属于 managed child 的任务生命周期；child 只处理 `threshold` 与 `overflow` 自动压缩；
+- 人工 `/compact` 默认只属于根会话；managed child 只有在本地入口和直接父边协调已经确认时才接纳扩展触发的 `manual` 压缩，未经协调的 child manual 仍是协议故障；
 - 节点为 `failed`、`terminating` 或 `terminated` 时，消息会被拒绝。`suspended` 可以保守接纳新文本，但粘性屏障不会自行投递或恢复。
 
 工具成功会返回 `message_id` 和 `task_id`。`accepted: true` 只表示插件 mailbox 已接纳消息，不表示 Pi 或模型已经读取，也不表示任务已经完成。真实 Pi 命令随后失败或连接中断时，状态会保守投影为 `suspended`/`delivery_uncertain`，不会撤销已经返回的接纳事实。消息被接受后，已下发任务范围在子代理给出最终答复或进入终态前由该子代理负责；父代理应等待、查询状态或发送 steering，不能以只读检查、运行相同测试、复现、评审或独立验证为名重复实施或再次委派同一任务。只有派发前已经明确拆分、产出独立、无数据依赖且无共享写资源的其他工作才适合并行。
@@ -492,7 +493,7 @@ Markdown 正文可以为空，UTF-8 编码后最多 `64 KiB`；该边界同时�
 
 `run_state` 为 `settled`、`failed` 或 `interrupted`，`output_state` 为 `present` 或 `absent`。只有非空文本存在时才是 `present`；assistant 图片块会被忽略，图片-only 输出形成 `absent` final。`absent` final 没有说明性业务正文，并通过 `reason_code` 表达 `no_output`、`provider_error` 或 `runtime_fault`。失败或中断可以保留最近的安全文本候选，但状态明确表示结果并非完整成功。
 
-final 总会触发父代理处理。raw `agent_settled` 只建立 provisional settlement，handler 随即返回；final 发布和 ACK 在独立 outbox 中完成，不阻塞同一 lifecycle 事件上的其他处理。final 只有在父会话接纳与匹配 settlement 两个条件都满足时才提交并获得 reply ACK。Pi 原生阈值压缩可以保留已完成的安全候选；`overflow` 且 `willRetry: true` 会撤销旧候选。压缩结束后运行时只等待真实 `agent_start` 或 `agent_settled`，不发布恢复帧、不读取状态竞速，也不协调第三方 continuation 所有权。自动压缩失败进入粘性的 `suspended/maintenance_failed`。人工 `/compact` 只属于根会话；child 侧出现 `manual` 压缩事件会被视为协议故障，不会生成 replacement final。
+final 总会触发父代理处理。raw `agent_settled` 只建立 provisional settlement，handler 随即返回；final 发布和 ACK 在独立 outbox 中完成，不阻塞同一 lifecycle 事件上的其他处理。final 只有在父会话接纳与匹配 settlement 两个条件都满足时才提交并获得 reply ACK。Pi 原生阈值压缩可以保留已完成的安全候选；`overflow` 且 `willRetry: true` 会撤销旧候选。压缩结束后运行时只等待真实 `agent_start` 或 `agent_settled`，不发布恢复帧、不读取状态竞速。可选的通用自动压缩协调只冻结当前会话本地入口和唯一直接父子消息边，不递归锁定后代，也不接管 continuation：协调成功时，旧 `interrupted` final 保持冻结，下一次真实 `agent_start` 沿用原 `task_id` 并创建新 `turn_id`；失败、取消或 `not_started` 会释放旧轮收尾。未经协调的 child `manual` 压缩仍被视为协议故障。
 
 思考块、工具前说明、工具调用、工具参数、工具结果和原始错误不会进入 final 正文。`wait_agent` 和 `get_agent_status` 不重复携带 final 正文，只通过 `last_task` 保留任务身份、结果枚举和输出是否存在。
 
@@ -638,6 +639,20 @@ Pi 会把不同供应商的工具调用统一为 assistant message 中的结构�
 
 一次处理中的 assistant `message_end` 只更新当前 turn 最近的安全最终候选，不直接发送给父会话。正常、provider error 和协作式中断分别形成 `settled`、`failed` 或 `interrupted` final；重复或旧 turn 的 final 会被隔离。无业务载荷的 `absent` final 是合法结果，不生成占位正文。
 
+### 自动压缩协调
+
+本扩展不触发自动压缩，也不依赖特定自动压缩 package。它可作为 `wj-pi-auto-compact/coordination/v1` 的可选参与者：发现响应只暴露不透明参与者标识和是否需要屏障，不暴露代理树角色、任务身份或节点身份。
+
+协调 prepare 在当前会话同步冻结两类本地入口：直接子回复进入本会话的 reply/final 接纳点，以及当前 child 自身向直接父级发布 reply/final 的 outbox。若当前会话有直接 parent，参与者再沿唯一上游监督通道发送 `compaction_prepare`；它不会向直接子或更深后代递归下发，也不阻止压缩期间创建新 child。因此根与 child、祖先与孙节点、不同 sibling 都可以独立并行压缩。
+
+parent 收到 child 的 prepare 后，会先为该 child 同步安装下行 mailbox 令牌和上行 reply/final 令牌，再等待准备线性化点前的工作静止。静止要求没有 in-flight 交付、Pi 宿主待处理计数为零、没有等待中的 prompt start，并排除 `delivery_uncertain` 与 `maintenance_failed`；Pi `queue_update.pendingMessageCount` 和 `get_state` 中的同一计数是内部消息队列的权威事实，`prompt()`/`steer()` RPC 返回成功本身不能证明排空。屏障之后的新父子消息仍可被 mailbox 接纳，但会可靠停留到全部叠加事务令牌释放。prepare/complete、业务响应、transport ACK 和关闭通知不经过消息闸门。
+
+`compaction_prepare`、`compaction_prepared`、`compaction_complete` 和 `compaction_completed` 在 supervisor `/10` 中只允许 child 请求、parent 响应。事务标识必须非空且不超过 256 字符；同一直接边允许不同事务令牌叠加，释放一个事务不会释放其他事务。普通累计 transport ACK 只证明帧送达，只有 `prepared/completed` 业务响应才能结算协调 waiter。业务 `false` 是已处理的拒绝；超时或异常是送达不确定。complete 不确定时，child 在原 waiter 清理后用独立期限补发同事务 `not_started`；补偿得到 `true` 或 `false` 都证明 parent 已闭合事务，补偿仍无业务响应才废止直接上游通道。父端在通道故障、关闭或补偿无法闭合时释放全部边令牌并按既有终止边界回收目标 child。
+
+只有本机会话通过 EventBus 发起的事务会把成功结果解释为等待本机 continuation。任一参与者的 complete 未确认时，协调发起方会对全部固定参与者补发同事务 `not_started`；已经确认 `succeeded` 的本参与者允许该补偿撤销 continuation 等待并释放旧 interrupted final。manual 压缩授权在 parent 接受对应 `compaction_start` 后保留到 Pi 的实际 `compaction_end`，即使业务 complete 通过独立监督流更早到达，也不会把合法的迟到结束事件判为未授权。
+
+协调参与者会在 `/reload` 交接前以 `not_started` 释放活动本地入口和直接上游边并注销旧实例监听器；新实例接管原运行时后重新发现既有监督连接并绑定，活动事务不跨实例转移。当 supervisor 主版本从 `/9` 升到 `/10` 时，活动树不能热接管，必须先结束旧树。
+
 ## 安全与资源边界
 
 ### 扩展拥有宿主用户权限
@@ -678,7 +693,7 @@ pi --version
 pi list
 ```
 
-- Node 必须至少是 `22.19.0`，Pi 必须至少是 `0.83.0`。
+- Node 必须至少是 `22.19.0`，Pi 必须至少是 `0.84.1`。
 - 确认本地 package 路径仍存在，并且该目录已经安装 `semver`、`yaml` 等生产依赖。`pi list` 只显示用户级来源；若使用了项目级 `-l` 安装，请在对应项目内启动 Pi 后确认 `/agent` 可用。
 - Windows 需要能从 `PATH` 调用 `powershell.exe`。
 - 如果启动时出现 `host_capability_unavailable`，括号中的稳定原因可帮助区分版本、平台、运行依赖、进程树适配器或 Pi API 问题。

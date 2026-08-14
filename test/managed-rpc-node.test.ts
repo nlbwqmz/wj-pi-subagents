@@ -22,6 +22,11 @@ import {
   type ManagedRpcNodeStartContext,
   type ManagedRpcReply,
 } from "../src/managed-rpc-node.ts";
+import type {
+  SupervisorCompactionComplete,
+  SupervisorCompactionPrepared,
+  SupervisorCompactionCompleted,
+} from "../src/supervisor-channel.ts";
 import { ManagedRpcSupervisorChannel } from "../src/managed-rpc-supervisor-channel.ts";
 import {
   RpcSupervisor,
@@ -784,6 +789,38 @@ class LinkedManagedNode extends FakeManagedRpcNode {
     this.publishedReplies += 1;
     this.endpoint?.publishReply(reply);
   }
+
+  onCompactionPrepare(listener: (transactionId: string) => void): () => void {
+    return this.endpoint?.onCompactionPrepare((request) => listener(request.transaction_id)) ?? (() => {});
+  }
+
+  onCompactionComplete(
+    listener: (transactionId: string, outcome: SupervisorCompactionComplete["outcome"]) => void,
+  ): () => void {
+    return this.endpoint?.onCompactionComplete((request) => listener(request.transaction_id, request.outcome))
+      ?? (() => {});
+  }
+
+  requestCompactionPrepare(transactionId: string): Promise<boolean> {
+    if (this.endpoint === undefined) throw new Error("测试 child 端点未启动");
+    return this.endpoint.requestCompactionPrepare(transactionId);
+  }
+
+  respondCompactionPrepared(response: SupervisorCompactionPrepared): void {
+    this.endpoint?.respondCompactionPrepared(response);
+  }
+
+  requestCompactionComplete(
+    transactionId: string,
+    outcome: SupervisorCompactionComplete["outcome"],
+  ): Promise<boolean> {
+    if (this.endpoint === undefined) throw new Error("测试 child 端点未启动");
+    return this.endpoint.requestCompactionComplete(transactionId, outcome);
+  }
+
+  respondCompactionCompleted(response: SupervisorCompactionCompleted): void {
+    this.endpoint?.respondCompactionCompleted(response);
+  }
 }
 
 test("RpcSupervisor 通过真正 child 端点完成双握手和回复 ACK", async () => {
@@ -853,6 +890,86 @@ test("RpcSupervisor 通过真正 child 端点完成双握手和回复 ACK", asyn
   assert.equal(events.some((event) => (
     typeof event === "object" && event !== null && (event as { kind?: unknown }).kind === "reply"
   )), false);
+});
+
+test("Managed RPC bridge 透明承载 child 请求和 parent 压缩业务 ACK", async () => {
+  const id = "98989898-9898-4989-8989-989898989898";
+  const node = new LinkedManagedNode();
+  const credential = "supervisor-credential-0123456789012345";
+  const channel = new ManagedRpcSupervisorChannel({
+    node,
+    rootId: "root-managed-compaction",
+    localAgentId: null,
+    peerAgentId: id,
+    parentAgentId: null,
+    depth: 1,
+    credential,
+    requestIdRegistry: new SupervisorRequestIdRegistry(),
+  });
+  const signal = new AbortController().signal;
+  await channel.bind(signal);
+  await node.start(signal, {
+    supervisor: {
+      root_id: "root-managed-compaction",
+      local_agent_id: id,
+      peer_agent_id: "",
+      parent_agent_id: null,
+      depth: 1,
+      credential,
+      initial_snapshot: [{
+        agent_id: id,
+        parent_agent_id: null,
+        template_id: "researcher",
+        name: "受管压缩",
+        depth: 1,
+        state: "idle",
+        mailbox_pending_count: 0,
+        host_pending_count: 0,
+        reply_outbox_pending_count: 0,
+        revision: 1,
+      }],
+      initial_subtree_revision: 1,
+    },
+  });
+  await channel.waitForReady(signal);
+
+  let parentPrepareRequest: string | undefined;
+  channel.onCompactionPrepare((request) => { parentPrepareRequest = request.transaction_id; });
+  const childPrepare = node.requestCompactionPrepare("compact-managed-child");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(parentPrepareRequest, "compact-managed-child");
+  let childPrepareSettled = false;
+  void childPrepare.then(() => { childPrepareSettled = true; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(childPrepareSettled, false);
+  await channel.respondCompactionPrepared({ transaction_id: "compact-managed-child", accepted: true });
+  assert.equal(await childPrepare, true);
+
+  let parentCompleteRequest: { transactionId: string; outcome: string } | undefined;
+  channel.onCompactionComplete((request) => {
+    parentCompleteRequest = {
+      transactionId: request.transaction_id,
+      outcome: request.outcome,
+    };
+  });
+  const childComplete = node.requestCompactionComplete("compact-managed-child", "cancelled");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(parentCompleteRequest, {
+    transactionId: "compact-managed-child",
+    outcome: "cancelled",
+  });
+  let childCompleteSettled = false;
+  void childComplete.then(() => { childCompleteSettled = true; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(childCompleteSettled, false);
+  await channel.respondCompactionCompleted({ transaction_id: "compact-managed-child", accepted: false });
+  assert.equal(await childComplete, false);
+
+  await assert.rejects(channel.requestCompactionPrepare("invalid-parent-request"));
+  await assert.rejects(channel.requestCompactionComplete("invalid-parent-request", "failed"));
+
+  await channel.release();
+  await node.release();
 });
 
 test("监督通道在 waitForReady 尚未开始时遇到 EOF 不产生未处理拒绝", async () => {

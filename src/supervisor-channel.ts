@@ -20,7 +20,7 @@ import {
 } from "./tree-controller.ts";
 
 /** 父子监督通道与 Pi 任务 RPC 完全隔离的固定协议版本。 */
-export const SUPERVISOR_PROTOCOL_VERSION = "pi-subagent/8";
+export const SUPERVISOR_PROTOCOL_VERSION = "pi-subagent/10";
 
 export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "hello",
@@ -33,6 +33,10 @@ export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "task_started",
   "control_request",
   "control_response",
+  "compaction_prepare",
+  "compaction_prepared",
+  "compaction_complete",
+  "compaction_completed",
   "ack",
   "close",
 ] as const);
@@ -101,7 +105,7 @@ export interface SupervisorSnapshot {
 
 export type SupervisorReplyKind = ChildReplyEnvelope["kind"];
 
-/** v8 wire reply：传输序号与模型可见信封保持明确分层。 */
+/** v10 wire reply：传输序号与模型可见信封保持明确分层。 */
 export interface SupervisorReply {
   readonly reply_seq: number;
   readonly envelope: ChildReplyEnvelope;
@@ -120,6 +124,26 @@ export interface SupervisorTaskAssignment {
 export interface SupervisorTaskStarted {
   readonly task_id: string;
   readonly turn_id: string;
+}
+
+export type SupervisorCompactionOutcome = "succeeded" | "failed" | "cancelled" | "not_started";
+
+/** child 在执行协调压缩前要求直接父端建立接纳屏障。 */
+export interface SupervisorCompactionPrepare {
+  readonly transaction_id: string;
+}
+
+export interface SupervisorCompactionPrepared extends SupervisorCompactionPrepare {
+  readonly accepted: boolean;
+}
+
+/** child 在压缩事务结束后要求直接父端释放同一屏障。 */
+export interface SupervisorCompactionComplete extends SupervisorCompactionPrepare {
+  readonly outcome: SupervisorCompactionOutcome;
+}
+
+export interface SupervisorCompactionCompleted extends SupervisorCompactionPrepare {
+  readonly accepted: boolean;
 }
 
 /** 监督控制正文只允许可复制、可深冻结的纯 JSON 值。 */
@@ -240,6 +264,14 @@ export interface SupervisorReceiveAccepted {
   readonly task_assignment?: SupervisorTaskAssignment;
   /** parent 端收到的 child 任务/turn 身份事实。 */
   readonly task_started?: SupervisorTaskStarted;
+  /** parent 端收到的协调压缩屏障请求。 */
+  readonly compaction_prepare?: SupervisorCompactionPrepare;
+  /** child 端收到的协调压缩准备结果。 */
+  readonly compaction_prepared?: SupervisorCompactionPrepared;
+  /** parent 端收到的协调压缩完成请求。 */
+  readonly compaction_complete?: SupervisorCompactionComplete;
+  /** child 端收到的协调压缩完成确认。 */
+  readonly compaction_completed?: SupervisorCompactionCompleted;
   /** 仅供本地监督器递交给 TreeController 的脱敏生命周期事实。 */
   readonly event?: SupervisorEvent;
   /** 本次接收原子替换的完整快照；调用方可直接交给树控制器。 */
@@ -400,6 +432,10 @@ function validBoundedString(value: unknown, limits: SupervisorChannelLimits): va
 
 function validOpaqueId(value: unknown, limits: SupervisorChannelLimits): value is string {
   return validBoundedString(value, limits) && SAFE_ID_PATTERN.test(value);
+}
+
+function validCompactionTransactionId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256;
 }
 
 function validStreamId(value: unknown, limits: SupervisorChannelLimits): value is string {
@@ -956,6 +992,51 @@ function parseTaskStarted(payload: Record<string, unknown>): SupervisorTaskStart
   });
 }
 
+const SUPERVISOR_COMPACTION_OUTCOMES: ReadonlySet<string> = new Set([
+  "succeeded",
+  "failed",
+  "cancelled",
+  "not_started",
+]);
+
+function parseCompactionPrepare(payload: Record<string, unknown>): SupervisorCompactionPrepare {
+  if (!hasExactObjectKeys(payload, ["transaction_id"]) || !validCompactionTransactionId(payload.transaction_id)) {
+    frameError("invalid_frame");
+  }
+  return Object.freeze({ transaction_id: payload.transaction_id });
+}
+
+function parseCompactionPrepared(payload: Record<string, unknown>): SupervisorCompactionPrepared {
+  if (
+    !hasExactObjectKeys(payload, ["transaction_id", "accepted"])
+    || !validCompactionTransactionId(payload.transaction_id)
+    || typeof payload.accepted !== "boolean"
+  ) frameError("invalid_frame");
+  return Object.freeze({ transaction_id: payload.transaction_id, accepted: payload.accepted });
+}
+
+function parseCompactionComplete(payload: Record<string, unknown>): SupervisorCompactionComplete {
+  if (
+    !hasExactObjectKeys(payload, ["transaction_id", "outcome"])
+    || !validCompactionTransactionId(payload.transaction_id)
+    || typeof payload.outcome !== "string"
+    || !SUPERVISOR_COMPACTION_OUTCOMES.has(payload.outcome)
+  ) frameError("invalid_frame");
+  return Object.freeze({
+    transaction_id: payload.transaction_id,
+    outcome: payload.outcome as SupervisorCompactionOutcome,
+  });
+}
+
+function parseCompactionCompleted(payload: Record<string, unknown>): SupervisorCompactionCompleted {
+  if (
+    !hasExactObjectKeys(payload, ["transaction_id", "accepted"])
+    || !validCompactionTransactionId(payload.transaction_id)
+    || typeof payload.accepted !== "boolean"
+  ) frameError("invalid_frame");
+  return Object.freeze({ transaction_id: payload.transaction_id, accepted: payload.accepted });
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -1164,6 +1245,38 @@ export class SupervisorChannel {
     ) throw new SupervisorProtocolError("closed");
     const parsed = parseTaskStarted(started as unknown as Record<string, unknown>);
     return this.createFrame("task_started", parsed as unknown as Record<string, unknown>);
+  }
+
+  publishCompactionPrepare(request: SupervisorCompactionPrepare): SupervisorFrame {
+    if (this.role !== "child" || this.terminationBarrier || this.state !== "ready") {
+      throw new SupervisorProtocolError("closed");
+    }
+    const parsed = parseCompactionPrepare(request as unknown as Record<string, unknown>);
+    return this.createFrame("compaction_prepare", parsed as unknown as Record<string, unknown>);
+  }
+
+  publishCompactionPrepared(response: SupervisorCompactionPrepared): SupervisorFrame {
+    if (this.role !== "parent" || this.terminationBarrier || this.state !== "ready") {
+      throw new SupervisorProtocolError("closed");
+    }
+    const parsed = parseCompactionPrepared(response as unknown as Record<string, unknown>);
+    return this.createFrame("compaction_prepared", parsed as unknown as Record<string, unknown>);
+  }
+
+  publishCompactionComplete(request: SupervisorCompactionComplete): SupervisorFrame {
+    if (this.role !== "child" || this.terminationBarrier || this.state !== "ready") {
+      throw new SupervisorProtocolError("closed");
+    }
+    const parsed = parseCompactionComplete(request as unknown as Record<string, unknown>);
+    return this.createFrame("compaction_complete", parsed as unknown as Record<string, unknown>);
+  }
+
+  publishCompactionCompleted(response: SupervisorCompactionCompleted): SupervisorFrame {
+    if (this.role !== "parent" || this.terminationBarrier || this.state !== "ready") {
+      throw new SupervisorProtocolError("closed");
+    }
+    const parsed = parseCompactionCompleted(response as unknown as Record<string, unknown>);
+    return this.createFrame("compaction_completed", parsed as unknown as Record<string, unknown>);
   }
 
   /** child 发布已绑定自身分支的内部控制请求；operation_id 不占用监督 request_id。 */
@@ -1417,6 +1530,10 @@ export class SupervisorChannel {
     let transportAck: number | undefined;
     let taskAssignment: SupervisorTaskAssignment | undefined;
     let taskStarted: SupervisorTaskStarted | undefined;
+    let compactionPrepare: SupervisorCompactionPrepare | undefined;
+    let compactionPrepared: SupervisorCompactionPrepared | undefined;
+    let compactionComplete: SupervisorCompactionComplete | undefined;
+    let compactionCompleted: SupervisorCompactionCompleted | undefined;
     let event: SupervisorEvent | undefined;
     let controlRequest: SupervisorControlRequest | undefined;
     let controlResponse: SupervisorControlResponse | undefined;
@@ -1451,6 +1568,22 @@ export class SupervisorChannel {
       case "task_started":
         if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
         taskStarted = parseTaskStarted(frame.payload);
+        break;
+      case "compaction_prepare":
+        if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
+        compactionPrepare = parseCompactionPrepare(frame.payload);
+        break;
+      case "compaction_prepared":
+        if (this.role !== "child" || this.state !== "ready") frameError("sequence_violation");
+        compactionPrepared = parseCompactionPrepared(frame.payload);
+        break;
+      case "compaction_complete":
+        if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
+        compactionComplete = parseCompactionComplete(frame.payload);
+        break;
+      case "compaction_completed":
+        if (this.role !== "child" || this.state !== "ready") frameError("sequence_violation");
+        compactionCompleted = parseCompactionCompleted(frame.payload);
         break;
       case "control_request":
         if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
@@ -1492,6 +1625,10 @@ export class SupervisorChannel {
       ...(transportAck === undefined ? {} : { transport_ack: transportAck }),
       ...(taskAssignment === undefined ? {} : { task_assignment: taskAssignment }),
       ...(taskStarted === undefined ? {} : { task_started: taskStarted }),
+      ...(compactionPrepare === undefined ? {} : { compaction_prepare: compactionPrepare }),
+      ...(compactionPrepared === undefined ? {} : { compaction_prepared: compactionPrepared }),
+      ...(compactionComplete === undefined ? {} : { compaction_complete: compactionComplete }),
+      ...(compactionCompleted === undefined ? {} : { compaction_completed: compactionCompleted }),
       ...(event === undefined ? {} : { event }),
       ...(acceptedSnapshot === undefined ? {} : { snapshot: acceptedSnapshot }),
       ...(controlRequest === undefined ? {} : { control_request: controlRequest }),

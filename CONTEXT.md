@@ -231,8 +231,8 @@ _避免使用_：原始工具结果 JSON、工具日志
 _避免使用_：工具最大集合、工具尽力集合、父工具子集校验
 
 **运行时重载**：
-Pi 在不重建子代理节点的情况下重新加载扩展与动态资源；同一监督主版本内，已认领的控制器、任务 mailbox、未确认 reply 和直接父子所有权继续保留。监督协议主版本变化不是普通重载：`pi-subagent/7` 及更早活动树不能由 `/8` 运行时接管，更新前必须结束旧树并以同版本端点重建。
-_避免使用_：重新创建、模板再次准入、向失效父 API 确认回复、跨协议热接管
+Pi 在不重建子代理节点的情况下重新加载扩展与动态资源；同一监督主版本内，已认领的控制器、任务 mailbox、未确认 reply 和直接父子所有权继续保留。协调压缩参与者属于扩展实例而不是代理树：旧实例交接前以 `not_started` 释放本地入口和直接上游边并注销监听，新实例接管后重新发现既有监督连接并绑定新参与者；活动协调事务不跨实例转移。监督协议主版本变化不是普通重载：`pi-subagent/9` 及更早活动树不能由 `/10` 运行时接管，更新前必须结束旧树并以同版本端点重建。
+_避免使用_：重新创建、模板再次准入、向失效父 API 确认回复、跨协议热接管、跨实例保留协调监听器
 
 **显式工具声明**：
 每个代理模板必须明确给出模板工具集；省略不是继承全部工具的缩写。唯一合法空集合写法是精确 YAML 字符串 `tools: ""`；非空字符串在逗号拆分、裁剪并丢弃空项后没有工具名时属于无效模板。
@@ -275,19 +275,27 @@ _避免使用_：诊断消息、上下文注入、持久化警告
 _避免使用_：子代理、代理实例
 
 **父子监督通道**：
-每个子控制器与直接父控制器之间独立于 Pi 任务 RPC 的本地双向控制通道；当前监督主版本为 `pi-subagent/8`，内部受管 bridge 主版本为 `pi-subagent/managed-rpc/3`。它在一个累计 ACK 顺序域中承载握手、生命周期、子树快照、任务 assignment/start、第四版结构化 reply、逐跳权威请求与关闭通知；业务 reply 不能越过对应 `task_started`，应用回调产生的帧也不能越过协议先生成的 ACK。
+每个子控制器与直接父控制器之间独立于 Pi 任务 RPC 的本地双向控制通道；当前监督主版本为 `pi-subagent/10`，内部受管 bridge 主版本为 `pi-subagent/managed-rpc/3`。它在一个累计 ACK 顺序域中承载握手、生命周期、子树快照、任务 assignment/start、第四版结构化 reply、逐跳权威请求、child 发起的直接边压缩请求、parent 业务响应与关闭通知；业务 reply 不能越过对应 `task_started`，协调请求也不能把 transport ACK 当作业务确认。
 _避免使用_：模型消息通道、共享事件总线、Pi 任务 RPC 控制帧、旧协议活动树
+
+**协调压缩事务**：
+由不透明事务标识关联的一次可选跨扩展压缩屏障；prepare 在当前会话冻结直接子 reply/final 入口、当前 child 自身的上行 reply/final，并在存在直接 parent 时请求唯一直接上游边，complete 以 `succeeded`、`failed`、`cancelled` 或 `not_started` 释放同一组本地边界。只有全部固定参与者完成业务确认后，本地触发会话才采纳原 complete 结果；任一确认失败时发起方对全体固定参与者补偿同事务 `not_started`，已确认成功的参与者必须允许该补偿撤销 continuation 等待。它只协调会话本地入口和直接父子消息边界，不拥有压缩实现、逻辑任务、处理轮次或 continuation 决策；普通传输确认不等于 prepare/complete 业务确认。
+_避免使用_：压缩恢复租约、任务事务、EventBus 已送达即完成、全局角色发现、递归子树事务
+
+**直接边协调屏障**：
+child 通过认证监督通道向唯一直接 parent 请求建立的会话局部屏障；parent 同步为该 child 安装下行 mailbox 令牌和上行 reply/final 令牌，再等待线性化点前的投递、prompt 启动和 Pi 内部消息队列静止。直接边静止至少要求 mailbox 没有 in-flight 交付、宿主待处理计数为零、没有等待中的 prompt start，并且不存在交付不确定或维护失败；Pi `queue_update.pendingMessageCount` 及 `get_state` 的同一计数是内部队列事实，RPC 命令成功本身不是排空证明。屏障令牌按非空且不超过 256 字符的事务标识叠加，释放一个事务不能释放其他事务；屏障后的新 prompt/steer 可可靠留在 mailbox 延迟投递，控制帧、业务响应、transport ACK 和关闭通知不受消息闸门阻塞。事务不递归传播到后代，不固定整棵子树成员，也不阻止创建新 child；根、父、子、孙和 sibling 会话可以各自并行压缩。complete 未确认时先以同事务 `not_started` 补偿；补偿仍没有业务响应才废止直接上游通道，父端无法闭合目标 child 的直接边时终止该 child。
+_避免使用_：递归协调屏障、广播冻结、祖先子树锁、动态全树成员、只释放已收到 ACK 的成员
 
 **原生压缩边界**：
 Pi 因阈值或上下文溢出执行的原生自动压缩边界；它不转移逻辑任务所有权。压缩后的真实 `agent_start` 证明后续消息可进入当前处理轮次，真实 `agent_settled` 证明宿主已静止；在两者出现前，控制器不猜测 continuation 所有权或投递模式。
 _避免使用_：压缩恢复租约、第三方 continuation marker、定时恢复、状态读取竞态
 
 **根会话人工压缩边界**：
-人工 `/compact` 只属于根 Pi 会话的宿主生命周期，不是 managed child 的任务、mailbox 或 supervisor 事件。child 只处理 `threshold` 与 `overflow` 自动压缩；若 child 侧出现 `manual` 压缩事实，则视为运行时不变量违约，而不是任务中断或 replacement final。
-_避免使用_：child 人工压缩、压缩中断任务、同轮 replacement final
+用户发起的 `/compact` 只属于根 Pi 会话的宿主生命周期，不是 managed child 的任务、mailbox 或 supervisor 事件。managed child 只有在协调压缩事务已经建立时才接纳扩展触发的 `manual` 压缩；未经协调的 child `manual` 事实仍是运行时不变量违约，而不是任务中断或 replacement final。
+_避免使用_：未经协调的 child 人工压缩、压缩中断任务、同轮 replacement final
 
 **监督帧闭集**：
-父子监督通道唯一允许的十二类帧：`hello`、`hello_ack`、`event`、`snapshot_request`、`snapshot`、`reply`、`task_assignment`、`task_started`、`control_request`、`control_response`、`ack` 和 `close`；闭集之外的控制语义必须拒绝。
+父子监督通道唯一允许的十六类帧：`hello`、`hello_ack`、`event`、`snapshot_request`、`snapshot`、`reply`、`task_assignment`、`task_started`、`control_request`、`control_response`、`compaction_prepare`、`compaction_prepared`、`compaction_complete`、`compaction_completed`、`ack` 和 `close`；闭集之外的控制语义必须拒绝。
 _避免使用_：开放事件总线、自定义控制消息、任务 RPC 控制帧
 
 **代理树权威**：

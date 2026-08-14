@@ -19,7 +19,7 @@
 
 本票据只定义并校验适配器边界，不伪造平台能力。默认入口在没有注入真实适配器时保持失败关闭；Issue 17 负责资源确认边界，Issue 22/23 分别交付并注入 Windows Job Object 与 macOS/Linux process group/session 的生产实现。适配器完成后，注入完整实现的支持宿主即可走空操作激活路径；在此之前真实 package 的失活是预期的安全行为，而不是把平台字符串当作能力证明。
 
-验证：`npm run check` 的 TypeScript 检查和全部自动化测试通过；package manifest 测试直接锁定规格要求的 Node `>=22.19.0` 与 Pi `>=0.83.0`，不会从实现常量反向生成期望值。
+验证：`npm run check` 的 TypeScript 检查和全部自动化测试通过；package manifest 测试直接锁定规格要求的 Node `>=22.19.0` 与 Pi `>=0.84.1`，不会从实现常量反向生成期望值。
 
 ## Comments
 

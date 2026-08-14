@@ -10,6 +10,8 @@ Blocked by: none
 
 ## Answer
 
+> 版本注记：本票据固定的上游提交和 `0.83.0` API 观察仅是研究证据；现行扩展最低宿主已升级为 Pi `0.84.1`，由统一规格和 host gate 裁决。
+
 Pi 原生足以承载单个长期、无会话持久化的 RPC 子代理进程，并直接提供 prompt/steering、abort、状态、队列、完整事件流、动态工具与扩展/TUI 生命周期 API；但 Pi 没有父子代理、深度预算或跨进程代理树领域对象。
 
 Pi 底层协议支持用 `prompt + streamingBehavior: "steer"` 原子覆盖空闲启动和繁忙 steering；但 `0.83.0` 公共 `RpcClient.prompt()` 没有暴露该字段。当前扩展因此采用兼容决策：控制器在单节点顺序域内读取已确认状态，空闲使用 `prompt`，工作中或中断中使用 `steer`；无法确认交付时不自动重发。直接在空闲状态调用原生 `steer` 只会入队，不会启动运行。

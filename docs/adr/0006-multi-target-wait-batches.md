@@ -2,7 +2,7 @@
 
 Status: accepted
 
-> 当前监督协议已由 [ADR-0008](./0008-native-compaction-lifecycle-and-root-manual-boundary.md) 硬切换为 `pi-subagent/8`；本 ADR 的 `/6` 版本号保留为历史决策。
+> 当前监督协议已由 [ADR-0010](./0010-session-local-direct-edge-compaction.md) 硬切换为 `pi-subagent/10`；历史递归 `/9` 方案由 [ADR-0009](./0009-generic-recursive-compaction-barrier.md) 记录，本 ADR 的 `/6` 版本号保留为历史决策。
 
 ## 背景
 

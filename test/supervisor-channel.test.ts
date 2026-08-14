@@ -144,7 +144,70 @@ test("task assignment 与 task_started 在同一累计 ACK 顺序域传递 UUIDv
   }), "invalid_frame");
 });
 
-test("v8 拒绝已移除的 compaction_resume 帧", () => {
+test("v10 压缩帧只允许 child 请求和 parent 响应", () => {
+  const pair = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+  });
+  handshake(pair);
+  const transactionId = "compact-transaction-1";
+
+  pair.child.send(pair.child.publishCompactionPrepare({ transaction_id: transactionId }));
+  const parentPrepare = pair.child.deliverNext();
+  assert.equal(parentPrepare?.kind, "accepted");
+  if (parentPrepare?.kind === "accepted") {
+    assert.deepEqual(parentPrepare.compaction_prepare, { transaction_id: transactionId });
+  }
+  pair.flush();
+
+  pair.parent.send(pair.parent.publishCompactionPrepared({ transaction_id: transactionId, accepted: true }));
+  const childPrepared = pair.parent.deliverNext();
+  assert.equal(childPrepared?.kind, "accepted");
+  if (childPrepared?.kind === "accepted") {
+    assert.deepEqual(childPrepared.compaction_prepared, { transaction_id: transactionId, accepted: true });
+  }
+  pair.flush();
+
+  pair.child.send(pair.child.publishCompactionComplete({ transaction_id: transactionId, outcome: "not_started" }));
+  const parentComplete = pair.child.deliverNext();
+  assert.equal(parentComplete?.kind, "accepted");
+  if (parentComplete?.kind === "accepted") {
+    assert.deepEqual(parentComplete.compaction_complete, {
+      transaction_id: transactionId,
+      outcome: "not_started",
+    });
+  }
+  pair.flush();
+
+  pair.parent.send(pair.parent.publishCompactionCompleted({ transaction_id: transactionId, accepted: false }));
+  const childCompleted = pair.parent.deliverNext();
+  assert.equal(childCompleted?.kind, "accepted");
+  if (childCompleted?.kind === "accepted") {
+    assert.deepEqual(childCompleted.compaction_completed, { transaction_id: transactionId, accepted: false });
+  }
+  pair.flush();
+
+  assertProtocolError(() => pair.parent.publishCompactionPrepare({ transaction_id: transactionId }), "closed");
+  assertProtocolError(() => pair.child.publishCompactionPrepared({
+    transaction_id: transactionId,
+    accepted: true,
+  }), "closed");
+  assertProtocolError(() => pair.parent.publishCompactionComplete({
+    transaction_id: transactionId,
+    outcome: "succeeded",
+  }), "closed");
+  assertProtocolError(() => pair.child.publishCompactionCompleted({
+    transaction_id: transactionId,
+    accepted: true,
+  }), "closed");
+  assertProtocolError(() => pair.child.publishCompactionComplete({
+    transaction_id: transactionId,
+    outcome: "unknown" as "succeeded",
+  }), "invalid_frame");
+});
+
+test("v10 拒绝已移除的 compaction_resume 帧", () => {
   const pair = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,
     childAgentId: CHILD_ID,
@@ -166,7 +229,7 @@ test("v8 拒绝已移除的 compaction_resume 帧", () => {
 
 test("长度边界 UTF-8 JSON 可处理分块与拼接帧，拒绝截断/损坏载荷", () => {
   const frame: SupervisorFrame = {
-    protocol: "pi-subagent/8",
+    protocol: "pi-subagent/10",
     kind: "event",
     stream_id: "stream_test",
     sender_agent_id: CHILD_ID,
@@ -501,7 +564,7 @@ test("工作中 message 为 final 预留窗口槽位，二者按同一 reply_seq
   assert.equal(pair.child.getPublicState().pending_reply_count, 0);
 });
 
-test("原始 v8 reply 必须携带合法 envelope，且 message/final 都拒绝图片字段", () => {
+test("v10 reply 必须携带合法 envelope，且 message/final 都拒绝图片字段", () => {
   const missingEnvelope = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,
     childAgentId: CHILD_ID,

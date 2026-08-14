@@ -112,6 +112,68 @@ test("新 turn 会作废旧 turn provisional final", () => {
   assert.equal(value.projection().last_task?.turn_id, TURN_2);
 });
 
+test("直接边协调令牌可叠加，旧交付排空后仍阻止新消息与 final commit", () => {
+  const value = mailbox([PLACEHOLDER_TASK]);
+  const current = value.submit("屏障前消息");
+  const inFlight = value.takeNextDelivery();
+  assert.ok(inFlight);
+
+  assert.equal(value.beginCoordinationBarrier("compact-a"), true);
+  assert.equal(value.beginCoordinationBarrier("compact-b"), true);
+  assert.equal(value.beginCoordinationBarrier("compact-a"), true);
+  assert.equal(value.hasCoordinationBarrier(), true);
+  assert.equal(value.coordinationBarrierReadiness(), "waiting");
+
+  assert.equal(value.hostAccepted(inFlight!.delivery_id), true);
+  assert.equal(value.coordinationBarrierReadiness(), "waiting");
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
+  assert.equal(value.coordinationBarrierReadiness(), "quiescent");
+
+  const queued = value.submit("屏障期间消息");
+  assert.equal(queued.task_id, current.task_id);
+  assert.equal(value.takeNextDelivery(), undefined);
+  value.observeAgentSettled();
+  const candidate = final(current.task_id, TURN_1, COMMIT_1);
+  assert.equal(value.prepareFinal(candidate), false);
+  assert.equal(value.commitPreparedFinal(COMMIT_1), false);
+
+  assert.equal(value.completeCoordinationBarrier("compact-a"), true);
+  assert.equal(value.hasCoordinationBarrier(), true);
+  assert.equal(value.takeNextDelivery(), undefined);
+  assert.equal(value.commitPreparedFinal(COMMIT_1), false);
+
+  assert.equal(value.completeCoordinationBarrier("compact-b"), true);
+  assert.equal(value.hasCoordinationBarrier(), false);
+  assert.equal(value.prepareFinal(candidate), false);
+  const delivery = value.takeNextDelivery();
+  assert.equal(delivery?.mode, "prompt");
+  assert.equal(delivery?.message_id, queued.message_id);
+  assert.equal(value.completeCoordinationBarrier("compact-b"), false);
+  assert.equal(value.beginCoordinationBarrier(""), false);
+  assert.equal(value.beginCoordinationBarrier("x".repeat(257)), false);
+});
+
+test("直接边准备把 delivery uncertainty 与维护失败标记为 unsafe", () => {
+  const uncertain = mailbox([PLACEHOLDER_TASK]);
+  uncertain.submit("不确定交付");
+  const delivery = uncertain.takeNextDelivery();
+  assert.ok(delivery);
+  assert.equal(uncertain.beginCoordinationBarrier("compact-uncertain"), true);
+  assert.equal(uncertain.hostDeliveryUncertain(delivery!.delivery_id), true);
+  assert.equal(uncertain.coordinationBarrierReadiness(), "unsafe");
+
+  const failed = mailbox([PLACEHOLDER_TASK]);
+  failed.submit("压缩失败");
+  const first = failed.takeNextDelivery();
+  assert.ok(first);
+  assert.equal(failed.hostAccepted(first!.delivery_id), true);
+  failed.observeCompactionStart("overflow");
+  failed.observeCompactionEnd("overflow", true);
+  assert.equal(failed.beginCoordinationBarrier("compact-failed"), true);
+  assert.equal(failed.coordinationBarrierReadiness(), "unsafe");
+});
+
 test("native 压缩不猜测续跑，在新的真实 start 前不投递 mailbox", () => {
   const value = mailbox([PLACEHOLDER_TASK]);
   const current = value.submit("原任务");

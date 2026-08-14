@@ -6,7 +6,7 @@ import test from "node:test";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const REQUIRED_NODE_RANGE = ">=22.19.0";
-const REQUIRED_PI_RANGE = ">=0.83.0";
+const REQUIRED_PI_RANGE = ">=0.84.1";
 
 test("package manifest 只暴露一个显式 Pi 扩展入口", () => {
   const manifest = JSON.parse(readFileSync(join(repositoryRoot, "package.json"), "utf8")) as {
@@ -15,6 +15,7 @@ test("package manifest 只暴露一个显式 Pi 扩展入口", () => {
     files?: string[];
     engines?: { node?: string };
     scripts?: { "pack:smoke"?: string };
+    devDependencies?: Record<string, string>;
     peerDependencies?: Record<string, string>;
     dependencies?: Record<string, string>;
     pi?: Record<string, unknown>;
@@ -28,6 +29,7 @@ test("package manifest 只暴露一个显式 Pi 扩展入口", () => {
   assert.equal(manifest.scripts?.["pack:smoke"], "node scripts/package-smoke.mjs");
   assert.equal(manifest.peerDependencies?.["@earendil-works/pi-coding-agent"], "*");
   assert.equal(manifest.peerDependencies?.["@earendil-works/pi-tui"], "*");
+  assert.equal(manifest.devDependencies?.["@earendil-works/pi-tui"], "0.84.1");
   assert.ok(manifest.dependencies?.semver, "生产安装必须能够解析 semver");
   assert.deepEqual(manifest.pi, {
     extensions: ["./extensions/pi-subagents-wj.ts"],

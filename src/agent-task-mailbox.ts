@@ -28,7 +28,8 @@ export interface AgentHostDelivery {
   readonly start_epoch: number;
 }
 
-export type AgentCompactionReason = "threshold" | "overflow";
+export type AgentCompactionReason = "manual" | "threshold" | "overflow";
+export type CoordinationBarrierReadiness = "waiting" | "quiescent" | "unsafe";
 
 export interface AgentTaskProjection {
   readonly state: Extract<AgentLifecycleState, "idle" | "working" | "interrupting" | "suspended">;
@@ -77,6 +78,7 @@ export class AgentTaskMailbox {
   private interruptBarrier = false;
   private settlementObserved = false;
   private compactionActive = false;
+  private readonly coordinationBarriers = new Set<string>();
   private awaitingNativeCompactionOutcome = false;
   private awaitingRetryStart = false;
   private awaitingPromptStart = false;
@@ -311,7 +313,33 @@ export class AgentTaskMailbox {
     return "candidate";
   }
 
-  /** 子代理只接受 Pi 原生阈值或溢出压缩；逻辑任务身份保持不变。 */
+  /** 直接 child 压缩时冻结这条父子边；不同事务令牌可以安全叠加。 */
+  beginCoordinationBarrier(transactionId: string): boolean {
+    if (!validCoordinationTransactionId(transactionId)) return false;
+    this.coordinationBarriers.add(transactionId);
+    return true;
+  }
+
+  completeCoordinationBarrier(transactionId: string): boolean {
+    if (!validCoordinationTransactionId(transactionId)) return false;
+    return this.coordinationBarriers.delete(transactionId);
+  }
+
+  /** prepare 只能在线性化前已开始的下行交付与 Pi 队列都静止后确认。 */
+  coordinationBarrierReadiness(): CoordinationBarrierReadiness {
+    if (this.deliveryUncertain || this.maintenanceFailed) return "unsafe";
+    return this.inFlight === undefined
+      && this.hostPendingCount === 0
+      && !this.awaitingPromptStart
+      ? "quiescent"
+      : "waiting";
+  }
+
+  hasCoordinationBarrier(): boolean {
+    return this.coordinationBarriers.size > 0;
+  }
+
+  /** 监督器已完成授权后记录手工或原生压缩生命周期；逻辑任务身份保持不变。 */
   observeCompactionStart(_reason: AgentCompactionReason): void {
     if (this.compactionActive) return;
     this.compactionActive = true;
@@ -326,8 +354,8 @@ export class AgentTaskMailbox {
     }
   }
 
-  /** 原生压缩结束后等待真实 agent_start 或 agent_settled 决定后续投递方式。 */
-  observeCompactionEnd(_reason: AgentCompactionReason, failed: boolean, willRetry = false): void {
+  /** 协调 manual 压缩已经发生在 raw settlement 之后，不再等待新的 settled。 */
+  observeCompactionEnd(reason: AgentCompactionReason, failed: boolean, willRetry = false): void {
     this.compactionActive = false;
     this.awaitingRetryStart = !failed && willRetry;
     if (failed || willRetry) {
@@ -343,6 +371,16 @@ export class AgentTaskMailbox {
     if (this.currentTask === undefined) {
       this.state = "idle";
       this.phase = undefined;
+      return;
+    }
+    if (reason === "manual" && !willRetry) {
+      this.awaitingNativeCompactionOutcome = false;
+      if (this.deliveryUncertain || this.maintenanceFailed) {
+        this.applySuspendedBarrier();
+        return;
+      }
+      if (!this.interruptBarrier) this.state = "working";
+      this.phase = this.preparedFinal === undefined ? "finalizing" : "waiting_parent_ack";
       return;
     }
     this.awaitingNativeCompactionOutcome = true;
@@ -540,6 +578,7 @@ export class AgentTaskMailbox {
     if (
       this.interruptBarrier
       || this.compactionActive
+      || this.coordinationBarriers.size > 0
       || this.awaitingNativeCompactionOutcome
       || this.awaitingPromptStart
       || this.deliveryUncertain
@@ -554,6 +593,7 @@ export class AgentTaskMailbox {
 
   private finalCommitBlocked(): boolean {
     return this.compactionActive
+      || this.coordinationBarriers.size > 0
       || this.awaitingNativeCompactionOutcome
       || this.deliveryUncertain
       || this.maintenanceFailed
@@ -624,4 +664,8 @@ export class AgentTaskMailbox {
     }
     throw new Error("task_identity_exhausted");
   }
+}
+
+function validCoordinationTransactionId(value: string): boolean {
+  return typeof value === "string" && value.length > 0 && value.length <= 256;
 }

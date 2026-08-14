@@ -10,6 +10,7 @@ import {
 } from "./child-reply-envelope.ts";
 import { normalizeAssistantMessageEnd } from "./rpc-bridge-event.ts";
 import type {
+  SupervisorCompactionOutcome,
   SupervisorTaskAssignment,
   SupervisorTaskStarted,
 } from "./supervisor-channel.ts";
@@ -28,7 +29,7 @@ export interface FinalCandidate {
   readonly stopReason: "stop" | "length";
 }
 
-export type ChildCompactionReason = "threshold" | "overflow";
+export type ChildCompactionReason = "manual" | "threshold" | "overflow";
 
 export interface ChildReplyPort {
   publishReplyAndWaitForAck(
@@ -72,6 +73,7 @@ export class ChildReplyCoordinator {
   private readonly issuedIds = new Set<string>();
   private readonly onFinalAccepted: (() => void) | undefined;
   private readonly onFinalFailure: (() => void) | undefined;
+  private readonly coordinationBarriers = new Set<string>();
   private publicationTail: Promise<void> = Promise.resolve();
   private candidate: FinalCandidate | undefined;
   private finalState: RunFinalState = "normal";
@@ -87,6 +89,7 @@ export class ChildReplyCoordinator {
   private finalSubmitted = false;
   private terminalFailure = false;
   private finalFailureNotified = false;
+  private awaitingCoordinatedContinuationTransactionId: string | undefined;
 
   constructor(options: ChildReplyCoordinatorOptions) {
     if (!isCanonicalUuid(options.agentId)) throw new TypeError("invalid_child_agent_id");
@@ -98,6 +101,51 @@ export class ChildReplyCoordinator {
     this.scheduleQuarantine = options.scheduleQuarantine ?? ((operation) => setImmediate(operation));
     this.onFinalAccepted = options.onFinalAccepted;
     this.onFinalFailure = options.onFinalFailure;
+  }
+
+  /** 协调令牌可叠加；但成功压缩等待 successor turn 时，同一会话不能再次开始物理压缩。 */
+  beginCoordinationBarrier(transactionId: string): boolean {
+    if (
+      this.terminalFailure
+      || !validCompactionTransactionId(transactionId)
+      || this.awaitingCoordinatedContinuationTransactionId !== undefined
+    ) return false;
+    this.coordinationBarriers.add(transactionId);
+    this.settlementEpoch += 1;
+    return true;
+  }
+
+  /** 释放匹配协调屏障；成功压缩的中断轮等待 continuation 建立新 turn。 */
+  completeCoordinationBarrier(transactionId: string, outcome: SupervisorCompactionOutcome): boolean {
+    if (!this.coordinationBarriers.delete(transactionId)) {
+      if (
+        outcome !== "not_started"
+        || this.awaitingCoordinatedContinuationTransactionId !== transactionId
+      ) return false;
+      // 其他固定参与者 complete 失败时，同事务补偿必须撤销 continuation 等待。
+      this.awaitingCoordinatedContinuationTransactionId = undefined;
+      this.settlementEpoch += 1;
+      if (!this.runActive && !this.finalSubmitted) this.scheduleFinalSubmission();
+      return true;
+    }
+    this.settlementEpoch += 1;
+    if (this.coordinationBarriers.size !== 0 || this.finalSubmitted) return true;
+    if (outcome === "succeeded" && this.finalState === "interrupted") {
+      // complete 可能先于本扩展的 agent_settled handler；状态必须跨该顺序保存。
+      this.awaitingCoordinatedContinuationTransactionId = transactionId;
+      return true;
+    }
+    if (this.runActive) return true;
+    this.scheduleFinalSubmission();
+    return true;
+  }
+
+  hasCoordinationBarrier(): boolean {
+    return this.coordinationBarriers.size > 0;
+  }
+
+  awaitsCoordinationContinuation(transactionId: string): boolean {
+    return this.awaitingCoordinatedContinuationTransactionId === transactionId;
   }
 
   /** 监督租约先于 prompt/steer 到达；正文和任务标识始终分离。 */
@@ -136,6 +184,7 @@ export class ChildReplyCoordinator {
     this.runActive = true;
     this.compactionActive = false;
     this.awaitingRetryStart = false;
+    this.awaitingCoordinatedContinuationTransactionId = undefined;
     this.finalSubmitted = false;
     this.candidate = undefined;
     this.finalState = "normal";
@@ -226,11 +275,12 @@ export class ChildReplyCoordinator {
     this.settlementEpoch += 1;
   }
 
-  /** 原生压缩完成只解除压缩屏障；后续 final 仍由真实 agent_settled 提交。 */
-  observeCompactionEnd(_reason: ChildCompactionReason): void {
+  /** 压缩完成只解除压缩屏障；协调 manual 会沿用已有 raw settlement。 */
+  observeCompactionEnd(reason: ChildCompactionReason): void {
     if (!this.compactionActive) return;
     this.compactionActive = false;
     this.settlementEpoch += 1;
+    if (reason === "manual" && !this.runActive && !this.finalSubmitted) this.scheduleFinalSubmission();
   }
 
   /**
@@ -240,6 +290,11 @@ export class ChildReplyCoordinator {
   settle(): void {
     if (this.awaitingRetryStart) {
       this.pendingSettledTurnId = undefined;
+      return;
+    }
+    if (this.awaitingCoordinatedContinuationTransactionId !== undefined) {
+      this.pendingSettledTurnId = undefined;
+      this.runActive = false;
       return;
     }
     const settledTurnId = this.pendingSettledTurnId ?? this.currentTurnId;
@@ -276,6 +331,8 @@ export class ChildReplyCoordinator {
       if (
         this.terminalFailure
         || this.compactionActive
+        || this.coordinationBarriers.size > 0
+        || this.awaitingCoordinatedContinuationTransactionId !== undefined
         || this.runActive
         || this.finalSubmitted
         || epoch !== this.settlementEpoch
@@ -387,6 +444,10 @@ export class ChildReplyCoordinator {
     this.publicationTail = next.catch(() => {});
     return next;
   }
+}
+
+function validCompactionTransactionId(value: string): boolean {
+  return typeof value === "string" && value.length > 0 && value.length <= 256;
 }
 
 function isReplyToParentInput(value: unknown): value is ReplyToParentInput {

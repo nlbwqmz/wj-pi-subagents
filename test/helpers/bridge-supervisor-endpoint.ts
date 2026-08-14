@@ -1,6 +1,10 @@
 import {
   SupervisorChannel,
   SupervisorRequestIdRegistry,
+  type SupervisorCompactionComplete,
+  type SupervisorCompactionCompleted,
+  type SupervisorCompactionPrepare,
+  type SupervisorCompactionPrepared,
   type SupervisorChannelPublicState,
   type SupervisorEvent,
   type SupervisorFrame,
@@ -30,6 +34,10 @@ export class BridgeSupervisorEndpoint {
   private readonly initialSubtreeRevision: number;
   private readonly sendFrame: (frame: Uint8Array) => void;
   private readonly onFault: (() => void) | undefined;
+  private readonly compactionPrepareListeners = new Set<(request: SupervisorCompactionPrepare) => void>();
+  private readonly compactionCompleteListeners = new Set<(request: SupervisorCompactionComplete) => void>();
+  private readonly compactionPrepared = new Map<string, (accepted: boolean) => void>();
+  private readonly compactionCompleted = new Map<string, (accepted: boolean) => void>();
   private snapshotSent = false;
   private faulted = false;
 
@@ -67,6 +75,20 @@ export class BridgeSupervisorEndpoint {
     if (result.kind === "accepted" || result.kind === "duplicate" || result.kind === "gap") {
       for (const outbound of result.outbound) this.send(outbound);
     }
+    if (result.kind === "accepted" && result.compaction_prepare !== undefined) {
+      for (const listener of this.compactionPrepareListeners) listener(result.compaction_prepare);
+    }
+    if (result.kind === "accepted" && result.compaction_complete !== undefined) {
+      for (const listener of this.compactionCompleteListeners) listener(result.compaction_complete);
+    }
+    if (result.kind === "accepted" && result.compaction_prepared !== undefined) {
+      this.compactionPrepared.get(result.compaction_prepared.transaction_id)?.(result.compaction_prepared.accepted);
+      this.compactionPrepared.delete(result.compaction_prepared.transaction_id);
+    }
+    if (result.kind === "accepted" && result.compaction_completed !== undefined) {
+      this.compactionCompleted.get(result.compaction_completed.transaction_id)?.(result.compaction_completed.accepted);
+      this.compactionCompleted.delete(result.compaction_completed.transaction_id);
+    }
     if (!this.snapshotSent && this.protocol.getPublicState().state === "awaiting_snapshot") {
       this.snapshotSent = true;
       try {
@@ -94,6 +116,41 @@ export class BridgeSupervisorEndpoint {
 
   publishSnapshot(nodes: readonly SupervisorSnapshot["nodes"][number][], subtreeRevision: number): void {
     this.send(this.protocol.publishSnapshot(nodes, subtreeRevision));
+  }
+
+  requestCompactionPrepare(transactionId: string): Promise<boolean> {
+    if (this.compactionPrepared.has(transactionId)) throw new Error("测试压缩事务已存在");
+    const result = new Promise<boolean>((resolve) => this.compactionPrepared.set(transactionId, resolve));
+    this.send(this.protocol.publishCompactionPrepare({ transaction_id: transactionId }));
+    return result;
+  }
+
+  respondCompactionPrepared(response: SupervisorCompactionPrepared): void {
+    this.send(this.protocol.publishCompactionPrepared(response));
+  }
+
+  onCompactionPrepare(listener: (request: SupervisorCompactionPrepare) => void): () => void {
+    this.compactionPrepareListeners.add(listener);
+    return () => this.compactionPrepareListeners.delete(listener);
+  }
+
+  requestCompactionComplete(
+    transactionId: string,
+    outcome: SupervisorCompactionComplete["outcome"],
+  ): Promise<boolean> {
+    if (this.compactionCompleted.has(transactionId)) throw new Error("测试压缩事务已存在");
+    const result = new Promise<boolean>((resolve) => this.compactionCompleted.set(transactionId, resolve));
+    this.send(this.protocol.publishCompactionComplete({ transaction_id: transactionId, outcome }));
+    return result;
+  }
+
+  respondCompactionCompleted(response: SupervisorCompactionCompleted): void {
+    this.send(this.protocol.publishCompactionCompleted(response));
+  }
+
+  onCompactionComplete(listener: (request: SupervisorCompactionComplete) => void): () => void {
+    this.compactionCompleteListeners.add(listener);
+    return () => this.compactionCompleteListeners.delete(listener);
   }
 
   getLatestSnapshot(): SupervisorSnapshot | undefined {

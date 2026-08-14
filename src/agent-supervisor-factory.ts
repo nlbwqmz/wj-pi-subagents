@@ -18,6 +18,7 @@ import {
   RpcSupervisor,
   type RpcSupervisorChannelBinding,
 } from "./rpc-supervisor.ts";
+import type { SupervisorCompactionComplete } from "./supervisor-channel.ts";
 import type { RootRuntimeContext } from "./root-runtime-context.ts";
 import type {
   TemplateDefinition,
@@ -50,6 +51,13 @@ export interface AgentSupervisorFactoryOptions {
   readonly childReplyToolNames?: readonly string[];
   /** 只有宿主消息已同步进入父会话上下文时才返回 true，随后协议才会 ACK。 */
   readonly deliverReply?: (agentId: string, reply: ManagedRpcReply) => boolean;
+  /** 为当前父会话内的直接子同步建立/释放协调压缩 reply 屏障。 */
+  readonly onCompactionPrepare?: (agentId: string, transactionId: string) => boolean;
+  readonly onCompactionComplete?: (
+    agentId: string,
+    transactionId: string,
+    outcome: SupervisorCompactionComplete["outcome"],
+  ) => boolean;
   /** 为每条直接子监督通道绑定根裁决或逐跳转发服务。 */
   readonly bindControlServer?: (
     agentId: string,
@@ -102,6 +110,7 @@ export function createAgentSupervisorFactory(
     });
 
     let rpcSupervisor: RpcSupervisor | undefined;
+    let directAgentId: string | undefined;
     rpcSupervisor = new RpcSupervisor({
       controller: options.tree,
       actor: input.actor,
@@ -109,6 +118,7 @@ export function createAgentSupervisorFactory(
       ...(input.grant === undefined ? {} : { grant: input.grant }),
       managedNode: node,
       channelFactory: (context): RpcSupervisorChannelBinding => {
+        directAgentId = context.agent_id;
         const credential = randomBytes(32).toString("base64url");
         const channel = new ManagedRpcSupervisorChannel({
           node,
@@ -170,6 +180,12 @@ export function createAgentSupervisorFactory(
       },
       startupTimeoutMs,
       gracefulShutdownMs,
+      onCompactionPrepare: (transactionId) => directAgentId === undefined
+        ? false
+        : options.onCompactionPrepare?.(directAgentId, transactionId) ?? false,
+      onCompactionComplete: (transactionId, outcome) => directAgentId === undefined
+        ? false
+        : options.onCompactionComplete?.(directAgentId, transactionId, outcome) ?? false,
     });
     return rpcSupervisor;
   }) as AgentSupervisorFactory;

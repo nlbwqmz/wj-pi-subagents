@@ -9,6 +9,10 @@ import type {
   ManagedRpcNodeStartContext,
 } from "./managed-rpc-node.ts";
 import type {
+  SupervisorCompactionComplete,
+  SupervisorCompactionCompleted,
+  SupervisorCompactionPrepare,
+  SupervisorCompactionPrepared,
   SupervisorControlRequest,
   SupervisorControlResponse,
   SupervisorEvent,
@@ -327,6 +331,12 @@ export interface RpcSupervisorChannel {
   onTaskStarted?(listener: (started: SupervisorTaskStarted) => void): () => void;
   /** child 发布实际启动的 task/turn 身份；必须先于该 turn 的 reply。 */
   publishTaskStarted?(started: SupervisorTaskStarted): Promise<void>;
+  /** parent 返回协调压缩准备结果。 */
+  respondCompactionPrepared?(response: SupervisorCompactionPrepared): Promise<void>;
+  onCompactionPrepare?(listener: (request: SupervisorCompactionPrepare) => void): () => void;
+  /** parent 返回协调压缩完成结果。 */
+  respondCompactionCompleted?(response: SupervisorCompactionCompleted): Promise<void>;
+  onCompactionComplete?(listener: (request: SupervisorCompactionComplete) => void): () => void;
   /** 父端在 reload 后重新尝试注入已接收但尚未确认的回复。 */
   retryPendingReplies?(): Promise<void>;
   establishTerminationBarrier(): void;
@@ -400,6 +410,12 @@ export interface RpcSupervisorOptions {
   readonly startupTimeoutMs: number;
   readonly gracefulShutdownMs: number;
   readonly now?: () => number;
+  /** 当前父会话同步建立或释放该直接 child 的 reply 接纳令牌。 */
+  readonly onCompactionPrepare?: (transactionId: string) => boolean;
+  readonly onCompactionComplete?: (
+    transactionId: string,
+    outcome: SupervisorCompactionComplete["outcome"],
+  ) => boolean;
 }
 
 export type RpcSupervisorStartupResult =
@@ -517,10 +533,31 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isCompactionReason(value: unknown): value is AgentCompactionReason {
-  return value === "threshold" || value === "overflow";
+  return value === "manual" || value === "threshold" || value === "overflow";
+}
+
+function readPendingMessageCount(value: unknown): number | undefined {
+  if (!isRecord(value) || !Number.isSafeInteger(value.pendingMessageCount)) return undefined;
+  const pending = value.pendingMessageCount as number;
+  return pending >= 0 ? pending : undefined;
 }
 
 type MessageCommandKind = "submit";
+
+type CoordinatedCompactionPhase = "preparing" | "prepared" | "release_failed" | "closed";
+
+interface CoordinatedCompactionState {
+  readonly transactionId: string;
+  phase: CoordinatedCompactionPhase;
+  mailboxPrepared: boolean;
+  replyPrepared: boolean;
+  preparation?: Promise<boolean>;
+}
+
+interface CompactionStateWaiter {
+  readonly version: number;
+  readonly resolve: () => void;
+}
 
 interface QueuedMessageCommand {
   readonly kind: MessageCommandKind;
@@ -560,11 +597,19 @@ export class RpcSupervisor {
   private unsubscribeChannelEvent: (() => void) | undefined;
   private unsubscribeChannelSnapshot: (() => void) | undefined;
   private unsubscribeTaskStarted: (() => void) | undefined;
+  private unsubscribeCompactionPrepare: (() => void) | undefined;
+  private unsubscribeCompactionComplete: (() => void) | undefined;
   private readonly commandQueue: QueuedCommand[] = [];
   private activeCommand: QueuedCommand | undefined;
   private readonly eventListeners = new Set<(event: RpcSupervisorEvent) => void>();
   private readonly activeTools = new Map<string, RpcSupervisorActivityCategory>();
   private readonly activeToolCounts = new Map<RpcSupervisorActivityCategory, number>();
+  private readonly coordinatedCompactions = new Map<string, CoordinatedCompactionState>();
+  private readonly closedCoordinatedCompactions = new Set<string>();
+  private readonly manualCompactionAuthorizations = new Set<string>();
+  private activeManualCompactionTransactionId: string | undefined;
+  private readonly compactionStateWaiters = new Set<CompactionStateWaiter>();
+  private compactionStateVersion = 0;
   private terminationPromise: Promise<RpcSupervisorTerminationResult> | undefined;
   private cleanupInFlight: Promise<"confirmed" | "incomplete"> | undefined;
   private lateStartupCleanupScheduled = false;
@@ -894,6 +939,220 @@ export class RpcSupervisor {
         this.receiveTaskStarted(started);
       });
     }
+    const onCompactionPrepare = channel.onCompactionPrepare;
+    if (typeof onCompactionPrepare === "function") {
+      this.unsubscribeCompactionPrepare = onCompactionPrepare.call(channel, (request) => {
+        void this.receiveCompactionPrepare(request);
+      });
+    }
+    const onCompactionComplete = channel.onCompactionComplete;
+    if (typeof onCompactionComplete === "function") {
+      this.unsubscribeCompactionComplete = onCompactionComplete.call(channel, (request) => {
+        void this.receiveCompactionComplete(request);
+      });
+    }
+  }
+
+  private async receiveCompactionPrepare(request: SupervisorCompactionPrepare): Promise<void> {
+    const channel = this.channel;
+    const respond = channel?.respondCompactionPrepared;
+    if (this.phase !== "ready" || typeof respond !== "function") return;
+    const transactionId = request.transaction_id;
+    let preparation: Promise<boolean>;
+    const existing = this.coordinatedCompactions.get(transactionId);
+    if (existing !== undefined) {
+      preparation = existing.phase === "prepared"
+        ? Promise.resolve(true)
+        : existing.preparation ?? Promise.resolve(false);
+    } else if (this.closedCoordinatedCompactions.has(transactionId)) {
+      preparation = Promise.resolve(false);
+    } else {
+      const state: CoordinatedCompactionState = {
+        transactionId,
+        phase: "preparing",
+        mailboxPrepared: false,
+        replyPrepared: false,
+      };
+      this.coordinatedCompactions.set(transactionId, state);
+      state.mailboxPrepared = this.mailbox.beginCoordinationBarrier(transactionId);
+      try {
+        state.replyPrepared = this.options.onCompactionPrepare?.(transactionId) === true;
+      } catch {
+        state.replyPrepared = false;
+      }
+      if (!state.mailboxPrepared || !state.replyPrepared) {
+        this.releaseCoordinatedCompaction(state, "not_started");
+        preparation = Promise.resolve(false);
+      } else {
+        preparation = this.awaitCoordinatedCompactionPreparation(state);
+        state.preparation = preparation;
+      }
+    }
+
+    const accepted = await preparation;
+    try {
+      await respond.call(channel, { transaction_id: transactionId, accepted });
+    } catch {
+      const state = this.coordinatedCompactions.get(transactionId);
+      if (state !== undefined) this.releaseCoordinatedCompaction(state, "not_started");
+      this.receiveTransportFault("protocol_fault", "supervisor");
+    }
+  }
+
+  private async receiveCompactionComplete(request: SupervisorCompactionComplete): Promise<void> {
+    const channel = this.channel;
+    const respond = channel?.respondCompactionCompleted;
+    if (this.phase !== "ready" || typeof respond !== "function") return;
+    const state = this.coordinatedCompactions.get(request.transaction_id);
+    const accepted = state === undefined
+      ? this.closedCoordinatedCompactions.has(request.transaction_id)
+      : this.releaseCoordinatedCompaction(state, request.outcome);
+    try {
+      await respond.call(channel, {
+        transaction_id: request.transaction_id,
+        accepted,
+      });
+    } catch {
+      this.receiveTransportFault("protocol_fault", "supervisor");
+    }
+  }
+
+  private async awaitCoordinatedCompactionPreparation(
+    state: CoordinatedCompactionState,
+  ): Promise<boolean> {
+    while (this.phase === "ready" && state.phase === "preparing") {
+      const readiness = this.mailbox.coordinationBarrierReadiness();
+      if (readiness === "unsafe") {
+        this.releaseCoordinatedCompaction(state, "not_started");
+        return false;
+      }
+      if (readiness === "waiting") {
+        await this.waitForCompactionStateChange(this.compactionStateVersion);
+        continue;
+      }
+
+      const version = this.compactionStateVersion;
+      const probe = Promise.resolve()
+        .then(() => this.commandClient().getState())
+        .then(
+          (value) => ({ kind: "state" as const, pending: readPendingMessageCount(value) }),
+          () => ({ kind: "state" as const, pending: undefined }),
+        );
+      const observed = await Promise.race([
+        probe,
+        this.waitForCompactionStateChange(version).then(() => ({ kind: "changed" as const })),
+      ]);
+      if (observed.kind === "changed") continue;
+      if (this.phase !== "ready" || state.phase !== "preparing") return false;
+      if (observed.pending === undefined) {
+        this.releaseCoordinatedCompaction(state, "not_started");
+        return false;
+      }
+      this.mailbox.reconcileHostPending(observed.pending);
+      this.commitTaskProjection();
+      if (observed.pending !== 0 || this.mailbox.coordinationBarrierReadiness() !== "quiescent") {
+        continue;
+      }
+      state.phase = "prepared";
+      this.manualCompactionAuthorizations.add(state.transactionId);
+      this.signalCompactionStateChange();
+      return true;
+    }
+    return state.phase === "prepared";
+  }
+
+  private releaseCoordinatedCompaction(
+    state: CoordinatedCompactionState,
+    outcome: SupervisorCompactionComplete["outcome"],
+  ): boolean {
+    if (state.phase === "closed") return true;
+    let mailboxReleased = !state.mailboxPrepared;
+    if (state.mailboxPrepared) {
+      mailboxReleased = this.mailbox.completeCoordinationBarrier(state.transactionId);
+      if (mailboxReleased) state.mailboxPrepared = false;
+    }
+    let replyReleased = !state.replyPrepared;
+    if (state.replyPrepared) {
+      try {
+        replyReleased = this.options.onCompactionComplete?.(state.transactionId, outcome) === true;
+      } catch {
+        replyReleased = false;
+      }
+      if (replyReleased) state.replyPrepared = false;
+    }
+    const released = mailboxReleased && replyReleased;
+    if (
+      outcome === "not_started"
+      && this.activeManualCompactionTransactionId !== state.transactionId
+    ) {
+      this.manualCompactionAuthorizations.delete(state.transactionId);
+    }
+    state.phase = released ? "closed" : "release_failed";
+    if (released) {
+      this.coordinatedCompactions.delete(state.transactionId);
+      this.rememberClosedCoordinatedCompaction(state.transactionId);
+    }
+    this.signalCompactionStateChange();
+    this.drainCommandQueue();
+    void this.retryPendingReplies();
+    return released;
+  }
+
+  private rememberClosedCoordinatedCompaction(transactionId: string): void {
+    this.closedCoordinatedCompactions.add(transactionId);
+    while (this.closedCoordinatedCompactions.size > 64) {
+      const oldest = this.closedCoordinatedCompactions.values().next().value;
+      if (oldest === undefined) return;
+      this.closedCoordinatedCompactions.delete(oldest);
+      if (this.activeManualCompactionTransactionId !== oldest) {
+        this.manualCompactionAuthorizations.delete(oldest);
+      }
+    }
+  }
+
+  private waitForCompactionStateChange(version: number): Promise<void> {
+    if (version !== this.compactionStateVersion) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const waiter = { version, resolve };
+      this.compactionStateWaiters.add(waiter);
+      if (version !== this.compactionStateVersion) {
+        this.compactionStateWaiters.delete(waiter);
+        resolve();
+      }
+    });
+  }
+
+  private signalCompactionStateChange(): void {
+    this.compactionStateVersion += 1;
+    for (const waiter of [...this.compactionStateWaiters]) {
+      this.compactionStateWaiters.delete(waiter);
+      waiter.resolve();
+    }
+  }
+
+  private beginAuthorizedManualCompaction(): boolean {
+    if (this.activeManualCompactionTransactionId !== undefined) return false;
+    const transactionId = this.manualCompactionAuthorizations.values().next().value;
+    if (transactionId === undefined) return false;
+    this.activeManualCompactionTransactionId = transactionId;
+    return true;
+  }
+
+  private completeAuthorizedManualCompaction(): boolean {
+    const transactionId = this.activeManualCompactionTransactionId;
+    if (transactionId === undefined) return false;
+    this.activeManualCompactionTransactionId = undefined;
+    this.manualCompactionAuthorizations.delete(transactionId);
+    return true;
+  }
+
+  /** 自动压缩只清理尚未消费的最早授权；活动 manual 必须保留到对应 compaction_end。 */
+  private consumeSupersededManualCompactionAuthorization(): void {
+    for (const transactionId of this.manualCompactionAuthorizations) {
+      if (transactionId === this.activeManualCompactionTransactionId) continue;
+      this.manualCompactionAuthorizations.delete(transactionId);
+      return;
+    }
   }
 
   private receiveTaskStarted(started: SupervisorTaskStarted): void {
@@ -923,10 +1182,14 @@ export class RpcSupervisor {
         this.observeProvisionalSettlement();
         return;
       case "compaction_start": {
-        if (!isCompactionReason(event.reason)) {
+        if (
+          !isCompactionReason(event.reason)
+          || (event.reason === "manual" && !this.beginAuthorizedManualCompaction())
+        ) {
           this.failRuntime("invalid_rpc_event");
           return;
         }
+        if (event.reason !== "manual") this.consumeSupersededManualCompactionAuthorization();
         this.mailbox.observeCompactionStart(event.reason);
         this.commitTaskProjection();
         return;
@@ -934,6 +1197,7 @@ export class RpcSupervisor {
       case "compaction_end":
         if (
           !isCompactionReason(event.reason)
+          || (event.reason === "manual" && !this.completeAuthorizedManualCompaction())
           || typeof event.aborted !== "boolean"
           || typeof event.willRetry !== "boolean"
           || typeof event.failed !== "boolean"
@@ -1032,6 +1296,7 @@ export class RpcSupervisor {
   }
 
   private commitTaskProjection(): void {
+    this.signalCompactionStateChange();
     if (this.agentId === undefined || this.phase === "starting" || this.phase === "new") return;
     const projection = this.mailbox.projection();
     const outcome = this.options.controller.applyTaskProjection(this.agentId, projection);
@@ -1093,6 +1358,7 @@ export class RpcSupervisor {
     if (this.phase !== "ready") return;
     this.applyLifecycle({ type: "runtime_failed", error_code: "internal_error" });
     this.phase = "failed";
+    this.releaseCoordinatedCompactions();
     this.activeTools.clear();
     this.activeToolCounts.clear();
     while (this.commandQueue.length > 0) {
@@ -1100,6 +1366,16 @@ export class RpcSupervisor {
     }
     this.resolveActiveMessageAsUnavailable();
     this.emitEvent(Object.freeze({ kind: "fault", code }));
+  }
+
+  private releaseCoordinatedCompactions(): void {
+    const states = [...this.coordinatedCompactions.values()];
+    for (const state of states) this.releaseCoordinatedCompaction(state, "not_started");
+    this.coordinatedCompactions.clear();
+    this.closedCoordinatedCompactions.clear();
+    this.manualCompactionAuthorizations.clear();
+    this.activeManualCompactionTransactionId = undefined;
+    this.signalCompactionStateChange();
   }
 
   private enqueueMessage(message: string): Promise<RpcSupervisorCommandResult> {
@@ -1485,6 +1761,8 @@ export class RpcSupervisor {
     this.unsubscribeChannelEvent?.();
     this.unsubscribeChannelSnapshot?.();
     this.unsubscribeTaskStarted?.();
+    this.unsubscribeCompactionPrepare?.();
+    this.unsubscribeCompactionComplete?.();
     this.channelBindingCleanup?.();
     this.unsubscribeRpcEvent = undefined;
     this.unsubscribeRpcFault = undefined;
@@ -1492,6 +1770,9 @@ export class RpcSupervisor {
     this.unsubscribeChannelEvent = undefined;
     this.unsubscribeChannelSnapshot = undefined;
     this.unsubscribeTaskStarted = undefined;
+    this.unsubscribeCompactionPrepare = undefined;
+    this.unsubscribeCompactionComplete = undefined;
+    this.releaseCoordinatedCompactions();
     this.channelBindingCleanup = undefined;
   }
 }

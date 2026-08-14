@@ -2,6 +2,8 @@
 
 Status: accepted
 
+> 当前会话本地、直接父边压缩协调与 `pi-subagent/10` 硬切换由 [ADR-0010](./0010-session-local-direct-edge-compaction.md) 覆盖；历史递归 `/9` 方案由 [ADR-0009](./0009-generic-recursive-compaction-barrier.md) 记录，本文的 `/8` 版本号和“第三方压缩不协调”限制保留为本 ADR 作出时的历史记录。
+
 父子监督协议硬切换到 `pi-subagent/8`，managed RPC bridge 硬切换到 `pi-subagent/managed-rpc/3`。运行时不再发布 generation-scoped `compaction_resume`，不再使用 `adaptive_steer`、固定延迟、状态读取后再命令或私有 Pi RPC 来推断 continuation 所有权。第三方压缩扩展没有公开的独占 continuation lease 或跨扩展交付确认，因此本扩展不为其提供兼容性承诺，也不会猜测它是否已经续跑。
 
 受管 child 只处理 Pi 原生 `"threshold"` 和 `"overflow"` 自动压缩。自动压缩发生在 `agent_end` 与最终的单次 `agent_settled` 之间；压缩结束后，mailbox 只接受真实 `agent_start` 或 `agent_settled` 作为下一步投递依据。阈值压缩可以保留已完成的 assistant candidate；`overflow` 且 `willRetry: true` 必须撤销旧 candidate，并等待下一次真实 `agent_start` 建立新 turn。压缩结束本身不证明宿主静止、loop 已开始或消息已经交付。
