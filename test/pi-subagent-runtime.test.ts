@@ -20,6 +20,7 @@ import {
 } from "../src/agent-tools.ts";
 import {
   AUTO_COMPACT_COORDINATION_CHANNELS,
+  AUTO_COMPACT_COORDINATION_VERSION,
 } from "../src/auto-compact-coordination.ts";
 import {
   FakeManagedRpcNode,
@@ -27,8 +28,10 @@ import {
   type ManagedRpcReply,
 } from "../src/managed-rpc-node.ts";
 import {
-  createPiSubagentRuntimeActivator,
+  createPiSubagentRuntimeActivator as createPiSubagentRuntimeActivatorWithHostEnvironment,
   readChildRuntimeBootstrap,
+  type PiSubagentRuntimeActivator,
+  type PiSubagentRuntimeOptions,
 } from "../src/pi-subagent-runtime.ts";
 import {
   InMemoryLocalSupervisorTransportAdapter,
@@ -55,6 +58,7 @@ const TURN_2 = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 const TASK_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const COMMIT_ID = "ffffffff-ffff-4fff-8fff-ffffffffffff";
 const COMMIT_2 = "99999999-9999-4999-8999-999999999999";
+const ROOT_TEST_ENVIRONMENT = Object.freeze({});
 const COORDINATION_PARTICIPANT_INPUT_CHANNELS = [
   AUTO_COMPACT_COORDINATION_CHANNELS.discover,
   AUTO_COMPACT_COORDINATION_CHANNELS.prepare,
@@ -65,6 +69,15 @@ const COORDINATION_PARTICIPANT_OUTPUT_CHANNELS = [
   AUTO_COMPACT_COORDINATION_CHANNELS.prepared,
   AUTO_COMPACT_COORDINATION_CHANNELS.completed,
 ] as const;
+
+function createPiSubagentRuntimeActivator(
+  options: PiSubagentRuntimeOptions = {},
+): PiSubagentRuntimeActivator {
+  return createPiSubagentRuntimeActivatorWithHostEnvironment({
+    environment: ROOT_TEST_ENVIRONMENT,
+    ...options,
+  });
+}
 
 function finalReply(
   agentId: string,
@@ -782,6 +795,263 @@ test("managed child 收到未经协调的 manual 压缩事件时关闭监督通�
   assert.equal(await parentChannel.waitForClose(Date.now() + 100), "released");
   assert.deepEqual(faults, ["eof"]);
   assert.deepEqual(delivered, []);
+
+  await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
+  await parentChannel.release();
+  await listener.close();
+});
+
+for (const nativeReason of ["threshold", "overflow"] as const) {
+  test(`prepare 后发生 native ${nativeReason} lifecycle 会撤销旧 manual 授权`, async () => {
+    const cwd = `C:\\workspace\\child-stale-manual-after-${nativeReason}`;
+    const eventBus = new FakeEventBus();
+    const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
+    const localCredential = `local_${"l".repeat(32)}`;
+    const supervisorCredential = `supervisor_${"s".repeat(32)}`;
+    const listener = await transportAdapter.listen({
+      agentId: AGENT_ID,
+      credential: localCredential,
+    });
+    const api = new FakeExtensionApi(eventBus);
+    const activate = createPiSubagentRuntimeActivator({
+      environment: childBootstrapEnvironment({
+        [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorEndpoint]: listener.endpoint,
+        [RUNTIME_EPHEMERAL_ENV_KEYS.localSupervisorCredential]: localCredential,
+        [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorCredential]: supervisorCredential,
+      }),
+      agentIdFactory: () => DESCENDANT_ID,
+      localSupervisorTransportAdapter: transportAdapter,
+      templateFileSystem: templateFileSystem(cwd),
+    });
+    await activate(api as never, {
+      ok: true,
+      nodeVersion: process.versions.node,
+      piVersion: "0.84.1",
+      platform: "win32",
+      processTreeAdapter: {} as never,
+    });
+    const context = extensionContext(cwd);
+    const sessionStart = api.emit("session_start", { type: "session_start", reason: "startup" }, context);
+    const transport = await listener.waitForConnection();
+    const faults: string[] = [];
+    const parentChannel = new StreamSupervisorChannel({
+      role: "parent",
+      rootId: "root-bootstrap",
+      localAgentId: null,
+      peerAgentId: AGENT_ID,
+      parentAgentId: null,
+      depth: 1,
+      credential: supervisorCredential,
+      requestIdRegistry: new SupervisorRequestIdRegistry(),
+      transport,
+    });
+    parentChannel.onCompactionPrepare((request) => {
+      void parentChannel.respondCompactionPrepared({
+        transaction_id: request.transaction_id,
+        accepted: true,
+      });
+    });
+    parentChannel.onCompactionComplete((request) => {
+      void parentChannel.respondCompactionCompleted({
+        transaction_id: request.transaction_id,
+        accepted: true,
+      });
+    });
+    parentChannel.onFault((fault) => faults.push(fault));
+    const bindingAbort = new AbortController();
+    await parentChannel.bind(bindingAbort.signal);
+    await Promise.all([parentChannel.waitForReady(bindingAbort.signal), sessionStart]);
+
+    const discovered = new Promise<Record<string, unknown>>((resolve) => {
+      const unsubscribe = eventBus.on(AUTO_COMPACT_COORDINATION_CHANNELS.discovered, (value) => {
+        unsubscribe();
+        resolve(value as Record<string, unknown>);
+      });
+    });
+    eventBus.emit(AUTO_COMPACT_COORDINATION_CHANNELS.discover, {
+      protocolVersion: AUTO_COMPACT_COORDINATION_VERSION,
+      requestId: `discover-stale-${nativeReason}`,
+    });
+    const participantId = String((await discovered).participantId);
+
+    const prepared = new Promise<Record<string, unknown>>((resolve) => {
+      const unsubscribe = eventBus.on(AUTO_COMPACT_COORDINATION_CHANNELS.prepared, (value) => {
+        unsubscribe();
+        resolve(value as Record<string, unknown>);
+      });
+    });
+    eventBus.emit(AUTO_COMPACT_COORDINATION_CHANNELS.prepare, {
+      protocolVersion: AUTO_COMPACT_COORDINATION_VERSION,
+      requestId: `compact-stale-${nativeReason}`,
+      participantId,
+    });
+    assert.equal((await prepared).prepared, true);
+
+    await api.emit("agent_start", { type: "agent_start" }, context);
+    const willRetry = nativeReason === "overflow";
+    await api.emit("session_before_compact", {
+      type: "session_before_compact",
+      reason: nativeReason,
+      willRetry,
+    }, context);
+    await api.emit("session_compact", {
+      type: "session_compact",
+      reason: nativeReason,
+      willRetry,
+    }, context);
+
+    const completed = new Promise<Record<string, unknown>>((resolve) => {
+      const unsubscribe = eventBus.on(AUTO_COMPACT_COORDINATION_CHANNELS.completed, (value) => {
+        unsubscribe();
+        resolve(value as Record<string, unknown>);
+      });
+    });
+    eventBus.emit(AUTO_COMPACT_COORDINATION_CHANNELS.complete, {
+      protocolVersion: AUTO_COMPACT_COORDINATION_VERSION,
+      requestId: `compact-stale-${nativeReason}`,
+      participantId,
+      outcome: "succeeded",
+    });
+    assert.equal((await completed).completed, true);
+    assert.equal(parentChannel.isReady(), true);
+
+    await api.emit("session_before_compact", {
+      type: "session_before_compact",
+      reason: "manual",
+      willRetry: false,
+    }, context);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const readyAfterManual = parentChannel.isReady();
+    const faultsAfterManual = [...faults];
+
+    if (readyAfterManual) {
+      await api.emit("session_compact", {
+        type: "session_compact",
+        reason: "manual",
+        willRetry: false,
+      }, context);
+    }
+    await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
+    await parentChannel.release();
+    await listener.close();
+
+    assert.equal(readyAfterManual, false);
+    assert.deepEqual(faultsAfterManual, ["eof"]);
+  });
+}
+
+test("child manual 生命周期在 complete 先于 session_compact 到达时保持授权", async () => {
+  const cwd = "C:\\workspace\\child-manual-complete-before-end";
+  const eventBus = new FakeEventBus();
+  const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
+  const localCredential = `local_${"l".repeat(32)}`;
+  const supervisorCredential = `supervisor_${"s".repeat(32)}`;
+  const listener = await transportAdapter.listen({
+    agentId: AGENT_ID,
+    credential: localCredential,
+  });
+  const api = new FakeExtensionApi(eventBus);
+  const activate = createPiSubagentRuntimeActivator({
+    environment: childBootstrapEnvironment({
+      [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorEndpoint]: listener.endpoint,
+      [RUNTIME_EPHEMERAL_ENV_KEYS.localSupervisorCredential]: localCredential,
+      [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorCredential]: supervisorCredential,
+    }),
+    agentIdFactory: () => DESCENDANT_ID,
+    localSupervisorTransportAdapter: transportAdapter,
+    templateFileSystem: templateFileSystem(cwd),
+  });
+  await activate(api as never, {
+    ok: true,
+    nodeVersion: process.versions.node,
+    piVersion: "0.84.1",
+    platform: "win32",
+    processTreeAdapter: {} as never,
+  });
+  const context = extensionContext(cwd);
+  const sessionStart = api.emit("session_start", { type: "session_start", reason: "startup" }, context);
+  const transport = await listener.waitForConnection();
+  const parentChannel = new StreamSupervisorChannel({
+    role: "parent",
+    rootId: "root-bootstrap",
+    localAgentId: null,
+    peerAgentId: AGENT_ID,
+    parentAgentId: null,
+    depth: 1,
+    credential: supervisorCredential,
+    requestIdRegistry: new SupervisorRequestIdRegistry(),
+    transport,
+  });
+  parentChannel.onCompactionPrepare((request) => {
+    void parentChannel.respondCompactionPrepared({
+      transaction_id: request.transaction_id,
+      accepted: true,
+    });
+  });
+  parentChannel.onCompactionComplete((request) => {
+    void parentChannel.respondCompactionCompleted({
+      transaction_id: request.transaction_id,
+      accepted: true,
+    });
+  });
+  const bindingAbort = new AbortController();
+  await parentChannel.bind(bindingAbort.signal);
+  await Promise.all([parentChannel.waitForReady(bindingAbort.signal), sessionStart]);
+
+  const discovered = new Promise<Record<string, unknown>>((resolve) => {
+    const unsubscribe = eventBus.on(AUTO_COMPACT_COORDINATION_CHANNELS.discovered, (value) => {
+      unsubscribe();
+      resolve(value as Record<string, unknown>);
+    });
+  });
+  eventBus.emit(AUTO_COMPACT_COORDINATION_CHANNELS.discover, {
+    protocolVersion: AUTO_COMPACT_COORDINATION_VERSION,
+    requestId: "discover-manual-runtime",
+  });
+  const participantId = String((await discovered).participantId);
+
+  const prepared = new Promise<Record<string, unknown>>((resolve) => {
+    const unsubscribe = eventBus.on(AUTO_COMPACT_COORDINATION_CHANNELS.prepared, (value) => {
+      unsubscribe();
+      resolve(value as Record<string, unknown>);
+    });
+  });
+  eventBus.emit(AUTO_COMPACT_COORDINATION_CHANNELS.prepare, {
+    protocolVersion: AUTO_COMPACT_COORDINATION_VERSION,
+    requestId: "compact-manual-runtime",
+    participantId,
+  });
+  assert.equal((await prepared).prepared, true);
+
+  await api.emit("agent_start", { type: "agent_start" }, context);
+  await api.emit("session_before_compact", {
+    type: "session_before_compact",
+    reason: "manual",
+    willRetry: false,
+  }, context);
+
+  const completed = new Promise<Record<string, unknown>>((resolve) => {
+    const unsubscribe = eventBus.on(AUTO_COMPACT_COORDINATION_CHANNELS.completed, (value) => {
+      unsubscribe();
+      resolve(value as Record<string, unknown>);
+    });
+  });
+  eventBus.emit(AUTO_COMPACT_COORDINATION_CHANNELS.complete, {
+    protocolVersion: AUTO_COMPACT_COORDINATION_VERSION,
+    requestId: "compact-manual-runtime",
+    participantId,
+    outcome: "succeeded",
+  });
+  assert.equal((await completed).completed, true);
+  assert.equal(parentChannel.isReady(), true);
+
+  await api.emit("session_compact", {
+    type: "session_compact",
+    reason: "manual",
+    willRetry: false,
+  }, context);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(parentChannel.isReady(), true);
 
   await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
   await parentChannel.release();
@@ -1791,6 +2061,7 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
   let oldController: AgentController | undefined;
   let newController: AgentController | undefined;
   const oldActivate = oldRuntimeModule.createPiSubagentRuntimeActivator({
+    environment: ROOT_TEST_ENVIRONMENT,
     rootIdFactory: () => "root-reload-handoff",
     agentIdFactory: () => allocatedIds.shift() ?? "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
     rootArguments: {
@@ -1850,6 +2121,7 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
 
   let replacementRootIdCalls = 0;
   const newActivate = newRuntimeModule.createPiSubagentRuntimeActivator({
+    environment: ROOT_TEST_ENVIRONMENT,
     rootIdFactory: () => {
       replacementRootIdCalls += 1;
       return "unexpected-new-root";
@@ -1980,6 +2252,7 @@ test("根与 child 跨实例 reload 保留同一监督连接，并让既有 chil
   const context = extensionContext(cwd);
 
   const oldRootActivate = oldRootModule.createPiSubagentRuntimeActivator({
+    environment: ROOT_TEST_ENVIRONMENT,
     rootIdFactory: () => "root-recursive-reload",
     agentIdFactory: () => allocatedIds.shift() ?? "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
     rootArguments: {
@@ -2027,6 +2300,7 @@ test("根与 child 跨实例 reload 保留同一监督连接，并让既有 chil
   await oldRootApi.emit("session_shutdown", { type: "session_shutdown", reason: "reload" }, context);
   oldRootApi.invalidate();
   const newRootActivate = newRootModule.createPiSubagentRuntimeActivator({
+    environment: ROOT_TEST_ENVIRONMENT,
     templateFileSystem: templateFileSystem(cwd, undefined, ["researcher", "reviewer"]),
     onController: (controller: AgentController) => { newRootController = controller; },
   });
@@ -2181,6 +2455,7 @@ test("新实例认领 lease 后可等待迟到的 reload start，不沿用 outgo
     processTreeAdapter: {} as never,
   };
   const oldActivate = oldRuntimeModule.createPiSubagentRuntimeActivator({
+    environment: ROOT_TEST_ENVIRONMENT,
     rootIdFactory: () => "root-reload-claimed-timeout",
     agentIdFactory: () => AGENT_ID,
     reloadLeaseTimeoutMs: 20,
@@ -2200,6 +2475,7 @@ test("新实例认领 lease 后可等待迟到的 reload start，不沿用 outgo
   oldApi.invalidate();
 
   const newActivate = newRuntimeModule.createPiSubagentRuntimeActivator({
+    environment: ROOT_TEST_ENVIRONMENT,
     reloadLeaseTimeoutMs: 20,
     templateFileSystem: templateFileSystem(cwd),
   });

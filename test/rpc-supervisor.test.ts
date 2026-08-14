@@ -1943,6 +1943,46 @@ test("早到 not_started 取消等待中的 prepare，重复 complete 由事务�
   stateGate.resolve();
 });
 
+test("先到 terminal complete 固定直接边事务 ACK，迟到 prepare 不重装 barrier", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const edgeOperations: string[] = [];
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "直接边 terminal-first" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+    onCompactionPrepare: (transactionId) => {
+      edgeOperations.push(`begin:${transactionId}`);
+      return true;
+    },
+    onCompactionComplete: (transactionId, outcome) => {
+      edgeOperations.push(`complete:${transactionId}:${outcome}`);
+      return true;
+    },
+  });
+  assert.equal((await supervisor.start()).ok, true);
+
+  channel.emitCompactionComplete("compact-terminal-first", "cancelled");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  channel.emitCompactionPrepare("compact-terminal-first");
+  channel.emitCompactionComplete("compact-terminal-first", "failed");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(edgeOperations, []);
+  assert.deepEqual(
+    channel.publishedCompactionResponses()
+      .filter((response) => response.transaction_id === "compact-terminal-first")
+      .map((response) => response.accepted),
+    [false, false, false],
+  );
+});
+
 test("业务 complete 与补偿先于 manual start/end 到达时仍保留生命周期授权", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
@@ -1987,14 +2027,14 @@ test("业务 complete 与补偿先于 manual start/end 到达时仍保留生命�
   assert.equal((await supervisor.prompt("manual 后仍可用")).ok, true);
 });
 
-test("多个 prepared manual 授权按 FIFO 消费并可分别结束", async () => {
+test("单个 pending manual 授权可通过公开事件正常 start/end", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
   const channel = new RecordingSupervisorChannel([]);
   const supervisor = new RpcSupervisor({
     controller: tree,
     actor: ROOT_TREE_ACTOR,
-    reservation: { templateId: "researcher", name: "manual 授权 FIFO" },
+    reservation: { templateId: "researcher", name: "单个 manual 授权" },
     managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
     channel,
     startupTimeoutMs: 100,
@@ -2002,101 +2042,128 @@ test("多个 prepared manual 授权按 FIFO 消费并可分别结束", async () 
     onCompactionPrepare: () => true,
     onCompactionComplete: () => true,
   });
+  const events: RpcSupervisorEvent[] = [];
+  supervisor.onEvent((event) => events.push(event));
   assert.equal((await supervisor.start()).ok, true);
 
-  channel.emitCompactionPrepare("manual-fifo-a");
-  channel.emitCompactionPrepare("manual-fifo-b");
+  channel.emitCompactionPrepare("manual-single");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
+  rpcClient.emitEvent({
+    type: "compaction_end",
+    reason: "manual",
+    aborted: false,
+    willRetry: false,
+    failed: false,
+  });
+  channel.emitCompactionComplete("manual-single", "succeeded");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(events.filter((event) => event.kind === "fault"), []);
+  assert.equal((await supervisor.prompt("manual 后仍可用")).ok, true);
+});
+
+test("多个 pending manual 授权存在歧义时通过公开事件 fail-closed", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "manual 授权歧义" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+    onCompactionPrepare: () => true,
+    onCompactionComplete: () => true,
+  });
+  const events: RpcSupervisorEvent[] = [];
+  supervisor.onEvent((event) => events.push(event));
+  assert.equal((await supervisor.start()).ok, true);
+
+  channel.emitCompactionPrepare("manual-ambiguous-a");
+  channel.emitCompactionPrepare("manual-ambiguous-b");
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.deepEqual(
     channel.publishedCompactionResponses().filter((response) => response.accepted),
     [
-      { transaction_id: "manual-fifo-a", accepted: true },
-      { transaction_id: "manual-fifo-b", accepted: true },
+      { transaction_id: "manual-ambiguous-a", accepted: true },
+      { transaction_id: "manual-ambiguous-b", accepted: true },
     ],
   );
 
   rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
-  rpcClient.emitEvent({
-    type: "compaction_end",
-    reason: "manual",
-    aborted: false,
-    willRetry: false,
-    failed: false,
-  });
-  rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
-  rpcClient.emitEvent({
-    type: "compaction_end",
-    reason: "manual",
-    aborted: false,
-    willRetry: false,
-    failed: false,
-  });
-  channel.emitCompactionComplete("manual-fifo-a", "succeeded");
-  channel.emitCompactionComplete("manual-fifo-b", "succeeded");
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  await new Promise<void>((resolve) => setImmediate(resolve));
 
-  const status = tree.getStatus(FIRST_AGENT_ID);
-  assert.equal(status.ok, true);
-  if (status.ok) assert.notEqual(status.data.state, "failed");
+  assert.deepEqual(
+    events.filter((event) => event.kind === "fault"),
+    [{ kind: "fault", code: "invalid_rpc_event" }],
+  );
+  assert.deepEqual(await supervisor.prompt("歧义授权后不可继续"), {
+    ok: false,
+    code: "agent_unavailable",
+  });
 });
 
-test("automatic compaction 不会消费正在进行的 manual 授权", async () => {
-  const tree = createController();
-  const rpcClient = new FakeRpcClient();
-  const channel = new RecordingSupervisorChannel([]);
-  const supervisor = new RpcSupervisor({
-    controller: tree,
-    actor: ROOT_TREE_ACTOR,
-    reservation: { templateId: "researcher", name: "manual 与 automatic 交错" },
-    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
-    channel,
-    startupTimeoutMs: 100,
-    gracefulShutdownMs: 5,
-    onCompactionPrepare: () => true,
-    onCompactionComplete: () => true,
+for (const nativeReason of ["threshold", "overflow"] as const) {
+  test(`native ${nativeReason} 撤销全部 pending 且不影响等待 manual end 的 active`, async () => {
+    const tree = createController();
+    const rpcClient = new FakeRpcClient();
+    const channel = new RecordingSupervisorChannel([]);
+    const supervisor = new RpcSupervisor({
+      controller: tree,
+      actor: ROOT_TREE_ACTOR,
+      reservation: { templateId: "researcher", name: `manual 与 ${nativeReason} 交错` },
+      managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+      channel,
+      startupTimeoutMs: 100,
+      gracefulShutdownMs: 5,
+      onCompactionPrepare: () => true,
+      onCompactionComplete: () => true,
+    });
+    const events: RpcSupervisorEvent[] = [];
+    supervisor.onEvent((event) => events.push(event));
+    assert.equal((await supervisor.start()).ok, true);
+
+    channel.emitCompactionPrepare("manual-active");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
+
+    channel.emitCompactionComplete("manual-active", "succeeded");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    channel.emitCompactionPrepare("manual-pending-a");
+    channel.emitCompactionPrepare("manual-pending-b");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    rpcClient.emitEvent({ type: "compaction_start", reason: nativeReason });
+    rpcClient.emitEvent({
+      type: "compaction_end",
+      reason: nativeReason,
+      aborted: false,
+      willRetry: nativeReason === "overflow",
+      failed: false,
+    });
+    rpcClient.emitEvent({
+      type: "compaction_end",
+      reason: "manual",
+      aborted: false,
+      willRetry: false,
+      failed: false,
+    });
+
+    assert.deepEqual(events.filter((event) => event.kind === "fault"), []);
+
+    rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
+    assert.deepEqual(
+      events.filter((event) => event.kind === "fault"),
+      [{ kind: "fault", code: "invalid_rpc_event" }],
+    );
   });
-  assert.equal((await supervisor.start()).ok, true);
-
-  channel.emitCompactionPrepare("manual-active");
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
-
-  channel.emitCompactionComplete("manual-active", "succeeded");
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  channel.emitCompactionPrepare("manual-pending");
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  await new Promise<void>((resolve) => setImmediate(resolve));
-
-  rpcClient.emitEvent({ type: "compaction_start", reason: "threshold" });
-  rpcClient.emitEvent({
-    type: "compaction_end",
-    reason: "threshold",
-    aborted: false,
-    willRetry: false,
-    failed: false,
-  });
-  rpcClient.emitEvent({
-    type: "compaction_end",
-    reason: "manual",
-    aborted: false,
-    willRetry: false,
-    failed: false,
-  });
-  await new Promise<void>((resolve) => setImmediate(resolve));
-
-  let status = tree.getStatus(FIRST_AGENT_ID);
-  assert.equal(status.ok, true);
-  if (status.ok) assert.notEqual(status.data.state, "failed");
-
-  // automatic start 已消费等待中的 manual-pending，但不得碰 active 的 manual-active。
-  rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
-  status = tree.getStatus(FIRST_AGENT_ID);
-  assert.equal(status.ok, true);
-  if (status.ok) assert.equal(status.data.state, "failed");
-});
+}
 
 test("not_started 在 manual start 前后分别处理授权，重复 manual end 进入故障", async () => {
   for (const timing of ["before_start", "after_start"] as const) {

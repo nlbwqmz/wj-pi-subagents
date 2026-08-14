@@ -552,6 +552,7 @@ interface CoordinatedCompactionState {
   mailboxPrepared: boolean;
   replyPrepared: boolean;
   preparation?: Promise<boolean>;
+  terminalAccepted?: boolean;
 }
 
 interface CompactionStateWaiter {
@@ -605,7 +606,7 @@ export class RpcSupervisor {
   private readonly activeTools = new Map<string, RpcSupervisorActivityCategory>();
   private readonly activeToolCounts = new Map<RpcSupervisorActivityCategory, number>();
   private readonly coordinatedCompactions = new Map<string, CoordinatedCompactionState>();
-  private readonly closedCoordinatedCompactions = new Set<string>();
+  private readonly closedCoordinatedCompactions = new Map<string, boolean>();
   private readonly manualCompactionAuthorizations = new Set<string>();
   private activeManualCompactionTransactionId: string | undefined;
   private readonly compactionStateWaiters = new Set<CompactionStateWaiter>();
@@ -1004,9 +1005,21 @@ export class RpcSupervisor {
     const respond = channel?.respondCompactionCompleted;
     if (this.phase !== "ready" || typeof respond !== "function") return;
     const state = this.coordinatedCompactions.get(request.transaction_id);
-    const accepted = state === undefined
-      ? this.closedCoordinatedCompactions.has(request.transaction_id)
-      : this.releaseCoordinatedCompaction(state, request.outcome);
+    let accepted: boolean;
+    if (state === undefined) {
+      const remembered = this.closedCoordinatedCompactions.get(request.transaction_id);
+      accepted = remembered ?? false;
+      if (remembered === undefined) {
+        this.rememberClosedCoordinatedCompaction(request.transaction_id, false);
+      }
+    } else if (state.terminalAccepted !== undefined) {
+      accepted = state.terminalAccepted;
+    } else {
+      accepted = this.releaseCoordinatedCompaction(state, request.outcome);
+      if (!accepted && this.coordinatedCompactions.get(request.transaction_id) === state) {
+        state.terminalAccepted = false;
+      }
+    }
     try {
       await respond.call(channel, {
         transaction_id: request.transaction_id,
@@ -1098,10 +1111,15 @@ export class RpcSupervisor {
     return released;
   }
 
-  private rememberClosedCoordinatedCompaction(transactionId: string): void {
-    this.closedCoordinatedCompactions.add(transactionId);
+  private rememberClosedCoordinatedCompaction(
+    transactionId: string,
+    accepted = true,
+  ): void {
+    if (!this.closedCoordinatedCompactions.has(transactionId)) {
+      this.closedCoordinatedCompactions.set(transactionId, accepted);
+    }
     while (this.closedCoordinatedCompactions.size > 64) {
-      const oldest = this.closedCoordinatedCompactions.values().next().value;
+      const oldest = this.closedCoordinatedCompactions.keys().next().value;
       if (oldest === undefined) return;
       this.closedCoordinatedCompactions.delete(oldest);
       if (this.activeManualCompactionTransactionId !== oldest) {
@@ -1131,9 +1149,13 @@ export class RpcSupervisor {
   }
 
   private beginAuthorizedManualCompaction(): boolean {
-    if (this.activeManualCompactionTransactionId !== undefined) return false;
+    if (
+      this.activeManualCompactionTransactionId !== undefined
+      || this.manualCompactionAuthorizations.size !== 1
+    ) return false;
     const transactionId = this.manualCompactionAuthorizations.values().next().value;
     if (transactionId === undefined) return false;
+    this.manualCompactionAuthorizations.delete(transactionId);
     this.activeManualCompactionTransactionId = transactionId;
     return true;
   }
@@ -1146,13 +1168,9 @@ export class RpcSupervisor {
     return true;
   }
 
-  /** 自动压缩只清理尚未消费的最早授权；活动 manual 必须保留到对应 compaction_end。 */
-  private consumeSupersededManualCompactionAuthorization(): void {
-    for (const transactionId of this.manualCompactionAuthorizations) {
-      if (transactionId === this.activeManualCompactionTransactionId) continue;
-      this.manualCompactionAuthorizations.delete(transactionId);
-      return;
-    }
+  /** 自动压缩撤销全部尚未消费的授权；active manual 独立保留到 compaction_end。 */
+  private revokePendingManualCompactionAuthorizations(): void {
+    this.manualCompactionAuthorizations.clear();
   }
 
   private receiveTaskStarted(started: SupervisorTaskStarted): void {
@@ -1189,7 +1207,7 @@ export class RpcSupervisor {
           this.failRuntime("invalid_rpc_event");
           return;
         }
-        if (event.reason !== "manual") this.consumeSupersededManualCompactionAuthorization();
+        if (event.reason !== "manual") this.revokePendingManualCompactionAuthorizations();
         this.mailbox.observeCompactionStart(event.reason);
         this.commitTaskProjection();
         return;

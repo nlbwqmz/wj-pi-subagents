@@ -160,6 +160,14 @@ async function settle(): Promise<void> {
   await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
+async function waitFor(condition: () => boolean, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error("等待测试条件超时");
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 test("发现只公开不透明参与者身份", async () => {
   const bus = new TestEventBus();
   const value = createRuntime();
@@ -184,6 +192,38 @@ test("发现只公开不透明参与者身份", async () => {
     participantId: "participant-root",
     requiresBarrier: true,
   });
+  await participant.close();
+});
+
+test("runtime 未就绪时不参与 discovery，就绪后才公开参与者", async () => {
+  const bus = new TestEventBus();
+  let runtime: AutoCompactCoordinationRuntime | undefined;
+  const participant = new AutoCompactCoordinationParticipant({
+    eventBus: bus,
+    readRuntime: () => runtime,
+    participantId: "participant-late-runtime",
+  });
+
+  bus.emit(AUTO_COMPACT_COORDINATION_CHANNELS.discover, {
+    protocolVersion: AUTO_COMPACT_COORDINATION_VERSION,
+    requestId: "discover-before-ready",
+  });
+  assert.equal(acknowledgement(
+    bus,
+    AUTO_COMPACT_COORDINATION_CHANNELS.discovered,
+    "discover-before-ready",
+  ), undefined);
+
+  runtime = createRuntime().runtime;
+  bus.emit(AUTO_COMPACT_COORDINATION_CHANNELS.discover, {
+    protocolVersion: AUTO_COMPACT_COORDINATION_VERSION,
+    requestId: "discover-after-ready",
+  });
+  assert.equal(acknowledgement(
+    bus,
+    AUTO_COMPACT_COORDINATION_CHANNELS.discovered,
+    "discover-after-ready",
+  )?.participantId, "participant-late-runtime");
   await participant.close();
 });
 
@@ -265,6 +305,143 @@ test("子会话只协调本地入口、自己的 reply 边和直接父边", asyn
   await participant.close();
 });
 
+test("重复 prepare 共用首次等待，重复 complete 重放首次 terminal ACK", async () => {
+  const bus = new TestEventBus();
+  const upstream = new FakeUpstreamChannel();
+  let allowPrepare!: () => void;
+  const prepareAllowed = new Promise<void>((resolve) => { allowPrepare = resolve; });
+  upstream.prepareOperation = async () => { await prepareAllowed; return true; };
+  const value = createRuntime({ upstream });
+  const participant = new AutoCompactCoordinationParticipant({
+    eventBus: bus,
+    readRuntime: () => value.runtime,
+    participantId: "participant-idempotent",
+    upstreamAckTimeoutMs: 100,
+  });
+
+  emitPrepare(bus, "participant-idempotent", "compact-replayed");
+  emitPrepare(bus, "participant-idempotent", "compact-replayed");
+  await settle();
+  assert.deepEqual(upstream.requests, [
+    { kind: "prepare", transactionId: "compact-replayed" },
+  ]);
+
+  allowPrepare();
+  await settle();
+  await settle();
+  assert.deepEqual(
+    bus.emitted
+      .filter((event) => event.channel === AUTO_COMPACT_COORDINATION_CHANNELS.prepared)
+      .map((event) => event.value as { requestId: string; prepared: boolean })
+      .filter((event) => event.requestId === "compact-replayed")
+      .map((event) => event.prepared),
+    [true, true],
+  );
+
+  emitComplete(bus, "participant-idempotent", "compact-replayed", "cancelled");
+  emitComplete(bus, "participant-idempotent", "compact-replayed", "cancelled");
+  await settle();
+  await settle();
+  assert.deepEqual(upstream.requests, [
+    { kind: "prepare", transactionId: "compact-replayed" },
+    { kind: "complete", transactionId: "compact-replayed", outcome: "cancelled" },
+  ]);
+  emitComplete(bus, "participant-idempotent", "compact-replayed", "not_started");
+  await settle();
+  assert.deepEqual(
+    bus.emitted
+      .filter((event) => event.channel === AUTO_COMPACT_COORDINATION_CHANNELS.completed)
+      .map((event) => event.value as { requestId: string; completed: boolean })
+      .filter((event) => event.requestId === "compact-replayed")
+      .map((event) => event.completed),
+    [true, true, true],
+  );
+  assert.equal(participant.beginManualCompaction(), false);
+  await participant.close();
+});
+
+test("多个未消费 manual 授权存在歧义时拒绝按插入顺序选择", async () => {
+  const bus = new TestEventBus();
+  const value = createRuntime();
+  const participant = new AutoCompactCoordinationParticipant({
+    eventBus: bus,
+    readRuntime: () => value.runtime,
+    participantId: "participant-manual-order",
+  });
+
+  emitPrepare(bus, "participant-manual-order", "compact-manual-old");
+  await settle();
+  emitComplete(bus, "participant-manual-order", "compact-manual-old", "succeeded");
+  await settle();
+
+  emitPrepare(bus, "participant-manual-order", "compact-manual-current");
+  await settle();
+  assert.equal(participant.beginManualCompaction(), false);
+
+  participant.revokePendingManualCompactionAuthorization();
+  emitComplete(bus, "participant-manual-order", "compact-manual-current", "not_started");
+  await settle();
+
+  assert.equal(participant.beginManualCompaction(), false);
+  await participant.close();
+});
+
+test("native 撤销只清理 pending，不影响已开始的 manual 生命周期", async () => {
+  const bus = new TestEventBus();
+  const value = createRuntime();
+  const participant = new AutoCompactCoordinationParticipant({
+    eventBus: bus,
+    readRuntime: () => value.runtime,
+    participantId: "participant-active-manual",
+  });
+
+  emitPrepare(bus, "participant-active-manual", "compact-active-manual");
+  await settle();
+  assert.equal(participant.beginManualCompaction(), true);
+
+  participant.revokePendingManualCompactionAuthorization();
+  emitComplete(bus, "participant-active-manual", "compact-active-manual", "succeeded");
+  await settle();
+
+  assert.equal(participant.completeManualCompaction(), true);
+  assert.equal(participant.completeManualCompaction(), false);
+  assert.equal(participant.beginManualCompaction(), false);
+  await participant.close();
+});
+
+test("先到 terminal complete 固定事务结果，迟到 prepare 不再安装 barrier", async () => {
+  const bus = new TestEventBus();
+  const value = createRuntime();
+  const participant = new AutoCompactCoordinationParticipant({
+    eventBus: bus,
+    readRuntime: () => value.runtime,
+    participantId: "participant-terminal-first",
+  });
+
+  emitComplete(bus, "participant-terminal-first", "compact-terminal-first", "cancelled");
+  emitComplete(bus, "participant-terminal-first", "compact-terminal-first", "failed");
+  emitPrepare(bus, "participant-terminal-first", "compact-terminal-first");
+  await settle();
+  await settle();
+
+  assert.deepEqual(
+    bus.emitted
+      .filter((event) => event.channel === AUTO_COMPACT_COORDINATION_CHANNELS.completed)
+      .map((event) => event.value as { requestId: string; completed: boolean })
+      .filter((event) => event.requestId === "compact-terminal-first")
+      .map((event) => event.completed),
+    [false, false],
+  );
+  assert.equal(acknowledgement(
+    bus,
+    AUTO_COMPACT_COORDINATION_CHANNELS.prepared,
+    "compact-terminal-first",
+  )?.prepared, false);
+  assert.equal(participant.hasBarrier(), false);
+  assert.equal(value.replyInbox.accept(CHILD_ID, workingReply()), true);
+  await participant.close();
+});
+
 test("不同会话参与者并行准备，不受另一会话上游等待阻塞", async () => {
   const bus = new TestEventBus();
   const rootValue = createRuntime();
@@ -330,8 +507,11 @@ test("complete 业务响应不确定时补发同事务 not_started", async () =>
   emitPrepare(bus, "participant-child", "compact-uncertain");
   await settle();
   emitComplete(bus, "participant-child", "compact-uncertain", "succeeded");
-  await new Promise<void>((resolve) => setTimeout(resolve, 30));
-  await settle();
+  await waitFor(() => acknowledgement(
+    bus,
+    AUTO_COMPACT_COORDINATION_CHANNELS.completed,
+    "compact-uncertain",
+  )?.completed === false);
 
   assert.deepEqual(upstream.requests, [
     { kind: "prepare", transactionId: "compact-uncertain" },
@@ -363,8 +543,7 @@ test("complete 与补偿都无业务响应时废止直接上游通道", async ()
   emitPrepare(bus, "participant-child", "compact-unrecoverable");
   await settle();
   emitComplete(bus, "participant-child", "compact-unrecoverable", "succeeded");
-  await new Promise<void>((resolve) => setTimeout(resolve, 35));
-  await settle();
+  await waitFor(() => upstream.protocolFailures === 1 && upstream.releases === 1);
 
   assert.equal(upstream.protocolFailures, 1);
   assert.equal(upstream.releases, 1);
@@ -458,32 +637,115 @@ test("prepare 明确拒绝时释放本地令牌并向直接父发送 not_started
   await participant.close();
 });
 
-test("close 等待未决直接父 prepare，并以独立 not_started 释放已建立边界", async () => {
+test("close 主动取消未决 prepare，并用独立清理请求释放边界", async () => {
   const bus = new TestEventBus();
   const upstream = new FakeUpstreamChannel();
-  let allowPrepare!: () => void;
-  const prepareAllowed = new Promise<void>((resolve) => { allowPrepare = resolve; });
-  upstream.prepareOperation = async () => { await prepareAllowed; return true; };
+  let prepareSignal: AbortSignal | undefined;
+  upstream.prepareOperation = async (_transactionId, signal) => {
+    prepareSignal = signal;
+    return new Promise<boolean>(() => {});
+  };
   const value = createRuntime({ upstream });
   const participant = new AutoCompactCoordinationParticipant({
     eventBus: bus,
     readRuntime: () => value.runtime,
     participantId: "participant-child",
-    upstreamAckTimeoutMs: 100,
+    upstreamAckTimeoutMs: 60_000,
   });
 
   emitPrepare(bus, "participant-child", "compact-close");
   await settle();
-  let closed = false;
-  const closing = participant.close().then(() => { closed = true; });
-  await settle();
-  assert.equal(closed, false);
+  assert.equal(prepareSignal?.aborted, false);
 
-  allowPrepare();
+  const closing = participant.close();
+  assert.equal(prepareSignal?.aborted, true);
   await closing;
   assert.deepEqual(upstream.requests, [
     { kind: "prepare", transactionId: "compact-close" },
     { kind: "complete", transactionId: "compact-close", outcome: "not_started" },
+  ]);
+  assert.equal(participant.hasBarrier(), false);
+  assert.equal(value.replyInbox.accept(CHILD_ID, workingReply()), true);
+});
+
+test("close 的清理 deadline 不被可配置业务 ACK 期限放大", async () => {
+  const bus = new TestEventBus();
+  const upstream = new FakeUpstreamChannel();
+  let prepareSignal: AbortSignal | undefined;
+  let cleanupSignal: AbortSignal | undefined;
+  upstream.prepareOperation = async (_transactionId, signal) => {
+    prepareSignal = signal;
+    return new Promise<boolean>(() => {});
+  };
+  upstream.completeOperation = async (_transactionId, _outcome, signal) => {
+    cleanupSignal = signal;
+    return new Promise<boolean>(() => {});
+  };
+  const value = createRuntime({ upstream });
+  const participant = new AutoCompactCoordinationParticipant({
+    eventBus: bus,
+    readRuntime: () => value.runtime,
+    participantId: "participant-bounded-close",
+    upstreamAckTimeoutMs: 60_000,
+  });
+
+  emitPrepare(bus, "participant-bounded-close", "compact-bounded-close");
+  await settle();
+  const closing = participant.close();
+  assert.equal(prepareSignal?.aborted, true);
+
+  let deadline: ReturnType<typeof setTimeout>;
+  const verdict = await Promise.race([
+    closing.then(() => {
+      clearTimeout(deadline);
+      return "closed" as const;
+    }),
+    new Promise<"timed_out">((resolve) => {
+      deadline = setTimeout(() => resolve("timed_out"), 2_000);
+    }),
+  ]);
+  assert.equal(verdict, "closed");
+  assert.equal(cleanupSignal?.aborted, true);
+  assert.equal(upstream.protocolFailures, 1);
+  assert.equal(upstream.releases, 1);
+  assert.equal(value.replyInbox.accept(CHILD_ID, workingReply()), true);
+});
+
+test("close 主动取消未决 complete，并以未取消的 deadline 补偿", async () => {
+  const bus = new TestEventBus();
+  const upstream = new FakeUpstreamChannel();
+  let completeSignal: AbortSignal | undefined;
+  let cleanupSignal: AbortSignal | undefined;
+  upstream.completeOperation = async (_transactionId, outcome, signal) => {
+    if (outcome === "succeeded") {
+      completeSignal = signal;
+      return new Promise<boolean>(() => {});
+    }
+    cleanupSignal = signal;
+    return true;
+  };
+  const value = createRuntime({ upstream });
+  const participant = new AutoCompactCoordinationParticipant({
+    eventBus: bus,
+    readRuntime: () => value.runtime,
+    participantId: "participant-complete-close",
+    upstreamAckTimeoutMs: 60_000,
+  });
+
+  emitPrepare(bus, "participant-complete-close", "compact-complete-close");
+  await settle();
+  emitComplete(bus, "participant-complete-close", "compact-complete-close", "succeeded");
+  await settle();
+  assert.equal(completeSignal?.aborted, false);
+
+  const closing = participant.close();
+  assert.equal(completeSignal?.aborted, true);
+  await closing;
+  assert.equal(cleanupSignal?.aborted, false);
+  assert.deepEqual(upstream.requests, [
+    { kind: "prepare", transactionId: "compact-complete-close" },
+    { kind: "complete", transactionId: "compact-complete-close", outcome: "succeeded" },
+    { kind: "complete", transactionId: "compact-complete-close", outcome: "not_started" },
   ]);
   assert.equal(participant.hasBarrier(), false);
   assert.equal(value.replyInbox.accept(CHILD_ID, workingReply()), true);

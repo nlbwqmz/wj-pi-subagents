@@ -753,14 +753,16 @@ export function createPiSubagentRuntimeActivator(
       const reason = isRecord(event) ? event.reason : undefined;
       const willRetry = isRecord(event) ? event.willRetry : undefined;
       if (reason === "manual") {
-        if (!coordinationParticipant?.hasPreparedBarrier()) {
+        if (!coordinationParticipant?.beginManualCompaction()) {
           failChildCompactionInvariant(current);
           return;
         }
         current.replyCoordinator?.observeCompactionStart("manual", false);
         return;
       }
-      if ((reason !== "threshold" && reason !== "overflow") || typeof willRetry !== "boolean") return;
+      if (reason !== "threshold" && reason !== "overflow") return;
+      coordinationParticipant?.revokePendingManualCompactionAuthorization();
+      if (typeof willRetry !== "boolean") return;
       current.replyCoordinator?.observeCompactionStart(reason, willRetry);
     });
 
@@ -769,7 +771,7 @@ export function createPiSubagentRuntimeActivator(
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
       const reason = isRecord(event) ? event.reason : undefined;
       if (reason === "manual") {
-        if (!coordinationParticipant?.hasPreparedBarrier()) {
+        if (!coordinationParticipant?.completeManualCompaction()) {
           failChildCompactionInvariant(current);
           return;
         }
@@ -777,6 +779,7 @@ export function createPiSubagentRuntimeActivator(
         return;
       }
       if (reason !== "threshold" && reason !== "overflow") return;
+      coordinationParticipant?.revokePendingManualCompactionAuthorization();
       current.replyCoordinator?.observeCompactionEnd(reason);
     });
 

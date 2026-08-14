@@ -319,11 +319,16 @@ export class ManagedRpcNode implements ManagedRpcNodeLike {
   private async runRelease(): Promise<void> {
     await this.waitForBindingSettlement();
     if (this.phase === "released") return;
+    const startWasInFlight = this.phase === "starting";
     const tree = this.binding?.tree;
     const operations: Promise<void>[] = [];
     if (this.bridge?.release !== undefined) operations.push(this.bridge.release());
     if (tree !== undefined) operations.push(this.adapter.release(tree));
     await settleAll(operations);
+    if (startWasInFlight && this.startPromise !== undefined) {
+      await this.startPromise.then(() => {}, () => {});
+      if (this.bridge?.release !== undefined) await this.bridge.release();
+    }
     this.unsubscribeBridgeEvent?.();
     this.unsubscribeBridgeFault?.();
     this.unsubscribeBridgeSupervisorFrame?.();

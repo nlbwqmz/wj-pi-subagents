@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -239,6 +240,50 @@ class DelayedStartBridge extends RecordingBridge {
   }
 }
 
+class ListenerInstallingBridge extends RecordingBridge {
+  readonly startEntered: Promise<void>;
+  readonly releaseEntered: Promise<void>;
+  private signalStartEntered!: () => void;
+  private signalReleaseEntered!: () => void;
+  private readonly startGate: Promise<void>;
+  private completeStartGate!: () => void;
+  private readonly source: EventEmitter;
+  private readonly listener: () => void;
+
+  constructor(source: EventEmitter, listener: () => void) {
+    super();
+    this.source = source;
+    this.listener = listener;
+    this.startEntered = new Promise<void>((resolve) => {
+      this.signalStartEntered = resolve;
+    });
+    this.releaseEntered = new Promise<void>((resolve) => {
+      this.signalReleaseEntered = resolve;
+    });
+    this.startGate = new Promise<void>((resolve) => {
+      this.completeStartGate = resolve;
+    });
+  }
+
+  override async start(): Promise<void> {
+    this.operations.push("bridge:start");
+    this.signalStartEntered();
+    await this.startGate;
+    this.source.on("resource", this.listener);
+  }
+
+  override release(): Promise<void> {
+    this.operations.push("bridge:release");
+    this.source.off("resource", this.listener);
+    this.signalReleaseEntered();
+    return Promise.resolve();
+  }
+
+  completeStart(): void {
+    this.completeStartGate();
+  }
+}
+
 class DelayedLaunchAdapter extends RecordingAdapter {
   readonly launchStarted: Promise<void>;
   private signalLaunchStarted!: () => void;
@@ -396,6 +441,37 @@ test("ManagedRpcNode 启动超时期间不伪造资源确认，并在迟到 laun
   assert.equal(adapter.operations.includes("force"), true);
   assert.equal(adapter.operations.includes("release"), true);
   assert.equal(bridgeCreations, 0);
+});
+
+test("ManagedRpcNode release 等待启动中的 bridge 收尾且不泄漏迟到监听器", async () => {
+  const adapter = new DelayedLaunchAdapter();
+  const source = new EventEmitter();
+  let observed = 0;
+  const bridge = new ListenerInstallingBridge(source, () => {
+    observed += 1;
+  });
+  const node = new ManagedRpcNode({
+    processTreeAdapter: adapter,
+    launch: { command: "bridge.exe" },
+    bridgeFactory: () => bridge,
+  });
+
+  const startup = node.start();
+  await adapter.launchStarted;
+  adapter.completeLaunch();
+  await bridge.startEntered;
+
+  const releasing = node.release();
+  await bridge.releaseEntered;
+  bridge.completeStart();
+
+  await assert.rejects(
+    startup,
+    (error: unknown) => error instanceof Error && error.name === "AbortError",
+  );
+  await releasing;
+  source.emit("resource");
+  assert.equal(observed, 0);
 });
 
 test("FakeManagedRpcNode 提供可控事件、故障和资源观察", async () => {

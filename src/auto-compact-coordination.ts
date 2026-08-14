@@ -17,6 +17,8 @@ export const AUTO_COMPACT_COORDINATION_CHANNELS = Object.freeze({
 
 // 外层 CoordinationClient 的 12s waiter 必须覆盖一次业务等待与一次 not_started 补偿。
 const UPSTREAM_ACK_TIMEOUT_MS = 4_500;
+const CLEANUP_ACK_TIMEOUT_MS = 1_000;
+const TRANSACTION_HISTORY_LIMIT = 64;
 const OUTCOMES: ReadonlySet<string> = new Set([
   "succeeded",
   "failed",
@@ -49,6 +51,18 @@ interface PreparedBarrier {
   readonly parentPrepared: boolean;
 }
 
+interface TransactionTerminal {
+  readonly outcome: SupervisorCompactionOutcome;
+  readonly accepted: boolean;
+  compensationAccepted?: boolean;
+}
+
+interface TransactionRecord {
+  preparation?: Promise<boolean>;
+  prepared?: boolean;
+  terminal?: TransactionTerminal;
+}
+
 type BusinessAckStatus = "accepted" | "rejected" | "uncertain";
 
 /**
@@ -61,9 +75,14 @@ export class AutoCompactCoordinationParticipant {
   private readonly eventBus: AutoCompactCoordinationEventBus;
   private readonly readRuntime: () => AutoCompactCoordinationRuntime | undefined;
   private readonly upstreamAckTimeoutMs: number;
+  private readonly cleanupAckTimeoutMs: number;
   private readonly barriers = new Map<string, PreparedBarrier>();
   private readonly pending = new Set<string>();
+  private readonly transactions = new Map<string, TransactionRecord>();
+  private readonly operationAbortController = new AbortController();
   private readonly unsubscribers: Array<() => void> = [];
+  private readonly pendingManualCompactionAuthorizations = new Set<string>();
+  private activeManualCompactionTransactionId: string | undefined;
   private completedLocalSuccess:
     | { readonly requestId: string; readonly runtime: AutoCompactCoordinationRuntime }
     | undefined;
@@ -76,6 +95,7 @@ export class AutoCompactCoordinationParticipant {
     this.readRuntime = options.readRuntime;
     this.participantId = options.participantId ?? randomUUID();
     this.upstreamAckTimeoutMs = options.upstreamAckTimeoutMs ?? UPSTREAM_ACK_TIMEOUT_MS;
+    this.cleanupAckTimeoutMs = Math.min(CLEANUP_ACK_TIMEOUT_MS, this.upstreamAckTimeoutMs);
     if (this.participantId.length === 0 || this.participantId.length > 256) {
       throw new TypeError("自动压缩协调参与者标识无效");
     }
@@ -97,13 +117,14 @@ export class AutoCompactCoordinationParticipant {
   close(): Promise<void> {
     if (this.closePromise !== undefined) return this.closePromise;
     this.closed = true;
+    this.operationAbortController.abort();
     for (const unsubscribe of this.unsubscribers.splice(0)) unsubscribe();
     this.closePromise = (async () => {
       await this.operationQueue;
       const barriers = [...this.barriers];
       this.barriers.clear();
       await Promise.allSettled(barriers.map(([requestId, barrier]) =>
-        this.releaseBarrier(requestId, barrier, "not_started")
+        this.releaseBarrier(requestId, barrier, "not_started", true)
       ));
       const completed = this.completedLocalSuccess;
       this.completedLocalSuccess = undefined;
@@ -112,6 +133,9 @@ export class AutoCompactCoordinationParticipant {
         void completed.runtime.retryPendingReplies().catch(() => {});
       }
       this.pending.clear();
+      this.transactions.clear();
+      this.pendingManualCompactionAuthorizations.clear();
+      this.activeManualCompactionTransactionId = undefined;
     })();
     return this.closePromise;
   }
@@ -120,15 +144,45 @@ export class AutoCompactCoordinationParticipant {
     return this.barriers.size > 0 || this.pending.size > 0;
   }
 
-  /** 只有全部 prepare 业务 ACK 已完成后，才授权当前 child 的 manual 压缩事实。 */
+  /** 只有全部 prepare 业务 ACK 已完成后，才存在可释放的消息屏障。 */
   hasPreparedBarrier(): boolean {
     return this.barriers.size > 0;
+  }
+
+  /** Pi 的真实 before_compact 消费授权；活动授权独立于消息屏障保留。 */
+  beginManualCompaction(): boolean {
+    if (
+      this.closed
+      || this.activeManualCompactionTransactionId !== undefined
+      || this.pendingManualCompactionAuthorizations.size !== 1
+    ) return false;
+    const transactionId = this.pendingManualCompactionAuthorizations.values().next().value;
+    if (transactionId === undefined) return false;
+    this.pendingManualCompactionAuthorizations.delete(transactionId);
+    this.activeManualCompactionTransactionId = transactionId;
+    return true;
+  }
+
+  /** 原生自动压缩只撤销尚未消费的 manual 授权。 */
+  revokePendingManualCompactionAuthorization(): void {
+    this.pendingManualCompactionAuthorizations.clear();
+    this.pruneTransactionHistory();
+  }
+
+  /** 只有匹配活动 manual 生命周期的真实 compact end 才撤销已消费授权。 */
+  completeManualCompaction(): boolean {
+    if (this.activeManualCompactionTransactionId === undefined) return false;
+    this.activeManualCompactionTransactionId = undefined;
+    this.pruneTransactionHistory();
+    return true;
   }
 
   private discover(value: unknown): void {
     if (this.closed) return;
     const request = parseDiscover(value);
     if (request === undefined) return;
+    const runtime = this.readRuntime();
+    if (runtime === undefined || runtime.handoffPending === true) return;
     this.eventBus.emit(AUTO_COMPACT_COORDINATION_CHANNELS.discovered, Object.freeze({
       protocolVersion: AUTO_COMPACT_COORDINATION_VERSION,
       requestId: request.requestId,
@@ -147,7 +201,21 @@ export class AutoCompactCoordinationParticipant {
     if (this.closed) return;
     const request = parseTargeted(value, this.participantId);
     if (request === undefined) return;
-    const prepared = await this.establishBarrier(request.requestId);
+    const existing = this.transactions.get(request.requestId);
+    if (existing !== undefined) {
+      const prepared = existing.prepared ?? await existing.preparation ?? false;
+      this.emitPrepared(request.requestId, prepared);
+      return;
+    }
+
+    const record: TransactionRecord = {};
+    this.transactions.set(request.requestId, record);
+    const preparation = this.establishBarrier(request.requestId);
+    record.preparation = preparation;
+    const prepared = await preparation;
+    delete record.preparation;
+    record.prepared = prepared;
+    this.pruneTransactionHistory();
     this.emitPrepared(request.requestId, prepared);
   }
 
@@ -172,6 +240,7 @@ export class AutoCompactCoordinationParticipant {
         ? await requestBusinessAck(
             (signal) => runtime.upstream!.channel.requestCompactionPrepare(requestId, signal),
             this.upstreamAckTimeoutMs,
+            this.operationAbortController.signal,
           )
         : "accepted";
       if (parentStatus !== "accepted" || this.closed) {
@@ -190,6 +259,7 @@ export class AutoCompactCoordinationParticipant {
         runtime,
         parentPrepared: parentRequested,
       }));
+      this.pendingManualCompactionAuthorizations.add(requestId);
       return true;
     } catch {
       if (parentRequested && runtime.upstream !== undefined) {
@@ -214,25 +284,46 @@ export class AutoCompactCoordinationParticipant {
     ) {
       this.completedLocalSuccess = undefined;
     }
-    const barrier = this.barriers.get(request.requestId);
-    if (barrier === undefined) {
-      const completed = this.completedLocalSuccess;
+    const record = this.transactions.get(request.requestId) ?? {};
+    if (!this.transactions.has(request.requestId)) this.transactions.set(request.requestId, record);
+    const terminal = record.terminal;
+    if (terminal !== undefined) {
       if (
         request.outcome === "not_started"
-        && completed?.requestId === request.requestId
+        && terminal.outcome !== "not_started"
+        && terminal.accepted
       ) {
-        this.completedLocalSuccess = undefined;
-        this.releaseLocal(request.requestId, completed.runtime, "not_started");
-        void completed.runtime.retryPendingReplies().catch(() => {});
-        this.emitCompleted(request.requestId, true);
+        if (terminal.compensationAccepted === undefined) {
+          terminal.compensationAccepted = true;
+          const completed = this.completedLocalSuccess;
+          if (completed?.requestId === request.requestId) {
+            this.completedLocalSuccess = undefined;
+            this.releaseLocal(request.requestId, completed.runtime, "not_started");
+            void completed.runtime.retryPendingReplies().catch(() => {});
+          }
+        }
+        this.pendingManualCompactionAuthorizations.delete(request.requestId);
+        this.emitCompleted(request.requestId, terminal.compensationAccepted);
         return;
       }
+      this.emitCompleted(request.requestId, terminal.accepted);
+      return;
+    }
+
+    const barrier = this.barriers.get(request.requestId);
+    if (barrier === undefined) {
+      record.terminal = { outcome: request.outcome, accepted: false };
+      this.pruneTransactionHistory();
       this.emitCompleted(request.requestId, false);
       return;
     }
 
     this.barriers.delete(request.requestId);
     const accepted = await this.releaseBarrier(request.requestId, barrier, request.outcome);
+    record.terminal = { outcome: request.outcome, accepted };
+    if (request.outcome === "not_started") {
+      this.pendingManualCompactionAuthorizations.delete(request.requestId);
+    }
     if (
       accepted
       && request.outcome === "succeeded"
@@ -240,16 +331,40 @@ export class AutoCompactCoordinationParticipant {
     ) {
       this.completedLocalSuccess = Object.freeze({ requestId: request.requestId, runtime: barrier.runtime });
     }
+    this.pruneTransactionHistory();
     this.emitCompleted(request.requestId, accepted);
+  }
+
+  private pruneTransactionHistory(): void {
+    while (this.transactions.size > TRANSACTION_HISTORY_LIMIT) {
+      let removed = false;
+      for (const [requestId, record] of this.transactions) {
+        if (
+          record.preparation !== undefined
+          || this.pending.has(requestId)
+          || this.barriers.has(requestId)
+          || this.completedLocalSuccess?.requestId === requestId
+          || this.pendingManualCompactionAuthorizations.has(requestId)
+          || this.activeManualCompactionTransactionId === requestId
+        ) continue;
+        this.transactions.delete(requestId);
+        removed = true;
+        break;
+      }
+      if (!removed) return;
+    }
   }
 
   private async releaseBarrier(
     requestId: string,
     barrier: PreparedBarrier,
     outcome: SupervisorCompactionOutcome,
+    cleanup = false,
   ): Promise<boolean> {
     const accepted = barrier.parentPrepared && barrier.runtime.upstream !== undefined
-      ? await this.completeUpstream(barrier.runtime.upstream.channel, requestId, outcome)
+      ? cleanup
+        ? await this.cleanupUpstream(barrier.runtime.upstream.channel, requestId)
+        : await this.completeUpstream(barrier.runtime.upstream.channel, requestId, outcome)
       : true;
     this.releaseLocal(requestId, barrier.runtime, accepted ? outcome : "not_started");
     void barrier.runtime.retryPendingReplies().catch(() => {});
@@ -264,16 +379,29 @@ export class AutoCompactCoordinationParticipant {
     const status = await requestBusinessAck(
       (signal) => channel.requestCompactionComplete(requestId, outcome, signal),
       this.upstreamAckTimeoutMs,
+      this.operationAbortController.signal,
     );
     if (status === "accepted") return true;
     if (status === "rejected") return false;
 
     const cleanup = await requestBusinessAck(
       (signal) => channel.requestCompactionComplete(requestId, "not_started", signal),
-      this.upstreamAckTimeoutMs,
+      this.cleanupAckTimeoutMs,
     );
     if (cleanup === "uncertain") await failUncertainUpstreamResponse(channel);
     return false;
+  }
+
+  private async cleanupUpstream(
+    channel: StreamSupervisorChannel,
+    requestId: string,
+  ): Promise<boolean> {
+    const status = await requestBusinessAck(
+      (signal) => channel.requestCompactionComplete(requestId, "not_started", signal),
+      this.cleanupAckTimeoutMs,
+    );
+    if (status === "uncertain") await failUncertainUpstreamResponse(channel);
+    return status !== "uncertain";
   }
 
   private async releaseRequestedUpstream(
@@ -284,7 +412,7 @@ export class AutoCompactCoordinationParticipant {
   ): Promise<void> {
     const status = await requestBusinessAck(
       (signal) => channel.requestCompactionComplete(requestId, outcome, signal),
-      this.upstreamAckTimeoutMs,
+      this.cleanupAckTimeoutMs,
     );
     if (status === "uncertain" && parentAtRisk) await failUncertainUpstreamResponse(channel);
   }
@@ -368,9 +496,10 @@ async function failUncertainUpstreamResponse(channel: StreamSupervisorChannel): 
 async function requestBusinessAck(
   operation: (signal: AbortSignal) => Promise<boolean>,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<BusinessAckStatus> {
   try {
-    return await withAbortTimeout(operation, timeoutMs) ? "accepted" : "rejected";
+    return await withAbortTimeout(operation, timeoutMs, signal) ? "accepted" : "rejected";
   } catch {
     return "uncertain";
   }
@@ -379,32 +508,40 @@ async function requestBusinessAck(
 function withAbortTimeout<T>(
   operation: (signal: AbortSignal) => Promise<T>,
   timeoutMs: number,
+  externalSignal?: AbortSignal,
 ): Promise<T> {
   const controller = new AbortController();
   return new Promise<T>((resolve, reject) => {
     let settled = false;
-    const timer = setTimeout(() => {
+    let timer: ReturnType<typeof setTimeout>;
+    const finish = (outcome: () => void): void => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
+      externalSignal?.removeEventListener("abort", onExternalAbort);
+      outcome();
+    };
+    const onExternalAbort = (): void => {
       controller.abort();
-      reject(new Error("自动压缩协调上游确认超时"));
+      finish(() => reject(new Error("自动压缩协调等待已取消")));
+    };
+    timer = setTimeout(() => {
+      controller.abort();
+      finish(() => reject(new Error("自动压缩协调上游确认超时")));
     }, timeoutMs);
     timer.unref?.();
+    if (externalSignal?.aborted) {
+      onExternalAbort();
+      return;
+    }
+    externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
     void Promise.resolve()
       .then(() => operation(controller.signal))
       .then(
-        (value) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolve(value);
-        },
-        (error: unknown) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          reject(error instanceof Error ? error : new Error("自动压缩协调上游确认失败"));
-        },
+        (value) => finish(() => resolve(value)),
+        (error: unknown) => finish(() => reject(
+          error instanceof Error ? error : new Error("自动压缩协调上游确认失败"),
+        )),
       );
   });
 }
