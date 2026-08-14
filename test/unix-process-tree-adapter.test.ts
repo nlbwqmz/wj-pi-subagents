@@ -130,7 +130,7 @@ test("释放未确认的活动句柄时保持 unknown 且重复释放幂等", na
 test("Unix 适配器拒绝无效启动并处理取消的优雅关闭", nativeTestOptions, async () => {
   const adapter = new UnixProcessTreeAdapter();
   await assert.rejects(
-    adapter.launch({ command: `pi-subagent-missing-${Date.now()}` }),
+    adapter.launch({ command: `wj-pi-subagents-missing-${Date.now()}` }),
     (error: unknown) => {
       assert.ok(error instanceof UnixProcessTreeLaunchError);
       assert.equal(error.cleanup, "released");

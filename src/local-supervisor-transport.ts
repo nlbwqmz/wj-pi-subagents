@@ -6,15 +6,15 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import type { SupervisorByteTransport } from "./stream-supervisor-channel.ts";
 
-export const LOCAL_SUPERVISOR_CONTROL_PROTOCOL = "pi-subagent/local-control/1" as const;
+export const LOCAL_SUPERVISOR_CONTROL_PROTOCOL = "wj-pi-subagents/local-control/1" as const;
 
 export const LOCAL_SUPERVISOR_MAX_PREAMBLE_BYTES = 4 * 1024;
 
 const CANONICAL_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const TRANSPORT_CREDENTIAL_PATTERN = /^[A-Za-z0-9_-]{32,128}$/;
-const UNIX_SOCKET_DIRECTORY_PREFIX = "pi-subagent-local-";
+const UNIX_SOCKET_DIRECTORY_PREFIX = "wj-pi-subagents-local-";
 const UNIX_SOCKET_FILENAME = "control.sock";
-const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\pi-subagent-local-";
+const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\wj-pi-subagents-local-";
 
 export interface LocalSupervisorListenOptions {
   readonly agentId: string;

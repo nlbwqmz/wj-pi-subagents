@@ -106,7 +106,7 @@ export interface AgentTreeUiBinding {
   dispose(): void;
 }
 
-const AGENTS_WIDGET_KEY = "pi-subagent-agents";
+const AGENTS_WIDGET_KEY = "wj-pi-subagents-agents";
 const ELAPSED_REFRESH_INTERVAL_MS = 1_000;
 const DEFAULT_PANEL_VIEWPORT_HEIGHT = 12;
 const AGENT_TREE_OVERLAY_OPTIONS = Object.freeze({

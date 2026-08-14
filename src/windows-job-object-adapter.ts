@@ -210,8 +210,8 @@ export class WindowsJobObjectAdapter implements ProcessTreeAdapter {
     }
 
     const pipeId = randomUUID();
-    const controlPipeName = `\\\\.\\pipe\\pi-subagent-job-control-${pipeId}`;
-    const eventPipeName = `\\\\.\\pipe\\pi-subagent-job-event-${pipeId}`;
+    const controlPipeName = `\\\\.\\pipe\\wj-pi-subagents-job-control-${pipeId}`;
+    const eventPipeName = `\\\\.\\pipe\\wj-pi-subagents-job-event-${pipeId}`;
     let connectState: TreeState | undefined;
     const controlServer = await listenNamedPipe(controlPipeName, (socket) => {
       if (connectState === undefined || connectState.controlSocket !== undefined) {

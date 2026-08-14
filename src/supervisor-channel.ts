@@ -20,7 +20,7 @@ import {
 } from "./tree-controller.ts";
 
 /** 父子监督通道与 Pi 任务 RPC 完全隔离的固定协议版本。 */
-export const SUPERVISOR_PROTOCOL_VERSION = "pi-subagent/11";
+export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/11";
 
 export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "hello",

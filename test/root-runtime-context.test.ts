@@ -10,6 +10,8 @@ import {
   resolveRuntimeConfig,
   InvalidRootRuntimeConfigError,
   RootRuntimeContextStore,
+  RUNTIME_EPHEMERAL_ENV_KEYS,
+  RUNTIME_INTERNAL_ENV_KEYS,
   type RuntimeConfigFileReader,
   type RootRuntimeContext,
 } from "../src/root-runtime-context.ts";
@@ -24,8 +26,8 @@ function missingConfigFile(): Error {
 
 function configFilePaths(cwd: string): { project: string; user: string } {
   return {
-    project: join(resolve(cwd), ".pi", "subagent.json"),
-    user: join(homedir(), ".pi", "agent", "subagent.json"),
+    project: join(resolve(cwd), ".pi", "wj-pi-subagents.json"),
+    user: join(homedir(), ".pi", "agent", "wj-pi-subagents.json"),
   };
 }
 
@@ -43,6 +45,16 @@ function configReader(
     },
   };
 }
+
+test("运行时环境变量统一使用 WJ_PI_SUBAGENTS_ 前缀", () => {
+  const keys = [
+    ...Object.values(RUNTIME_INTERNAL_ENV_KEYS),
+    ...Object.values(RUNTIME_EPHEMERAL_ENV_KEYS),
+  ];
+
+  assert.equal(new Set(keys).size, keys.length);
+  assert.ok(keys.every((key) => key.startsWith("WJ_PI_SUBAGENTS_")));
+});
 
 test("根上下文只捕获一次 cwd、信任和环境，并让子代理沿用快照", () => {
   const root = captureRootRuntimeContext({
@@ -85,8 +97,8 @@ test("子代理只追加受控内部元数据，不把模板环境覆盖带入�
     projectTrust: false,
     environment: {
       EXISTING: "value",
-      PI_SUBAGENT_AGENT_ID: "forged-agent",
-      PI_SUBAGENT_PROTOCOL_VERSION: "forged-version",
+      WJ_PI_SUBAGENTS_AGENT_ID: "forged-agent",
+      WJ_PI_SUBAGENTS_PROTOCOL_VERSION: "forged-version",
     },
     controllerMetadata,
   });
@@ -114,8 +126,8 @@ test("子代理只追加受控内部元数据，不把模板环境覆盖带入�
   assert.equal(child.metadata.maxDepth, 2);
   assert.equal(child.metadata.rootId, "fixed-root");
   assert.equal(child.metadata.protocolVersion, "1");
-  assert.equal(child.environment.PI_SUBAGENT_AGENT_ID, "child-id");
-  assert.equal(child.environment.PI_SUBAGENT_PROTOCOL_VERSION, "1");
+  assert.equal(child.environment.WJ_PI_SUBAGENTS_AGENT_ID, "child-id");
+  assert.equal(child.environment.WJ_PI_SUBAGENTS_PROTOCOL_VERSION, "1");
   assert.notEqual(child.environment, root.environment);
   assert.doesNotMatch(JSON.stringify(child), /top-secret|PI_SECRET_CANARY/);
 });
@@ -137,11 +149,11 @@ test("多层后代始终从根环境派生，不继承中间父代理的内部�
   });
 
   assert.equal(grandchild.environment.ROOT_VALUE, "stable");
-  assert.equal(grandchild.environment.PI_SUBAGENT_AGENT_ID, "grandchild");
-  assert.equal(grandchild.environment.PI_SUBAGENT_PARENT_AGENT_ID, "child");
-  assert.equal(grandchild.environment.PI_SUBAGENT_ROOT_ID, "root-id");
-  assert.equal(grandchild.environment.PI_SUBAGENT_MAX_DEPTH, "2");
-  assert.equal(grandchild.environment.PI_SUBAGENT_PROTOCOL_VERSION, "1");
+  assert.equal(grandchild.environment.WJ_PI_SUBAGENTS_AGENT_ID, "grandchild");
+  assert.equal(grandchild.environment.WJ_PI_SUBAGENTS_PARENT_AGENT_ID, "child");
+  assert.equal(grandchild.environment.WJ_PI_SUBAGENTS_ROOT_ID, "root-id");
+  assert.equal(grandchild.environment.WJ_PI_SUBAGENTS_MAX_DEPTH, "2");
+  assert.equal(grandchild.environment.WJ_PI_SUBAGENTS_PROTOCOL_VERSION, "1");
 });
 
 test("固定 cwd 只作为相对路径基点，不形成 cwd 沙箱", () => {

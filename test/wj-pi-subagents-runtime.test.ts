@@ -28,11 +28,11 @@ import {
   type ManagedRpcReply,
 } from "../src/managed-rpc-node.ts";
 import {
-  createPiSubagentRuntimeActivator as createPiSubagentRuntimeActivatorWithHostEnvironment,
+  createWjPiSubagentsRuntimeActivator as createWjPiSubagentsRuntimeActivatorWithHostEnvironment,
   readChildRuntimeBootstrap,
-  type PiSubagentRuntimeActivator,
-  type PiSubagentRuntimeOptions,
-} from "../src/pi-subagent-runtime.ts";
+  type WjPiSubagentsRuntimeActivator,
+  type WjPiSubagentsRuntimeOptions,
+} from "../src/wj-pi-subagents-runtime.ts";
 import {
   InMemoryLocalSupervisorTransportAdapter,
   type LocalSupervisorConnectOptions,
@@ -70,10 +70,10 @@ const COORDINATION_PARTICIPANT_OUTPUT_CHANNELS = [
   AUTO_COMPACT_COORDINATION_CHANNELS.completed,
 ] as const;
 
-function createPiSubagentRuntimeActivator(
-  options: PiSubagentRuntimeOptions = {},
-): PiSubagentRuntimeActivator {
-  return createPiSubagentRuntimeActivatorWithHostEnvironment({
+function createWjPiSubagentsRuntimeActivator(
+  options: WjPiSubagentsRuntimeOptions = {},
+): WjPiSubagentsRuntimeActivator {
+  return createWjPiSubagentsRuntimeActivatorWithHostEnvironment({
     environment: ROOT_TEST_ENVIRONMENT,
     ...options,
   });
@@ -613,7 +613,7 @@ test("child bootstrap 严格要求完整临时监督字段并区分根直接子�
     [RUNTIME_EPHEMERAL_ENV_KEYS.localSupervisorCredential]: secretCanary,
   });
   const api = new FakeExtensionApi();
-  const activate = createPiSubagentRuntimeActivator({ environment: invalidEnvironment });
+  const activate = createWjPiSubagentsRuntimeActivator({ environment: invalidEnvironment });
   await activate(api as never, {
     ok: true,
     nodeVersion: process.versions.node,
@@ -625,7 +625,7 @@ test("child bootstrap 严格要求完整临时监督字段并区分根直接子�
     api.emit("session_start", { type: "session_start", reason: "startup" }, extensionContext("C:\\workspace\\invalid-bootstrap")),
     (error: unknown) => {
       assert.match(String(error), /子运行时身份元数据无效/);
-      assert.doesNotMatch(String(error), /secret_canary|PI_SUBAGENT|memory_bootstrap/);
+      assert.doesNotMatch(String(error), /secret_canary|WJ_PI_SUBAGENTS|memory_bootstrap/);
       return true;
     },
   );
@@ -641,7 +641,7 @@ test("child runtime 按真实 threshold 压缩顺序保留候选并只在最终 
     credential: localCredential,
   });
   const api = new FakeExtensionApi();
-  const activate = createPiSubagentRuntimeActivator({
+  const activate = createWjPiSubagentsRuntimeActivator({
     environment: childBootstrapEnvironment({
       [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorEndpoint]: listener.endpoint,
       [RUNTIME_EPHEMERAL_ENV_KEYS.localSupervisorCredential]: localCredential,
@@ -733,7 +733,7 @@ test("managed child 接管未经协调的 manual 压缩并在结束后发布原�
     credential: localCredential,
   });
   const api = new FakeExtensionApi();
-  const activate = createPiSubagentRuntimeActivator({
+  const activate = createWjPiSubagentsRuntimeActivator({
     environment: childBootstrapEnvironment({
       [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorEndpoint]: listener.endpoint,
       [RUNTIME_EPHEMERAL_ENV_KEYS.localSupervisorCredential]: localCredential,
@@ -829,7 +829,7 @@ for (const nativeReason of ["threshold", "overflow"] as const) {
       credential: localCredential,
     });
     const api = new FakeExtensionApi(eventBus);
-    const activate = createPiSubagentRuntimeActivator({
+    const activate = createWjPiSubagentsRuntimeActivator({
       environment: childBootstrapEnvironment({
         [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorEndpoint]: listener.endpoint,
         [RUNTIME_EPHEMERAL_ENV_KEYS.localSupervisorCredential]: localCredential,
@@ -967,7 +967,7 @@ test("child manual 生命周期在 complete 先于 session_compact 到达时保�
     credential: localCredential,
   });
   const api = new FakeExtensionApi(eventBus);
-  const activate = createPiSubagentRuntimeActivator({
+  const activate = createWjPiSubagentsRuntimeActivator({
     environment: childBootstrapEnvironment({
       [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorEndpoint]: listener.endpoint,
       [RUNTIME_EPHEMERAL_ENV_KEYS.localSupervisorCredential]: localCredential,
@@ -1085,7 +1085,7 @@ test("final ACK 失败不阻塞 runtime settled handler，并由独立监督流�
   });
   const api = new FakeExtensionApi();
   let controller: AgentController | undefined;
-  const activate = createPiSubagentRuntimeActivator({
+  const activate = createWjPiSubagentsRuntimeActivator({
     environment: childBootstrapEnvironment({
       [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorEndpoint]: listener.endpoint,
       [RUNTIME_EPHEMERAL_ENV_KEYS.localSupervisorCredential]: localCredential,
@@ -1153,7 +1153,7 @@ test("前置 settled handler 延迟期间启动的新轮不会被旧 settle 提�
   let precedingDelay: Promise<void> | undefined;
   let releasePreceding!: () => void;
   api.on("agent_settled", () => precedingDelay);
-  const activate = createPiSubagentRuntimeActivator({
+  const activate = createWjPiSubagentsRuntimeActivator({
     environment: childBootstrapEnvironment({
       [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorEndpoint]: listener.endpoint,
       [RUNTIME_EPHEMERAL_ENV_KEYS.localSupervisorCredential]: localCredential,
@@ -1236,7 +1236,7 @@ test("生产运行时闭合直接父子的创建、消息、回复、等待、�
   const api = new FakeExtensionApi();
   const node = new RuntimeLinkedNode();
   let controller: AgentController | undefined;
-  const activate = createPiSubagentRuntimeActivator({
+  const activate = createWjPiSubagentsRuntimeActivator({
     rootIdFactory: () => "root-runtime",
     agentIdFactory: () => AGENT_ID,
     environment: { ROOT_STABLE: "yes" },
@@ -1260,9 +1260,9 @@ test("生产运行时闭合直接父子的创建、消息、回复、等待、�
 
   assert.deepEqual([...api.tools.keys()], [...AGENT_TOOL_NAMES]);
   assert.deepEqual([...api.messageRenderers.keys()], [
-    "pi-subagent-message",
-    "pi-subagent-final",
-    "pi-subagent-terminal",
+    "wj-pi-subagents-message",
+    "wj-pi-subagents-final",
+    "wj-pi-subagents-terminal",
   ]);
   assert.equal(api.handlers.get("session_start")?.length, 1);
   assert.equal(api.handlers.get("session_shutdown")?.length, 1);
@@ -1302,7 +1302,7 @@ test("生产运行时闭合直接父子的创建、消息、回复、等待、�
 
   assert.deepEqual(api.sentMessages, [{
     message: {
-      customType: "pi-subagent-final",
+      customType: "wj-pi-subagents-final",
       content: [
         {
           type: "text",
@@ -1321,7 +1321,7 @@ test("生产运行时闭合直接父子的创建、消息、回复、等待、�
     options: { triggerTurn: true, deliverAs: "steer" },
   }]);
 
-  const finalRenderer = api.messageRenderers.get("pi-subagent-final");
+  const finalRenderer = api.messageRenderers.get("wj-pi-subagents-final");
   assert.ok(finalRenderer);
   const finalDisplay = finalRenderer(
     api.sentMessages[0]!.message,
@@ -1369,7 +1369,7 @@ test("运行时以单数 agent 命令交付只读 TUI，并在会话关闭时清
   const ui = new FakeRuntimeUi();
   const context = tuiExtensionContext(cwd, ui);
   const node = new RuntimeLinkedNode();
-  const activate = createPiSubagentRuntimeActivator({
+  const activate = createWjPiSubagentsRuntimeActivator({
     rootIdFactory: () => "root-agent-tree-ui",
     agentIdFactory: () => AGENT_ID,
     rootArguments: {
@@ -1391,7 +1391,7 @@ test("运行时以单数 agent 命令交付只读 TUI，并在会话关闭时清
   assert.deepEqual([...api.commands.keys()], ["agent"]);
   await api.emit("session_start", { type: "session_start", reason: "startup" }, context);
   const firstWidget = ui.widgetCalls.at(-1);
-  assert.equal(firstWidget?.key, "pi-subagent-agents");
+  assert.equal(firstWidget?.key, "wj-pi-subagents-agents");
   assert.equal(typeof firstWidget?.content, "function");
   const tui = { requestRender: () => {} };
   const widget = (firstWidget?.content as (
@@ -1423,11 +1423,11 @@ test("运行时以单数 agent 命令交付只读 TUI，并在会话关闭时清
   assert.equal(api.sentMessages.length, 1);
   assert.deepEqual(api.sentMessages[0], {
     message: {
-      customType: "pi-subagent-terminal",
+      customType: "wj-pi-subagents-terminal",
       content: [{
         type: "text",
         text: JSON.stringify({
-          schema: "pi-subagent.terminal",
+          schema: "wj-pi-subagents.terminal",
           version: CHILD_REPLY_VERSION,
           kind: "terminal",
           agent_id: AGENT_ID,
@@ -1447,7 +1447,7 @@ test("运行时以单数 agent 命令交付只读 TUI，并在会话关闭时清
   });
   await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
   assert.deepEqual(ui.widgetCalls.at(-1), {
-    key: "pi-subagent-agents",
+    key: "wj-pi-subagents-agents",
     content: undefined,
     options: { placement: "aboveEditor" },
   });
@@ -1458,7 +1458,7 @@ test("根会话 new、resume、fork 与 quit 都按同一有界关闭语义清�
     const cwd = `C:\\workspace\\root-close-${reason}`;
     const api = new FakeExtensionApi();
     const node = new RuntimeLinkedNode();
-    const activate = createPiSubagentRuntimeActivator({
+    const activate = createWjPiSubagentsRuntimeActivator({
       rootIdFactory: () => `root-close-${reason}`,
       agentIdFactory: () => AGENT_ID,
       rootArguments: {
@@ -1495,7 +1495,7 @@ test("父端不再用自身 thinking registry 否决模板，能力留给 child 
   const api = new FakeExtensionApi();
   let nodeCreations = 0;
   const node = new RuntimeLinkedNode();
-  const activate = createPiSubagentRuntimeActivator({
+  const activate = createWjPiSubagentsRuntimeActivator({
     rootIdFactory: () => "root-thinking",
     agentIdFactory: () => AGENT_ID,
     templateFileSystem: templateFileSystem(cwd, "off"),
@@ -1543,7 +1543,7 @@ test("根会话 max 场景允许模板请求父活动工具之外的已注册业
   api.activeTools = ["read"];
   let nodeCreations = 0;
   let createdTools: readonly string[] | undefined;
-  const activate = createPiSubagentRuntimeActivator({
+  const activate = createWjPiSubagentsRuntimeActivator({
     rootIdFactory: () => "root-active-tool-preflight",
     agentIdFactory: () => AGENT_ID,
     templateFileSystem: templateFileSystem(
@@ -1603,7 +1603,7 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
     "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
     "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
   ];
-  const rootActivate = createPiSubagentRuntimeActivator({
+  const rootActivate = createWjPiSubagentsRuntimeActivator({
     rootIdFactory: () => "root-recursive",
     agentIdFactory: () => allocatedIds.shift() ?? "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
     environment: { ROOT_STABLE: "yes" },
@@ -1674,7 +1674,7 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   }, rootContext) as Promise<{ details?: Record<string, unknown> }>;
   const parentBootstrap = await waitForBootstrap(parentNode);
 
-  const childActivate = createPiSubagentRuntimeActivator({
+  const childActivate = createWjPiSubagentsRuntimeActivator({
     // 故意给 child 一个更宽松的候选配置；bootstrap 不应读取它。
     rootIdFactory: () => "wrong-child-root",
     rootArguments: {
@@ -1759,7 +1759,7 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   });
   assert.deepEqual(rootApi.sentMessages[0]!.options, { triggerTurn: true, deliverAs: "steer" });
 
-  const progressRenderer = rootApi.messageRenderers.get("pi-subagent-message");
+  const progressRenderer = rootApi.messageRenderers.get("wj-pi-subagents-message");
   assert.ok(progressRenderer);
   assert.match(
     progressRenderer(rootApi.sentMessages[0]!.message, { expanded: true, outputPad: 0 }, MESSAGE_RENDER_THEME)
@@ -1797,7 +1797,7 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
     sender_name: "递归父代理",
   });
   assert.deepEqual(rootApi.sentMessages[1]!.options, { triggerTurn: true, deliverAs: "steer" });
-  const recursiveFinalRenderer = rootApi.messageRenderers.get("pi-subagent-final");
+  const recursiveFinalRenderer = rootApi.messageRenderers.get("wj-pi-subagents-final");
   assert.ok(recursiveFinalRenderer);
   assert.match(
     recursiveFinalRenderer(rootApi.sentMessages[1]!.message, { expanded: true, outputPad: 0 }, MESSAGE_RENDER_THEME)
@@ -1813,7 +1813,7 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   const grandchildBootstrap = await waitForBootstrap(grandchildNode);
 
   const leafApi = new FakeExtensionApi();
-  const leafActivate = createPiSubagentRuntimeActivator({
+  const leafActivate = createWjPiSubagentsRuntimeActivator({
     environment: grandchildBootstrap.environment,
     localSupervisorTransportAdapter: transportAdapter,
     templateFileSystem: templateFileSystem(cwd),
@@ -1835,7 +1835,7 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   const spawnedGrandchild = await grandchildSpawn;
   const grandchildId = String(spawnedGrandchild.details?.agent_id);
   assert.equal(grandchildId, "cccccccc-cccc-4ccc-8ccc-cccccccccccc");
-  assert.equal(grandchildBootstrap.environment?.PI_SUBAGENT_MANAGEMENT_ENABLED, "false");
+  assert.equal(grandchildBootstrap.environment?.WJ_PI_SUBAGENTS_MANAGEMENT_ENABLED, "false");
   const childActiveTools = childApi.activeToolHistory.at(-1) ?? [];
   const leafActiveTools = leafApi.activeToolHistory.at(-1) ?? [];
   assert.equal(AGENT_TOOL_NAMES.every((name) => childActiveTools.includes(name)), true);
@@ -2043,8 +2043,8 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
 test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复绑定到新 API", async () => {
   const cwd = "C:\\workspace\\reload-handoff";
   const moduleNonce = `${Date.now()}-${Math.random()}`;
-  const oldModuleUrl = new URL("../src/pi-subagent-runtime.ts", import.meta.url);
-  const newModuleUrl = new URL("../src/pi-subagent-runtime.ts", import.meta.url);
+  const oldModuleUrl = new URL("../src/wj-pi-subagents-runtime.ts", import.meta.url);
+  const newModuleUrl = new URL("../src/wj-pi-subagents-runtime.ts", import.meta.url);
   oldModuleUrl.searchParams.set("reload-old", moduleNonce);
   newModuleUrl.searchParams.set("reload-new", moduleNonce);
   const [oldRuntimeModule, newRuntimeModule] = await Promise.all([
@@ -2052,8 +2052,8 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
     import(newModuleUrl.href),
   ]);
   assert.notStrictEqual(
-    oldRuntimeModule.createPiSubagentRuntimeActivator,
-    newRuntimeModule.createPiSubagentRuntimeActivator,
+    oldRuntimeModule.createWjPiSubagentsRuntimeActivator,
+    newRuntimeModule.createWjPiSubagentsRuntimeActivator,
   );
   const eventBus = new FakeEventBus();
   const oldApi = new FakeExtensionApi(eventBus);
@@ -2078,7 +2078,7 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
   const newContext = tuiExtensionContext(cwd, newUi);
   let oldController: AgentController | undefined;
   let newController: AgentController | undefined;
-  const oldActivate = oldRuntimeModule.createPiSubagentRuntimeActivator({
+  const oldActivate = oldRuntimeModule.createWjPiSubagentsRuntimeActivator({
     environment: ROOT_TEST_ENVIRONMENT,
     rootIdFactory: () => "root-reload-handoff",
     agentIdFactory: () => allocatedIds.shift() ?? "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
@@ -2138,7 +2138,7 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
   assert.equal(firstNode.pendingReplyCount(), 1);
 
   let replacementRootIdCalls = 0;
-  const newActivate = newRuntimeModule.createPiSubagentRuntimeActivator({
+  const newActivate = newRuntimeModule.createWjPiSubagentsRuntimeActivator({
     environment: ROOT_TEST_ENVIRONMENT,
     rootIdFactory: () => {
       replacementRootIdCalls += 1;
@@ -2164,7 +2164,7 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
   assert.equal(newApi.sentMessages.length, 1);
   assert.deepEqual(newApi.sentMessages[0], {
     message: {
-      customType: "pi-subagent-final",
+      customType: "wj-pi-subagents-final",
       content: [{
         type: "text",
         text: JSON.stringify(handoffReply),
@@ -2179,7 +2179,7 @@ test("跨扩展实例 reload 以 lease 交接树，并把既有监督器回复�
     },
     options: { triggerTurn: true, deliverAs: "steer" },
   });
-  const reloadedFinalRenderer = newApi.messageRenderers.get("pi-subagent-final");
+  const reloadedFinalRenderer = newApi.messageRenderers.get("wj-pi-subagents-final");
   assert.ok(reloadedFinalRenderer);
   assert.match(
     reloadedFinalRenderer(newApi.sentMessages[0]!.message, { expanded: true, outputPad: 0 }, MESSAGE_RENDER_THEME)
@@ -2235,7 +2235,7 @@ test("根与 child 跨实例 reload 保留同一监督连接，并让既有 chil
   const cwd = "C:\\workspace\\recursive-reload";
   const moduleNonce = `${Date.now()}-${Math.random()}`;
   const moduleUrl = (role: string): URL => {
-    const url = new URL("../src/pi-subagent-runtime.ts", import.meta.url);
+    const url = new URL("../src/wj-pi-subagents-runtime.ts", import.meta.url);
     url.searchParams.set(role, moduleNonce);
     return url;
   };
@@ -2269,7 +2269,7 @@ test("根与 child 跨实例 reload 保留同一监督连接，并让既有 chil
   };
   const context = extensionContext(cwd);
 
-  const oldRootActivate = oldRootModule.createPiSubagentRuntimeActivator({
+  const oldRootActivate = oldRootModule.createWjPiSubagentsRuntimeActivator({
     environment: ROOT_TEST_ENVIRONMENT,
     rootIdFactory: () => "root-recursive-reload",
     agentIdFactory: () => allocatedIds.shift() ?? "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
@@ -2290,7 +2290,7 @@ test("根与 child 跨实例 reload 保留同一监督连接，并让既有 chil
   }, context) as Promise<{ details?: Record<string, unknown> }>;
   const parentBootstrap = await waitForBootstrap(parentNode);
 
-  const oldChildActivate = oldChildModule.createPiSubagentRuntimeActivator({
+  const oldChildActivate = oldChildModule.createWjPiSubagentsRuntimeActivator({
     environment: parentBootstrap.environment,
     localSupervisorTransportAdapter: transportAdapter,
     templateFileSystem: templateFileSystem(cwd),
@@ -2306,7 +2306,7 @@ test("根与 child 跨实例 reload 保留同一监督连接，并让既有 chil
 
   await oldChildApi.emit("session_shutdown", { type: "session_shutdown", reason: "reload" }, context);
   oldChildApi.invalidate();
-  const newChildActivate = newChildModule.createPiSubagentRuntimeActivator({
+  const newChildActivate = newChildModule.createWjPiSubagentsRuntimeActivator({
     environment: parentBootstrap.environment,
     localSupervisorTransportAdapter: transportAdapter,
     templateFileSystem: templateFileSystem(cwd),
@@ -2317,7 +2317,7 @@ test("根与 child 跨实例 reload 保留同一监督连接，并让既有 chil
 
   await oldRootApi.emit("session_shutdown", { type: "session_shutdown", reason: "reload" }, context);
   oldRootApi.invalidate();
-  const newRootActivate = newRootModule.createPiSubagentRuntimeActivator({
+  const newRootActivate = newRootModule.createWjPiSubagentsRuntimeActivator({
     environment: ROOT_TEST_ENVIRONMENT,
     templateFileSystem: templateFileSystem(cwd, undefined, ["researcher", "reviewer"]),
     onController: (controller: AgentController) => { newRootController = controller; },
@@ -2365,7 +2365,7 @@ test("根与 child 跨实例 reload 保留同一监督连接，并让既有 chil
     output_state: "present",
   });
   assert.deepEqual(newRootApi.sentMessages[0]!.options, { triggerTurn: true, deliverAs: "steer" });
-  const recursiveReloadRenderer = newRootApi.messageRenderers.get("pi-subagent-final");
+  const recursiveReloadRenderer = newRootApi.messageRenderers.get("wj-pi-subagents-final");
   assert.ok(recursiveReloadRenderer);
   assert.match(
     recursiveReloadRenderer(newRootApi.sentMessages[0]!.message, { expanded: true, outputPad: 0 }, MESSAGE_RENDER_THEME)
@@ -2378,7 +2378,7 @@ test("根与 child 跨实例 reload 保留同一监督连接，并让既有 chil
     name: "使用 reload 新模板的后代",
   }, context) as Promise<{ details?: Record<string, unknown> }>;
   const grandchildBootstrap = await waitForBootstrap(grandchildNode);
-  const leafActivate = createPiSubagentRuntimeActivator({
+  const leafActivate = createWjPiSubagentsRuntimeActivator({
     environment: grandchildBootstrap.environment,
     localSupervisorTransportAdapter: transportAdapter,
     templateFileSystem: templateFileSystem(cwd, undefined, ["researcher", "reviewer"]),
@@ -2420,7 +2420,7 @@ test("reload lease 未被新实例提交时在有界期限后清理旧树", asyn
   const api = new FakeExtensionApi(new FakeEventBus());
   const node = new RuntimeLinkedNode();
   const context = extensionContext(cwd);
-  const activate = createPiSubagentRuntimeActivator({
+  const activate = createWjPiSubagentsRuntimeActivator({
     rootIdFactory: () => "root-reload-timeout",
     agentIdFactory: () => AGENT_ID,
     reloadLeaseTimeoutMs: 20,
@@ -2452,8 +2452,8 @@ test("reload lease 未被新实例提交时在有界期限后清理旧树", asyn
 test("新实例认领 lease 后可等待迟到的 reload start，不沿用 outgoing watchdog", async () => {
   const cwd = "C:\\workspace\\reload-claimed-timeout";
   const moduleNonce = `${Date.now()}-${Math.random()}`;
-  const oldModuleUrl = new URL("../src/pi-subagent-runtime.ts", import.meta.url);
-  const newModuleUrl = new URL("../src/pi-subagent-runtime.ts", import.meta.url);
+  const oldModuleUrl = new URL("../src/wj-pi-subagents-runtime.ts", import.meta.url);
+  const newModuleUrl = new URL("../src/wj-pi-subagents-runtime.ts", import.meta.url);
   oldModuleUrl.searchParams.set("claimed-timeout-old", moduleNonce);
   newModuleUrl.searchParams.set("claimed-timeout-new", moduleNonce);
   const [oldRuntimeModule, newRuntimeModule] = await Promise.all([
@@ -2472,7 +2472,7 @@ test("新实例认领 lease 后可等待迟到的 reload start，不沿用 outgo
     platform: "win32" as const,
     processTreeAdapter: {} as never,
   };
-  const oldActivate = oldRuntimeModule.createPiSubagentRuntimeActivator({
+  const oldActivate = oldRuntimeModule.createWjPiSubagentsRuntimeActivator({
     environment: ROOT_TEST_ENVIRONMENT,
     rootIdFactory: () => "root-reload-claimed-timeout",
     agentIdFactory: () => AGENT_ID,
@@ -2492,7 +2492,7 @@ test("新实例认领 lease 后可等待迟到的 reload start，不沿用 outgo
   await oldApi.emit("session_shutdown", { type: "session_shutdown", reason: "reload" }, context);
   oldApi.invalidate();
 
-  const newActivate = newRuntimeModule.createPiSubagentRuntimeActivator({
+  const newActivate = newRuntimeModule.createWjPiSubagentsRuntimeActivator({
     environment: ROOT_TEST_ENVIRONMENT,
     reloadLeaseTimeoutMs: 20,
     templateFileSystem: templateFileSystem(cwd),
@@ -2511,7 +2511,7 @@ test("同一 activator 的 reload 也提交自身 lease，不会被 watchdog 误
   const api = new FakeExtensionApi(new FakeEventBus());
   const node = new RuntimeLinkedNode();
   const context = extensionContext(cwd);
-  const activate = createPiSubagentRuntimeActivator({
+  const activate = createWjPiSubagentsRuntimeActivator({
     rootIdFactory: () => "root-reload-same-instance",
     agentIdFactory: () => AGENT_ID,
     reloadLeaseTimeoutMs: 25,

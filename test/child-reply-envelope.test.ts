@@ -143,7 +143,7 @@ test("reply and terminal envelopes use ordinary JSON independent of field order 
   const value = final();
   const encoded = encodeChildReplyEnvelope(value);
   assert.deepEqual(parseChildReplyEnvelope(JSON.parse(encoded)), value);
-  assert.match(encoded, /\"schema\":\"pi-subagent.reply\"/);
+  assert.match(encoded, /\"schema\":\"wj-pi-subagents.reply\"/);
 
   const reordered = JSON.stringify({
     text: value.text,

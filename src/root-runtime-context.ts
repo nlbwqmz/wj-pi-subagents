@@ -39,25 +39,25 @@ export const RUNTIME_CONFIG_LIMITS: Readonly<Record<RuntimeConfigField, RuntimeC
 });
 
 export const RUNTIME_INTERNAL_ENV_KEYS = Object.freeze({
-  rootId: "PI_SUBAGENT_ROOT_ID",
-  parentAgentId: "PI_SUBAGENT_PARENT_AGENT_ID",
-  agentId: "PI_SUBAGENT_AGENT_ID",
-  depth: "PI_SUBAGENT_DEPTH",
-  maxDepth: "PI_SUBAGENT_MAX_DEPTH",
-  maxChildrenPerAgent: "PI_SUBAGENT_MAX_CHILDREN_PER_AGENT",
-  maxAgentsPerTree: "PI_SUBAGENT_MAX_AGENTS_PER_TREE",
-  waitTimeoutMs: "PI_SUBAGENT_WAIT_TIMEOUT_MS",
-  managementEnabled: "PI_SUBAGENT_MANAGEMENT_ENABLED",
-  templateId: "PI_SUBAGENT_TEMPLATE_ID",
-  name: "PI_SUBAGENT_AGENT_NAME",
-  protocolVersion: "PI_SUBAGENT_PROTOCOL_VERSION",
+  rootId: "WJ_PI_SUBAGENTS_ROOT_ID",
+  parentAgentId: "WJ_PI_SUBAGENTS_PARENT_AGENT_ID",
+  agentId: "WJ_PI_SUBAGENTS_AGENT_ID",
+  depth: "WJ_PI_SUBAGENTS_DEPTH",
+  maxDepth: "WJ_PI_SUBAGENTS_MAX_DEPTH",
+  maxChildrenPerAgent: "WJ_PI_SUBAGENTS_MAX_CHILDREN_PER_AGENT",
+  maxAgentsPerTree: "WJ_PI_SUBAGENTS_MAX_AGENTS_PER_TREE",
+  waitTimeoutMs: "WJ_PI_SUBAGENTS_WAIT_TIMEOUT_MS",
+  managementEnabled: "WJ_PI_SUBAGENTS_MANAGEMENT_ENABLED",
+  templateId: "WJ_PI_SUBAGENTS_TEMPLATE_ID",
+  name: "WJ_PI_SUBAGENTS_AGENT_NAME",
+  protocolVersion: "WJ_PI_SUBAGENTS_PROTOCOL_VERSION",
 });
 
 /** 每一跳本地监督连接独有，捕获根环境或创建下一代时必须剥离。 */
 export const RUNTIME_EPHEMERAL_ENV_KEYS = Object.freeze({
-  supervisorEndpoint: "PI_SUBAGENT_SUPERVISOR_ENDPOINT",
-  localSupervisorCredential: "PI_SUBAGENT_LOCAL_SUPERVISOR_CREDENTIAL",
-  supervisorCredential: "PI_SUBAGENT_SUPERVISOR_CREDENTIAL",
+  supervisorEndpoint: "WJ_PI_SUBAGENTS_SUPERVISOR_ENDPOINT",
+  localSupervisorCredential: "WJ_PI_SUBAGENTS_LOCAL_SUPERVISOR_CREDENTIAL",
+  supervisorCredential: "WJ_PI_SUBAGENTS_SUPERVISOR_CREDENTIAL",
 });
 
 type RuntimeMetadataField = keyof typeof RUNTIME_INTERNAL_ENV_KEYS;
@@ -448,8 +448,8 @@ function resolveRuntimeConfigInternal(
   fileReader: RuntimeConfigFileReader | undefined,
 ): RuntimeConfigResolution {
   const { cwd, explicit, projectTrust } = inputs;
-  const projectPath = join(cwd, ".pi", "subagent.json");
-  const userPath = join(homedir(), ".pi", "agent", "subagent.json");
+  const projectPath = join(cwd, ".pi", "wj-pi-subagents.json");
+  const userPath = join(homedir(), ".pi", "agent", "wj-pi-subagents.json");
   const needsFileConfig = RUNTIME_CONFIG_FIELDS.some(
     (field) => explicit === undefined || !own(explicit, field),
   );

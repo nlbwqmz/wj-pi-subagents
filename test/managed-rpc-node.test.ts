@@ -80,11 +80,11 @@ function capabilityManifest(): SupervisorCapabilityManifest {
     protocol_version: SUPERVISOR_PROTOCOL_VERSION,
     business_active_tools: ["bash", "read"],
     system_active_tools: ["reply_to_parent"],
-    system_tool_sources: { reply_to_parent: "extension:pi-subagents" },
+    system_tool_sources: { reply_to_parent: "extension:wj-pi-subagents" },
     provider: "openai",
     model: "gpt-5.2-codex",
     thinking: "high",
-    self_extension_path: "C:\\pi\\extensions\\pi-subagents.ts",
+    self_extension_path: "C:\\pi\\extensions\\wj-pi-subagents.ts",
   };
 }
 
@@ -106,16 +106,16 @@ test("编译后的受管节点优先解析同目录 bridge，源码节点仍解�
 
 test("受管节点只为源码 bridge 启用 TypeScript stripping，配置不进入命令行", () => {
   const compiled = createManagedRpcNodeLaunchSpec({
-    bridgeScriptPath: "C:/pi-subagents-wj/dist/src/rpc-bridge-process.js",
+    bridgeScriptPath: "C:/wj-pi-subagents/dist/src/rpc-bridge-process.js",
   });
-  assert.deepEqual(compiled.args, ["C:/pi-subagents-wj/dist/src/rpc-bridge-process.js"]);
+  assert.deepEqual(compiled.args, ["C:/wj-pi-subagents/dist/src/rpc-bridge-process.js"]);
 
   const source = createManagedRpcNodeLaunchSpec({
-    bridgeScriptPath: "C:/pi-subagents-wj/src/rpc-bridge-process.ts",
+    bridgeScriptPath: "C:/wj-pi-subagents/src/rpc-bridge-process.ts",
   });
   assert.deepEqual(source.args, [
     "--experimental-strip-types",
-    "C:/pi-subagents-wj/src/rpc-bridge-process.ts",
+    "C:/wj-pi-subagents/src/rpc-bridge-process.ts",
   ]);
 });
 
@@ -351,7 +351,7 @@ test("ManagedRpcNode 以单一启动事务绑定 launch 返回的树和桥接，
   node.onEvent((event) => observed.push(event));
 
   await node.start();
-  const credential = adapter.launchSpec?.env?.PI_SUBAGENT_MANAGED_RPC_CREDENTIAL;
+  const credential = adapter.launchSpec?.env?.WJ_PI_SUBAGENTS_MANAGED_RPC_CREDENTIAL;
   assert.equal(typeof credential, "string");
   assert.equal(credential?.length, 43);
   assert.deepEqual(bridgeRpcOptions, {

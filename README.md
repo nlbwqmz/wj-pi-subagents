@@ -1,6 +1,6 @@
-# Pi Subagents WJ
+# wj-pi-subagents
 
-为 [Pi](https://github.com/earendil-works/pi) 提供递归子代理能力的扩展包。它在一个根 Pi 会话内创建受监督的临时代理树：每个子代理运行在独立的 Pi RPC 进程中，拥有自己的上下文，并且只能由直接父会话管理。
+`wj-pi-subagents` 为 [Pi](https://github.com/earendil-works/pi) 提供递归子代理能力。它在一个根 Pi 会话内创建受监督的临时代理树：每个子代理运行在独立的 Pi RPC 进程中，拥有自己的上下文，并且只能由直接父会话管理。
 
 > [!IMPORTANT]
 > 当前版本处于开发阶段，主要通过本地源码 package 使用，尚未执行 npm 正式发布。Windows 是当前原生验收平台；macOS 和 Linux 已包含进程树适配代码及自动化测试，但尚未完成独立的原生端到端验收。
@@ -121,8 +121,8 @@ pi --version
 ### 2. 获取源码并安装运行依赖
 
 ```bash
-git clone https://github.com/nlbwqmz/pi-subagents-wj.git
-cd pi-subagents-wj
+git clone https://github.com/nlbwqmz/wj-pi-subagents.git
+cd wj-pi-subagents
 npm ci --omit=dev --legacy-peer-deps
 ```
 
@@ -373,11 +373,13 @@ thinking: medium
 
 每个字段独立按以下顺序解析：
 
-1. 已授权项目的 `<PROJECT_DIR>/.pi/subagent.json`
-2. 用户级 `<PI_AGENT_DIR>/subagent.json`
+1. 已授权项目的 `<PROJECT_DIR>/.pi/wj-pi-subagents.json`
+2. 用户级 `<PI_AGENT_DIR>/wj-pi-subagents.json`
 3. 内置默认值
 
 项目未获授权时，项目配置不参与解析。
+
+`WJ_PI_SUBAGENTS_*` 是扩展向受管子进程注入的内部环境变量前缀，用于传递节点身份、配额、协议版本和本地监督凭据。不要手工设置或覆盖这些变量；用户运行配置只通过上述 `wj-pi-subagents.json` 文件提供。
 
 ### 配置示例
 
@@ -403,7 +405,7 @@ thinking: medium
 
 如果某层文件不可读、不是有效 JSON、不是对象，或被选中的已知字段非法，受影响字段直接使用内置默认值，不会继续回退到更低优先级。未知字段会被忽略，并在有 UI 时显示脱敏警告。
 
-修改 `subagent.json` 后必须结束并重新启动根 Pi 会话；`/reload` 不会重新读取运行配置。
+修改 `wj-pi-subagents.json` 后必须结束并重新启动根 Pi 会话；`/reload` 不会重新读取运行配置。
 
 ## 项目授权与安全边界
 
@@ -433,7 +435,7 @@ Pi package 和模板 `extensions` 都以当前操作系统用户权限执行代�
 
 以下变更建议完全退出并重新启动 Pi：
 
-- 修改 `<PI_AGENT_DIR>/subagent.json` 或项目 `subagent.json`；
+- 修改 `<PI_AGENT_DIR>/wj-pi-subagents.json` 或项目 `wj-pi-subagents.json`；
 - 更新本扩展源码或运行依赖；
 - 更新监督协议主版本；
 - 更换本地 package 目录。
@@ -526,7 +528,7 @@ pi list
 ### reload 或更新后行为没有变化
 
 - `/reload` 只改变未来创建的子代理，不会重建现有节点。
-- `subagent.json` 只在根会话启动时读取。
+- `wj-pi-subagents.json` 只在根会话启动时读取。
 - 本地源码和依赖更新后需要退出并重新启动 Pi。
 - 本地路径 package 不受 `pi update --extensions` 管理。
 
@@ -535,8 +537,8 @@ pi list
 ### 安装开发依赖
 
 ```bash
-git clone https://github.com/nlbwqmz/pi-subagents-wj.git
-cd pi-subagents-wj
+git clone https://github.com/nlbwqmz/wj-pi-subagents.git
+cd wj-pi-subagents
 npm ci --legacy-peer-deps
 ```
 
@@ -616,6 +618,6 @@ npm run pack:smoke
 ## 项目文档
 
 - [领域上下文](./CONTEXT.md)
-- [完整规格](./.scratch/pi-subagent-spec/spec.md)
+- [完整规格](./.scratch/wj-pi-subagents-spec/spec.md)
 - [架构决策记录](./docs/adr/)
 - [Issue 跟踪说明](./docs/agents/issue-tracker.md)

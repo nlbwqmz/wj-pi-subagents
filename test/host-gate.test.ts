@@ -7,7 +7,7 @@ import {
   MIN_PI_VERSION,
   SUPPORTED_PLATFORMS,
   checkHostCapabilities,
-  createPiSubagentExtension,
+  createWjPiSubagentsExtension,
   type ExtensionApiSurface,
   type HostProbeOverrides,
   type SupportedPlatform,
@@ -200,7 +200,7 @@ test("缺失消息 renderer 注册能力时拒绝整套扩展激活", async () =
   }
 
   let activated = false;
-  const extension = createPiSubagentExtension({
+  const extension = createWjPiSubagentsExtension({
     probe: readyOverrides(),
     activate: () => { activated = true; },
   });
@@ -377,7 +377,7 @@ test("进程树适配器加载失败时安全失活", async () => {
 
 test("通过门禁后只执行一次空操作激活", async () => {
   let activationCount = 0;
-  const extension = createPiSubagentExtension({
+  const extension = createWjPiSubagentsExtension({
     probe: readyOverrides(),
     activate: () => {
       activationCount += 1;
@@ -423,11 +423,11 @@ test("扩展 factory 探针期间保持 reload lease，成功时交接、失败�
   let cleanupCalls = 0;
   const common = {
     timeoutMs: 20,
-    activationIdentity: { isChild: false, protocolVersion: "pi-subagent/10" } as const,
+    activationIdentity: { isChild: false, protocolVersion: "wj-pi-subagents/10" } as const,
     isTransfer: (value: unknown): value is Transfer =>
       typeof value === "object" && value !== null && "runtime" in value,
-    identityOfRuntime: () => ({ isChild: false, protocolVersion: "pi-subagent/10" } as const),
-    identityOfTransfer: () => ({ isChild: false, protocolVersion: "pi-subagent/10" } as const),
+    identityOfRuntime: () => ({ isChild: false, protocolVersion: "wj-pi-subagents/10" } as const),
+    identityOfTransfer: () => ({ isChild: false, protocolVersion: "wj-pi-subagents/10" } as const),
     createTransfer: (current: Runtime): Transfer => ({ runtime: current }),
     restoreTransfer: (transfer: Transfer): Runtime => transfer.runtime,
     setHandoffPending: (current: Runtime, pending: boolean) => {
@@ -457,7 +457,7 @@ test("扩展 factory 探针期间保持 reload lease，成功时交接、失败�
     emit: eventBus.emit.bind(eventBus),
     on: eventBus.on.bind(eventBus),
   };
-  const extension = createPiSubagentExtension({
+  const extension = createWjPiSubagentsExtension({
     probe: readyOverrides({
       loadRuntimeDependency: async () => {
         await probeGate;
@@ -504,7 +504,7 @@ test("扩展 factory 探针期间保持 reload lease，成功时交接、失败�
     setActive: (current) => { oldActive = current; },
   });
   assert.equal(failedCoordinator.beginHandoff(failedRuntime), true);
-  const unavailableExtension = createPiSubagentExtension({
+  const unavailableExtension = createWjPiSubagentsExtension({
     probe: readyOverrides({ nodeVersion: "22.18.9" }),
   });
   await unavailableExtension(api);
@@ -518,9 +518,9 @@ test("扩展 factory 探针期间保持 reload lease，成功时交接、失败�
   const legacyCoordinator = new RuntimeReloadCoordinator<Runtime, Transfer>({
     ...common,
     eventBus,
-    activationIdentity: { isChild: false, protocolVersion: "pi-subagent/2" },
-    identityOfRuntime: () => ({ isChild: false, protocolVersion: "pi-subagent/2" }),
-    identityOfTransfer: () => ({ isChild: false, protocolVersion: "pi-subagent/2" }),
+    activationIdentity: { isChild: false, protocolVersion: "wj-pi-subagents/2" },
+    identityOfRuntime: () => ({ isChild: false, protocolVersion: "wj-pi-subagents/2" }),
+    identityOfTransfer: () => ({ isChild: false, protocolVersion: "wj-pi-subagents/2" }),
     getActive: () => legacyActive,
     setActive: (current) => { legacyActive = current; },
   });
@@ -568,7 +568,7 @@ test("门禁失败只注册一次诊断桥，不注册公开面或运行副作�
     appendEntry: () => forbiddenSideEffects.push("session-entry"),
   });
   let activationCount = 0;
-  const extension = createPiSubagentExtension({
+  const extension = createWjPiSubagentsExtension({
     probe: readyOverrides({ nodeVersion: "22.18.9" }),
     activate: () => {
       activationCount += 1;
@@ -610,7 +610,7 @@ test("无 UI 宿主保持静默且诊断不回退到模型上下文", async () =
     sendUserMessage: () => forbiddenSideEffects.push("user-message"),
     appendEntry: () => forbiddenSideEffects.push("session-entry"),
   });
-  const extension = createPiSubagentExtension({
+  const extension = createWjPiSubagentsExtension({
     probe: readyOverrides({ platform: "aix" }),
   });
 
@@ -631,7 +631,7 @@ test("诊断桥面对异常上下文和通知异常保持静默", async () => {
       handlers.push(handler);
     }) as NonNullable<ExtensionApiSurface["on"]>,
   };
-  const extension = createPiSubagentExtension({
+  const extension = createWjPiSubagentsExtension({
     probe: readyOverrides({ nodeVersion: "22.18.9" }),
   });
 
@@ -720,7 +720,7 @@ test("兼容负向组合统一保持完全失活", async () => {
       appendEntry: () => forbiddenSideEffects.push("session-entry"),
     });
     if (scenario.removeApi !== undefined) delete api[scenario.removeApi];
-    const extension = createPiSubagentExtension({ probe: scenario.probe });
+    const extension = createWjPiSubagentsExtension({ probe: scenario.probe });
 
     await extension(api);
 

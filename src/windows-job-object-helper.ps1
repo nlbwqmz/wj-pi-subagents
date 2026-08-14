@@ -20,7 +20,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 
-public static class PiSubagentWindowsJobHelper
+public static class WjPiSubagentsWindowsJobHelper
 {
     private const uint CREATE_SUSPENDED = 0x00000004;
     private const uint CREATE_NO_WINDOW = 0x08000000;
@@ -579,7 +579,7 @@ public static class PiSubagentWindowsJobHelper
 
 try {
   Add-Type -TypeDefinition $nativeHelperSource -Language CSharp -ErrorAction Stop
-  $exitCode = [PiSubagentWindowsJobHelper]::Run(
+  $exitCode = [WjPiSubagentsWindowsJobHelper]::Run(
     $ControlPipe,
     $EventPipe,
     $CommandBase64,

@@ -1,7 +1,7 @@
 import { isCanonicalUuid, isCanonicalUuidV4 } from "./tree-controller.ts";
 
-export const CHILD_REPLY_SCHEMA = "pi-subagent.reply" as const;
-export const CHILD_TERMINAL_SCHEMA = "pi-subagent.terminal" as const;
+export const CHILD_REPLY_SCHEMA = "wj-pi-subagents.reply" as const;
+export const CHILD_TERMINAL_SCHEMA = "wj-pi-subagents.terminal" as const;
 /** v7 监督协议沿用第四版 reply 信封；旧监督主版本不可热接管。 */
 export const CHILD_REPLY_VERSION = 4 as const;
 

@@ -95,7 +95,7 @@ test("Windows Job Object 启动失败时完成 helper 回滚", nativeTestOptions
   const adapter = new WindowsJobObjectAdapter();
 
   await assert.rejects(
-    adapter.launch({ command: `C:\\pi-subagent-missing-${randomUUID()}.exe` }),
+    adapter.launch({ command: `C:\\wj-pi-subagents-missing-${randomUUID()}.exe` }),
     /Windows Job Object helper 未就绪/,
   );
 });

@@ -54,8 +54,8 @@ import { StreamSupervisorChannel } from "./stream-supervisor-channel.ts";
 import { SubtreePublisher } from "./subtree-publisher.ts";
 import {
   ParentReplyInbox,
-  PI_SUBAGENT_FINAL_TYPE,
-  PI_SUBAGENT_MESSAGE_TYPE,
+  WJ_PI_SUBAGENTS_FINAL_TYPE,
+  WJ_PI_SUBAGENTS_MESSAGE_TYPE,
   registerParentReplyMessageRenderers,
   type ParentReplyMessageRenderer,
 } from "./parent-reply-inbox.ts";
@@ -90,8 +90,8 @@ import {
 } from "./agent-tree-ui.ts";
 
 /** @deprecated 使用区分 message/final 的两个 customType。 */
-export const PI_SUBAGENT_REPLY_MESSAGE_TYPE = PI_SUBAGENT_FINAL_TYPE;
-export { PI_SUBAGENT_FINAL_TYPE, PI_SUBAGENT_MESSAGE_TYPE };
+export const WJ_PI_SUBAGENTS_REPLY_MESSAGE_TYPE = WJ_PI_SUBAGENTS_FINAL_TYPE;
+export { WJ_PI_SUBAGENTS_FINAL_TYPE, WJ_PI_SUBAGENTS_MESSAGE_TYPE };
 
 interface RuntimeExtensionApi extends AgentToolRegistrationApi {
   on(event: string, handler: (event: unknown, context: unknown) => unknown): void;
@@ -160,7 +160,7 @@ interface RuntimeAuthority {
 /** 同一进程内的递归 fake/宿主旅程共享唯一根树顺序域。 */
 const runtimeAuthorities = new Map<string, RuntimeAuthority>();
 
-export interface PiSubagentRuntimeOptions {
+export interface WjPiSubagentsRuntimeOptions {
   readonly rootIdFactory?: () => string;
   readonly agentIdFactory?: () => string;
   readonly environment?: EnvironmentInput;
@@ -180,7 +180,7 @@ export interface PiSubagentRuntimeOptions {
   readonly onController?: (controller: AgentControllerType) => void;
 }
 
-export type PiSubagentRuntimeActivator = (
+export type WjPiSubagentsRuntimeActivator = (
   extensionApi: ExtensionApiSurface,
   capabilities: AvailableHostCapabilities,
 ) => void | Promise<void>;
@@ -565,7 +565,7 @@ function systemToolSources(
 
 function defaultSelfExtensionPath(): string {
   try {
-    return fileURLToPath(new URL("../extensions/pi-subagents-wj.ts", import.meta.url));
+    return fileURLToPath(new URL("../extensions/wj-pi-subagents.ts", import.meta.url));
   } catch {
     throw new Error("子代理扩展入口不可用");
   }
@@ -664,9 +664,9 @@ function readDirectChildDisplayName(
   }
 }
 
-export function createPiSubagentRuntimeActivator(
-  options: PiSubagentRuntimeOptions = {},
-): PiSubagentRuntimeActivator {
+export function createWjPiSubagentsRuntimeActivator(
+  options: WjPiSubagentsRuntimeOptions = {},
+): WjPiSubagentsRuntimeActivator {
   const reloadLeaseTimeoutMs = validateRuntimeReloadLeaseTimeout(options.reloadLeaseTimeoutMs);
   return async (extensionApi, capabilities) => {
     const api = asRuntimeApi(extensionApi);
@@ -1365,4 +1365,4 @@ export function createPiSubagentRuntimeActivator(
   };
 }
 
-export const activatePiSubagentRuntime = createPiSubagentRuntimeActivator();
+export const activateWjPiSubagentsRuntime = createWjPiSubagentsRuntimeActivator();

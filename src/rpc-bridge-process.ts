@@ -275,7 +275,7 @@ function clearBridgeSupervisorEnvironment(): void {
 }
 
 function createTemplatePromptFile(prompt: TemplatePromptConfig): string {
-  const directory = mkdtempSync(join(tmpdir(), "pi-subagent-prompt-"));
+  const directory = mkdtempSync(join(tmpdir(), "wj-pi-subagents-prompt-"));
   const filePath = join(directory, "system-prompt.txt");
   try {
     writeFileSync(filePath, prompt.body, { encoding: "utf8", mode: 0o600 });

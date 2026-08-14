@@ -788,7 +788,7 @@ test("UI 绑定通过 widget、overlay 和 notify 跟随树修订并完整清理
   await opened;
   binding.dispose();
   assert.equal(listeners.size, 0);
-  assert.deepEqual(widgetCalls.at(-1), ["pi-subagent-agents", undefined, { placement: "aboveEditor" }]);
+  assert.deepEqual(widgetCalls.at(-1), ["wj-pi-subagents-agents", undefined, { placement: "aboveEditor" }]);
 });
 
 test("首次树读取失败时 agent 面板仍显示固定安全错误并可关闭", async () => {

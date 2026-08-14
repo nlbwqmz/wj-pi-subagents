@@ -80,7 +80,7 @@ function template(overrides: Partial<TemplateDefinition> = {}): TemplateDefiniti
   return Object.freeze({
     templateId: "researcher",
     source: "user",
-    templateDirectory: "C:/pi-subagents-wj/.pi/agents",
+    templateDirectory: "C:/wj-pi-subagents/.pi/agents",
     description: "研究任务",
     tools: undefined,
     extensions: undefined,
@@ -121,7 +121,7 @@ function factoryHarness(deliverReply?: (agentId: string, reply: ManagedRpcReply)
     rootArguments: { maxDepth: 2 },
     controllerMetadata: {
       rootId: "root-factory",
-      protocolVersion: "pi-subagent/11",
+      protocolVersion: "wj-pi-subagents/11",
     },
   });
   const options = {
@@ -204,14 +204,14 @@ test("受管 RPC 选项按模板覆盖或在创建瞬间继承模型与 thinking
   ]);
 
   const withExtension = buildManagedRpcOptions(template(), {
-    extensionPath: "C:/pi-subagents-wj/extensions/pi-subagents-wj.ts",
+    extensionPath: "C:/wj-pi-subagents/extensions/wj-pi-subagents.ts",
     cliPath: "C:/pi/dist/cli.js",
     piModulePath: "C:/pi/dist/index.js",
   });
   assert.deepEqual(withExtension.args, [
     "--no-session",
     "-e",
-    "C:/pi-subagents-wj/extensions/pi-subagents-wj.ts",
+    "C:/wj-pi-subagents/extensions/wj-pi-subagents.ts",
     "--no-context-files",
   ]);
   assert.equal(withExtension.cliPath, "C:/pi/dist/cli.js");
@@ -239,12 +239,12 @@ test("身份预留后才建立监督上下文并追加最终子代理环境", as
   assert.equal(context.supervisor.parent_agent_id, null);
   assert.equal(context.supervisor.root_id, "root-factory");
   assert.equal(context.environment?.ROOT_VALUE, "stable");
-  assert.equal(context.environment?.PI_SUBAGENT_ROOT_ID, "root-factory");
-  assert.equal(context.environment?.PI_SUBAGENT_PARENT_AGENT_ID, "");
-  assert.equal(context.environment?.PI_SUBAGENT_AGENT_ID, AGENT_ID);
-  assert.equal(context.environment?.PI_SUBAGENT_DEPTH, "1");
-  assert.equal(context.environment?.PI_SUBAGENT_MAX_DEPTH, "2");
-  assert.equal(context.environment?.PI_SUBAGENT_PROTOCOL_VERSION, "pi-subagent/11");
+  assert.equal(context.environment?.WJ_PI_SUBAGENTS_ROOT_ID, "root-factory");
+  assert.equal(context.environment?.WJ_PI_SUBAGENTS_PARENT_AGENT_ID, "");
+  assert.equal(context.environment?.WJ_PI_SUBAGENTS_AGENT_ID, AGENT_ID);
+  assert.equal(context.environment?.WJ_PI_SUBAGENTS_DEPTH, "1");
+  assert.equal(context.environment?.WJ_PI_SUBAGENTS_MAX_DEPTH, "2");
+  assert.equal(context.environment?.WJ_PI_SUBAGENTS_PROTOCOL_VERSION, "wj-pi-subagents/11");
   await supervisor.terminate();
 });
 

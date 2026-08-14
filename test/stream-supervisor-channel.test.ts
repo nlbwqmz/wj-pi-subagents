@@ -58,11 +58,11 @@ function capabilityManifest(): SupervisorCapabilityManifest {
     protocol_version: SUPERVISOR_PROTOCOL_VERSION,
     business_active_tools: ["bash", "read"],
     system_active_tools: ["reply_to_parent"],
-    system_tool_sources: { reply_to_parent: "extension:pi-subagents" },
+    system_tool_sources: { reply_to_parent: "extension:wj-pi-subagents" },
     provider: "openai",
     model: "gpt-5.2-codex",
     thinking: "high",
-    self_extension_path: "C:\\pi\\extensions\\pi-subagents.ts",
+    self_extension_path: "C:\\pi\\extensions\\wj-pi-subagents.ts",
   };
 }
 

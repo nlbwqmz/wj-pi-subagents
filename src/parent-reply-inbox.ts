@@ -24,9 +24,9 @@ import {
 import type { ManagedRpcReply } from "./managed-rpc-node.ts";
 import { isCanonicalUuid } from "./tree-controller.ts";
 
-export const PI_SUBAGENT_MESSAGE_TYPE = "pi-subagent-message" as const;
-export const PI_SUBAGENT_FINAL_TYPE = "pi-subagent-final" as const;
-export const PI_SUBAGENT_TERMINAL_TYPE = "pi-subagent-terminal" as const;
+export const WJ_PI_SUBAGENTS_MESSAGE_TYPE = "wj-pi-subagents-message" as const;
+export const WJ_PI_SUBAGENTS_FINAL_TYPE = "wj-pi-subagents-final" as const;
+export const WJ_PI_SUBAGENTS_TERMINAL_TYPE = "wj-pi-subagents-terminal" as const;
 
 export interface ParentConversationApi {
   sendMessage(message: unknown, options?: unknown): void;
@@ -175,7 +175,7 @@ export class ParentReplyInbox {
     const senderName = this.safeReadSenderName(agentId);
     try {
       this.readApi().sendMessage({
-        customType: envelope.kind === "message" ? PI_SUBAGENT_MESSAGE_TYPE : PI_SUBAGENT_FINAL_TYPE,
+        customType: envelope.kind === "message" ? WJ_PI_SUBAGENTS_MESSAGE_TYPE : WJ_PI_SUBAGENTS_FINAL_TYPE,
         content,
         display: true,
         details: {
@@ -230,7 +230,7 @@ export class ParentReplyInbox {
     const senderName = this.safeReadSenderName(agentId);
     try {
       this.readApi().sendMessage({
-        customType: PI_SUBAGENT_TERMINAL_TYPE,
+        customType: WJ_PI_SUBAGENTS_TERMINAL_TYPE,
         content: [{ type: "text", text: encodeTerminalNotice(notice) }],
         display: true,
         details: {
@@ -269,15 +269,15 @@ export function registerParentReplyMessageRenderers(
     throw new TypeError("宿主缺少 registerMessageRenderer");
   }
   api.registerMessageRenderer(
-    PI_SUBAGENT_MESSAGE_TYPE,
+    WJ_PI_SUBAGENTS_MESSAGE_TYPE,
     createParentReplyMessageRenderer("message", options),
   );
   api.registerMessageRenderer(
-    PI_SUBAGENT_FINAL_TYPE,
+    WJ_PI_SUBAGENTS_FINAL_TYPE,
     createParentReplyMessageRenderer("final", options),
   );
   api.registerMessageRenderer(
-    PI_SUBAGENT_TERMINAL_TYPE,
+    WJ_PI_SUBAGENTS_TERMINAL_TYPE,
     createParentReplyMessageRenderer("terminal", options),
   );
 }
@@ -445,9 +445,9 @@ function messageContent(envelope: ChildReplyEnvelope): Array<{ readonly type: st
 }
 
 function customTypeFor(kind: VisibleKind): string {
-  if (kind === "message") return PI_SUBAGENT_MESSAGE_TYPE;
-  if (kind === "final") return PI_SUBAGENT_FINAL_TYPE;
-  return PI_SUBAGENT_TERMINAL_TYPE;
+  if (kind === "message") return WJ_PI_SUBAGENTS_MESSAGE_TYPE;
+  if (kind === "final") return WJ_PI_SUBAGENTS_FINAL_TYPE;
+  return WJ_PI_SUBAGENTS_TERMINAL_TYPE;
 }
 
 function resolveCurrentSenderName(

@@ -20,9 +20,9 @@ export type ManagedRpcReply = ChildReplyEnvelope;
 
 export type ManagedRpcTransportFault = "eof" | "protocol_fault" | "process_exit";
 
-export const MANAGED_RPC_BRIDGE_PROTOCOL = "pi-subagent/managed-rpc/3" as const;
+export const MANAGED_RPC_BRIDGE_PROTOCOL = "wj-pi-subagents/managed-rpc/3" as const;
 /** 只用于节点启动事务的一次性本地认证，不进入公开控制面。 */
-export const MANAGED_RPC_BRIDGE_CREDENTIAL_ENV = "PI_SUBAGENT_MANAGED_RPC_CREDENTIAL" as const;
+export const MANAGED_RPC_BRIDGE_CREDENTIAL_ENV = "WJ_PI_SUBAGENTS_MANAGED_RPC_CREDENTIAL" as const;
 /** 外层桥接 JSON 正文的硬边界。 */
 export const MANAGED_RPC_BRIDGE_MAX_FRAME_BYTES = 64 * 1024;
 /** 单个高层命令的重组边界，覆盖长模板配置和监督启动快照。 */

@@ -71,21 +71,21 @@ test("v11 reply wire payload contains only reply_seq and envelope", () => {
   const pair = readyPair();
   const value = envelope();
   const frame = pair.child.publishReply(value);
-  assert.equal(frame.protocol, "pi-subagent/11");
+  assert.equal(frame.protocol, "wj-pi-subagents/11");
   assert.deepEqual(frame.payload, { reply_seq: 1, envelope: value });
 });
 
 test("v11 rejects v8/v9 frames and reply envelopes with a forged agent identity", () => {
   const legacyPair = readyPair();
   const valid = legacyPair.child.publishReply(envelope());
-  const v8 = { ...valid, protocol: "pi-subagent/8" } as unknown as SupervisorFrame;
+  const v8 = { ...valid, protocol: "wj-pi-subagents/8" } as unknown as SupervisorFrame;
   assert.deepEqual(legacyPair.parent.receive(v8), {
     kind: "protocol_fault",
     error: "protocol_mismatch",
   });
 
   const v9Pair = readyPair();
-  const v9 = { ...v9Pair.child.publishReply(envelope()), protocol: "pi-subagent/9" } as unknown as SupervisorFrame;
+  const v9 = { ...v9Pair.child.publishReply(envelope()), protocol: "wj-pi-subagents/9" } as unknown as SupervisorFrame;
   assert.deepEqual(v9Pair.parent.receive(v9), {
     kind: "protocol_fault",
     error: "protocol_mismatch",

@@ -7,7 +7,7 @@ import { holdRuntimeReloadLeaseDuringActivation } from "./runtime-reload-coordin
 
 interface PackageManifestRequirements {
   engines?: { node?: unknown };
-  piSubagent?: { requiresPi?: unknown };
+  wjPiSubagents?: { requiresPi?: unknown };
 }
 
 const manifestRequirements = packageManifest as PackageManifestRequirements;
@@ -27,11 +27,11 @@ function minimumVersion(range: string, field: string): string {
 
 export const NODE_VERSION_RANGE = requiredVersionRange(manifestRequirements.engines?.node, "engines.node");
 export const PI_VERSION_RANGE = requiredVersionRange(
-  manifestRequirements.piSubagent?.requiresPi,
-  "piSubagent.requiresPi",
+  manifestRequirements.wjPiSubagents?.requiresPi,
+  "wjPiSubagents.requiresPi",
 );
 export const MIN_NODE_VERSION = minimumVersion(NODE_VERSION_RANGE, "engines.node");
-export const MIN_PI_VERSION = minimumVersion(PI_VERSION_RANGE, "piSubagent.requiresPi");
+export const MIN_PI_VERSION = minimumVersion(PI_VERSION_RANGE, "wjPiSubagents.requiresPi");
 export const HOST_CAPABILITY_DIAGNOSTIC_CODE = "host_capability_unavailable";
 export const SUPPORTED_PLATFORMS = ["win32", "darwin", "linux"] as const;
 
@@ -96,7 +96,7 @@ export type HostCapabilityResult =
 
 export type AvailableHostCapabilities = Extract<HostCapabilityResult, { ok: true }>;
 
-export interface PiSubagentExtensionOptions {
+export interface WjPiSubagentsExtensionOptions {
   probe?: HostProbeOverrides;
   activate?: (
     extensionApi: ExtensionApiSurface,
@@ -104,7 +104,7 @@ export interface PiSubagentExtensionOptions {
   ) => void | Promise<void>;
 }
 
-export type PiSubagentExtensionFactory = (
+export type WjPiSubagentsExtensionFactory = (
   extensionApi: ExtensionApiSurface,
 ) => void | Promise<void>;
 
@@ -345,9 +345,9 @@ export async function checkHostCapabilities(input: HostProbeInput): Promise<Host
   };
 }
 
-export function createPiSubagentExtension(
-  options: PiSubagentExtensionOptions = {},
-): PiSubagentExtensionFactory {
+export function createWjPiSubagentsExtension(
+  options: WjPiSubagentsExtensionOptions = {},
+): WjPiSubagentsExtensionFactory {
   return async (extensionApi) => {
     const reloadHold = holdRuntimeReloadLeaseDuringActivation();
     try {

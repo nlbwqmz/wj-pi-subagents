@@ -64,11 +64,11 @@ function capabilityManifest(
     protocol_version: SUPERVISOR_PROTOCOL_VERSION,
     business_active_tools: ["bash", "read"],
     system_active_tools: ["reply_to_parent"],
-    system_tool_sources: { reply_to_parent: "extension:pi-subagents" },
+    system_tool_sources: { reply_to_parent: "extension:wj-pi-subagents" },
     provider: "openai",
     model: "gpt-5.2-codex",
     thinking: "high",
-    self_extension_path: "C:\\pi\\extensions\\pi-subagents.ts",
+    self_extension_path: "C:\\pi\\extensions\\wj-pi-subagents.ts",
     ...overrides,
   };
 }
@@ -290,7 +290,7 @@ test("长度边界 UTF-8 JSON 可处理分块与拼接帧，拒绝截断/损坏�
   assert.throws(() => encodeSupervisorFrame({ ...frame, unexpected: "不得透传" }), (error: unknown) => {
     return error instanceof SupervisorProtocolError && error.code === "invalid_frame";
   });
-  assert.throws(() => encodeSupervisorFrame({ ...frame, protocol: "pi-subagent/1" }), (error: unknown) => {
+  assert.throws(() => encodeSupervisorFrame({ ...frame, protocol: "wj-pi-subagents/1" }), (error: unknown) => {
     return error instanceof SupervisorProtocolError && error.code === "protocol_mismatch";
   });
 });
@@ -398,7 +398,7 @@ test("capability manifest 严格拒绝越界、危险字符和不一致来源", 
     readonly error: SupervisorProtocolError["code"];
   }> = [
     {
-      manifest: capabilityManifest({ protocol_version: "pi-subagent/10" as never }),
+      manifest: capabilityManifest({ protocol_version: "wj-pi-subagents/10" as never }),
       error: "protocol_mismatch",
     },
     {
@@ -424,7 +424,7 @@ test("capability manifest 严格拒绝越界、危险字符和不一致来源", 
     },
     {
       manifest: capabilityManifest({
-        system_tool_sources: { missing_tool: "extension:pi-subagents" },
+        system_tool_sources: { missing_tool: "extension:wj-pi-subagents" },
       }),
       error: "invalid_frame",
     },

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
-const RELOAD_LEASE_REQUEST_CHANNEL = "pi-subagent/runtime/reload/request/v1";
-const SHARED_RELOAD_LEASE_REGISTRY = Symbol.for("pi-subagents-wj/runtime-reload-leases/v1");
+const RELOAD_LEASE_REQUEST_CHANNEL = "wj-pi-subagents/runtime/reload/request/v1";
+const SHARED_RELOAD_LEASE_REGISTRY = Symbol.for("wj-pi-subagents/runtime-reload-leases/v1");
 const SHARED_RELOAD_LEASE_REGISTRY_VERSION = 1;
 const DEFAULT_RELOAD_LEASE_TIMEOUT_MS = 5_000;
 
@@ -47,7 +47,7 @@ export interface RuntimeReloadCoordinatorOptions<TRuntime, TTransfer> {
 }
 
 interface ReloadLeaseRequest {
-  readonly kind: "pi-subagent-reload-lease-request";
+  readonly kind: "wj-pi-subagents-reload-lease-request";
   readonly requestId: string;
   readonly identity: RuntimeReloadIdentity;
   claim(transfer: unknown): boolean;
@@ -242,7 +242,7 @@ export class RuntimeReloadCoordinator<TRuntime, TTransfer> {
     if (eventBus === undefined) return;
     let accepting = true;
     const request: ReloadLeaseRequest = Object.freeze({
-      kind: "pi-subagent-reload-lease-request" as const,
+      kind: "wj-pi-subagents-reload-lease-request" as const,
       requestId: randomUUID(),
       identity: Object.freeze({ ...identity }),
       claim: (value: unknown): boolean => accepting && this.acceptIncoming(value, identity),
@@ -413,7 +413,7 @@ export function validateRuntimeReloadLeaseTimeout(value: number | undefined): nu
 
 function isReloadLeaseRequest(value: unknown): value is ReloadLeaseRequest {
   return isRecord(value)
-    && value.kind === "pi-subagent-reload-lease-request"
+    && value.kind === "wj-pi-subagents-reload-lease-request"
     && typeof value.requestId === "string"
     && value.requestId.length > 0
     && isReloadIdentity(value.identity)

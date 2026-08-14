@@ -124,7 +124,7 @@ test("原生监听返回时已就绪并无损交接认证后的双向字节", as
 
   try {
     if (process.platform === "win32") {
-      assert.equal(listener.endpoint.startsWith("\\\\.\\pipe\\pi-subagent-local-"), true);
+      assert.equal(listener.endpoint.startsWith("\\\\.\\pipe\\wj-pi-subagents-local-"), true);
     }
 
     const accepted = listener.waitForConnection();
@@ -197,7 +197,7 @@ test("原生监听拒绝越界或非白名单前导且不消耗合法连接", as
     encodeTestBody(Uint8Array.from([0xc3, 0x28])),
     encodeTestBody(Buffer.from("{", "utf8")),
     encodeTestFrame({
-      protocol: "pi-subagent/local-control/999",
+      protocol: "wj-pi-subagents/local-control/999",
       credential: CREDENTIAL,
       agent_id: AGENT_ID,
     }),
