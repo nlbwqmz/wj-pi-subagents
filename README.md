@@ -1,163 +1,176 @@
-# Pi Subagent
+# Pi Subagents WJ
 
-面向 [Pi](https://github.com/earendil-works/pi) 的递归子代理扩展。它为一个 Pi 根会话建立受监督的临时代理树：父会话只能直接控制自己创建的节点，子代理使用独立的 Pi RPC 进程和上下文，并通过直接父子监督通道汇聚状态与回复。
+为 [Pi](https://github.com/earendil-works/pi) 提供递归子代理能力的扩展包。它在一个根 Pi 会话内创建受监督的临时代理树：每个子代理运行在独立的 Pi RPC 进程中，拥有自己的上下文，并且只能由直接父会话管理。
 
 > [!IMPORTANT]
-> 本仓库是开发阶段的本地 Pi package，尚未发布到 npm registry。Windows 是当前开发验收目标；macOS/Linux 已有进程树适配代码，但尚未完成原生 runner、真实 Pi 宿主和完整回收场景的独立验收。本文描述当前实现契约，不代表三平台生产认证。
+> 当前版本处于开发阶段，主要通过本地源码 package 使用，尚未执行 npm 正式发布。Windows 是当前原生验收平台；macOS 和 Linux 已包含进程树适配代码及自动化测试，但尚未完成独立的原生端到端验收。
 
 ## 目录
 
-- [能力与边界](#能力与边界)
-- [运行要求与验证状态](#运行要求与验证状态)
-- [安装、来源与项目授权](#安装来源与项目授权)
-- [五分钟上手](#五分钟上手)
-- [代理模板](#代理模板)
-- [子进程启动与能力证明](#子进程启动与能力证明)
-- [日常使用](#日常使用)
+- [路径占位符](#路径占位符)
+- [功能概览](#功能概览)
+- [运行要求](#运行要求)
+- [安装](#安装)
+- [快速上手](#快速上手)
+- [使用方法](#使用方法)
+- [代理模板配置](#代理模板配置)
 - [运行配置](#运行配置)
-- [重载与更新](#重载与更新)
-- [安全与脱敏](#安全与脱敏)
+- [项目授权与安全边界](#项目授权与安全边界)
+- [重载、更新与卸载](#重载更新与卸载)
 - [故障排查](#故障排查)
-- [本地开发](#本地开发)
+- [开发与调试](#开发与调试)
+- [项目文档](#项目文档)
 
-## 能力与边界
+## 路径占位符
 
-根会话和拥有递归管理能力的子代理可使用以下八项管理工具：
+| 占位符 | 含义 |
+| --- | --- |
+| `<REPOSITORY_PATH>` | 本仓库在本机的检出目录 |
+| `<PROJECT_DIR>` | 希望 Pi 和子代理处理的目标项目目录 |
+| `<USER_HOME>` | 当前操作系统用户的主目录 |
+| `<PI_AGENT_DIR>` | 本扩展的用户级配置目录，即 `<USER_HOME>/.pi/agent` |
+| `<TEMPLATE_DIR>` | 当前代理模板所在目录 |
 
-- `get_agent_templates`
-- `spawn_agent`
-- `send_message`
-- `wait_agent`
-- `interrupt_agent`
-- `terminate_agent`
-- `get_agent_status`
-- `get_agent_tree`
+在命令中使用占位符时，请将整个占位符替换为实际路径；路径含空格时保留引号。
 
-每个非根子代理还拥有 `reply_to_parent`，它只能向自己的直接父会话发送必要的工作中协作消息。根会话没有该工具。运行时会在处理结束边界向直接父会话自动提交一次最终答复。
+## 功能概览
 
-关键约束如下：
+### 递归代理树
 
-- 每个子代理是独立的临时 Pi RPC 进程，使用 `--no-session`，不会复制父会话的对话历史，也不会成为可单独恢复的 Pi 会话。
-- 整棵树固定使用根会话启动时捕获的 `cwd`、环境快照、项目信任结论和配额配置；模板不能改写这些值。
-- 一个父会话只能发送消息、等待、打断、终止或查询自己的直接子代理。根会话可以只读查看整棵树；普通子代理只读查看自己的子树。
-- 节点可复用：向同一 `agent_id` 再次发送消息会保留该节点自身的会话上下文。
-- 代理树受深度、每父节点数量和全树数量约束，但当前没有 token、费用、创建速率或空闲超时预算。
-- 终止会递归清理目标节点及其已登记后代。`interrupt_agent` 仅协作式打断当前处理，保留节点与上下文。
+- 根会话可以创建直接子代理；有管理能力且未达到深度上限的子代理可以继续创建下一层子代理。
+- 每个子代理对应一个独立的 `pi --mode rpc --no-session` 进程，不复制父会话的对话历史。
+- 整棵树固定使用根会话启动时的工作目录、环境快照、项目授权结论和配额配置。
+- 子代理可以在根会话存活期间重复使用；向同一 `agent_id` 发送新任务会保留该节点自己的上下文。
+- 根会话结束、切换会话或显式终止节点时，扩展会按代理子树回收相关进程。
 
-## 运行要求与验证状态
+### 受控的父子协作
 
-| 项目 | 当前要求或状态 |
+- 父会话只能控制自己的直接子代理，不能越级向孙代理发送消息、中断或终止。
+- 根会话可以只读查看整棵树；普通子代理只能查看自己的子树。
+- 不同子代理可以并行工作；同一子代理的消息、任务、中断和终止由单一 mailbox 串行协调。
+- 父子消息只支持纯文本，不支持图片或其他二进制载荷。
+- 子代理可通过 `reply_to_parent` 向直接父会话发送必要的工作中回复，最终答复由运行时自动提交。
+
+### 模板与能力核验
+
+- 从用户级和已授权项目级目录发现 Markdown 代理模板。
+- 模板可以配置业务工具、额外扩展、模型、thinking 等级、上下文文件和递归权限。
+- 模板使用严格 YAML frontmatter；无效模板不会进入可用模板目录。
+- 子代理完成实际资源加载后会上报能力清单。工具、模型、thinking 或扩展入口与模板不匹配时，创建会以 `capability_mismatch` 失败，不会静默降级。
+
+### 状态与界面
+
+- TUI 中的 `Agents` widget 持续显示当前会话的直接子代理。
+- `/agent` 打开只读代理树面板，支持滚动、展开、折叠和查看已终止节点。
+- `get_agent_status` 返回直接子代理的安全状态快照。
+- `get_agent_tree` 返回当前调用者可见范围内的完整树快照。
+- 状态、错误和 UI 不公开消息正文、模板正文、环境变量、凭据、绝对路径、进程句柄或堆栈。
+
+### 管理工具
+
+拥有子代理管理能力的会话会获得以下八个工具：
+
+| 工具 | 用途 |
+| --- | --- |
+| `get_agent_templates` | 列出当前格式有效的代理模板 |
+| `spawn_agent` | 使用模板创建一个直接子代理 |
+| `send_message` | 向直接子代理发送任务或 steering |
+| `wait_agent` | 等待一个或多个直接子代理的首个有效事件 |
+| `interrupt_agent` | 协作式中断当前任务，保留节点上下文 |
+| `terminate_agent` | 永久终止节点及其已登记子树 |
+| `get_agent_status` | 查询直接子代理的最近安全状态 |
+| `get_agent_tree` | 查询当前作用域内的只读代理树 |
+
+每个非根子代理还会获得 `reply_to_parent`。它不属于管理工具，也不能指定任意目标。
+
+### 当前边界
+
+本扩展当前不提供：
+
+- 跨根会话持久化或恢复子代理；
+- 兄弟代理、跨层代理之间的直接通信或广播；
+- token、费用、并发运行数、创建速率或空闲时间预算；
+- 文件系统沙箱、逐路径权限或操作系统级隔离；
+- 远程主机、分布式调度或多用户共享代理树。
+
+## 运行要求
+
+| 项目 | 要求或状态 |
 | --- | --- |
 | Node.js | `>= 22.19.0` |
-| Pi | `>= 0.84.1`，包名 `@earendil-works/pi-coding-agent` |
-| 平台门禁 | 仅 Windows、macOS、Linux 可激活扩展 |
-| Windows | 当前开发验收目标；需要可用的 Bash，推荐 Git for Windows 的 Git Bash；进程树由 Job Object 管理，并需要 `powershell.exe` |
-| macOS / Linux | 已实现 process group/session 适配；原生 runner 和端到端回收证据仍未完成 |
-| 模型 | 根会话必须能解析一个可用模型；模板可显式指定 `provider/model` 和 thinking 等级 |
+| Pi | `>= 0.84.1`，包名为 `@earendil-works/pi-coding-agent` |
+| 目标平台 | Windows、macOS、Linux；当前只完成 Windows 原生验收 |
+| Windows Shell | Pi 需要可用的 Bash，推荐 Git for Windows 提供的 Git Bash |
+| Windows 进程管理 | 需要可从 `PATH` 调用的 `powershell.exe`，扩展使用 Job Object 回收进程树 |
+| 模型 | 根会话必须已选择可用模型；模板也可以指定精确的 `provider/model` |
 
-扩展启动会检查 Node、Pi、平台进程树适配器、Pi API 与运行依赖。门禁失败时扩展整体不激活，不注册管理工具、`/agent` 或代理树 widget；普通 Pi 会话仍可继续使用。
+扩展启动时会检查 Node、Pi、必需 API、运行依赖和平台进程树适配器。任一门禁失败时，扩展不会注册半套工具或启动子进程；普通 Pi 会话仍可继续运行，TUI 中会显示 `host_capability_unavailable` 诊断。
 
-当前仓库的自动化检查覆盖大量纯逻辑、协议和 fake 旅程，但本文档更新没有执行真实 Pi 端到端验证，也不能替代 Windows、macOS 或 Linux 的原生验收。
-
-## 安装、来源与项目授权
-
-### 先理解 Pi package 的安全模型
-
-Pi package、扩展和模板 `extensions` source 都以启动 Pi 的操作系统用户权限执行代码。扩展可注册工具、provider、命令和事件处理器；技能也可引导模型执行外部程序。只使用已审查、可信且版本可追溯的来源。
-
-Pi 支持以下 package source 形式：
-
-| 来源 | 示例 | 行为 |
-| --- | --- | --- |
-| 本地路径 | `D:\path\to\pi-subagents-wj`、`./local-package` | 直接引用磁盘上的文件或目录，不复制源码 |
-| npm | `npm:@scope/package@1.2.3` | 由 Pi 管理安装；精确版本是固定来源 |
-| git / 远程 URL | `git:github.com/org/repo@v1`、`https://github.com/org/repo` | 由 Pi 克隆或解析；固定 tag/commit 不会被常规更新移动 |
-
-`pi -e` / `--extension` 是一次性加载入口；`pi install` 把来源写入持久设置。对于 npm 或 git source，`-e` 在本次运行的临时目录解析，不持久化到 settings。对于本地路径，它仍直接加载当前磁盘内容。
+## 安装
 
 ### 1. 安装 Pi
 
-```powershell
+```bash
 npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 node --version
 pi --version
 ```
 
-先确认 Pi 已能完成登录或 API Key 配置、选择模型并正常运行，再安装本扩展。
+先通过 `/login` 或 API Key 完成 Pi 的 provider 配置，并确认普通 Pi 会话可以正常调用模型。
 
-### 2. 准备本地 package
+### 2. 获取源码并安装运行依赖
 
-本仓库的 Pi 依赖是宿主 peer dependency。取得源码后，在 package 目录安装运行依赖：
-
-```powershell
-Set-Location D:\path\to\pi-subagents-wj
+```bash
+git clone https://github.com/nlbwqmz/pi-subagents-wj.git
+cd pi-subagents-wj
 npm ci --omit=dev --legacy-peer-deps
 ```
 
-本地路径安装不会替 package 执行 `npm install`。因此必须保留源码目录和其中的 `node_modules`；移动、删除或更名后，Pi settings 中的本地来源会失效。
+Pi 是本 package 的宿主 peer dependency。本地路径 package 不会由 Pi 自动执行依赖安装，因此必须保留仓库目录及其中的 `node_modules`。
 
-### 3. 一次性试用
+### 3. 一次性加载
 
-在真正要处理的项目目录运行：
+在目标项目目录启动 Pi：
 
-```powershell
-Set-Location D:\path\to\your-project
-pi -e "D:\path\to\pi-subagents-wj"
+```bash
+cd <PROJECT_DIR>
+pi -e "<REPOSITORY_PATH>"
 ```
 
-这只影响本次 Pi 进程，不写入持久 settings。工作目录来自启动 Pi 的项目目录，而不是扩展目录。
+`-e` / `--extension` 只影响当前 Pi 进程，不写入持久设置。子代理的工作目录是启动 Pi 时的 `<PROJECT_DIR>`，不是扩展仓库目录。
 
 ### 4. 持久安装
 
-用户级安装会在全部项目中启用该 package：
+用户级安装会在所有项目中启用本 package：
 
-```powershell
-pi install "D:\path\to\pi-subagents-wj"
+```bash
+pi install "<REPOSITORY_PATH>"
 ```
 
-仅在当前项目启用时使用 `-l`：
+只在当前项目中启用：
 
-```powershell
-Set-Location D:\path\to\your-project
-pi install "D:\path\to\pi-subagents-wj" -l
+```bash
+cd <PROJECT_DIR>
+pi install "<REPOSITORY_PATH>" -l
 ```
 
-项目级 package 会写入 `<cwd>/.pi/settings.json`，并受 Pi 的项目授权机制保护。仅在你已审查且明确希望执行项目 `.pi` 资源时，才在非交互命令中传入 `--approve`：
+项目级安装会修改 `<PROJECT_DIR>/.pi/settings.json`，并受 Pi 的项目授权机制保护。只有在已审查该项目的 `.pi` 资源后，才为非交互命令显式授权：
 
-```powershell
-pi install "D:\path\to\pi-subagents-wj" -l --approve
+```bash
+pi install "<REPOSITORY_PATH>" -l --approve
 ```
 
-当前没有可用的 `npm:pi-subagents-wj` 公共安装来源，也没有本文可提供的公共 git 安装地址。
+使用 `pi list` 可以确认 package 来源是否已经写入设置。
 
-### 项目授权如何影响子代理
+## 快速上手
 
-Pi 在交互式根会话中会对未决项目授权作出提示。授权前，Pi 可以加载用户级资源和命令行 `-e` 来源；项目 `.pi/settings.json`、项目扩展、项目 package 与其他受授权控制的项目 `.pi` 资源只有在项目获信任后才加载。非交互模式不会弹出提示：保存的决定或全局 `defaultProjectTrust` 决定默认行为，`--approve` 与 `--no-approve` 只覆盖本次运行。
+### 1. 创建代理模板
 
-本扩展在根会话启动时捕获该结论，并在所有 child Pi 启动参数中传递相同的 `--approve` 或 `--no-approve`。子代理不能重新询问、提升或降低根会话的项目授权。上下文文件是独立开关：`contextFiles` 决定 child 是否允许 Pi 按其规则读取 context files，不由 project trust 代替。
-
-这有两个容易混淆的后果：
-
-1. `<cwd>/.pi/agents` 中的项目模板只在根项目已获信任时参与发现。
-2. 模板中的 `extensions` 会成为 child 的显式 `-e` source。`--no-approve` 只关闭普通项目资源发现，不能把已经由可信模板显式要求加载的 source 变成安全沙箱。因此，模板 extension source 本身也是代码执行授权的一部分。
-
-不要在 extension URL 中嵌入 token、用户名密码或私有查询参数。模板目录会向模型公开规范化后的 extension source 字符串。
-
-## 五分钟上手
-
-### 1. 创建用户级模板
-
-创建用户模板目录：
-
-```powershell
-New-Item -ItemType Directory -Force (Join-Path $HOME '.pi\agent\agents') | Out-Null
-```
-
-创建 `researcher.md`，使用 UTF-8 保存：
+创建 `<PI_AGENT_DIR>/agents/researcher.md`，使用 UTF-8 编码保存：
 
 ```markdown
 ---
-description: 只读核对代码和测试
+description: 只读检查代码、文档和测试
 tools:
   - read
   - grep
@@ -168,196 +181,62 @@ contextFiles: true
 systemPromptMode: append
 ---
 
-先阅读相关代码和测试，再给出带文件位置的结论。不要修改代码。
+先阅读相关实现和测试，再给出带文件位置的结论。不要修改文件。
 ```
 
-此例故意省略 `extensions`，因此 child 遵循 Pi 的正常扩展发现规则。`tools` 是 YAML 字符串数组，不是逗号分隔标量。
+项目专用模板可以放在 `<PROJECT_DIR>/.pi/agents/researcher.md`，但只有根项目已获 Pi 授权时才会被发现。
 
-### 2. 启动或重载根会话
+### 2. 启动或重载 Pi
 
-新建模板后可重新启动 Pi；若根会话正在运行，输入：
+新会话直接在目标项目中启动：
+
+```bash
+cd <PROJECT_DIR>
+pi -e "<REPOSITORY_PATH>"
+```
+
+如果 Pi 已经运行，新增或修改模板后执行：
 
 ```text
 /reload
 ```
 
-根 reload 会重新发现供未来 child 创建使用的模板。详见 [重载与更新](#重载与更新)。
-
 ### 3. 委派任务
 
-可以直接提出自然语言任务，例如：
+直接向根会话描述目标即可，无需手工组织工具 JSON：
 
 ```text
-创建 researcher 子代理，名为“鉴权调查”，让它只读检查鉴权入口和相关测试；
-等待它完成后汇总结论和涉及的文件。
+创建 researcher 子代理，名称为“鉴权调查”，只读检查鉴权入口和相关测试。
+等待它完成后，汇总结论并列出涉及的文件。
 ```
 
-典型工具流程是：
+模型通常会按以下顺序调用扩展工具：
 
-1. 调用 `get_agent_templates`，只从当前返回项复制精确的 `template_id`。
-2. 调用 `spawn_agent` 创建节点，得到 `agent_id`。
-3. 调用 `send_message` 发送第一项任务。创建本身不接受首条任务。
-4. 使用 `wait_agent` 等待必要工作中回复、任务提交、挂起或终态。
-5. 继续向同一 `agent_id` 发送任务以复用上下文，或通过 `terminate_agent` 回收不再需要的分支。
+1. `get_agent_templates` 获取当前模板目录。
+2. `spawn_agent` 原样使用目录中的 `template_id` 创建节点。
+3. `send_message` 发送首项任务。
+4. `wait_agent` 等待工作中回复、任务提交、挂起或终态。
+5. 继续复用该 `agent_id`，或用 `terminate_agent` 回收不再需要的分支。
 
-`send_message` 返回的 `accepted: true` 只表示插件 mailbox 已接纳文本，不表示模型已读取或任务已经完成。
+## 使用方法
 
-## 代理模板
+### 创建与发送任务
 
-### 发现目录与覆盖
+`spawn_agent` 只负责创建节点，不接受首项任务。创建成功后必须再调用 `send_message`。
 
-| 来源 | 目录 | 何时参与发现 |
-| --- | --- | --- |
-| 用户级 | `~/.pi/agent/agents/*.md` | 始终 |
-| 项目级 | `<root cwd>/.pi/agents/*.md` | 仅根项目已获 Pi 信任 |
+`send_message` 返回 `accepted: true` 时，只表示扩展 mailbox 已接纳消息并分配 `message_id` / `task_id`，不表示 Pi 或模型已经读取，更不表示任务完成。消息交付不确定时，应先查询状态，不能盲目重发。
 
-只扫描目录直属的 UTF-8、严格小写 `.md` 文件及符号链接，不递归扫描子目录。`template_id` 是文件名去掉末尾 `.md` 后的原始值，精确区分大小写，不裁剪、不转小写，也不做 Unicode 归一化。
+向同一 `agent_id` 再次发送消息时：
 
-同名项目候选会整体遮蔽用户候选，不合并字段或正文。遮蔽在有效性校验之前发生：无效的项目模板仍会让同名用户模板不可用，并使该标识返回 `template_invalid`。
+- 节点空闲：建立新逻辑任务，并复用现有上下文；
+- 节点工作中：消息通常作为当前任务的 steering；
+- 节点正在中断：消息进入后继任务，等待当前任务完成中断提交后再处理。
 
-### 完整 schema
+一旦任务由 `send_message` 接纳，父会话不应同时重复执行或再次委派同一工作。需要接管时，应先 `interrupt_agent`，再用 `wait_agent` 确认当前处理已经结束。
 
-模板必须以 YAML frontmatter 开始，随后是可为空的 Markdown 正文：
+### 等待多个子代理
 
-```markdown
----
-description: 审核远程资料并给出可核对结论
-tools:
-  - read
-  - grep
-extensions:
-  - ./extensions/audit.ts
-  - npm:@example/pi-audit@1.2.0
-allowSubagents: false
-contextFiles: false
-systemPromptMode: replace
-model: openai/gpt-example
-thinking: medium
----
-
-优先给出来源、判断依据和未能确认的部分。
-```
-
-允许且只允许以下八个 frontmatter 字段：
-
-| 字段 | 必填 | 默认值 | 含义 |
-| --- | --- | --- | --- |
-| `description` | 是 | 无 | 非空字符串，裁剪后最多 512 个 Unicode code point；仅用于模板目录展示 |
-| `extensions` | 否 | 省略 | YAML 字符串数组；控制 child 的额外 extension source 与自动发现策略 |
-| `tools` | 否 | 省略 | YAML 字符串数组；控制 child 的业务工具 allowlist 策略 |
-| `allowSubagents` | 否 | `true` | 原生 YAML boolean；是否允许该节点具备完整管理工具集合 |
-| `contextFiles` | 否 | `true` | 原生 YAML boolean；`false` 时为 child 传递 `--no-context-files` |
-| `systemPromptMode` | 否 | `append` | `append` 或 `replace` |
-| `model` | 否 | 创建时的直接父会话当前模型 | 精确 `provider/model` 字符串 |
-| `thinking` | 否 | 创建时的直接父会话当前等级 | `off`、`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max` |
-
-正文以 UTF-8 计最多 `64 KiB`。`description` 不会自动注入系统提示；正文才是模板角色提示。`replace` 只替换模板可控制的项目与角色提示层，不能移除运行时的所有权、通信、最终答复或安全约束。
-
-### 严格解析规则
-
-- `description` 必须存在且为非空字符串。
-- `tools` 与 `extensions` 只能是原生 YAML 字符串数组；标量、空值、对象、数字、布尔值、空字符串条目和裁剪后重复项都会使候选无效。
-- `tools` 不得包含系统保留名称：八项管理工具以及 `reply_to_parent`。这些工具由角色、祖先授权和深度自动决定，不能由模板直接索取。
-- 未知字段会被拒绝，不会静默忽略。`name`、`env`、`skills`、`promptTemplates` 等都不是本扩展的模板字段。
-- YAML merge 键、非字符串顶层键、重复键、无效 UTF-8、无法读取的文件和无效 frontmatter 都会使候选无效。
-- 无效模板不会进入 `get_agent_templates`。有 UI 时，根会话只显示脱敏汇总诊断，包含逻辑来源、直属文件名和固定原因，不包含正文、绝对路径、异常文本或堆栈。
-
-### `tools` 的三态语义
-
-`tools` 的省略、空数组和非空数组不等价：
-
-| 写法 | child 启动行为 |
-| --- | --- |
-| 省略 `tools` | 不传 `--tools`，保留 Pi 正常的业务工具选择；模板没有建立业务工具 allowlist |
-| `tools: []` | 传递严格 allowlist；没有模板业务工具，但运行时仍保留角色必需的协议工具，例如 child 的 `reply_to_parent` |
-| 非空数组 | 严格 allowlist 由声明的业务工具与角色必需的协议工具组成 |
-
-显式 `tools` 是对 child 的启动时工具集约束。若某个模板 extension 注册了业务工具，并且该工具应在显式 allowlist 下可调用，就必须同时把它写入 `tools`。只加载 extension source 不会自动把它注册的工具加入显式业务 allowlist。
-
-### `extensions` 的三态语义与 source 解析
-
-`extensions` 同样拥有三态，且由 child 的 Pi CLI 参数实现：
-
-| 写法 | child 扩展行为 |
-| --- | --- |
-| 省略 `extensions` | 遵循 Pi 的普通扩展发现：用户资源始终按 Pi 规则参与，项目资源取决于继承到的 project trust |
-| `extensions: []` | 传递 `--no-extensions`，关闭普通扩展发现；child 仍显式加载本扩展自身以维持监督与回复协议 |
-| 非空数组 | 同样传递 `--no-extensions`，再显式加载本扩展和数组内的每个 source，形成受模板控制的显式集合 |
-
-Pi 的 `--no-extensions` 关闭的是普通发现路径，不会把 child 变成无代码或无权限进程，也不能移除 Pi 固定的内建 inline extension。它不是沙箱。
-
-模板 extension source 的解释规则如下：
-
-- `./...`、`../...`、绝对路径等本地 source 相对模板文件所在目录解析，而不是相对 child 的工作目录解析。
-- `npm:...`、`git:...`、完整 `https://` / `http://` / `ssh://` / `git://` URL 与 `git@host:...` 形式按 Pi package source 规则原样交给 Pi 解析。
-- 每个 source 最终按 YAML 声明顺序作为 child 的显式 `-e` 参数加载；远程 source 可能引发临时下载、安装或 git 操作。
-- source 字符串会以裁剪后的显示值出现在模板目录中。不要写入认证信息，也不要依赖前后空白。
-- `extensions` 只控制 extension source；它不提供技能、提示模板、环境变量、cwd 或文件系统权限的模板级白名单。
-
-### 模板目录的公开内容
-
-`get_agent_templates` 返回当前根权威的安全目录。每项仅包含：
-
-```json
-{
-  "template_id": "researcher",
-  "description": "只读核对代码和测试",
-  "tools": ["read", "grep"],
-  "extensions": ["./extensions/audit.ts"]
-}
-```
-
-`tools` 或 `extensions` 省略时，返回项中对应字段也省略；显式空数组会返回 `[]`。目录不会公开模板正文、真实模板目录、来源层级、模型、thinking、上下文文件策略或递归授权开关。
-
-目录有效只表示 frontmatter 合法，不代表 child 已实际完成加载。模板业务工具、模型、thinking 与 provider 可以由模板 extension 提供，因此父端不会以自身当前可见的工具或 provider 做最终可用性裁决。
-
-## 子进程启动与能力证明
-
-创建 child 的事务按以下边界进行：
-
-1. 根权威解析当前模板快照并签发模板修订与节点预留事实。
-2. 父端启动受管 Pi RPC child，固定根 `cwd`、根环境快照、根 project trust 与节点身份；child 使用 `--no-session`。
-3. child 总是通过当前实际加载的扩展入口显式 `-e` 加载本扩展。它不会按 package 名重新解析另一份安装；入口由根运行时传入，以避免加载到不同副本。
-4. 直接父子监督通道完成身份、凭据、协议版本和初始快照握手，普通 ready 后 child 才能报告运行能力。
-5. child 最多一次发布内部 capability manifest，父端缓存并据此裁决模板请求与实际激活能力是否匹配；通过后节点才作为可用 child 进入 `idle`。
-
-manifest 是内部控制信息，不属于 `get_agent_status`、`get_agent_tree`、widget 或模型可见模板目录。它只包含受限、可校验的运行时事实：实际业务工具、系统工具及其来源、provider、model、thinking 和当前自扩展入口标识。它不携带模板正文、环境、凭据、进程句柄或原始异常。
-
-这解决了两个旧假设的问题：
-
-- 父会话当前未知的工具和 provider 可能由模板列出的 source 注册，最终判断必须等待 child 实际完成加载。
-- Pi 对未知 CLI allowlist 工具可能采取静默处理；只有 child 实际加载完成后的能力事实才能说明模板请求是否真正生效。
-
-若 child 已启动并绑定监督通道，但上报的能力无法满足模板，节点以稳定的 `capability_mismatch` 失败并清理。进程、RPC、监督握手或准备阶段无法完成时使用 `spawn_failed`；超过启动期限时使用 `spawn_timeout`。这些公开错误不会暴露 source 路径、manifest 内容、凭据或堆栈。
-
-## 日常使用
-
-### 发送、回复与等待
-
-`spawn_agent` 只创建节点。首项工作必须由 `send_message` 另行发送：
-
-```json
-{
-  "agent_id": "550e8400-e29b-41d4-a716-446655440000",
-  "message": "检查鉴权入口，并列出相关测试。"
-}
-```
-
-父端将文本线性化进入 child mailbox。节点空闲时会以 Pi `prompt()` 启动逻辑任务；已有活动任务时，后续文本可作为 `steer()` 进入当前处理。Pi 自动压缩、交付不确定或终止屏障期间，运行时保守地保持消息与节点状态，不把 RPC 返回成功误写为模型已读取。
-
-`reply_to_parent` 仅用于 child 在最终答复前遇到必须由直接父代理裁决的阻塞问题，或父代理明确要求过程回报时：
-
-```json
-{
-  "message": "需要父代理裁决：任务要求与当前接口契约冲突。"
-}
-```
-
-它不用于心跳、常规进度、阶段性总结、完成通知或替代最终答复。成功的工作中回复会唤醒直接父会话，但不会结束 child 当前任务。
-
-child 到达本轮结束边界时，运行时在独立 outbox 中准备并向直接父会话提交一次最终答复。普通 assistant 过程输出、思考块、工具参数、工具结果和原始错误不会自动上行。最终答复被父会话接纳并完成相应确认后，任务才提交为完成、失败或中断。
-
-`wait_agent` 可在一次调用中观察多个直接 child：
+`wait_agent` 一次可以观察 `1..64` 个直接子代理：
 
 ```json
 {
@@ -369,38 +248,138 @@ child 到达本轮结束边界时，运行时在独立 outbox 中准备并向直
 }
 ```
 
-任一目标产生必要工作中回复、最终任务结果、挂起或稳定终态时，等待返回。`timeout` 只结束观察，不中断、不终止，也不表示任务失败。
+所有目标共享一个观察窗口，任一目标出现有效事件时返回。常见 outcome：
 
-### 管理范围与递归
+| outcome | 含义 |
+| --- | --- |
+| `reply` | 收到工作中回复；子代理通常仍在处理 |
+| `task_completed` | 最近任务已正常提交 |
+| `task_failed` | 最近任务以失败结果提交，节点仍可能可复用 |
+| `task_interrupted` | 最近任务已完成中断提交 |
+| `suspended` | 交付或维护状态无法确认，需要查询状态并裁决 |
+| `terminal` | 节点已进入 `failed` 或 `terminated` |
+| `timeout` | 本次观察窗口结束，节点状态没有因此改变 |
+| `batch_released` | 同一工具批次已被另一个等待目标解除 |
 
-`allowSubagents: false` 会关闭该节点完整的八项管理工具；它不会移除 child 的 `reply_to_parent`。即使模板允许递归，父节点已经没有管理能力或深度达到 `maxDepth` 时，也无法把能力重新授予后代。
+`timeout` 不会中断或终止子代理。耗时任务仍处于 `working` 时，应继续等待；不要仅因一次 timeout 就创建替代代理或重复工作。
 
-默认 `maxDepth` 为 `2`：根深度是 `0`，根可创建深度 `1`，深度 `1` 可创建深度 `2`，最后一层是叶节点。展示名称仅供 UI 使用，所有工具寻址均使用规范小写 UUID `agent_id`。
+### 中断、复用与终止
 
-### 状态与终止
+- `interrupt_agent`：协作式结束当前处理，保留节点及其上下文；调用成功后仍需 `wait_agent` 确认任务已提交中断结果。
+- `terminate_agent`：永久终止目标及其全部已登记后代，并等待资源回收；终止后不可复用。
+- `failed` 节点不会自动重启，仍需显式终止才能释放名额。
+- `termination_incomplete` 表示资源尚未全部确认回收，应稍后对同一直接子代理重试终止。
+
+### 生命周期状态
 
 | 状态 | 含义 | 是否占用名额 |
 | --- | --- | --- |
-| `starting` | 身份与名额已预留，正在建立进程、监督通道和 RPC | 是 |
-| `idle` | 已就绪且没有当前任务、未决回复或待交付消息 | 是 |
-| `working` | 正在处理、对账或提交任务 | 是 |
-| `interrupting` | 已接受协作式中断，等待当前任务结束 | 是 |
+| `starting` | 正在建立进程、RPC 和监督通道 | 是 |
+| `idle` | 已就绪且当前严格静止 | 是 |
+| `working` | 正在投递、处理、压缩、对账或提交任务 | 是 |
+| `interrupting` | 中断栅栏已生效，等待当前任务结束 | 是 |
 | `suspended` | 交付或维护状态无法确认，需要外部裁决 | 是 |
-| `failed` | 发生不可自动恢复的运行或控制故障 | 是 |
-| `terminating` | 终止屏障已建立，资源尚未全部确认 | 是 |
-| `terminated` | 本节点和其已登记后代已确认回收 | 否 |
+| `failed` | 出现不可自动恢复的运行故障 | 是 |
+| `terminating` | 终止已开始，资源尚未全部确认回收 | 是 |
+| `terminated` | 节点及其子树资源已确认回收 | 否 |
 
-`failed` 不会自动重启，仍需显式终止才能释放名额。`termination_incomplete` 表示资源尚未确认回收，应稍后对同一直接子代理重试终止，而不是假设进程已经消失。
+### 查看代理树
 
-在交互式 TUI 中，`Agents` widget 显示当前会话的直接、未终止 child。输入 `/agent` 可打开当前可见作用域的完整只读树；根看到整棵树，普通 child 看到自己的子树。树视图不会提供越级控制权限。
+- 常驻 `Agents` widget 只显示当前会话的直接、未终止子代理。
+- 输入 `/agent` 打开完整只读树面板。
+- 根会话看到整棵树；普通父会话只看到自己的子树。
+- 面板只提供观察能力，不扩大跨层控制权限。
+
+## 代理模板配置
+
+### 模板发现位置
+
+| 作用域 | 路径 | 生效条件 |
+| --- | --- | --- |
+| 用户级 | `<PI_AGENT_DIR>/agents/*.md` | 始终参与发现 |
+| 项目级 | `<PROJECT_DIR>/.pi/agents/*.md` | 根项目已获 Pi 授权 |
+
+本扩展当前固定从 `<USER_HOME>/.pi/agent` 读取用户级模板和运行配置。只扫描目录直属的小写 `.md` 文件或符号链接，不递归扫描子目录。
+
+`template_id` 是文件名移除末尾 `.md` 后的原始值，区分大小写，不裁剪、不转换大小写，也不做模糊匹配。项目模板与用户模板同名时，项目模板整体覆盖用户模板；两者不会合并。无效的同名项目模板仍会遮蔽用户模板。
+
+### 完整模板示例
+
+```markdown
+---
+description: 审核代码并核对相关测试
+extensions:
+  - ./extensions/audit-tools.ts
+tools:
+  - read
+  - grep
+  - find
+allowSubagents: false
+contextFiles: true
+systemPromptMode: append
+model: openai/gpt-example
+thinking: medium
+---
+
+优先说明判断依据、涉及的文件和未能确认的部分。
+```
+
+模板正文是子代理的角色提示。正文允许为空，UTF-8 编码后最大为 `64 KiB`。
+
+### Frontmatter 字段
+
+| 字段 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `description` | 是 | 无 | 非空字符串，最多 512 个 Unicode code point，用于模板目录展示 |
+| `extensions` | 否 | 省略 | Pi extension source 字符串数组 |
+| `tools` | 否 | 省略 | 子代理业务工具字符串数组 |
+| `allowSubagents` | 否 | `true` | 是否允许该节点继续管理子代理 |
+| `contextFiles` | 否 | `true` | 是否加载 Pi 的 `AGENTS.md` / `CLAUDE.md` 上下文文件 |
+| `systemPromptMode` | 否 | `append` | `append` 或 `replace` |
+| `model` | 否 | 创建时直接父会话的当前模型 | 精确的 `provider/model` |
+| `thinking` | 否 | 创建时直接父会话的当前等级 | `off`、`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max` |
+
+只允许以上八个字段。未知字段、重复键、YAML merge 键、错误类型、空数组项、重复数组项和保留工具名都会使模板无效。`allowSubagents` 与 `contextFiles` 必须使用 YAML 布尔值，不能写成字符串。
+
+### `tools` 的三种状态
+
+| 写法 | 行为 |
+| --- | --- |
+| 省略 `tools` | 不传 `--tools`，保留 Pi 正常的业务工具选择 |
+| `tools: []` | 使用严格的零业务工具 allowlist，但仍保留运行时必需的协议工具 |
+| 非空数组 | 使用声明的精确业务工具 allowlist，并附加获授权的协议工具 |
+
+`tools` 只能声明业务工具，不能包含八个管理工具或 `reply_to_parent`。如果模板扩展注册了某个业务工具，并且模板显式声明了 `tools`，该工具还必须同时出现在 `tools` 中。
+
+### `extensions` 的三种状态
+
+| 写法 | 行为 |
+| --- | --- |
+| 省略 `extensions` | 保留 Pi 的普通扩展发现规则 |
+| `extensions: []` | 传递 `--no-extensions`，关闭普通扩展发现，仅显式加载本扩展自身 |
+| 非空数组 | 关闭普通扩展发现，再显式加载本扩展和数组中的每个 source |
+
+相对本地 source 以模板文件所在目录 `<TEMPLATE_DIR>` 为基准解析，而不是以 `<PROJECT_DIR>` 为基准。`npm:`、`git:`、完整协议 URL 和 `git@host:...` 形式交由 Pi 解析。远程 source 可能触发下载、依赖安装和任意扩展代码执行。
+
+### 模板重载
+
+根会话执行 `/reload` 后，会原子刷新供未来 `spawn_agent` 使用的模板快照。它不会修改已存在子代理的工具、扩展、模型、提示、上下文或递归能力。
 
 ## 运行配置
 
-根会话只在启动时解析一次配置，并将结果冻结给整个代理树。优先级为：
+运行配置在根会话启动时读取一次，并冻结给整棵代理树。
 
-1. 已获信任项目的 `<cwd>/.pi/subagent.json`
-2. 用户级 `~/.pi/agent/subagent.json`
+### 配置位置与优先级
+
+每个字段独立按以下顺序解析：
+
+1. 已授权项目的 `<PROJECT_DIR>/.pi/subagent.json`
+2. 用户级 `<PI_AGENT_DIR>/subagent.json`
 3. 内置默认值
+
+项目未获授权时，项目配置不参与解析。
+
+### 配置示例
 
 ```json
 {
@@ -411,158 +390,232 @@ child 到达本轮结束边界时，运行时在独立 outbox 中准备并向直
 }
 ```
 
+### 配置字段
+
 | 字段 | 默认值 | 合法范围 | 作用 |
 | --- | ---: | ---: | --- |
-| `maxDepth` | `2` | `1..8` | 根深度为 0 时允许创建的最大 child 层级 |
-| `maxChildrenPerAgent` | `4` | `1..16` | 每个父节点尚未终止的直接 child 上限 |
+| `maxDepth` | `2` | `1..8` | 最大子代理层级，根会话深度为 0 |
+| `maxChildrenPerAgent` | `4` | `1..16` | 每个父会话尚未终止的直接子代理上限 |
 | `maxAgentsPerTree` | `16` | `1..64` | 根之外、尚未终止的全树节点上限 |
-| `waitTimeoutMs` | `60000` | `10000..600000` | `wait_agent` 未传超时时间时的默认毫秒数 |
+| `waitTimeoutMs` | `60000` | `10000..600000` | `wait_agent` 省略 `timeout_ms` 时的默认毫秒数 |
 
-项目未获信任时，项目配置完全不参与解析。缺失字段继续向下一层取值；已选层的文件不可读、JSON 无效或字段越界时，受影响字段使用内置默认值，而不是回退到更低优先级层。配置变更需要新建根会话；`/reload` 只刷新未来 child 创建时使用的模板与资源。
+达到深度上限会立即拒绝创建。达到直接子代理或全树名额上限后，需要先终止并完成资源回收，再重新创建。
 
-## 重载与更新
+如果某层文件不可读、不是有效 JSON、不是对象，或被选中的已知字段非法，受影响字段直接使用内置默认值，不会继续回退到更低优先级。未知字段会被忽略，并在有 UI 时显示脱敏警告。
 
-### `/reload` 的准确边界
+修改 `subagent.json` 后必须结束并重新启动根 Pi 会话；`/reload` 不会重新读取运行配置。
 
-Pi `/reload` 会重新发现模板和 Pi 资源，并原子替换供后续 `spawn_agent` 创建 child 使用的模板快照。解析和创建之间若发生 reload，应重新查询模板并重新发起创建。
+## 项目授权与安全边界
 
-`/reload` 只影响未来 child 的模板与资源，不影响任何已存在 child。
+### 项目授权
 
-升级监督协议主版本或本地 package 代码时，退出并重新启动 Pi。
+Pi 的 project trust 决定项目级 `.pi/settings.json`、package、扩展和本扩展的项目模板、项目运行配置是否参与加载。根会话会将启动时的授权结论固定传给所有后代，子代理不能重新提示、提升或降低该结论。
 
-### 更新本地来源
-
-Pi 不管理本地路径中的源码副本。按你取得源码的方式更新后，重新安装依赖：
-
-```powershell
-Set-Location D:\path\to\pi-subagents-wj
-npm ci --omit=dev --legacy-peer-deps
-```
-
-随后退出并重新启动 Pi。若只需让新增模板或资源用于未来 child，可在根会话执行 `/reload`。`pi update --extensions` 只更新由 Pi 管理的 npm/git package，不会拉取或重装当前这种本地路径来源。
-
-移除持久引用时使用与安装时相同的 source：
-
-```powershell
-pi remove "D:\path\to\pi-subagents-wj"
-pi remove "D:\path\to\pi-subagents-wj" -l
-```
-
-这些命令只删除 settings 中的引用，不删除本地源码或 `node_modules`。
-
-## 安全与脱敏
+`contextFiles` 是独立开关。即使项目未获授权，`contextFiles: true` 仍允许 Pi 按自身规则读取 `AGENTS.md` / `CLAUDE.md`；`contextFiles: false` 会为该子代理传递 `--no-context-files`。
 
 ### `cwd` 不是沙箱
 
-根 `cwd` 是相对路径、项目资源发现和模板项目目录的基点，不是文件访问边界。只要 Pi 工具与宿主用户权限允许，`read`、`write`、`edit` 与 Bash 仍可能访问绝对路径或 `cwd` 外的路径。`contextFiles: false` 只关闭 Pi 的上下文文件发现，不会撤销普通工具权限。
+根工作目录只是相对路径和项目资源发现的基点，不是文件访问边界。只要宿主权限和可见工具允许，子代理仍可能访问 `<PROJECT_DIR>` 之外的路径。
 
-要隔离不可信仓库、模型操作或 extension 代码，应在容器、虚拟机或其他操作系统级沙箱中运行整个 Pi 会话。
+模板 `tools` 只限制模型可调用的工具集合，不改变进程的操作系统权限。`extensions: []` 也不是安全沙箱，它只关闭 Pi 的普通扩展发现。
 
-### 工具与 extension 不是权限边界
+需要处理不可信代码、扩展或模型操作时，应在容器、虚拟机或其他操作系统级隔离环境中运行整个 Pi 会话。
 
-模板 `tools` 控制 child 的模型可调用工具集，不改变进程的操作系统权限。模板 `extensions` 也不是安全过滤器：它明确选择哪些 source 在 child 中执行。应把可写工具、远程 package、项目模板与 extension source 都当作需审查的可执行输入。
+### 扩展来源安全
 
-### 公开面只保留安全事实
+Pi package 和模板 `extensions` 都以当前操作系统用户权限执行代码。只使用已审查、可信且版本可追溯的来源。不要在 npm、git 或 URL source 中嵌入 token、用户名密码或私有查询参数，因为规范化后的 source 可能出现在模板目录展示中。
 
-控制工具、代理树、UI 与模型可见错误只公开稳定的状态、枚举、计数和错误码。它们不会携带：
+## 重载、更新与卸载
 
-- 模板正文、消息正文、final 正文、图片或工具参数
-- 模板目录绝对路径、环境变量、凭据、认证 URL
-- 进程 ID、Job Object、process group、管道/socket、句柄
-- 原始异常、远程安装输出或堆栈
-- capability manifest 的内部内容和自扩展实际路径
+### `/reload` 的作用
 
-常见稳定错误码包括：
+`/reload` 会刷新 Pi 资源和代理模板，并让新模板快照用于之后创建的子代理。现有代理树、活动任务、mailbox、模型和上下文保持不变。
 
-| 错误码 | 含义 | 处理方向 |
-| --- | --- | --- |
-| `template_not_found` | 当前快照没有该模板标识 | 检查文件名、目录、trust 与 reload |
-| `template_invalid` | 候选文件不满足严格 schema | 修复 UTF-8、frontmatter 或字段类型 |
-| `template_capability_unavailable` | 当前节点没有递归管理能力 | 检查深度、祖先授权和 `allowSubagents` |
-| `capability_mismatch` | child 实际能力未满足模板请求 | 检查模板 `tools`、`extensions`、模型和 child 启动环境 |
-| `spawn_failed` / `spawn_timeout` | child 未能启动或未及时就绪 | 检查 Pi、来源、平台、模型与资源 |
-| `message_delivery_failed` | 无法确认消息交付 | 先查询状态，不要盲目重发 |
-| `termination_incomplete` | 资源尚未确认回收 | 稍后重试终止 |
-| `internal_error` | 已脱敏的控制器故障 | 保存可复现步骤并查看 UI 状态 |
+以下变更建议完全退出并重新启动 Pi：
+
+- 修改 `<PI_AGENT_DIR>/subagent.json` 或项目 `subagent.json`；
+- 更新本扩展源码或运行依赖；
+- 更新监督协议主版本；
+- 更换本地 package 目录。
+
+### 更新本地源码
+
+```bash
+cd <REPOSITORY_PATH>
+git pull --ff-only
+npm ci --omit=dev --legacy-peer-deps
+```
+
+本地路径 package 直接引用磁盘内容，`pi update --extensions` 不会拉取本仓库或重新安装其依赖。更新后应重新启动 Pi。
+
+### 卸载
+
+用户级来源：
+
+```bash
+pi remove "<REPOSITORY_PATH>"
+```
+
+项目级来源：
+
+```bash
+cd <PROJECT_DIR>
+pi remove "<REPOSITORY_PATH>" -l
+```
+
+移除命令只删除 Pi 设置中的来源引用，不会删除仓库或 `node_modules`。
 
 ## 故障排查
 
-### 没有管理工具、Agents widget 或 `/agent`
+### 没有管理工具、`Agents` widget 或 `/agent`
 
-先检查：
+依次检查：
 
-```powershell
+```bash
 node --version
 pi --version
 pi list
 ```
 
 - Node 必须至少为 `22.19.0`，Pi 必须至少为 `0.84.1`。
-- 确认本地 package 路径存在，且已执行 `npm ci --omit=dev --legacy-peer-deps`。
-- Windows 需要从 `PATH` 调用 `powershell.exe`，并需要 Pi 可用的 Bash。
-- 项目级 `-l` 安装和项目模板都要求根项目获信任；检查是否误用了 `--no-approve`，或尚未在交互式 Pi 中作出授权决定。
-- 若通过 `-e` 试用，确认本次 Pi 启动命令包含正确的 source。
+- 确认 `<REPOSITORY_PATH>` 存在，且已安装生产依赖。
+- 确认本次启动包含 `-e "<REPOSITORY_PATH>"`，或 package 已持久安装。
+- Windows 上确认 Bash 和 `powershell.exe` 可用。
+- 查看 TUI 是否出现 `host_capability_unavailable`。
 
-门禁失败不会留下半套工具。修复环境后重启 Pi。
+修复门禁问题后重新启动 Pi。
 
-### `template_invalid` 或模板未出现
+### 模板没有出现或返回 `template_invalid`
 
-检查：
+检查以下项目：
 
-- 文件必须在 `~/.pi/agent/agents` 或已信任项目的 `.pi/agents` 直属目录，且后缀是小写 `.md`。
-- 文件开头必须立即是 `---`，frontmatter 必须是 YAML 对象。
-- `description` 必填；`tools` 与 `extensions` 必须写成 YAML 数组，例如 `tools: [read, grep]` 或多行数组。
-- `allowSubagents` 和 `contextFiles` 必须是 `true` / `false`，不是字符串或旧枚举。
-- 不要使用未知字段，也不要使用 YAML merge。
-- 同名无效项目模板会遮蔽有效用户模板。
-- 新增、删除或改名后在根会话执行 `/reload`，使变更用于未来 child 创建。
+- 文件位于 `<PI_AGENT_DIR>/agents` 或已授权项目的 `.pi/agents` 直属目录；
+- 后缀是严格小写 `.md`，文件编码是 UTF-8；
+- 文件第一行就是 `---`，frontmatter 是 YAML mapping；
+- `description` 存在且非空；
+- `tools` 与 `extensions` 是 YAML 字符串数组；
+- `allowSubagents` 和 `contextFiles` 是原生布尔值；
+- 没有未知字段、重复键、YAML merge 或保留工具名；
+- 没有同名无效项目模板遮蔽用户模板。
 
-TUI 诊断只显示安全原因；它不会显示正文或绝对路径。
+修复后执行 `/reload`，再重新调用 `get_agent_templates`。
 
-### extension source、工具或模型无法满足模板
+### `template_capability_unavailable` 或 `capability_mismatch`
 
-- `extensions: []` 会关闭普通发现。若 child 依赖用户级、项目级或已安装 provider extension，请省略 `extensions`，或将所需 source 显式列入数组。
-- 使用显式 `tools` 时，extension 注册的业务工具还必须显式写入 `tools`；否则它虽可加载，但不会成为可调用业务工具。
-- 相对本地 source 相对模板目录，而不是相对项目 cwd。检查 `./` / `../` 路径是否以该目录为基点。
-- 远程 source 应使用 Pi 支持的 `npm:`、`git:` 或完整 URL 格式；确认网络、git 认证和 source 版本可用。
-- `capability_mismatch` 表示 child 实际启动后的能力与模板不一致。不要把它理解为父会话当前工具列表的简单子集错误。
+- `template_capability_unavailable`：当前调用者没有递归管理能力，或已到达允许的创建层级。
+- `capability_mismatch`：子代理已经启动并上报实际能力，但工具、模型、thinking 或本扩展入口与请求不一致。
+- 显式 `extensions: []` 会关闭普通扩展发现；依赖其他扩展或 provider 时应省略该字段，或显式列出所需 source。
+- 显式 `tools` 必须包含模板扩展所注册且任务需要调用的业务工具。
+- 模板指定的模型和 thinking 必须在子代理实际启动环境中可用。
 
-### reload 或本地更新后行为与预期不同
+### `spawn_failed` 或 `spawn_timeout`
 
-- `/reload` 重新发现模板和资源，只用于之后创建的 child；它不影响任何已存在 child。
-- `subagent.json` 在根启动时冻结；修改它需要结束并新建根会话。
-- 本地路径 source 不会被 `pi update --extensions` 更新。更新源码和依赖后应退出并重新启动 Pi；新增模板或资源需要用于未来 child 时，可在根会话执行 `/reload`。
-- 若改变了监督协议主版本或自扩展入口无法再被解析，请退出并重新启动 Pi。
+- 检查 Pi、模型认证、模板 extension source、网络和运行依赖。
+- 检查相对 extension source 是否确实相对 `<TEMPLATE_DIR>` 可解析。
+- `spawn_timeout` 表示启动期限内没有形成完整就绪事实，可以在确认环境后重试。
+- `spawn_failed` 不应原样反复重试，应先修复来源、模型、平台或依赖问题。
 
-### 节点停在 `interrupting`、`suspended`、`failed` 或 `terminating`
+### `message_delivery_failed` 或 `suspended`
 
-- `interrupting`：当前任务仍在形成 interrupted final；长期无结果时显式终止。
-- `suspended`：交付或维护状态不可确认。先查询状态，不要把它当作完成或无条件重发任务。
-- `failed`：节点不会自动恢复；根据稳定错误码排查后终止以释放名额。
-- `terminating`：资源清理尚未确认。若错误为 `termination_incomplete`，稍后对同一直接 child 重试终止。
+这表示消息交付或维护状态无法确认，不等于“消息未处理”。先调用 `get_agent_status` 检查 `state`、`activity.phase`、三类队列计数和 `last_task`，再决定继续等待、发送恢复指令或人工处理。不要盲目重发可能产生副作用的任务。
 
-## 本地开发
+### `termination_incomplete`
 
-安装开发依赖并运行仓库检查：
+目标仍处于 `terminating`，表示部分进程或子树资源尚未确认回收。稍后对同一直接子代理再次调用 `terminate_agent`；不要把它当作已经终止。
 
-```powershell
-Set-Location D:\path\to\pi-subagents-wj
+### reload 或更新后行为没有变化
+
+- `/reload` 只改变未来创建的子代理，不会重建现有节点。
+- `subagent.json` 只在根会话启动时读取。
+- 本地源码和依赖更新后需要退出并重新启动 Pi。
+- 本地路径 package 不受 `pi update --extensions` 管理。
+
+## 开发与调试
+
+### 安装开发依赖
+
+```bash
+git clone https://github.com/nlbwqmz/pi-subagents-wj.git
+cd pi-subagents-wj
 npm ci --legacy-peer-deps
+```
+
+本项目不需要启动开发服务器。
+
+### 常用脚本
+
+| 命令 | 作用 |
+| --- | --- |
+| `npm run typecheck` | 使用 TypeScript 执行 `--noEmit` 类型检查 |
+| `npm test` | 使用 Node test runner 运行 `test/*.test.ts` |
+| `npm run check` | 依次执行类型检查和全部测试 |
+| `npm run build:bridge` | 将 RPC bridge 编译到 `dist/` |
+| `npm run pack:smoke` | 打包 tarball，并在 `package-smoke/` 中执行隔离生产安装 |
+
+源码开发时，若 `dist/` 中没有编译 bridge，运行时会回退到 `src/rpc-bridge-process.ts`。打包时 `prepack` 会自动执行 `build:bridge`。
+
+`npm run pack:smoke` 会生成 `dist/` 和 `package-smoke/`。验证完成、且没有 Pi 设置继续引用 smoke package 后，应删除这些生成目录。
+
+### 运行单个测试
+
+```bash
+node --experimental-strip-types --test test/agent-controller.test.ts
+```
+
+按测试名称过滤：
+
+```bash
+node --experimental-strip-types --test --test-name-pattern="中断" test/agent-controller.test.ts
+```
+
+### 使用 Node Inspector 调试测试
+
+单进程运行目标测试并在第一行暂停：
+
+```bash
+node --inspect-brk --experimental-strip-types --test --experimental-test-isolation=none test/agent-controller.test.ts
+```
+
+随后使用浏览器 DevTools 或 IDE 附加到 Node 默认 inspector 端口。只调试一个测试文件，避免多个 test worker 竞争调试端口。
+
+### 在真实 Pi 宿主中调试
+
+1. 先运行仓库检查：
+
+```bash
+cd <REPOSITORY_PATH>
 npm run check
 ```
 
-`npm run check` 依次执行 TypeScript `--noEmit` 类型检查和 Node 测试，不会启动开发服务。
+2. 在 `<PI_AGENT_DIR>/agents` 或 `<PROJECT_DIR>/.pi/agents` 准备一个最小模板。
+3. 从目标项目一次性加载源码 package：
 
-如需构建隔离 smoke package：
+```bash
+cd <PROJECT_DIR>
+pi --verbose -e "<REPOSITORY_PATH>"
+```
 
-```powershell
+4. 验证以下旅程：创建子代理、发送任务、等待 final、复用节点、中断节点、打开 `/agent`、终止节点。
+5. 使用 Pi 隐藏命令 `/debug` 生成 `pi-debug.log`，检查 TUI 渲染和最近发送给模型的消息。日志可能包含项目上下文，分享前必须脱敏。
+6. 退出根 Pi 会话后确认没有遗留由本次测试创建的子进程、临时 pipe/socket 或 smoke 目录。
+
+### 提交前检查
+
+```bash
+npm run check
+git status --short
+git diff -- README.md
+```
+
+涉及发布装配或 bridge 的改动还应执行：
+
+```bash
 npm run pack:smoke
 ```
 
-该命令在仓库根目录创建 `package-smoke` 安装目录。完成验证后，先移除测试项目中登记的 package source，再确认目标路径无误后删除该临时目录。
-
-更多项目背景和架构依据见：
+## 项目文档
 
 - [领域上下文](./CONTEXT.md)
 - [完整规格](./.scratch/pi-subagent-spec/spec.md)
 - [架构决策记录](./docs/adr/)
+- [Issue 跟踪说明](./docs/agents/issue-tracker.md)
