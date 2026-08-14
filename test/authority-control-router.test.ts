@@ -70,10 +70,15 @@ function template(): TemplateDefinition {
   return Object.freeze({
     templateId: "worker",
     source: "project" as const,
-    tools: Object.freeze(["read"]),
+    templateDirectory: "D:/templates",
     description: "受控模板",
-    subagents: "inherit" as const,
-    contextFiles: "disabled" as const,
+    tools: Object.freeze(["read"]),
+    extensions: Object.freeze([Object.freeze({
+      source: "./audit-extension.ts",
+      displaySource: "audit-extension",
+    })]),
+    allowSubagents: true,
+    contextFiles: false,
     systemPromptMode: "replace" as const,
     model: "provider/model",
     thinking: "high" as const,
@@ -136,12 +141,27 @@ test("远程端口经请求相关器调用根权威并保留完整模板语义",
     template_id: "worker",
     description: "受控模板",
     tools: ["read"],
+    extensions: ["audit-extension"],
   }]);
-  assert.doesNotMatch(JSON.stringify(templates), /source|body|model|thinking|context_files|subagents/);
+  assert.doesNotMatch(JSON.stringify(templates), /source|template_directory|body|model|thinking|context_files|allow_subagents|subagents/);
   const resolved = expectSuccess(await remote.resolveTemplate(actor, "worker"));
-  assert.equal(resolved.template.systemPromptMode, "replace");
-  assert.equal(resolved.template.contextFiles, "disabled");
-  assert.equal(resolved.template.body, "只通过受认证控制请求传输的模板正文");
+  const resolvedTemplate = resolved.template as unknown as {
+    readonly allowSubagents: boolean;
+    readonly contextFiles: boolean;
+    readonly templateDirectory: string;
+    readonly extensions: readonly { readonly source: string; readonly displaySource: string }[] | undefined;
+    readonly body: string;
+    readonly systemPromptMode: string;
+  };
+  assert.equal(resolvedTemplate.systemPromptMode, "replace");
+  assert.equal(resolvedTemplate.allowSubagents, true);
+  assert.equal(resolvedTemplate.contextFiles, false);
+  assert.equal(resolvedTemplate.templateDirectory, "D:/templates");
+  assert.deepEqual(resolvedTemplate.extensions, [{
+    source: "./audit-extension.ts",
+    displaySource: "audit-extension",
+  }]);
+  assert.equal(resolvedTemplate.body, "只通过受认证控制请求传输的模板正文");
   const grant = expectSuccess(await remote.reserveChild(actor, {
     template_id: "worker",
     template_revision: resolved.template_revision,
@@ -216,6 +236,121 @@ test("远程端口拒绝夹带未声明节点字段的权威响应", async () =>
   server.close();
 });
 
+test("完整模板 wire 可省略 tools 与 extensions，并保留布尔能力字段", async () => {
+  const links = linkPair();
+  const server = new SupervisorControlServer(links.parent, async (request) => Object.freeze({
+    operation_id: request.operation_id,
+    ok: true as const,
+    data: Object.freeze({
+      template: Object.freeze({
+        template_id: "minimal",
+        source: "user",
+        template_directory: "D:/templates",
+        description: "最小受控模板",
+        allow_subagents: false,
+        context_files: true,
+        system_mode: "append",
+        body: "",
+      }),
+      template_revision: 1,
+    }),
+  }));
+  const client = new SupervisorControlClient(links.child, 1_000);
+  const remote = new RemoteTreeAuthorityPort(A_ID, client);
+  const result = expectSuccess(await remote.resolveTemplate(
+    Object.freeze({ kind: "agent" as const, agent_id: A_ID }),
+    "minimal",
+  ));
+  const resolved = result.template as unknown as Record<string, unknown>;
+
+  assert.equal(resolved.allowSubagents, false);
+  assert.equal(resolved.contextFiles, true);
+  assert.equal(resolved.tools, undefined);
+  assert.equal(resolved.extensions, undefined);
+  client.close();
+  server.close();
+});
+
+test("完整模板 wire 拒绝旧的 subagents 能力字段", async () => {
+  const links = linkPair();
+  const server = new SupervisorControlServer(links.parent, async (request) => Object.freeze({
+    operation_id: request.operation_id,
+    ok: true as const,
+    data: Object.freeze({
+      template: Object.freeze({
+        template_id: "legacy",
+        source: "user",
+        template_directory: "D:/templates",
+        description: "旧字段不应通过",
+        allow_subagents: true,
+        context_files: true,
+        system_mode: "append",
+        body: "",
+        subagents: "inherit",
+      }),
+      template_revision: 1,
+    }),
+  }));
+  const client = new SupervisorControlClient(links.child, 1_000);
+  const remote = new RemoteTreeAuthorityPort(A_ID, client);
+  const result = await remote.resolveTemplate(
+    Object.freeze({ kind: "agent" as const, agent_id: A_ID }),
+    "legacy",
+  );
+
+  assert.equal(result.ok, false);
+  if (result.ok) throw new Error("预期拒绝旧模板 wire");
+  assert.equal(result.error.code, "internal_error");
+  client.close();
+  server.close();
+});
+
+test("权威响应快照接受固定的 capability_mismatch 故障", async () => {
+  const links = linkPair();
+  const server = new SupervisorControlServer(links.parent, async (request) => Object.freeze({
+    operation_id: request.operation_id,
+    ok: true as const,
+    data: Object.freeze({
+      action: "get_agent_status",
+      node: Object.freeze({
+        agent_id: B_ID,
+        parent_agent_id: A_ID,
+        template_id: "worker",
+        name: "B",
+        depth: 2,
+        state: "failed",
+        mailbox_pending_count: 0,
+        host_pending_count: 0,
+        reply_outbox_pending_count: 0,
+        revision: 2,
+        created_at: "2026-08-06T07:59:59.000Z",
+        lifecycle_elapsed_ms: 1_000,
+        error: Object.freeze({
+          code: "capability_mismatch",
+          message: "代理能力不匹配",
+          retryable: false,
+        }),
+      }),
+      tree_revision: 1,
+    }),
+  }));
+  const client = new SupervisorControlClient(links.child, 1_000);
+  const remote = new RemoteTreeAuthorityPort(A_ID, client);
+  const result = expectSuccess(await remote.admitControl(
+    Object.freeze({ kind: "agent" as const, agent_id: A_ID }),
+    B_ID,
+    "get_agent_status",
+  ));
+
+  assert.deepEqual(result.node.error, {
+    code: "capability_mismatch",
+    message: "代理能力不匹配",
+    retryable: false,
+  });
+  client.close();
+  server.close();
+});
+
 test("中间父只扩展 route，深层创建仍由同一个根权威分配身份和全树名额", async () => {
   const { tree, authority } = await createAuthority();
   const revision = (expectSuccess(await authority.resolveTemplate(
@@ -249,6 +384,7 @@ test("中间父只扩展 route，深层创建仍由同一个根权威分配身�
     template_id: "worker",
     description: "受控模板",
     tools: ["read"],
+    extensions: ["audit-extension"],
   }]);
   const resolved = expectSuccess(await remote.resolveTemplate(actor, "worker"));
   const c = expectSuccess(await remote.reserveChild(actor, {
@@ -274,6 +410,7 @@ test("远程模板目录解析拒绝额外配置字段", async () => {
     ok: true as const,
     data: Object.freeze([Object.freeze({
       template_id: "worker",
+      description: "受控模板",
       tools: Object.freeze(["read"]),
       body: "不得进入模型可见目录",
     })]),

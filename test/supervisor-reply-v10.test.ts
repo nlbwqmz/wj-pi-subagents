@@ -67,15 +67,15 @@ function receiveAndAck(
   return result;
 }
 
-test("v10 reply wire payload contains only reply_seq and envelope", () => {
+test("v11 reply wire payload contains only reply_seq and envelope", () => {
   const pair = readyPair();
   const value = envelope();
   const frame = pair.child.publishReply(value);
-  assert.equal(frame.protocol, "pi-subagent/10");
+  assert.equal(frame.protocol, "pi-subagent/11");
   assert.deepEqual(frame.payload, { reply_seq: 1, envelope: value });
 });
 
-test("v10 rejects v8/v9 frames and reply envelopes with a forged agent identity", () => {
+test("v11 rejects v8/v9 frames and reply envelopes with a forged agent identity", () => {
   const legacyPair = readyPair();
   const valid = legacyPair.child.publishReply(envelope());
   const v8 = { ...valid, protocol: "pi-subagent/8" } as unknown as SupervisorFrame;

@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { parseAgentFault } from "../src/agent-snapshot-codec.ts";
 import {
   ROOT_TREE_ACTOR,
   TreeController,
+  controlFailure,
   isCanonicalUuid,
   isCanonicalUuidV4,
   type ControlResult,
@@ -185,7 +187,7 @@ test("管理能力沿直接父、模板禁用与深度逐级收窄，不能由�
   const disabled = expectSuccess(tree.reserveStartingChild(ROOT_TREE_ACTOR, {
     templateId: "leaf-template",
     name: "叶代理",
-    subagents: "disabled",
+    allowSubagents: false,
   }));
   rememberOutcome(tree, disabled);
   expectSuccess(applyEvent(tree, disabled.node.agent_id, { type: "startup_ready" }));
@@ -199,10 +201,48 @@ test("管理能力沿直接父、模板禁用与深度逐级收窄，不能由�
     tree.reserveStartingChild({ kind: "agent", agent_id: disabled.node.agent_id }, {
       templateId: "attempted-reenable",
       name: "不应创建",
-      subagents: "inherit",
+      allowSubagents: true,
     }),
     "template_capability_unavailable",
   );
+});
+
+test("capability_mismatch 使用固定公开故障，并由快照 codec 与生命周期接受", () => {
+  const failure = controlFailure("capability_mismatch");
+  assert.deepEqual(failure.error, {
+    code: "capability_mismatch",
+    message: "代理能力不匹配",
+    retryable: false,
+    details: {},
+  });
+  assert.deepEqual(parseAgentFault({
+    code: "capability_mismatch",
+    message: "代理能力不匹配",
+    retryable: false,
+  }), {
+    code: "capability_mismatch",
+    message: "代理能力不匹配",
+    retryable: false,
+  });
+  assert.equal(parseAgentFault({
+    code: "capability_mismatch",
+    message: "错误的故障文本",
+    retryable: false,
+  }), undefined);
+
+  const tree = controller();
+  const created = reserveRootChild(tree);
+  expectSuccess(applyEvent(tree, created.node.agent_id, { type: "startup_ready" }));
+  const failed = expectSuccess(applyEvent(tree, created.node.agent_id, {
+    type: "runtime_failed",
+    error_code: "capability_mismatch",
+  }));
+  assert.equal(failed.node.state, "failed");
+  assert.deepEqual(failed.node.error, {
+    code: "capability_mismatch",
+    message: "代理能力不匹配",
+    retryable: false,
+  });
 });
 
 test("资源生命周期与任务投影各自只接受闭集事实，资源代际丢弃迟到事件", () => {

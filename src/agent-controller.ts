@@ -250,19 +250,12 @@ export class AgentController {
       if (!preflight.ok) return preflight;
       template = preflight.data;
     }
-    if (template !== undefined && this.validateTemplate !== undefined) {
-      try {
-        const validated = this.validateTemplate(template, this.actor);
-        if (!validated.ok) return validated;
-      } catch {
-        return controlFailure("internal_error");
-      }
-    }
-
+    // 模板专属 extension 可以注册父会话未知的工具或 provider；只有 child
+    // 完成 extension bind 后的 capability manifest 才能裁决实际可用性。
     const reservation: ReserveStartingChildInput = Object.freeze({
       templateId: input.template_id,
       name: input.name,
-      ...(template === undefined ? {} : { subagents: template.subagents }),
+      ...(template === undefined ? {} : { allowSubagents: template.allowSubagents }),
     });
     let grant: SpawnGrant | undefined;
     if (this.authority !== undefined) {

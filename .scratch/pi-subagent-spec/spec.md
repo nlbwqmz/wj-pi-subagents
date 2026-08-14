@@ -111,7 +111,9 @@ Node 版本低到宿主 Pi 本身无法启动时，由 Node/Pi 既有启动路�
 
 `cwd` 不是文件系统访问边界。只要模型可见工具和宿主权限允许，子代理可以使用绝对路径或 `..` 访问工作目录之外的文件。扩展不得额外实现 cwd 沙箱；隐藏一个工具也不代表仍可见的 `bash`、扩展或其他工具失去同等宿主权限。
 
-**REQ-008**：根会话的 project trust 结果必须原样传给整棵树，只控制项目设置、扩展、技能、提示模板和系统提示等项目资源是否加载，不限制普通文件访问。模板不能提升、降低或重新确认该信任。
+**REQ-008**：根会话的 project trust 结果必须在建立根运行时一次捕获，并原样传给整棵树。每个 child 启动时必须显式传递相同的 Pi `--approve` 或 `--no-approve`，不得重新读取、提示、提升、降低或绕过该结论。project trust 只控制项目设置、项目包、项目扩展、skills、提示模板、主题和项目系统提示等项目资源是否加载，不限制普通文件访问；Pi 的 `AGENTS.md`/`CLAUDE.md` context files 不受该 trust 保护，是否加载仅由模板的 `contextFiles` 决定。
+
+模板 extension source 的信任边界与 project trust 分开定义：用户模板属于本机用户已选择的输入；项目模板只有在根 project trust 为真时才参与发现。模板中显式传给 child 的 `-e/--extension` source，无论是本地路径、npm 还是 git，都是可执行代码来源；Pi 的 `--no-extensions` 和 `--no-approve` 都不会阻止显式 `-e`。因此，项目模板的远程 source 只有在项目模板已经获信任后才会被采纳，用户模板的远程 source 由本机用户模板的信任承担；不存在额外的 Pi remote-source 审批、签名、锁定或沙箱承诺。远程 source 可能下载包、执行安装脚本或加载任意扩展代码，必须按当前用户权限和模板作者信任边界评估，不能被表述为受 project trust 隔离。
 
 建立代理树时必须捕获一次根环境快照，所有后代从该快照启动，不继承中间父进程后续环境修改。控制器只可追加不可覆盖的节点身份、父标识、深度、`maxDepth`、根关联和协议版本等内部元数据。环境秘密不得进入状态、树、错误、UI、监督帧或日志。
 
@@ -146,38 +148,53 @@ Node 版本低到宿主 Pi 本身无法启动时，由 Node/Pi 既有启动路�
 **REQ-011**：根控制器只从以下两个目录发现 UTF-8 Markdown 模板，并且只扫描直属 `*.md`，不递归：
 
 - 用户级：`~/.pi/agent/agents/*.md`；
-- 项目级：`<cwd>/.pi/agents/*.md`，仅在根 project trust 允许时参与。
+- 项目级：`<cwd>/.pi/agents/*.md`，仅在根 project trust 为真时参与。
 
-接受直属普通文件和符号链接；失效或不可读链接是无效候选。缺失目录是正常空来源；目录存在但无法枚举时产生来源诊断，并继续使用另一来源。
+接受直属普通文件和符号链接；失效或不可读链接是无效候选。缺失目录是正常空来源；目录存在但无法枚举时产生来源诊断，并继续使用另一来源。项目模板是否参与完全由根已捕获的 project trust 决定，不因 child 的 cwd、模板正文、extension source 或 reload 重新判断。
 
 **REQ-012**：`template_id` 是原始文件名去掉末尾 `.md` 的精确值。它区分大小写，不裁剪、不转写、不做 Unicode 归一化、别名或模糊匹配，也不增加扩展级字符限制。frontmatter 不提供 `name`。根 project trust 是项目模板唯一人工确认边界；信任后根和所有后代使用项目模板不再逐次确认。
 
-### 4.2 Markdown 与 frontmatter schema
+### 4.2 Markdown、frontmatter 与 extension source schema
 
-**REQ-013**：每个模板必须有可解析 YAML frontmatter；Markdown 正文允许为空，UTF-8 编码后不得超过 `64 KiB`。已知字段如下：
+**REQ-013**：每个模板必须有可解析 YAML frontmatter；Markdown 正文允许为空，UTF-8 编码后不得超过 `64 KiB`。frontmatter 必须是严格 YAML mapping，禁止重复键、非字符串键、YAML merge 键和未知键。字段闭集及语义如下：
 
 | 字段 | 类型与默认值 | 规范语义 |
 | --- | --- | --- |
-| `tools` | 必填 YAML 字符串 | `""` 是唯一合法空工具集；非空值按逗号拆分、裁剪、丢弃空项、按首次顺序去重；规范化后为空无效 |
-| `description` | 可选字符串 | 裁剪后只作父代理展示元数据，可由 `get_agent_templates` 返回；空值等同无描述 |
-| `subagents` | `inherit` 或 `disabled`，默认 `inherit` | `disabled` 对当前节点及所有后代关闭整组管理工具 |
-| `contextFiles` | `enabled` 或 `disabled`，默认 `enabled` | 只控制固定 `cwd` 祖先链的 `AGENTS.md`/`CLAUDE.md` |
-| `systemPromptMode` | `append` 或 `replace`，默认 `append` | 决定正文追加或替换项目与角色提示层 |
-| `model` | 可选规范 `provider/model` 字符串 | 省略时捕获直接父会话当前精确模型；显式值必须精确匹配模型目录 |
-| `thinking` | 可选枚举 | `off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`；省略时捕获父会话实际等级 |
+| `description` | 必填 YAML 字符串 | 裁剪后必须非空，最多 `512` 个 Unicode code point；是 `get_agent_templates` 必返的展示元数据 |
+| `extensions` | 可选 YAML 字符串数组 | 缺失、显式 `[]`、非空数组是三个不同状态；每项裁剪后必须非空且按裁剪值唯一，保持首次顺序 |
+| `tools` | 可选 YAML 字符串数组 | 缺失、显式 `[]`、非空数组是三个不同状态；每项裁剪后必须非空且按裁剪值唯一，保持首次顺序 |
+| `allowSubagents` | 可选 YAML 布尔值，默认 `true` | 是否为该节点授予整组子代理管理能力；`false` 不能被后代重新开启 |
+| `contextFiles` | 可选 YAML 布尔值，默认 `true` | 是否允许 Pi 读取固定 `cwd` 祖先链和 agentDir 中的 context files |
+| `systemPromptMode` | `append` 或 `replace`，默认 `append` | 决定正文追加到、或替换模板可控制的基础提示层 |
+| `model` | 可选规范 `provider/model` 字符串 | 省略时在创建时捕获直接父会话当前 provider/model；显式值只在 schema 阶段检查格式 |
+| `thinking` | 可选枚举 | `off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`；省略时在创建时捕获直接父会话当前等级 |
 
-未列出的字段一律静默忽略，不进入运行配置，也不产生诊断。因此 `name`、`env`、`skills`、`extensions`、`promptTemplates` 和 project trust 字段都不起作用。
+`tools` 不得包含八个管理工具或 `reply_to_parent`，这些保留名使候选无效；发现层不查询父会话工具表，也不把未知业务工具名判为无效。`extensions` 与 `tools` 的三态必须在根权威、递归控制 wire、未来创建工厂和模型可见目录中保持：缺失字段省略，显式空数组保留为 `[]`，非空数组保留规范化后的顺序。
 
-frontmatter 缺失或解析失败、文件不可读、已知字段类型/枚举错误、未知业务工具名、显式模型格式错误或 thinking 格式错误都使候选模板无效。`tools: " , "` 无效；`tools: "read, , grep, read"` 规范化为 `read, grep`。
+`extensions` 每项是一个 Pi 显式 `-e/--extension` source。发现层只验证其为非空字符串，不访问网络、包缓存或目标路径；child 启动时按 Pi source grammar 解释：
+
+- 以 `npm:` 或 `git:` 开头的值保留为 Pi npm/git source；
+- 匹配 `<scheme>://...` 的 URI 或以 `git@` 开头的值原样保留并交给 Pi source parser；
+- 其余值一律走本扩展的 local-path fallback。绝对路径保持绝对；相对路径必须以模板所在目录而不是 child `cwd` 解析为有效绝对路径后再传入 child。因而 bare package name、`github:...` 等未落入前两类的字符串在当前实现中不是隐式 npm/git source。
+
+解析器保留 YAML 原始 source，同时生成裁剪后的 `display source`；运行时按后者分类并构造 `-e` 参数。模型目录和 UI 只可见 `display source`，不得暴露模板所在目录或 local fallback 解析后的绝对路径。根向后代传递模板时，模板目录只属于受认证控制/启动数据，绝不能进入模型可见目录或公开状态。Pi 的 source parser 仍可能在实际安装或加载阶段失败，该失败不是模板发现诊断。
+
+frontmatter 缺失或解析失败、文件不可读、未知字段、已知字段类型/枚举错误、空/重复数组项、保留工具名、显式模型格式错误或 thinking 格式错误都使候选模板无效。候选诊断包含稳定原因，以及可选安全的字段名、行、列；不得包含正文、绝对路径、环境、OS 异常或堆栈。
 
 模板示例：
 
 ```markdown
 ---
 description: 汇总并核对外部资料
-tools: read, grep, find
-subagents: inherit
-contextFiles: enabled
+extensions:
+  - ./extensions/research-tools.ts
+  - npm:@example/pi-research-tools@1.2.3
+tools:
+  - read
+  - grep
+  - find
+allowSubagents: true
+contextFiles: true
 systemPromptMode: append
 model: openai/gpt-example
 thinking: medium
@@ -192,41 +209,34 @@ thinking: medium
 
 **REQ-014**：项目和用户候选具有相同 `template_id` 时，项目候选整体覆盖用户候选，不合并字段或正文。覆盖在有效性判断之前决定：无效项目候选仍遮蔽有效用户候选，显式创建返回 `template_invalid`；有效项目候选不因被遮蔽用户候选无效而失效。
 
-根必须独立读取和校验所有可信来源候选，包括最终被遮蔽者。有效候选进入有效模板目录并成为 `get_agent_templates` 的唯一数据来源；无效候选进入只含逻辑来源、文件名和安全短原因的诊断索引；来源无法枚举形成无 `template_id` 的来源诊断。无效候选和来源诊断不得进入模型可见模板数组。
+根必须独立读取和校验所有可信来源候选，包括最终被遮蔽者。有效候选进入有效模板目录并成为 `get_agent_templates` 的唯一数据来源；无效候选进入只含逻辑来源、文件名、稳定原因以及可选字段位置的诊断索引；来源无法枚举形成无 `template_id` 的来源诊断。无效候选和来源诊断不得进入模型可见模板数组。
 
 没有选中候选时 `spawn_agent` 返回 `template_not_found`；选中候选无效时返回 `template_invalid`；无法归类的控制器故障才返回 `internal_error`。诊断不得保存或展示正文、绝对路径、环境、OS 异常或堆栈。
 
-根首次发现和每次根 `/reload` 后原子发布模板发现快照。存在诊断时只发送一次根 `ctx.ui.notify(..., "warning")` 汇总；没有诊断时不通知。子代理自身 reload 不重建根快照或重复通知。无 UI 模式仍建立同一快照，但不输出替代诊断。
+根首次发现和每次根 `/reload` 后原子发布模板发现快照。存在诊断时只发送一次根 `ctx.ui.notify(..., "warning")` 汇总；没有诊断时不通知。child 自身 reload 不重建根快照或重复通知。无 UI 模式仍建立同一快照，但不输出替代诊断。
 
-### 4.4 创建预检与上下文继承
+### 4.4 创建、能力握手与上下文继承
 
-**REQ-015**：`spawn_agent` 在预留名额或启动进程前必须完成以下最小静态预检：
+**REQ-015**：`spawn_agent` 在预留名额前只做模板选择、严格 schema、直接父管理权限、深度、模板修订和配额等可由根权威裁决的检查。发现阶段不得再根据父会话当前活动工具、当前模型目录、provider、认证或 thinking 支持范围拒绝模板；模板 extension 可以在 child 中注册父端未知的工具或 provider，父端静态观察不能替代 child 实际加载后的证明。
 
-1. 精确解析当前模板发现快照；
-2. 校验已知 schema 和工具名；
-3. 将模板 `tools` 作为子代理初始业务工具请求，不与直接父会话当前活动工具做子集校验；
-4. 精确解析显式或捕获的 provider/model，并校验当前模型目录、根策略和静态认证可用性；
-5. 校验 thinking 枚举及当前已知模型支持范围；
-6. 校验有效子代理管理能力、深度和名额。
-
-结构、格式或未知工具名问题返回 `template_invalid`。模板合法但模型、认证、thinking 或父授权静态不可满足时返回不可重试的 `template_capability_unavailable`，不得静默削减工具、夹紧 thinking、构造 custom model、预留名额、登记节点或启动进程。
-
-预检不得通过真实模型请求证明最终可用性，也不计算环境、提示、技能、扩展、上下文文件或工具注册表哈希。创建成功只要求监督通道和 Pi RPC 都可通信，不保证运行期资源永不变化。
+模板结构错误返回 `template_invalid`；调用者没有子代理管理能力时返回 `template_capability_unavailable`；深度和名额分别返回其稳定错误码。通过这些检查后才原子预留、登记 `starting` 并启动 child。child 完成 Pi 资源加载、模板 extension bind、监督握手和首个完整快照后，必须上报第 7.2 节的 capability manifest；只有 manifest 通过实际能力核验才可进入 `idle`。有效 manifest 与模板请求不一致时，创建以不可重试 `capability_mismatch` 失败并清理；不得静默删工具、夹紧 thinking、接受 Pi custom-model 回退或假定父端未知 extension 能力可用。
 
 **REQ-016**：模板和子进程上下文必须遵守：
 
 - 子代理不复制父会话渲染后的系统提示或对话历史；
 - `append` 将模板正文追加到项目与角色提示层；`replace` 只替换该层；两者都不能移除安全、所有权、直接父子通信、工具和树控制契约；
-- 每个子代理始终保留只向直接父会话发送工作中回复的运行时契约；模板正文、模板 `tools` 和 `subagents: disabled` 均不能移除、替换或扩大其目标；
-- `contextFiles` 只控制固定 `cwd` 祖先链的 `AGENTS.md`/`CLAUDE.md`，每个模板独立决定；父节点禁用不阻止子模板重新启用；
-- skills、extensions 和 slash prompt templates 不由模板限制，按固定 `cwd`、统一 project trust、用户资源目录和 Pi 正常发现机制加载；
-- prompt template 不自动展开为首条任务；模板也没有 `env` 覆盖。
+- 每个子代理始终保留只向直接父会话发送工作中回复的运行时契约；模板正文、模板 `tools` 和 `allowSubagents: false` 均不能移除、替换或扩大其目标；
+- `tools` 缺失时不施加模板业务工具 allowlist，child 使用 Pi 正常发现的业务工具集合并在 manifest 中如实报告；`tools: []` 是显式零业务工具请求；非空 `tools` 是有序、精确的业务工具 allowlist 请求。后两种情形均可附加必需的 `reply_to_parent` 和获授的管理工具，且 manifest 必须按请求核验；
+- `extensions` 缺失表示模板没有额外显式 source，`extensions: []` 表示显式空 source 列表，非空数组按 YAML 顺序各产生一个 `-e <effective-source>`。无论哪种状态，child 都必须显式加载当前实际的本扩展入口；它不是模板 extension，也不因模板空数组而移除；
+- `contextFiles: false` 必须传 Pi `--no-context-files`；`true` 允许 Pi 正常读取 context files，即使 project trust 为假；
+- 当 `extensions` 缺失时，child 不传 `--no-extensions`，因此保留受根 trust 约束的 Pi 正常 extension/resource 发现和动态 provider；当 `extensions` 为显式空数组或非空数组时，child 必须先传 `--no-extensions`，随后传一个当前本扩展入口的 `-e`，再按数组顺序传每个模板 effective source 的 `-e`。数组规范化已禁止内部重复，但不得因它与本扩展入口或 Pi 自动发现项碰撞而自行删改或重排参数；Pi inline extension factories 不受该开关影响；
+- prompt template 不自动展开为首条任务；模板没有 `env`、cwd、trust、技能或其他资源路径覆盖。
 
 ### 4.5 Reload
 
-**REQ-017**：成功的根 `/reload` 必须原子更新模板发现快照和 Pi 动态业务资源，只影响未来创建；既有节点的模板正文、初始工具请求、模型选择、提示、生命周期和上下文不得回溯改变。运行期业务工具或资源变化不重新执行模板能力预检，不降级、终止或重建节点。
+**REQ-017**：成功的根 `/reload` 必须先完整重建并原子替换模板发现快照，再使该快照只影响未来的 `spawn_agent`。根和所有后代的 `get_agent_templates` 必须通过根权威读取同一最新目录；已经签发的模板 grant、既有监督器、既有 child 树、模板正文、extension source、初始工具请求、模型选择、提示、生命周期和上下文不得被接管、重建、保留后更新或回溯改变。reload 后 Pi 正常动态资源变化也不得重新执行既有节点的 capability manifest 核验，或据此降级、终止、重建节点。
 
-树控制面是例外：reload 后必须按保存的身份、直接父关系、祖先 `subagents` 关闭状态和 `maxDepth` 重新施加八个管理工具的完整可见性，并为所有子运行时重新施加 `reply_to_parent`。成功 reload 通过控制器交接保留代理树与回复协调状态；根和后代的 `get_agent_templates` 必须通过根权威读取 reload 后的同一最新目录，不得继续使用子运行时的旧快照。旧实例只在没有新扩展 factory 接管时使用有界 watchdog；新 factory 开始宿主门禁后必须暂停该 watchdog，并在公开面和生命周期处理器完整注册后才认领旧控制器。已认领的控制器等待 Pi 发出 reload `session_start`，不得因固定 lease 期限误终止。交接窗口中已经通过监督传输接收、但旧 Pi API 未接纳的回复必须按 `reply_seq` 有界保留且不发送 reply ACK；新 API 绑定后重试注入，只有成功进入父会话才累计确认。若新扩展实例未通过宿主兼容门禁，旧控制器必须按终止语义清理全部子代理，不保留旧工具、widget、端点或孤儿进程，也不自动回退旧实例。
+树控制能力是已预留节点的身份事实：reload 只可按保存的 `management_enabled`、直接父关系和 `maxDepth` 重新施加八个管理工具可见性，并为每个 child 重新施加 `reply_to_parent`；新模板的 `allowSubagents` 不得追溯改变既有节点。成功 reload 通过控制器交接保留代理树与回复协调状态。旧实例只在没有新扩展 factory 接管时使用有界 watchdog；新 factory 开始宿主门禁后必须暂停该 watchdog，并在公开面和生命周期处理器完整注册后才认领旧控制器。已认领的控制器等待 Pi 发出 reload `session_start`，不得因固定 lease 期限误终止。交接窗口中已经通过监督传输接收、但旧 Pi API 未接纳的回复必须按 `reply_seq` 有界保留且不发送 reply ACK；新 API 绑定后重试注入，只有成功进入父会话才累计确认。若新扩展实例未通过宿主兼容门禁，旧控制器必须按终止语义清理全部子代理，不保留旧工具、widget、端点或孤儿进程，也不自动回退旧实例。
 
 ## 5. 能力、深度和资源配额
 
@@ -234,15 +244,15 @@ thinking: medium
 
 **REQ-018**：根深度固定为 `0`，每经过一条父子边深度加一。有效 `maxDepth` 是可创建的最大子代理层级。默认 `maxDepth=2` 时，根可创建 A（深度 1），A 可创建 A-1（深度 2），A-1 是叶节点。
 
-八个管理工具是不可拆分的“子代理管理能力”。一个节点只有同时满足以下条件才获得整组工具：
+八个管理工具是不可拆分的“子代理管理能力”。根的能力在根启动时确定；新节点只有同时满足以下条件才获得整组工具：
 
-1. 直接父会话仍有该能力；
-2. 所有祖先模板均未以 `subagents: disabled` 关闭它；
-3. 当前节点 `depth < maxDepth`。
+1. 其直接父会话仍有该能力；
+2. 被选模板的 `allowSubagents` 为 `true`；
+3. 新节点深度严格小于 `maxDepth`。
 
-任一条件不满足时整组隐藏，后代不能重新开启。服务端仍必须重复校验直接父权限和深度；绕过工具发现的模板目录查询返回 `template_capability_unavailable`，创建请求返回 `max_depth_reached` 或相应授权错误。
+根权威必须在原子预留时把结论写入不可提升的 `management_enabled` 身份事实。任一条件不满足时整组隐藏，后代不能通过自己的模板重新开启。服务端仍必须重复校验直接父权限和深度；绕过工具发现的模板目录查询返回 `template_capability_unavailable`，创建请求返回 `max_depth_reached` 或相应授权错误。旧的 `subagents` frontmatter 键不是兼容别名，必须作为未知字段使模板无效。
 
-`reply_to_parent` 不属于八个管理工具。每个子代理无论是否达到 `maxDepth`、是否继承管理能力、模板是否设置 `subagents: disabled`，都必须保留该工具；根会话不得注册它。
+`reply_to_parent` 不属于八个管理工具。每个子代理无论是否达到 `maxDepth`、是否获得管理能力、模板是否设置 `allowSubagents: false`，都必须保留该工具；根会话不得注册它。
 
 ### 5.2 名额占用与释放
 
@@ -286,7 +296,7 @@ thinking: medium
 | 当前状态 | 触发 | 下一状态/阶段 | 守卫 |
 | --- | --- | --- | --- |
 | 无节点 | 原子预留、分配身份并登记 | `starting` | 登记先于进程启动 |
-| `starting` | 双握手、首个快照和无副作用 RPC 成功 | `idle` | 此时 `spawn_agent` 才成功 |
+| `starting` | 双握手、首个快照、无副作用 RPC 与 capability manifest 核验成功 | `idle` | 此时 `spawn_agent` 才成功 |
 | `idle` | mailbox 接纳首条消息并分配 `task_id` | `working/reconciling` | 工具可立即返回 accepted |
 | `working` | mailbox 接纳后续消息 | `working` | 中断栅栏前归入当前 task |
 | `working` | 中断被接纳 | `interrupting/processing` | 栅栏后消息属于 successor task |
@@ -365,14 +375,15 @@ thinking: medium
   {
     "template_id": "Explore",
     "description": "Fast codebase exploration agent (read-only)",
-    "tools": ["read", "bash", "grep", "find", "ls"]
+    "extensions": ["./extensions/research-tools.ts"],
+    "tools": ["read", "grep", "find"]
   }
 ]
 ```
 
-每项字段闭集为区分大小写的 `template_id`、可选 `description` 和始终存在的 `tools`。没有描述时省略 `description`；合法空工具模板返回 `tools: []`。`tools` 只包含模板声明并已规范化的业务工具，不得混入八个管理工具或 `reply_to_parent`。结果不得包含模板正文、来源、model、thinking、`subagents`、`contextFiles`、路径、诊断或其他运行配置；无效候选与来源诊断不得枚举。失败仍使用本节统一错误契约。
+每项字段闭集为区分大小写的 `template_id`、必有非空 `description`、可选 `extensions` 和可选 `tools`。字段缺失表示模板没有声明该数组；合法显式空数组必须原样返回 `[]`。`tools` 只包含模板声明并已规范化的业务工具，不得混入八个管理工具或 `reply_to_parent`；`extensions` 只包含裁剪后的 display source，不能泄露模板目录或有效绝对路径。结果不得包含模板正文、来源、模型、thinking、`allowSubagents`、`contextFiles`、路径、诊断或其他运行配置；无效候选与来源诊断不得枚举。失败仍使用本节统一错误契约。
 
-数组只表示根权威当前发现且格式有效的模板，不执行调用者当前模型、thinking 或管理权限的完整创建预检。`tools` 是子代理的初始业务工具请求，不要求是父会话当前活动工具的子集；非空项仍可能在 `spawn_agent` 返回 `template_capability_unavailable`。根 `/reload` 后，根和所有后代查询必须立即读取根权威发布的同一最新目录。
+数组只表示根权威当前发现且格式有效、且调用者有管理能力访问的模板，不预测 parent 当前工具、模型、provider、认证、thinking 或模板 extension 实际加载结果。`tools` 不要求是 parent 当前活动工具的子集；其实际结果只能在 child capability manifest 后裁决，因而列出的项仍可能使 `spawn_agent` 返回 `capability_mismatch`。根 `/reload` 后，根和所有后代查询必须立即读取根权威发布的同一最新目录。
 
 ### 6.5 `spawn_agent`
 
@@ -382,11 +393,11 @@ thinking: medium
 { "template_id": "researcher", "name": "资料代理" }
 ```
 
-不得携带首条任务，也不得覆盖 cwd、环境、模型、thinking、工具、扩展、技能、提示、信任、深度或配额。首条任务必须另行调用 `send_message`。
+不得携带首条任务，也不得覆盖 cwd、环境、模型、thinking、工具、extension source、技能、提示、trust、深度或配额。首条任务必须另行调用 `send_message`。
 
-模型调用前必须先调用 `get_agent_templates`，并原样复制当前返回项的 `template_id`。标识区分大小写，不得猜测、裁剪、改写、做 Unicode 归一化或使用 `description` 代替。模板 `tools` 不要求是父会话活动工具的子集；若目录返回 `[]`，不得调用 `spawn_agent`；非空目录不替代本次创建预检。
+模型调用前必须先调用 `get_agent_templates`，并原样复制当前返回项的 `template_id`。标识区分大小写，不得猜测、裁剪、改写、做 Unicode 归一化或使用 `description` 代替。若目录返回 `[]`，不得调用 `spawn_agent`；非空目录不替代根权威裁决、child 启动或 capability 核验。
 
-创建顺序为：静态模板/能力预检，原子预留与登记，进程树监督绑定，子进程启动，父子监督握手与首个快照，无副作用 Pi RPC 请求/响应，最后进入 `idle`。成功最小结果：
+创建顺序为：当前根快照精确解析和根权威裁决，原子预留与 `starting` 登记，进程树监督绑定，child 启动并加载实际 Pi CLI/module、当前本扩展入口及模板显式 extension source，监督握手与首个快照，无副作用 Pi RPC 请求/响应，child capability manifest 上报和父端核验，最后进入 `idle`。父端不得在此流程前以当前工具表、模型目录、provider 或认证静态拒绝模板。成功最小结果：
 
 ```json
 {
@@ -401,7 +412,7 @@ thinking: medium
 }
 ```
 
-启动或协议失败返回 `spawn_failed`，启动期限内未就绪返回 `spawn_timeout`。返回前必须确认残余资源回收并释放名额；若无法确认，则顶层改为 `termination_incomplete`，节点保持 `terminating`，安全详情保留原始启动错误和诊断 `agent_id`。
+有效 capability manifest 与模板/控制身份请求不一致时返回 `capability_mismatch`。启动、Pi 资源加载、显式 source 解析、桥接、握手、快照、协议或无副作用 RPC 失败返回 `spawn_failed`；启动期限内未获得完整可验证的就绪事实返回 `spawn_timeout`。三种失败都必须先终止并确认残余资源回收后释放名额；若资源无法确认，则顶层改为 `termination_incomplete`，节点保持 `terminating`。公开 error 的 `details` 固定为空，状态、UI、日志和工具结果不得保留原始启动错误、模板正文、source、绝对路径、凭据、端点或诊断 `agent_id`。
 
 ### 6.6 `send_message`
 
@@ -600,19 +611,20 @@ thinking: medium
 | `agent_not_found` | 标识不在当前根注册表或属于其他根 | 不可重试 |
 | `not_direct_child` | 节点存在但不是调用者直接子代理 | 不可重试 |
 | `template_not_found` | 当前可信来源没有选中候选 | 不可重试 |
-| `template_invalid` | 选中模板存在但格式或已知字段无效 | 修正模板后再调用 |
-| `template_capability_unavailable` | 模板合法但父授权、模型或 thinking 静态不满足 | 更换模板或父配置后再调用 |
+| `template_invalid` | 选中模板存在但 schema、字段类型、source 数组或保留工具名无效 | 修正模板后再调用 |
+| `template_capability_unavailable` | 调用者没有模板/子代理管理能力 | 更换调用位置或父能力后再调用 |
+| `capability_mismatch` | child 已上报有效 manifest，但工具、控制工具来源、模型、thinking 或实际本扩展入口不满足请求 | 不可重试 |
 | `max_depth_reached` | 调用者达到深度上限 | 不可重试 |
 | `max_children_reached` | 直接子代理名额已满 | 完成直接子代理回收后可重试 |
 | `max_tree_agents_reached` | 全树名额已满 | 任一节点完成回收后可重试 |
-| `spawn_failed` | 启动、提前退出、握手、RPC 或协议失败 | 按安全详情判断 |
-| `spawn_timeout` | 启动期限内未进入可通信 `idle` | 可重试 |
+| `spawn_failed` | 启动、Pi 资源/显式 source 加载、提前退出、桥接、握手、RPC 或协议失败 | 不可重试 |
+| `spawn_timeout` | 启动期限内未获得完整可验证的就绪事实 | 可重试 |
 | `agent_unavailable` | 节点当前状态不接受操作 | 不可对当前状态重试 |
 | `message_delivery_failed` | 工作中回复或 final 的监督/父会话接纳无法确认 | 不得盲目重发；先查询任务状态 |
 | `termination_incomplete` | 强制阶段后仍无法确认全部资源退出 | 可幂等重试终止 |
-| `internal_error` | 无法归类的控制器内部异常 | 由实例决定 |
+| `internal_error` | 无法归类的控制器内部异常 | 不可重试 |
 
-不得新增 `template_not_allowed`、配置文件错误、协议阶段、kill 阶段或 cleanup 阶段专用公开码。`host_capability_unavailable` 仅是扩展激活 UI 诊断。
+所有公开 error 的 `details` 是空对象；不得新增 `template_not_allowed`、配置文件错误、协议阶段、kill 阶段、source 解析阶段或 cleanup 阶段专用公开码。`host_capability_unavailable` 仅是扩展激活 UI 诊断。
 
 ## 7. 父子任务与监督协议
 
@@ -621,7 +633,7 @@ thinking: medium
 **REQ-033**：每条直接父子关系必须有两个相互隔离的平面：
 
 1. **Pi 任务通道**：监督器独占子进程 RPC stdin/stdout；承载 prompt/steer、abort、Pi 状态事件和原始 assistant 生命周期输出。
-2. **父子监督通道**：独立本地双向可靠字节流；承载握手、生命周期、完整子树快照、task assignment/start、结构化 reply、逐跳控制、child 发起的直接边压缩请求、parent 业务响应、累计 ACK、重同步和关闭通知。
+2. **父子监督通道**：独立本地双向可靠字节流；承载握手、生命周期、完整子树快照、child 一次性 capability manifest、task assignment/start、结构化 reply、逐跳控制、child 发起的直接边压缩请求、parent 业务响应、累计 ACK、重同步和关闭通知。
 
 Unix 使用本地 Unix socket，Windows 使用命名管道。上层必须用带长度边界的 UTF-8 JSON 帧，不能依赖换行、模型文本、Pi 日志或 `entry_appended` 分帧。控制帧不得成为模型工具、prompt、会话条目或模型上下文。
 
@@ -629,8 +641,8 @@ Unix 使用本地 Unix socket，Windows 使用命名管道。上层必须用带�
 
 ```json
 {
-  "protocol": "pi-subagent/10",
-  "kind": "hello|hello_ack|event|snapshot_request|snapshot|reply|task_assignment|task_started|control_request|control_response|compaction_prepare|compaction_prepared|compaction_complete|compaction_completed|ack|close",
+  "protocol": "pi-subagent/11",
+  "kind": "hello|hello_ack|event|snapshot_request|snapshot|capability|reply|task_assignment|task_started|control_request|control_response|compaction_prepare|compaction_prepared|compaction_complete|compaction_completed|ack|close",
   "stream_id": "stream_...",
   "sender_agent_id": "550e8400-e29b-41d4-a716-446655440000",
   "target_agent_id": "550e8400-e29b-41d4-a716-446655440001",
@@ -640,15 +652,38 @@ Unix 使用本地 Unix socket，Windows 使用命名管道。上层必须用带�
 }
 ```
 
-协议主版本不匹配、未知 kind 或必填字段类型错误是协议故障；同主版本未知可选字段忽略。根发送者使用保留空 `sender_agent_id`，不伪装成代理。接收方必须核对根关联、直接父子身份、目标、深度和当前流。
+协议版本必须精确等于 `pi-subagent/11`；版本不匹配、未知 kind 或必填字段类型错误是协议故障。帧外壳和每种 payload 都是闭集，未知字段不得忽略。根发送者使用保留空 `sender_agent_id`，不伪装成代理。接收方必须核对根关联、直接父子身份、目标、深度和当前流。
 
-### 7.2 握手与子树快照
+### 7.2 握手、能力证明与子树快照
 
 **REQ-034**：每次通道建立生成随机 `stream_id`；单向 `seq` 从 1 单调递增且不复用；`request_id` 在当前根会话内不复用。握手必须验证协议版本、一次性本地连接凭据、根关联、子 `agent_id`、直接父标识、深度和初始完整快照。
 
+child 仅可在普通握手已 ready、终止屏障前向直接 parent 发出一次 `kind: "capability"`。payload 是闭集：必有 `protocol_version: "pi-subagent/11"`、`business_active_tools`、`system_active_tools` 和 `system_tool_sources`；可选 `provider`、`model`、`thinking`、`self_extension_path`。两类 tool 数组是有界安全 token 列表，交集非法；接收端按首次出现顺序去重。`system_tool_sources` 是 system tool 到安全 source token/无 `.` 或 `..` 的本地路径的有界映射，映射键必须属于 `system_active_tools`。可选 model/provider/thinking 与 self extension path 同样受严格 token/path/枚举校验。清单及其缓存是内部启动事实，绝不进入公开状态、树快照、工具结果、UI 或模型上下文。
+
+有效 payload 示例：
+
+```json
+{
+  "protocol_version": "pi-subagent/11",
+  "business_active_tools": ["find", "grep", "read"],
+  "system_active_tools": ["get_agent_templates", "reply_to_parent", "spawn_agent"],
+  "system_tool_sources": {
+    "get_agent_templates": "C:\\package\\extensions\\pi-subagents-wj.ts",
+    "reply_to_parent": "C:\\package\\extensions\\pi-subagents-wj.ts",
+    "spawn_agent": "C:\\package\\extensions\\pi-subagents-wj.ts"
+  },
+  "provider": "openai",
+  "model": "gpt-example",
+  "thinking": "medium",
+  "self_extension_path": "C:\\package\\extensions\\pi-subagents-wj.ts"
+}
+```
+
+parent 只接受一个来自已认证 direct child 的有效 manifest，并原子缓存供迟到内部观察者读取；重复、错误方向、ready 之前、终止后、版本不匹配或格式非法的 capability 帧必须作为协议故障。启动裁决必须等待清单：显式 `tools` 请求须与报告的 business active tools 一致，必需 `reply_to_parent` 和按 grant 获授的管理工具须存在且具有预期系统来源，effective provider/model/thinking 与 child 实际本扩展入口须符合启动请求。模板 `tools` 缺失时不以 parent 当前工具表推断或限制 business tools。有效清单不满足这些关系时是 `capability_mismatch`；清单协议/加载故障是 `spawn_failed`，在启动期限内未得到可核验清单是 `spawn_timeout`。所有这些公开结果只返回固定安全错误，不携带 manifest 或比较细节。
+
 每个子控制器只报告以自身为作用域根的完整子树，并维护单调 `subtree_revision`。快照节点复用安全树字段，不能包含 prompt、回复正文、工具参数/结果、路径、环境、端点、句柄或堆栈。父控制器必须完整校验作用域、父关系、深度和重复身份；失败时不得部分应用。
 
-只有 `subtree_revision` 大于父侧已接受值时才替换该直接子树缓存；相等或更小视为重复/迟到但仍确认传输序号。替换与公开 `tree_revision` 分配必须在同一临界区，观察者不得看到混合新旧子树。`spawn_agent` 只有在监督握手、首个快照和 Pi RPC 就绪都成功后进入 `idle`。
+只有 `subtree_revision` 大于父侧已接受值时才替换该直接子树缓存；相等或更小视为重复/迟到但仍确认传输序号。替换与公开 `tree_revision` 分配必须在同一临界区，观察者不得看到混合新旧子树。`spawn_agent` 只有在监督握手、首个快照、Pi RPC 和 capability 核验都成功后进入 `idle`。
 
 ### 7.3 顺序、ACK 与重同步
 
@@ -712,7 +747,7 @@ child 只能向直接 parent 发送 `compaction_prepare` 和 `compaction_complet
 | `ManagedRpcNode` | 在平台树内启动受管桥接进程，桥接进程独占公共 `RpcClient`，提供高层命令、事件、故障和资源操作 | 复制 Pi JSONL、裁决整树所有权 |
 | `RpcSupervisor` | 驱动 mailbox、assignment/Pi command 顺序、事件归一化、目标 child 直接边 prepare/complete、启动/关闭和节点级资源协调 | 拼接独立进程与客户端、递归冻结 descendant、自动重试不确定交付 |
 | `ProcessTreeAdapter` | 为 `ManagedRpcNode` 在目标进程运行前建立平台树归属，并提供不透明句柄的优雅请求、强制整树回收、退出观察和释放 | 修改生命周期或配额、暴露 PID |
-| `SupervisorChannel` | 直接父子帧、握手、累计 ACK、assignment/start、快照、reply、单向角色压缩请求/响应、控制路由和关闭；协议 outbound 优先于 listener 重入发送 | 注入模型、parent 发起压缩请求或越级通信 |
+| `SupervisorChannel` | 直接父子帧、握手、一次性 capability manifest、累计 ACK、assignment/start、快照、reply、单向角色压缩请求/响应、控制路由和关闭；协议 outbound 优先于 listener 重入发送 | 注入模型、向公开状态泄露 capability、parent 发起压缩请求或越级通信 |
 | `TreeController` | 所有权、配额、任务投影应用、树合并、`tree_revision` 和安全 UI 快照 | 直接访问 RPC、PID、socket 或管道 |
 
 模型工具不得直接调用平台适配器；树视图不得发送 RPC；子控制器不得直接访问祖先控制器；`RpcSupervisor` 之外不得直接调用 `ManagedRpcNode` 的状态变更接口。
@@ -721,16 +756,16 @@ child 只能向直接 parent 发送 `compaction_prepare` 和 `compaction_complet
 
 **REQ-039**：单节点启动必须按可回滚阶段执行：
 
-1. 原子预留直接和全树名额，分配身份，登记 `starting`；
-2. 创建本地监督端点和一次性凭据，准备固定 cwd、根环境快照、模板结果及内部元数据；
-3. 由 `ProcessTreeAdapter` 在目标进程运行前启动受管桥接进程并建立 Job Object 或 process group/session 归属；
-4. 桥接进程内部创建公共 Pi `RpcClient`，其 RPC 子进程继承同一平台树；受管节点只通过高层桥接协议转发命令、事件和故障，不复制 Pi JSONL；
-5. 完成监督协议身份、版本和初始快照校验，并通过受管节点发出无副作用状态请求；
-6. 双通道就绪后记录创建成功的单调时间，进入 `idle` 并返回。
+1. 根权威原子预留直接和全树名额，分配身份、冻结模板修订和 `management_enabled`，登记 `starting`；
+2. 创建本地监督端点和一次性凭据，准备固定 cwd、根环境快照、根 project-trust 结论、有效模板和内部身份元数据；
+3. 从当前宿主 Pi 推导或使用显式 Pi CLI/module 路径，从当前实际加载的 package root 取得本扩展入口，构造 child 参数：`--no-session`、固定 `--approve`/`--no-approve`、按 `extensions` 三态选择 `--no-extensions` 与重复 `-e`、按 `contextFiles` 选择 `--no-context-files`、effective thinking 和仅在 `tools` 显式声明时的 `--tools`；
+4. 由 `ProcessTreeAdapter` 在目标进程运行前启动受管桥接进程并建立 Job Object 或 process group/session 归属；桥接进程内部以该 CLI/module 和参数创建公共 Pi `RpcClient`，其 RPC 子进程继承同一平台树；受管节点只通过高层桥接协议转发命令、事件、故障和监督字节，不复制 Pi JSONL；
+5. child 的当前本扩展入口从实际 package root 绑定 runtime，并建立本地监督通道；完成身份、版本、凭据、初始快照和无副作用状态请求，随后接收并核验一次 capability manifest；
+6. 全部启动事实通过后记录创建成功的单调时间，进入 `idle` 并返回。
 
-bridge 启动响应可以等待 child `session_start` 和无副作用状态屏障，而 child `session_start` 又需要完成监督 hello/ACK；因此 `ManagedRpcNode` 一旦已经绑定 bridge，在 `starting` 与 `ready` 阶段都必须允许监督帧双向通过。普通 prompt、steering、abort 和状态查询仍只能在 `ready` 后通过公开命令面调用，不能借此扩大启动期业务 RPC 能力。
+bridge 启动响应可以等待 child `session_start`、监督 hello/ACK、manifest 与无副作用状态屏障；因此 `ManagedRpcNode` 一旦已经绑定 bridge，在 `starting` 与 `ready` 阶段都必须允许监督帧双向通过。普通 prompt、steering、abort 和状态查询仍只能在 `ready` 后通过公开命令面调用，不能借此扩大启动期业务 RPC 能力。
 
-任一步失败必须先记录安全故障，再执行终止清理。失败身份不复用。
+任一步失败必须先记录安全故障，再执行终止清理。失败身份不复用；不得以 package name 再解析本扩展来替代已传入的实际入口。在本地开发、临时 `-e` 和已安装 package 形态中，扩展均必须从当前实际加载入口捕获并传递同一入口身份；不得按 `NODE_ENV`、开发/生产模式或路径猜测建立不同的 child 自加载分支，也不得把 CLI/module、extension 绝对路径、source、凭据或底层异常暴露到公开面。
 
 ### 8.3 单节点命令顺序
 
@@ -825,7 +860,7 @@ interface ProcessTreeAdapter {
 
 ### 9.3 生命周期时间和状态反馈
 
-**REQ-046**：生命周期计时从 `spawn_agent` 完成监督/RPC 双握手、节点进入 `idle` 并成功返回的线性化点开始，使用单调时钟。`starting` 不显示正常时长；`idle`、`working`、`interrupting`、`suspended`、`terminating` 累计；`failed`/`terminated` 冻结。它不是单个 task、prompt 或工具耗时。
+**REQ-046**：生命周期计时从 `spawn_agent` 完成监督/RPC 双握手、无副作用状态请求和 capability manifest 核验、节点进入 `idle` 并成功返回的线性化点开始，使用单调时钟。`starting` 不显示正常时长；`idle`、`working`、`interrupting`、`suspended`、`terminating` 累计；`failed`/`terminated` 冻结。它不是单个 task、prompt 或工具耗时。
 
 UI 只消费控制器原子任务投影，不按逐 token 刷新：mailbox 接纳显示 working 和 mailbox 计数；assignment/Pi command 接纳移动到 host 计数；工具与压缩事件更新安全 phase；raw settlement 显示 finalizing；final prepare 显示 reply outbox；commit 后更新 last_task 并仅在全静止时 idle；中断、suspension、终止和故障使用各自稳定状态。一次级联变化必须按单一 `tree_revision` 原子刷新。
 
@@ -854,11 +889,11 @@ Windows 执行两个锁定宿主组合：
 
 **REQ-049**：实现必须提供以下五层自动化测试，且不依赖外部模型网络、API key 或人工交互：
 
-1. **纯逻辑测试**：mailbox reducer、任务身份、八态、三类队列、final commit、配额、配置、模板、树合并、seq/ACK/重同步与脱敏；使用显式 gate/barrier 和可控时钟覆盖确定性并发交错，不以 sleep 概率复现竞态。
-2. **Pi 契约测试**：加载真实扩展入口和 Pi `RpcClient`，验证八个管理工具与子运行时 `reply_to_parent` 的角色可见性/schema、`get_agent_templates` 直接数组例外、其余成功外壳、错误外壳、事件映射、reload 与 UI-only 边界。
-3. **原生进程集成测试**：启动真实 `pi --mode rpc --no-session`，使用确定性本地假模型/提供者，验证创建、steering、中断、故障和整树回收。
+1. **纯逻辑测试**：mailbox reducer、任务身份、八态、三类队列、final commit、配额、配置、闭集模板 schema、`tools`/`extensions` 三态、模板目录相对 source 归一化、树合并、`pi-subagent/11` seq/ACK/capability/重同步与脱敏；使用显式 gate/barrier 和可控时钟覆盖确定性并发交错，不以 sleep 概率复现竞态。
+2. **Pi 契约测试**：加载真实扩展入口和 Pi `RpcClient`，验证八个管理工具与子运行时 `reply_to_parent` 的角色可见性/schema、`get_agent_templates` 的 description/数组三态和直接数组例外、其余成功外壳、固定安全错误、事件映射、实际扩展入口的 child 自加载、reload 与 UI-only 边界。
+3. **原生进程集成测试**：启动真实 `pi --mode rpc --no-session`，使用确定性本地假模型/提供者，验证固定 cwd/trust、模板 explicit source 和 `--no-extensions` 三态、能力清单核验、创建、steering、中断、故障和整树回收。
 4. **TUI 交互测试**：验证直接子代理 widget、`/agent` 遮罩、滚动/展开/关闭、稳定尺寸和 UI-only 通知。
-5. **本地 package 测试**：验证本地包目录或本地构建包的 manifest、生产依赖、临时加载和隔离的本地持久安装形态。
+5. **本地 package 测试**：验证本地包目录或本地构建包的唯一 manifest 入口、生产依赖、临时加载和隔离的本地持久安装形态，以及 child 从当前实际 package root 重用该入口而非按包名解析另一副本。
 
 五层自动化当前都在 Windows runner 执行。平台无关逻辑和 Unix 适配代码可以通过 fake、类型检查和条件分支契约测试覆盖；需要 macOS/Linux 内核原语的测试不属于本里程碑通过项，必须留给独立原生验证计划。
 
@@ -868,7 +903,7 @@ Windows 执行两个锁定宿主组合：
 
 **REQ-050**：以下旅程必须在 Windows 乘两个宿主组合的两个 job 中全部执行；macOS/Linux 只保留代码、类型、纯逻辑和 fake 测试，不在本里程碑执行原生旅程：
 
-1. 加载扩展并发现合法模板，根先通过 `get_agent_templates` 获得安全目录、精确复制 `template_id` 再创建 A；只有双握手后才以 `idle` 成功。
+1. 加载扩展并发现合法模板，覆盖必填 description、闭集 frontmatter、`tools`/`extensions` 缺失/空/非空三态和模板目录相对 source；根先通过 `get_agent_templates` 获得安全目录、精确复制 `template_id` 再创建 A。A 必须从当前实际扩展入口启动，并仅在双握手、无副作用 RPC 与 capability manifest 核验后以 `idle` 成功。
 2. 向空闲 A 发送任务；工具立即返回 mailbox 分配的 `message_id/task_id`。A 发布 `task_started` 后发送工作中回复，父端 wait 以 `reply + working` 返回；raw settlement 不结束任务，final 经父会话接纳和 commit 后 wait 返回 `task_completed + idle`。
 3. A 工作时再次发送，验证同一 task steering；中断后立即发送第三条，验证它获得 successor task，必须在 interrupted final 提交后作为新 prompt。
 4. A 查询到与根权威一致的模板目录并创建 A-1 到默认深度 2；A-1 不可见八个管理工具但仍可见 `reply_to_parent`，绕过发现查询返回 `template_capability_unavailable`，绕过发现创建仍返回 `max_depth_reached`。
@@ -878,21 +913,21 @@ Windows 执行两个锁定宿主组合：
 8. 覆盖 Pi 原生自动压缩：按 `agent_end -> compaction -> retry start 或单次 settled` 建模；threshold 保留安全候选，overflow `willRetry` 撤销旧候选；只由后续真实 start/settled 选择 steer/prompt，不生成恢复帧；自动压缩失败投影 maintenance_failed，未经协调的 child manual 固定为协议故障。
 9. 覆盖可选协调 manual：根与 child、祖先与孙节点、sibling 会话可并行准备；parent 等待在途 prompt/steer 与 Pi pending 队列静止，屏障后消息延迟投递；同边叠加令牌、提前 `not_started`、ACK 不确定补偿、关闭释放，以及业务 complete 先于 Pi manual start/end 到达都必须收敛。
 10. 终止 A，验证 A-1 后代优先、整树资源确认、幂等终止和两类名额释放。
-11. 成功根 `/reload` 后，根和 A 的模板查询立即看到同一新目录；活动 task/mailbox、未确认 reply、直接边控制响应和 UI 状态保持，`pi-subagent/9` 及更早活动树明确拒绝由 `/10` 热接管。
+11. 成功根 `/reload` 后，根和 A 的模板查询立即看到同一新目录；活动 task/mailbox、未确认 reply、直接边控制响应、既有 capability 缓存和 UI 状态保持。新模板快照只影响未来创建；`pi-subagent/10` 及更早活动树明确拒绝由 `/11` 热接管。
 
 ### 10.4 负向、安全与资源正确性
 
 **REQ-051**：负向矩阵至少必须覆盖：
 
 - 公开闭集中每个工具错误码至少一个场景，核对 `retryable`、安全 details 和无副作用；
-- 参数错误（包括 `get_agent_templates` 多余参数和非 canonical UUID 的 `agent_id`）、格式正确但未注册的 UUID、非直接子代理、模板不存在/无效/能力不足、深度/直接/全树配额耗尽；
+- 参数错误（包括 `get_agent_templates` 多余参数和非 canonical UUID 的 `agent_id`）、格式正确但未注册的 UUID、非直接子代理、模板不存在/无效/无管理能力、深度/直接/全树配额耗尽，以及有效 manifest 的 capability mismatch；
 - 配置不可读、坏 JSON、非法值、未知字段 UI-only 默认回退，以及非法显式根参数拒绝启动；
 - 启动超时/提前退出、一般 RPC 断开、mailbox accepted 后 Pi command rejection、delivery uncertainty、中断-final 竞态、suspension、屏障后迟到事件、部分级联失败、中间父故障和根关闭；
-- 重复帧、断序、旧 revision、旧/非法 stream、损坏快照、ACK 丢失、reset 快照和回复去重；reply 缺 task/turn/commit、旧 turn final、final 先于 settlement、settlement 先于 final、message/final 混排和 final 槽位预留；
+- 重复帧、断序、旧 revision、旧/非法 stream、损坏快照、ACK 丢失、reset 快照和回复去重；capability 方向、时序、重复、版本、字段闭集、数组交集和 source/path 校验；reply 缺 task/turn/commit、旧 turn final、final 先于 settlement、settlement 先于 final、message/final 混排和 final 槽位预留；
 - receive listener 同步发送 control/reply 的确定性交错，证明协议生成低 seq ACK 先入写队列；同一交错覆盖 Stream 与 Managed RPC；
 - `agent_end` 后的 threshold/overflow 自动压缩、start/settled 尚未出现、threshold 候选保留、overflow `willRetry` 候选撤销、自动压缩失败、未协调 child manual 拒绝、协调 manual 的本地入口/直接父边、并行会话、Pi 队列排空、叠加令牌、complete 补偿和跨流结束重排、同 turn 重复 final 的 ACK 与跨实例 reload；证明不阻塞 handler、不猜测原生 continuation 所有权、不误提交或覆盖旧 final；
 - assistant 思考、工具前说明、工具调用、参数、结果、错误和中止内容不能泄漏到父会话；重复/stale settlement 不得重复 final commit；
-- 模板目录为空时直接返回 `[]`，无效候选和来源诊断不枚举，非空项字段闭合且不泄露运行配置，模板业务 `tools` 不混入八个管理工具或 `reply_to_parent`；
+- 模板目录为空时直接返回 `[]`，无效候选和来源诊断不枚举，非空项必须有 description 且 `tools`/`extensions` 保留缺失/空/非空状态，字段闭合且不泄露运行配置；模板业务 `tools` 不混入八个管理工具或 `reply_to_parent`，未知业务工具不在 parent 静态预检拒绝；
 - 未信任项目资源不加载、模板不能扩权、叶节点不能绕过管理能力和深度、根不能越级控制；
 - cwd 外路径仍按 Pi 正常工具能力处理，证明扩展没有误实现 cwd 沙箱；
 - 以秘密 canary 注入 prompt、路径、环境、工具参数/结果、连接凭据和堆栈，证明 widget、`/agent`、状态/树、错误、UI 通知、监督帧和 UI-only 诊断不泄露，也不进入模型上下文；
@@ -930,28 +965,28 @@ Windows 执行两个锁定宿主组合：
 | `AC-003` | 原子宿主兼容门禁 | 版本/API/平台缺失时零公开面、UI-only 诊断、宿主继续运行 |
 | `AC-004` | 配置优先级 | 根参数、可信项目、用户、默认按字段解析且根值固定 |
 | `AC-005` | 配置错误诊断 | 文件/JSON/值错误用默认且不下退；未知字段忽略；非法根参数拒绝 |
-| `AC-006` | 模板发现与身份 | 双来源直属 Markdown、project trust、文件名 ID、符号链接、来源故障和安全模板目录数组 |
-| `AC-007` | 模板 schema | 空正文、UTF-8 `64 KiB` 正文边界、逗号 tools 规范化、枚举、model/thinking、未知字段静默忽略 |
+| `AC-006` | 模板发现、身份与 source trust | 双来源直属 Markdown、project trust、文件名 ID、符号链接、来源故障、安全模板目录数组，以及 user/project/remote extension source 的信任边界 |
+| `AC-007` | 模板 schema | 必填 description 的 Unicode 上限、空正文、UTF-8 `64 KiB` 正文边界、闭集 YAML mapping、数组三态/裁剪/去重、布尔字段、枚举、model/thinking、未知/merge/非字符串键拒绝 |
 | `AC-008` | 覆盖、诊断和模板 reload | 无效项目遮蔽用户；诊断 UI-only；根与后代查询 reload 后同一新目录；新快照只影响未来创建 |
-| `AC-009` | 创建能力与上下文继承 | 工具缺一即拒绝；精确模型/thinking；prompt mode、contextFiles、资源继承 |
-| `AC-010` | 深度、管理工具和配额 | 默认两级；八工具整体隐藏但 child 回复工具保留；祖先 disabled 衰减；查询/创建服务端复核；直接/全树原子预留和回收释放 |
+| `AC-009` | 创建能力与上下文继承 | 无 parent 静态工具/模型预检；child 后绑定 capability manifest 核验；精确 model/thinking、prompt mode、contextFiles、trust、extensions 与资源继承 |
+| `AC-010` | 深度、管理工具和配额 | 默认两级；八工具整体隐藏但 child 回复工具保留；`allowSubagents: false` 不可重新开启；查询/创建服务端复核；直接/全树原子预留和回收释放 |
 | `AC-011` | 八态、任务投影与 revision | 合法/非法转换、三类队列、activity、last_task、stale task/turn 与修订单调 |
-| `AC-012` | 创建成功与失败回滚 | 创建生成 canonical UUID v4；双握手后严格 idle；启动错误/超时；清理完整与不完整两条返回路径 |
+| `AC-012` | 创建成功与失败回滚 | 创建生成 canonical UUID v4；双握手、状态 RPC 与 capability 核验后严格 idle；`capability_mismatch`、启动错误/超时；清理完整与不完整两条返回路径 |
 | `AC-013` | mailbox、任务、steering 与回复 | accepted 身份、assignment/start、同 task steer、交付不确定、工作中 reply、双条件 final commit |
 | `AC-014` | 等待竞态 | 原子登记、多等待者、reply/三类 task/suspended/terminal/timeout 七种 outcome |
 | `AC-015` | 协作式中断 | interrupt 栅栏、未交付当前项取消、successor task、interrupted final 后复用 |
 | `AC-016` | 终止与部分级联 | 屏障、后代优先、强制回收、幂等合并、partial failure |
 | `AC-017` | 状态和树查询 | 直接状态权限、根/子树裁剪、原子 tree revision、安全字段 |
 | `AC-018` | 公开错误码闭集 | 非法 UUID 与未注册 UUID 分流；每个错误码、retryable 和无副作用；无额外阶段错误码 |
-| `AC-019` | 监督握手和快照 | 身份/版本/凭据、初始快照、subtree replacement、原子根修订 |
-| `AC-020` | v10 seq、ACK、重同步与出站屏障 | assignment/start、reply_seq 去重、同 turn 首 final 单调提交、单向角色压缩帧、final 槽位、ACK 失败、listener 重入时协议 outbound 优先 |
-| `AC-021` | mailbox 与监督器命令顺序 | 先挂接 OS 树、双通道就绪、接纳/宿主交付分离、终止和中断栅栏、迟到丢弃 |
+| `AC-019` | 监督握手、能力证明和快照 | `pi-subagent/11` 身份/版本/凭据、一次 capability 帧的闭集/缓存/脱敏、初始快照、subtree replacement、原子根修订 |
+| `AC-020` | v11 seq、ACK、重同步与出站屏障 | capability 时序、assignment/start、reply_seq 去重、同 turn 首 final 单调提交、单向角色压缩帧、final 槽位、ACK 失败、listener 重入时协议 outbound 优先 |
+| `AC-021` | mailbox、监督器与 child 启动顺序 | 先挂接 OS 树、固定 cwd/trust/Pi CLI-module、实际本扩展入口和 explicit source、双通道/manifest 就绪、接纳/宿主交付分离、终止和中断栅栏、迟到丢弃 |
 | `AC-022` | Windows 原生进程树回收 | Windows Job Object、资源确认和孙进程整树回收；Unix 原生部分延期 |
 | `AC-023` | 父故障、原生/协调压缩、根关闭与 reload | 防孤儿、真实 lifecycle、threshold/overflow 候选规则、未协调 manual 拒绝、会话本地直接边并行与补偿、粘性 suspension、跨实例保留、失败 reload 清树 |
 | `AC-024` | 常驻 widget | 只显示直接子代理、稳定行字段、activity、三类队列、计时、suspension 和故障码 |
 | `AC-025` | `/agent` 遮罩 | 作用域、折叠/滚动/展开/Esc、finished、修订保持交互状态 |
 | `AC-026` | UI-only 与秘密 canary | 诊断/通知不进上下文，所有公开面不泄露正文和秘密 |
-| `AC-027` | 本地 package 形态 | 唯一入口、生产依赖、本地临时/持久 scope、无隐式写入、清理临时资源 |
+| `AC-027` | 本地 package 形态 | 唯一入口、child 重用当前 package root 入口、生产依赖、本地临时/持久 scope、无隐式写入、清理临时资源 |
 | `AC-028` | Windows 双组合核心旅程 | Windows 乘最低/当前组合完整执行 REQ-050 |
 | `AC-029` | 兼容负向组合 | 低版本、不可解析版本、API 缺失、不支持平台统一失活 |
 | `AC-030` | 无性能门槛 | 测试计划和 CI 不含性能/压力/SLO/coverage 百分比阻断项 |
@@ -968,7 +1003,7 @@ Windows 执行两个锁定宿主组合：
 | `REQ-007..008` | 04、13、15 | `AC-002`、`AC-009`、`AC-026` |
 | `REQ-009..010` | 02、06 | `AC-004`、`AC-005` |
 | `REQ-011..014` | 05、14 | `AC-006`、`AC-007`、`AC-008` |
-| `REQ-015..017` | 04、05、09、15 | `AC-008`、`AC-009`、`AC-023` |
+| `REQ-015..017` | 04、05、09、15 | `AC-008`、`AC-009`、`AC-012`、`AC-020`、`AC-023` |
 | `REQ-018..020` | 02、04、06 | `AC-010`、`AC-012`、`AC-018` |
 | `REQ-021..023` | 03 | `AC-011`、`AC-014` |
 | `REQ-024` | 02 | `AC-018` |
@@ -980,7 +1015,7 @@ Windows 执行两个锁定宿主组合：
 | `REQ-030..031` | 02、03、07、11 | `AC-017`、`AC-026` |
 | `REQ-032` | 02、04、06、08 | `AC-018` |
 | `REQ-033..037` | 11 | `AC-013`、`AC-019`、`AC-020`、`AC-026` |
-| `REQ-038..040` | 12 | `AC-021` |
+| `REQ-038..040` | 12 | `AC-012`、`AC-021` |
 | `REQ-041..043` | 03、08、12 | `AC-016`、`AC-022`、`AC-023` |
 | `REQ-044..047` | 05、07、09、11 | `AC-024`、`AC-025`、`AC-026` |
 | `REQ-048..050` | 10 | `AC-028`、`AC-031` |

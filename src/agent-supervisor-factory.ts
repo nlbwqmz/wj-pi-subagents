@@ -18,7 +18,10 @@ import {
   RpcSupervisor,
   type RpcSupervisorChannelBinding,
 } from "./rpc-supervisor.ts";
-import type { SupervisorCompactionComplete } from "./supervisor-channel.ts";
+import type {
+  SupervisorCapabilityManifest,
+  SupervisorCompactionComplete,
+} from "./supervisor-channel.ts";
 import type { RootRuntimeContext } from "./root-runtime-context.ts";
 import type {
   TemplateDefinition,
@@ -90,22 +93,29 @@ export function createAgentSupervisorFactory(
   const factory = ((input: AgentSupervisorFactoryInput): RpcSupervisor => {
     const template = input.template ?? resolveTemplate(templateSnapshot, input.reservation.templateId);
     if (template === undefined) throw new Error("模板快照未提供有效模板");
+    const extensionPath = options.childExtensionPath ?? defaultChildExtensionPath();
+    const childReplyTools = options.childReplyToolNames ?? [CHILD_REPLY_TOOL_NAME];
+    const managementTools = childManagementEnabled(options, input, template)
+      ? (options.managementToolNames ?? AGENT_TOOL_NAMES)
+      : [];
+    // 在创建瞬间冻结继承配置，避免 parent 会话后续切换模型后改变该 child 的契约。
+    const expectedModel = template.model ?? resolveCurrent(options.currentModel);
+    const expectedThinking = template.thinking ?? resolveCurrent(options.currentThinking);
+    const rpcOptions = buildManagedRpcOptions(template, {
+      currentModel: expectedModel,
+      currentThinking: expectedThinking,
+      projectTrust: options.rootRuntime.projectTrust,
+      extensionPath,
+      ...(childPiPaths.cliPath === undefined ? {} : { cliPath: childPiPaths.cliPath }),
+      ...(childPiPaths.modulePath === undefined ? {} : { piModulePath: childPiPaths.modulePath }),
+      childReplyTools,
+      managementTools,
+    });
     const node = options.nodeFactory?.(template) ?? createManagedRpcNode({
       processTreeAdapter: options.processTreeAdapter,
       cwd: options.rootRuntime.cwd,
       env: options.rootRuntime.environment,
-      rpcOptions: buildManagedRpcOptions(template, {
-        currentModel: options.currentModel,
-        currentThinking: options.currentThinking,
-        projectTrust: options.rootRuntime.projectTrust,
-        extensionPath: options.childExtensionPath ?? defaultChildExtensionPath(),
-        ...(childPiPaths.cliPath === undefined ? {} : { cliPath: childPiPaths.cliPath }),
-        ...(childPiPaths.modulePath === undefined ? {} : { piModulePath: childPiPaths.modulePath }),
-        childReplyTools: options.childReplyToolNames ?? [CHILD_REPLY_TOOL_NAME],
-        managementTools: childManagementEnabled(options, input, template)
-          ? (options.managementToolNames ?? AGENT_TOOL_NAMES)
-          : [],
-      }),
+      rpcOptions,
       ...(options.bridgeScriptPath === undefined ? {} : { bridgeScriptPath: options.bridgeScriptPath }),
     });
 
@@ -117,6 +127,19 @@ export function createAgentSupervisorFactory(
       reservation: input.reservation,
       ...(input.grant === undefined ? {} : { grant: input.grant }),
       managedNode: node,
+      // nodeFactory 是测试/宿主 seam；生产受管节点必须在首任务前获得 manifest。
+      ...(options.nodeFactory === undefined
+        ? {
+          validateCapability: (capability: SupervisorCapabilityManifest) => childCapabilityMatches(capability, {
+            template,
+            extensionPath,
+            childReplyTools,
+            managementTools,
+            expectedModel,
+            expectedThinking,
+          }),
+        }
+        : {}),
       channelFactory: (context): RpcSupervisorChannelBinding => {
         directAgentId = context.agent_id;
         const credential = randomBytes(32).toString("base64url");
@@ -226,12 +249,13 @@ export function buildManagedRpcOptions(
     "--no-session",
     ...(options.projectTrust === undefined ? [] : [options.projectTrust ? "--approve" : "--no-approve"]),
   ];
-  if (options.extensionPath !== undefined) {
-    // 保留显式加载本扩展，同时允许 Pi 按根会话 settings 发现 provider 等扩展。
-    // 子 Pi 若关闭扩展发现，将无法解析根会话使用的动态 provider。
-    args.push("-e", options.extensionPath);
+  // 缺省 extensions 完全遵循 Pi 发现规则；显式空数组与白名单均关闭普通发现。
+  if (template.extensions !== undefined) args.push("--no-extensions");
+  if (options.extensionPath !== undefined) args.push("-e", options.extensionPath);
+  for (const extension of template.extensions ?? []) {
+    args.push("-e", resolveTemplateExtensionSource(template, extension.displaySource));
   }
-  if (template.contextFiles === "disabled") args.push("--no-context-files");
+  if (!template.contextFiles) args.push("--no-context-files");
   const thinking = template.thinking ?? resolveCurrent(options.currentThinking);
   if (thinking !== undefined) args.push("--thinking", thinking);
   const templatePrompt = template.body.trim() === ""
@@ -240,13 +264,16 @@ export function buildManagedRpcOptions(
       mode: template.systemPromptMode,
       body: template.body,
     });
-  const tools = [...new Set([
-    ...template.tools,
-    ...(options.childReplyTools ?? []),
-    ...(options.managementTools ?? []),
-  ])];
-  // 空字符串仍是显式 allowlist；省略 --tools 会错误启用 Pi 默认工具。
-  args.push("--tools", tools.join(","));
+  // tools 缺省时绝不能传 --tools，否则会覆写 Pi 的原生活动工具集合。
+  // 显式列表（包含 []）才与协议工具合并为 child 的严格 allowlist。
+  if (template.tools !== undefined) {
+    const tools = [...new Set([
+      ...template.tools,
+      ...(options.childReplyTools ?? []),
+      ...(options.managementTools ?? []),
+    ])];
+    args.push("--tools", tools.join(","));
+  }
   const selectedModel = template.model ?? resolveCurrent(options.currentModel);
   const [provider, model] = splitModel(selectedModel);
   return Object.freeze({
@@ -257,6 +284,64 @@ export function buildManagedRpcOptions(
     ...(templatePrompt === undefined ? {} : { templatePrompt }),
     args: Object.freeze(args),
   });
+}
+
+interface ExpectedChildCapability {
+  readonly template: TemplateDefinition;
+  readonly extensionPath: string;
+  readonly childReplyTools: readonly string[];
+  readonly managementTools: readonly string[];
+  readonly expectedModel: string | undefined;
+  readonly expectedThinking: string | undefined;
+}
+
+function childCapabilityMatches(
+  capability: SupervisorCapabilityManifest,
+  expected: ExpectedChildCapability,
+): boolean {
+  if (!sameStringSet(capability.system_active_tools, [
+    ...expected.childReplyTools,
+    ...expected.managementTools,
+  ])) return false;
+  if (expected.template.tools !== undefined && !sameStringSet(
+    capability.business_active_tools,
+    expected.template.tools,
+  )) return false;
+
+  const systemNames = new Set(capability.system_active_tools);
+  const sourceNames = Object.keys(capability.system_tool_sources);
+  if (!sameStringSet(sourceNames, [...systemNames])) return false;
+  if (!samePathIdentity(capability.self_extension_path, expected.extensionPath)) return false;
+  for (const name of systemNames) {
+    if (!samePathIdentity(capability.system_tool_sources[name], expected.extensionPath)) return false;
+  }
+
+  const model = splitModel(expected.expectedModel);
+  if (model[0] === undefined || model[1] === undefined) {
+    if (capability.provider !== undefined || capability.model !== undefined) return false;
+  } else if (capability.provider !== model[0] || capability.model !== model[1]) {
+    return false;
+  }
+  return capability.thinking === expected.expectedThinking;
+}
+
+function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  const values = new Set(left);
+  return values.size === left.length && right.every((value) => values.has(value));
+}
+
+function samePathIdentity(left: string | undefined, right: string): boolean {
+  if (left === undefined) return false;
+  const normalize = (value: string): string => {
+    const resolved = resolvePath(value).replace(/\\/g, "/");
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  };
+  try {
+    return normalize(left) === normalize(right);
+  } catch {
+    return false;
+  }
 }
 
 interface ChildPiPaths {
@@ -308,12 +393,23 @@ function childManagementEnabled(
   input: AgentSupervisorFactoryInput,
   template: TemplateDefinition,
 ): boolean {
-  if (template.subagents === "disabled") return false;
+  if (!template.allowSubagents) return false;
   const parentCapability = options.tree.getManagementCapability(input.actor);
   if (!parentCapability.ok || !parentCapability.data.enabled) return false;
   if (input.actor.kind === "root") return 1 < options.rootRuntime.config.maxDepth;
   const parent = options.tree.getStatus(input.actor.agent_id);
   return parent.ok && parent.data.depth + 1 < options.rootRuntime.config.maxDepth;
+}
+
+function resolveTemplateExtensionSource(template: TemplateDefinition, source: string): string {
+  if (!isLocalExtensionSource(source)) return source;
+  return resolvePath(template.templateDirectory, source);
+}
+
+function isLocalExtensionSource(source: string): boolean {
+  if (source.startsWith("npm:") || source.startsWith("git:")) return false;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(source) || /^git@/i.test(source)) return false;
+  return true;
 }
 
 function resolveCurrent(

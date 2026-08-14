@@ -11,6 +11,7 @@ import {
   SupervisorChannel,
   SupervisorFrameDecoder,
   type SupervisorChannelOptions,
+  type SupervisorCapabilityManifest,
   type SupervisorCompactionComplete,
   type SupervisorCompactionCompleted,
   type SupervisorCompactionPrepare,
@@ -38,6 +39,8 @@ type ParentSupervisorOptions = Omit<SupervisorChannelOptions, "role">;
 export interface ManagedRpcSupervisorChannelOptions extends ParentSupervisorOptions {
   readonly node: ManagedRpcNodeLike;
   readonly onSnapshot?: (snapshot: SupervisorSnapshot) => void;
+  /** parent 在普通 ready 后收到的一次性内部 capability manifest。 */
+  readonly onCapability?: (capability: SupervisorCapabilityManifest) => void;
 }
 
 /**
@@ -53,6 +56,7 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
   private readonly faults = new Set<(fault: RpcSupervisorChannelFault) => void>();
   private readonly events = new Set<(event: SupervisorEvent) => void>();
   private readonly snapshots = new Set<(snapshot: SupervisorSnapshot) => void>();
+  private readonly capabilities = new Set<(capability: SupervisorCapabilityManifest) => void>();
   private readonly controlRequests = new Set<(request: SupervisorControlRequest) => void>();
   private readonly controlResponses = new Set<(response: SupervisorControlResponse) => void>();
   private readonly compactionPrepare = new Set<(request: SupervisorCompactionPrepare) => void>();
@@ -108,6 +112,7 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
     // 同时保留原 Promise 的拒绝结果供稍后 waitForReady 观察。
     void this.ready.promise.catch(() => {});
     if (options.onSnapshot !== undefined) this.snapshots.add(options.onSnapshot);
+    if (options.onCapability !== undefined) this.capabilities.add(options.onCapability);
     this.unsubscribeFrame = this.node.onSupervisorFrame((frame) => this.receive(frame));
     this.unsubscribeTransport = this.node.onTransportFault((fault) => {
       if (fault !== "protocol_fault") {
@@ -230,6 +235,19 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
   onSnapshot(listener: (snapshot: SupervisorSnapshot) => void): () => void {
     this.snapshots.add(listener);
     return () => this.snapshots.delete(listener);
+  }
+
+  /** 获取 parent 已缓存的一次性 capability；该信息不属于公开状态。 */
+  getCapability(): SupervisorCapabilityManifest | undefined {
+    return this.protocol.getCapability();
+  }
+
+  /** 注册 capability 观察者；若已缓存则同步交付安全副本。 */
+  onCapability(listener: (capability: SupervisorCapabilityManifest) => void): () => void {
+    this.capabilities.add(listener);
+    const capability = this.protocol.getCapability();
+    if (capability !== undefined) notifySupervisorListeners(new Set([listener]), capability);
+    return () => this.capabilities.delete(listener);
   }
 
   async publishControlRequest(request: SupervisorControlRequest): Promise<void> {
@@ -358,6 +376,9 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
           // 快照观察者异常不能回滚已经原子接受的协议缓存。
         }
       }
+    }
+    if (result.kind === "accepted" && result.capability !== undefined) {
+      notifySupervisorListeners(this.capabilities, result.capability);
     }
     if (result.kind === "accepted" && result.control_request !== undefined) {
       notifySupervisorListeners(this.controlRequests, result.control_request);

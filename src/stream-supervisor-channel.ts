@@ -3,6 +3,7 @@ import {
   SupervisorChannel,
   SupervisorFrameDecoder,
   type SupervisorChannelOptions,
+  type SupervisorCapabilityManifest,
   type SupervisorCompactionComplete,
   type SupervisorCompactionCompleted,
   type SupervisorCompactionPrepare,
@@ -46,6 +47,8 @@ export interface StreamSupervisorChannelOptions extends SupervisorChannelOptions
   /** 父端收到已经通过协议校验的生命周期事实。 */
   readonly onEvent?: (event: SupervisorEvent) => void;
   readonly onSnapshot?: (snapshot: SupervisorSnapshot) => void;
+  /** parent 在普通 ready 后收到的一次性内部 capability manifest。 */
+  readonly onCapability?: (capability: SupervisorCapabilityManifest) => void;
   /** child 收到 close 后执行后代优先清理；只有 true 才关闭本地字节流。 */
   readonly onCloseRequested?: () => boolean | Promise<boolean>;
 }
@@ -74,6 +77,7 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
   private readonly faults = new Set<(fault: RpcSupervisorChannelFault) => void>();
   private readonly eventListeners = new Set<(event: SupervisorEvent) => void>();
   private readonly snapshotListeners = new Set<(snapshot: SupervisorSnapshot) => void>();
+  private readonly capabilityListeners = new Set<(capability: SupervisorCapabilityManifest) => void>();
   private readonly controlRequestListeners = new Set<(request: SupervisorControlRequest) => void>();
   private readonly controlResponseListeners = new Set<(response: SupervisorControlResponse) => void>();
   private writeQueue: Promise<void> = Promise.resolve();
@@ -114,6 +118,7 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     void this.ready.promise.catch(() => {});
     if (options.onEvent !== undefined) this.eventListeners.add(options.onEvent);
     if (options.onSnapshot !== undefined) this.snapshotListeners.add(options.onSnapshot);
+    if (options.onCapability !== undefined) this.capabilityListeners.add(options.onCapability);
     this.transport.stdout.on("data", (chunk: Uint8Array | string) => {
       try {
         const bytes = typeof chunk === "string" ? new TextEncoder().encode(chunk) : new Uint8Array(chunk);
@@ -150,6 +155,11 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
 
   async publishReply(reply: SupervisorReplyInput | SupervisorReply): Promise<void> {
     await this.send(this.protocol.publishReply(reply));
+  }
+
+  /** child 在普通 ready 后发布一次内部 capability manifest。 */
+  async publishCapability(capability: SupervisorCapabilityManifest): Promise<void> {
+    await this.send(this.protocol.publishCapability(capability));
   }
 
   /** 发布 reply 并等待父端累计 ACK；同一 reply_seq 只创建一次逻辑消息。 */
@@ -338,6 +348,19 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     return () => this.snapshotListeners.delete(listener);
   }
 
+  /** 获取 parent 已缓存的一次性 capability；该信息不属于公开状态。 */
+  getCapability(): SupervisorCapabilityManifest | undefined {
+    return this.protocol.getCapability();
+  }
+
+  /** 注册 capability 观察者；若已缓存则同步交付安全副本。 */
+  onCapability(listener: (capability: SupervisorCapabilityManifest) => void): () => void {
+    this.capabilityListeners.add(listener);
+    const capability = this.protocol.getCapability();
+    if (capability !== undefined) notifySupervisorListeners(new Set([listener]), capability);
+    return () => this.capabilityListeners.delete(listener);
+  }
+
   onControlRequest(listener: (request: SupervisorControlRequest) => void): () => void {
     this.controlRequestListeners.add(listener);
     return () => this.controlRequestListeners.delete(listener);
@@ -397,6 +420,9 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
           // 快照观察者异常不能回滚协议已接受的原子替换。
         }
       }
+    }
+    if (result.kind === "accepted" && result.capability !== undefined) {
+      notifySupervisorListeners(this.capabilityListeners, result.capability);
     }
     if (result.kind === "accepted" && result.control_request !== undefined) {
       notifySupervisorListeners(this.controlRequestListeners, result.control_request);

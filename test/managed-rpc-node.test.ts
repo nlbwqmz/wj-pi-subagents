@@ -45,8 +45,11 @@ import type {
   ProcessTreeHandle,
 } from "../src/process-tree-capability.ts";
 import {
+  SUPERVISOR_PROTOCOL_VERSION,
   SupervisorChannel,
   SupervisorRequestIdRegistry,
+  type SupervisorCapabilityManifest,
+  type SupervisorFrame,
 } from "../src/supervisor-channel.ts";
 
 const TREE = Object.freeze({ kind: "tree" });
@@ -69,6 +72,19 @@ function finalReply(
     run_state: "settled",
     output_state: "present",
     text,
+  };
+}
+
+function capabilityManifest(): SupervisorCapabilityManifest {
+  return {
+    protocol_version: SUPERVISOR_PROTOCOL_VERSION,
+    business_active_tools: ["bash", "read"],
+    system_active_tools: ["reply_to_parent"],
+    system_tool_sources: { reply_to_parent: "extension:pi-subagents" },
+    provider: "openai",
+    model: "gpt-5.2-codex",
+    thinking: "high",
+    self_extension_path: "C:\\pi\\extensions\\pi-subagents.ts",
   };
 }
 
@@ -841,6 +857,61 @@ test("桥接 child 监督端点完成 hello、首快照与双端 ready", () => {
   assert.equal(parent.getPublicState().snapshot_node_count, 1);
 });
 
+class CapabilityLinkedManagedNode extends FakeManagedRpcNode {
+  private childProtocol: SupervisorChannel | undefined;
+  private initialSnapshot: readonly unknown[] = [];
+  private initialSubtreeRevision = 0;
+  private snapshotSent = false;
+
+  override async start(signal?: AbortSignal, context?: ManagedRpcNodeStartContext): Promise<void> {
+    const init = context?.supervisor;
+    if (init === undefined) throw new Error("缺少监督初始化上下文");
+    this.childProtocol = new SupervisorChannel({
+      role: "child",
+      rootId: init.root_id,
+      localAgentId: init.local_agent_id,
+      peerAgentId: init.peer_agent_id,
+      parentAgentId: init.parent_agent_id,
+      depth: init.depth,
+      credential: init.credential,
+      requestIdRegistry: new SupervisorRequestIdRegistry(),
+    });
+    this.initialSnapshot = init.initial_snapshot;
+    this.initialSubtreeRevision = init.initial_subtree_revision;
+    await super.start(signal, context);
+    this.forwardFromChild(this.childProtocol.startHandshake());
+  }
+
+  override async sendSupervisorFrame(frame: Uint8Array): Promise<void> {
+    const protocol = this.childProtocol;
+    if (protocol === undefined) throw new Error("测试 child 端点未启动");
+    const result = protocol.receive(frame);
+    if (result.kind === "protocol_fault" || result.kind === "eof") {
+      this.emitTransportFault("protocol_fault");
+      return;
+    }
+    if (result.kind === "accepted" || result.kind === "duplicate" || result.kind === "gap") {
+      for (const outbound of result.outbound) this.forwardFromChild(outbound);
+    }
+    if (!this.snapshotSent && protocol.getPublicState().state === "awaiting_snapshot") {
+      this.snapshotSent = true;
+      this.forwardFromChild(protocol.publishSnapshot(this.initialSnapshot, this.initialSubtreeRevision));
+    }
+  }
+
+  publishCapability(manifest: SupervisorCapabilityManifest): void {
+    const protocol = this.childProtocol;
+    if (protocol === undefined) throw new Error("测试 child 端点未启动");
+    this.forwardFromChild(protocol.publishCapability(manifest));
+  }
+
+  private forwardFromChild(frame: SupervisorFrame): void {
+    const protocol = this.childProtocol;
+    if (protocol === undefined) throw new Error("测试 child 端点未启动");
+    this.emitSupervisorFrame(protocol.encode(frame));
+  }
+}
+
 class LinkedManagedNode extends FakeManagedRpcNode {
   private endpoint: BridgeSupervisorEndpoint | undefined;
   publishedReplies = 0;
@@ -966,6 +1037,65 @@ test("RpcSupervisor 通过真正 child 端点完成双握手和回复 ACK", asyn
   assert.equal(events.some((event) => (
     typeof event === "object" && event !== null && (event as { kind?: unknown }).kind === "reply"
   )), false);
+});
+
+test("Managed RPC supervisor transport 转发并缓存 child capability manifest", async () => {
+  const id = "97979797-9797-4979-8979-979797979797";
+  const credential = "supervisor-credential-0123456789012345";
+  const node = new CapabilityLinkedManagedNode();
+  const optionObserved: SupervisorCapabilityManifest[] = [];
+  const channel = new ManagedRpcSupervisorChannel({
+    node,
+    rootId: "root-managed-capability",
+    localAgentId: null,
+    peerAgentId: id,
+    parentAgentId: null,
+    depth: 1,
+    credential,
+    requestIdRegistry: new SupervisorRequestIdRegistry(),
+    onCapability: (capability) => optionObserved.push(capability),
+  });
+  const signal = new AbortController().signal;
+  await channel.bind(signal);
+  await node.start(signal, {
+    supervisor: {
+      root_id: "root-managed-capability",
+      local_agent_id: id,
+      peer_agent_id: "",
+      parent_agent_id: null,
+      depth: 1,
+      credential,
+      initial_snapshot: [{
+        agent_id: id,
+        parent_agent_id: null,
+        template_id: "researcher",
+        name: "受管能力",
+        depth: 1,
+        state: "idle",
+        mailbox_pending_count: 0,
+        host_pending_count: 0,
+        reply_outbox_pending_count: 0,
+        revision: 1,
+      }],
+      initial_subtree_revision: 1,
+    },
+  });
+  await channel.waitForReady(signal);
+  assert.equal(channel.getCapability(), undefined);
+
+  const observed: SupervisorCapabilityManifest[] = [];
+  channel.onCapability((capability) => observed.push(capability));
+  node.publishCapability(capabilityManifest());
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(optionObserved, [capabilityManifest()]);
+  assert.deepEqual(observed, [capabilityManifest()]);
+  assert.deepEqual(channel.getCapability(), capabilityManifest());
+
+  const replayed: SupervisorCapabilityManifest[] = [];
+  channel.onCapability((capability) => replayed.push(capability));
+  assert.deepEqual(replayed, [capabilityManifest()]);
+  await channel.release();
+  await node.release();
 });
 
 test("Managed RPC bridge 透明承载 child 请求和 parent 压缩业务 ACK", async () => {

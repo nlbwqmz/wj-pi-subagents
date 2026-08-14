@@ -449,13 +449,16 @@ function templateFileSystem(
     },
     readFile(path) {
       if (!files.has(path)) throw new Error("意外文件");
-      const toolsFrontmatter = templateTools.length === 0 ? 'tools: ""' : `tools: ${templateTools}`;
+      const toolsFrontmatter = templateTools.length === 0
+        ? ["tools: []"]
+        : ["tools:", ...templateTools.split(",").map((tool) => `  - ${tool.trim()}`)];
       return Buffer.from([
         "---",
-        toolsFrontmatter,
+        "description: 运行时测试模板",
+        ...toolsFrontmatter,
         ...(thinking === undefined ? [] : [`thinking: ${thinking}`]),
-        "subagents: inherit",
-        "contextFiles: disabled",
+        "allowSubagents: true",
+        "contextFiles: false",
         "---",
         "保持回复简洁。",
       ].join("\n"), "utf8");
@@ -1474,17 +1477,18 @@ test("根会话 new、resume、fork 与 quit 都按同一有界关闭语义清�
   }
 });
 
-test("预检遵循 Pi thinking 支持集合并拒绝被模型显式禁用的 off", async () => {
+test("父端不再用自身 thinking registry 否决模板，能力留给 child 启动后裁决", async () => {
   const cwd = "C:\\workspace\\thinking-preflight";
   const api = new FakeExtensionApi();
   let nodeCreations = 0;
+  const node = new RuntimeLinkedNode();
   const activate = createPiSubagentRuntimeActivator({
     rootIdFactory: () => "root-thinking",
     agentIdFactory: () => AGENT_ID,
     templateFileSystem: templateFileSystem(cwd, "off"),
     nodeFactory: () => {
       nodeCreations += 1;
-      return new FakeManagedRpcNode();
+      return node;
     },
   });
   await activate(api as never, {
@@ -1511,15 +1515,12 @@ test("预检遵循 Pi thinking 支持集合并拒绝被模型显式禁用的 off
   };
   await api.emit("session_start", { type: "session_start", reason: "startup" }, context);
 
-  await assert.rejects(
-    execute(api, "spawn_agent", { template_id: "researcher", name: "不应启动" }, context),
-    (error: unknown) => {
-      assert.ok(error instanceof SubagentToolError);
-      assert.equal(error.code, "template_capability_unavailable");
-      return true;
-    },
-  );
-  assert.equal(nodeCreations, 0);
+  const spawned = await execute(api, "spawn_agent", { template_id: "researcher", name: "允许启动" }, context) as {
+    details?: { template_id?: string; state?: string };
+  };
+  assert.equal(spawned.details?.template_id, "researcher");
+  assert.equal(spawned.details?.state, "idle");
+  assert.equal(nodeCreations, 1);
   await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
 });
 
@@ -1646,9 +1647,13 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   assert.match(String(rootCustomPromptResult.systemPrompt), /不要只总结当前探索内容/);
 
   const rootTemplates = await execute(rootApi, "get_agent_templates", {}, rootContext) as {
-    details?: Array<{ template_id: string; tools: string[] }>;
+    details?: Array<{ template_id: string; description: string; tools?: string[] }>;
   };
-  assert.deepEqual(rootTemplates.details, [{ template_id: "researcher", tools: [] }]);
+  assert.deepEqual(rootTemplates.details, [{
+    template_id: "researcher",
+    description: "运行时测试模板",
+    tools: [],
+  }]);
 
   const parentSpawn = execute(rootApi, "spawn_agent", {
     template_id: "researcher",
@@ -2310,11 +2315,11 @@ test("根与 child 跨实例 reload 保留同一监督连接，并让既有 chil
   assert.equal(transportAdapter.connectCalls, 1);
 
   const reloadedTemplates = await execute(newChildApi, "get_agent_templates", {}, context) as {
-    details?: Array<{ template_id: string; tools: string[] }>;
+    details?: Array<{ template_id: string; description: string; tools?: string[] }>;
   };
   assert.deepEqual(reloadedTemplates.details, [
-    { template_id: "researcher", tools: [] },
-    { template_id: "reviewer", tools: [] },
+    { template_id: "researcher", description: "运行时测试模板", tools: [] },
+    { template_id: "reviewer", description: "运行时测试模板", tools: [] },
   ]);
 
   await newChildApi.emit("agent_start", { type: "agent_start" }, context);

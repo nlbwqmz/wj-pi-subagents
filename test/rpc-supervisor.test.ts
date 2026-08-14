@@ -25,6 +25,7 @@ import type {
   SupervisorCompactionCompleted,
   SupervisorCompactionPrepare,
   SupervisorCompactionPrepared,
+  SupervisorCapabilityManifest,
 } from "../src/supervisor-channel.ts";
 import type {
   ManagedRpcNodeLike,
@@ -502,6 +503,24 @@ class RecordingSupervisorChannel implements RpcSupervisorChannel {
   }
 }
 
+class CapabilityRecordingSupervisorChannel extends RecordingSupervisorChannel {
+  private readonly capabilityListeners = new Set<(capability: SupervisorCapabilityManifest) => void>();
+  private capabilitySubscribedResolve!: () => void;
+  readonly capabilitySubscribed = new Promise<void>((resolve) => {
+    this.capabilitySubscribedResolve = resolve;
+  });
+
+  getCapability(): SupervisorCapabilityManifest | undefined {
+    return undefined;
+  }
+
+  onCapability(listener: (capability: SupervisorCapabilityManifest) => void): () => void {
+    this.capabilityListeners.add(listener);
+    this.capabilitySubscribedResolve();
+    return () => this.capabilityListeners.delete(listener);
+  }
+}
+
 class HangingCloseSupervisorChannel extends RecordingSupervisorChannel {
   closeSignal: AbortSignal | undefined;
 
@@ -550,6 +569,40 @@ test("启动按预留、监督绑定、进程树、双通道握手和无副作�
   assert.equal(tree.getStatus(FIRST_AGENT_ID).ok, true);
   const status = tree.getStatus(FIRST_AGENT_ID);
   if (status.ok) assert.equal(status.data.state, "idle");
+});
+
+test("等待 child capability 期间的监督故障立即以 spawn_failed 回滚", async () => {
+  const trace: string[] = [];
+  const tree = createController();
+  const controller = new RecordingController(tree, trace);
+  const processTreeAdapter = new RecordingProcessTreeAdapter(trace);
+  const rpcClient = new FakeRpcClient();
+  const stateGate = rpcClient.deferNext("get_state");
+  const managedNode = new TestManagedRpcNode(rpcClient, processTreeAdapter);
+  const channel = new CapabilityRecordingSupervisorChannel(trace);
+  const supervisor = new RpcSupervisor({
+    controller,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "能力故障" },
+    managedNode,
+    channel,
+    startupTimeoutMs: 1_000,
+    gracefulShutdownMs: 10,
+    validateCapability: () => true,
+  });
+
+  const starting = supervisor.start();
+  await stateGate.started;
+  stateGate.resolve();
+  await channel.capabilitySubscribed;
+  channel.emitFault("protocol_fault");
+
+  assert.deepEqual(await starting, {
+    ok: false,
+    agent_id: FIRST_AGENT_ID,
+    code: "spawn_failed",
+    cleanup: "confirmed",
+  });
 });
 
 test("启动超时先记录安全故障再强制回滚，确认回收后释放名额且不复用身份", async () => {

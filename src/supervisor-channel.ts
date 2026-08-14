@@ -20,7 +20,7 @@ import {
 } from "./tree-controller.ts";
 
 /** 父子监督通道与 Pi 任务 RPC 完全隔离的固定协议版本。 */
-export const SUPERVISOR_PROTOCOL_VERSION = "pi-subagent/10";
+export const SUPERVISOR_PROTOCOL_VERSION = "pi-subagent/11";
 
 export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "hello",
@@ -28,6 +28,7 @@ export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "event",
   "snapshot_request",
   "snapshot",
+  "capability",
   "reply",
   "task_assignment",
   "task_started",
@@ -84,6 +85,30 @@ export interface SupervisorChannelLimits {
   readonly maxDepth: number;
 }
 
+/** capability manifest 的独立边界，避免工具目录占用通用控制帧预算。 */
+export const SUPERVISOR_CAPABILITY_LIMITS = Object.freeze({
+  maxToolsPerCategory: 128,
+  maxSystemToolSources: 128,
+  maxToolNameBytes: 128,
+  maxSourceBytes: 512,
+  maxProviderBytes: 128,
+  maxModelBytes: 512,
+  maxThinkingBytes: 32,
+  maxSelfExtensionPathBytes: 4 * 1024,
+} as const);
+
+/** child 在普通 ready 后至多一次上报的内部运行时能力快照。 */
+export interface SupervisorCapabilityManifest {
+  readonly protocol_version: typeof SUPERVISOR_PROTOCOL_VERSION;
+  readonly business_active_tools: readonly string[];
+  readonly system_active_tools: readonly string[];
+  readonly system_tool_sources: Readonly<Record<string, string>>;
+  readonly provider?: string;
+  readonly model?: string;
+  readonly thinking?: string;
+  readonly self_extension_path?: string;
+}
+
 export interface SupervisorFrame<Payload = Record<string, unknown>> {
   readonly protocol: typeof SUPERVISOR_PROTOCOL_VERSION;
   readonly kind: SupervisorFrameKind;
@@ -105,7 +130,7 @@ export interface SupervisorSnapshot {
 
 export type SupervisorReplyKind = ChildReplyEnvelope["kind"];
 
-/** v10 wire reply：传输序号与模型可见信封保持明确分层。 */
+/** v11 wire reply：传输序号与模型可见信封保持明确分层。 */
 export interface SupervisorReply {
   readonly reply_seq: number;
   readonly envelope: ChildReplyEnvelope;
@@ -262,6 +287,8 @@ export interface SupervisorReceiveAccepted {
   readonly transport_ack?: number;
   /** child 端收到并通过身份校验的任务租约。 */
   readonly task_assignment?: SupervisorTaskAssignment;
+  /** parent 端原子缓存的 child capability manifest；不进入公开状态。 */
+  readonly capability?: SupervisorCapabilityManifest;
   /** parent 端收到的 child 任务/turn 身份事实。 */
   readonly task_started?: SupervisorTaskStarted;
   /** parent 端收到的协调压缩屏障请求。 */
@@ -359,6 +386,23 @@ interface StoredReply {
 
 const SAFE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const SAFE_STREAM_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+const SAFE_CAPABILITY_TOKEN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@+/-]*$/;
+const SAFE_CAPABILITY_SYNTHETIC_SOURCE_PATTERN = /^<[A-Za-z0-9][A-Za-z0-9._:@+/-]*>$/;
+const SAFE_CAPABILITY_PATH_PATTERN = /^(?:[A-Za-z]:)?[A-Za-z0-9._:@+~/\\-]+$/;
+const CAPABILITY_THINKING_LEVELS: ReadonlySet<string> = new Set([
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
+const CAPABILITY_RESERVED_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+]);
 const RFC3339_MILLIS_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const EMPTY_FAULT: SupervisorChannelFault = Object.freeze({ code: "internal_error" });
 const EMPTY_NODES: readonly AgentSnapshot[] = Object.freeze([]);
@@ -440,6 +484,43 @@ function validCompactionTransactionId(value: unknown): value is string {
 
 function validStreamId(value: unknown, limits: SupervisorChannelLimits): value is string {
   return validBoundedString(value, limits) && SAFE_STREAM_PATTERN.test(value);
+}
+
+function validCapabilityToken(value: unknown, maxBytes: number): value is string {
+  return (
+    typeof value === "string"
+    && utf8Length(value) <= maxBytes
+    && SAFE_CAPABILITY_TOKEN_PATTERN.test(value)
+    && !CAPABILITY_RESERVED_TOOL_NAMES.has(value)
+  );
+}
+
+function validCapabilityPath(
+  value: unknown,
+  maxBytes = SUPERVISOR_CAPABILITY_LIMITS.maxSelfExtensionPathBytes,
+): value is string {
+  if (
+    typeof value !== "string"
+    || utf8Length(value) > maxBytes
+    || !SAFE_CAPABILITY_PATH_PATTERN.test(value)
+    || value.startsWith("//")
+    || value.startsWith("\\\\")
+  ) return false;
+  return !value.split(/[\\/]+/).some((segment) => segment === "." || segment === "..");
+}
+
+function validCapabilitySource(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  if (value.includes("/") || value.includes("\\")) {
+    return validCapabilityPath(value, SUPERVISOR_CAPABILITY_LIMITS.maxSourceBytes);
+  }
+  return (
+    validCapabilityToken(value, SUPERVISOR_CAPABILITY_LIMITS.maxSourceBytes)
+    || (
+      utf8Length(value) <= SUPERVISOR_CAPABILITY_LIMITS.maxSourceBytes
+      && SAFE_CAPABILITY_SYNTHETIC_SOURCE_PATTERN.test(value)
+    )
+  );
 }
 
 function validPeerAgentId(value: string): boolean {
@@ -992,6 +1073,96 @@ function parseTaskStarted(payload: Record<string, unknown>): SupervisorTaskStart
   });
 }
 
+function parseCapabilityTools(value: unknown): readonly string[] {
+  if (!Array.isArray(value) || value.length > SUPERVISOR_CAPABILITY_LIMITS.maxToolsPerCategory) {
+    frameError("invalid_frame");
+  }
+  const tools: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (!validCapabilityToken(item, SUPERVISOR_CAPABILITY_LIMITS.maxToolNameBytes)) {
+      frameError("invalid_frame");
+    }
+    if (seen.has(item)) continue;
+    seen.add(item);
+    tools.push(item);
+  }
+  return Object.freeze(tools);
+}
+
+function parseCapabilityManifest(
+  value: unknown,
+  limits: SupervisorChannelLimits,
+): SupervisorCapabilityManifest {
+  assertJsonBounds(value, limits);
+  const manifest = asPlainJsonRecord(value);
+  const allowed = new Set([
+    "protocol_version",
+    "business_active_tools",
+    "system_active_tools",
+    "system_tool_sources",
+    "provider",
+    "model",
+    "thinking",
+    "self_extension_path",
+  ]);
+  if (
+    Object.keys(manifest).some((key) => !allowed.has(key))
+    || !hasOwn(manifest, "protocol_version")
+    || !hasOwn(manifest, "business_active_tools")
+    || !hasOwn(manifest, "system_active_tools")
+    || !hasOwn(manifest, "system_tool_sources")
+  ) frameError("invalid_frame");
+  if (manifest.protocol_version !== SUPERVISOR_PROTOCOL_VERSION) frameError("protocol_mismatch");
+
+  const businessActiveTools = parseCapabilityTools(manifest.business_active_tools);
+  const systemActiveTools = parseCapabilityTools(manifest.system_active_tools);
+  const systemToolSet = new Set(systemActiveTools);
+  if (businessActiveTools.some((tool) => systemToolSet.has(tool))) frameError("invalid_frame");
+
+  const sourceRecord = asPlainJsonRecord(manifest.system_tool_sources);
+  const sourceEntries = plainJsonEntries(sourceRecord);
+  if (sourceEntries.length > SUPERVISOR_CAPABILITY_LIMITS.maxSystemToolSources) {
+    frameError("invalid_frame");
+  }
+  const systemToolSources: Record<string, string> = {};
+  for (const [tool, source] of sourceEntries) {
+    if (
+      !validCapabilityToken(tool, SUPERVISOR_CAPABILITY_LIMITS.maxToolNameBytes)
+      || !systemToolSet.has(tool)
+      || !validCapabilitySource(source)
+    ) frameError("invalid_frame");
+    definePlainValue(systemToolSources, tool, source);
+  }
+
+  if (
+    (manifest.provider !== undefined
+      && !validCapabilityToken(manifest.provider, SUPERVISOR_CAPABILITY_LIMITS.maxProviderBytes))
+    || (manifest.model !== undefined
+      && !validCapabilityToken(manifest.model, SUPERVISOR_CAPABILITY_LIMITS.maxModelBytes))
+    || (manifest.thinking !== undefined
+      && (
+        typeof manifest.thinking !== "string"
+        || utf8Length(manifest.thinking) > SUPERVISOR_CAPABILITY_LIMITS.maxThinkingBytes
+        || !CAPABILITY_THINKING_LEVELS.has(manifest.thinking)
+      ))
+    || (manifest.self_extension_path !== undefined && !validCapabilityPath(manifest.self_extension_path))
+  ) frameError("invalid_frame");
+
+  return freezePlain({
+    protocol_version: SUPERVISOR_PROTOCOL_VERSION,
+    business_active_tools: businessActiveTools,
+    system_active_tools: systemActiveTools,
+    system_tool_sources: Object.freeze(systemToolSources),
+    ...(manifest.provider === undefined ? {} : { provider: manifest.provider }),
+    ...(manifest.model === undefined ? {} : { model: manifest.model }),
+    ...(manifest.thinking === undefined ? {} : { thinking: manifest.thinking }),
+    ...(manifest.self_extension_path === undefined
+      ? {}
+      : { self_extension_path: manifest.self_extension_path }),
+  }) as SupervisorCapabilityManifest;
+}
+
 const SUPERVISOR_COMPACTION_OUTCOMES: ReadonlySet<string> = new Set([
   "succeeded",
   "failed",
@@ -1103,6 +1274,8 @@ export class SupervisorChannel {
   private nextReplySeq = 1;
   private nextExpectedReplySeq = 1;
   private highestReplyAck = 0;
+  private capabilityPublished = false;
+  private capability: SupervisorCapabilityManifest | undefined;
   private terminationBarrier = false;
 
   constructor(options: SupervisorChannelOptions) {
@@ -1224,6 +1397,19 @@ export class SupervisorChannel {
     this.outboundReplies.set(parsed.reply_seq, { reply: parsed });
     this.nextReplySeq += 1;
     return frame;
+  }
+
+  /** child 仅在普通 ready 后发布一次固定的内部能力快照。 */
+  publishCapability(manifest: SupervisorCapabilityManifest): SupervisorFrame {
+    if (
+      this.role !== "child"
+      || this.terminationBarrier
+      || this.state !== "ready"
+      || this.capabilityPublished
+    ) throw new SupervisorProtocolError("closed");
+    const parsed = parseCapabilityManifest(manifest, this.limits);
+    this.capabilityPublished = true;
+    return this.createFrame("capability", parsed as unknown as Record<string, unknown>);
   }
 
   /** parent 在 prompt/steer 之前发布任务租约；普通 transport ACK 即持久接纳点。 */
@@ -1423,6 +1609,12 @@ export class SupervisorChannel {
     });
   }
 
+  /** parent 最近一次通过严格校验的 capability manifest；返回副本避免改写缓存。 */
+  getCapability(): SupervisorCapabilityManifest | undefined {
+    if (this.capability === undefined) return undefined;
+    return freezePlain(cloneJson(this.capability)) as SupervisorCapabilityManifest;
+  }
+
   /** 供 TreeController 以单一临界区取得已合并的安全子树数据。 */
   getTreeSnapshot(): { readonly tree_revision: number; readonly nodes: readonly AgentSnapshot[] } {
     return Object.freeze({
@@ -1530,6 +1722,7 @@ export class SupervisorChannel {
     let transportAck: number | undefined;
     let taskAssignment: SupervisorTaskAssignment | undefined;
     let taskStarted: SupervisorTaskStarted | undefined;
+    let capability: SupervisorCapabilityManifest | undefined;
     let compactionPrepare: SupervisorCompactionPrepare | undefined;
     let compactionPrepared: SupervisorCompactionPrepared | undefined;
     let compactionComplete: SupervisorCompactionComplete | undefined;
@@ -1554,6 +1747,14 @@ export class SupervisorChannel {
         break;
       case "snapshot_request":
         outbound.push(this.applySnapshotRequest(frame));
+        break;
+      case "capability":
+        if (this.role !== "parent" || this.state !== "ready" || this.capability !== undefined) {
+          frameError("sequence_violation");
+        }
+        capability = parseCapabilityManifest(frame.payload, this.limits);
+        this.capability = capability;
+        applied = true;
         break;
       case "reply": {
         const result = this.applyReplyFrame(frame);
@@ -1625,6 +1826,7 @@ export class SupervisorChannel {
       ...(transportAck === undefined ? {} : { transport_ack: transportAck }),
       ...(taskAssignment === undefined ? {} : { task_assignment: taskAssignment }),
       ...(taskStarted === undefined ? {} : { task_started: taskStarted }),
+      ...(capability === undefined ? {} : { capability }),
       ...(compactionPrepare === undefined ? {} : { compaction_prepare: compactionPrepare }),
       ...(compactionPrepared === undefined ? {} : { compaction_prepared: compactionPrepared }),
       ...(compactionComplete === undefined ? {} : { compaction_complete: compactionComplete }),
@@ -1833,6 +2035,7 @@ export class SupervisorChannel {
     if (payload.error_code !== undefined && ![
       "spawn_failed",
       "spawn_timeout",
+      "capability_mismatch",
       "message_delivery_failed",
       "termination_incomplete",
       "internal_error",

@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
 import type {
   AgentController as AgentControllerType,
   AgentSupervisorFactory,
@@ -35,6 +37,7 @@ import {
 import {
   SUPERVISOR_PROTOCOL_VERSION,
   SupervisorRequestIdRegistry,
+  type SupervisorCapabilityManifest,
 } from "./supervisor-channel.ts";
 import {
   RemoteTreeAuthorityPort,
@@ -166,6 +169,8 @@ export interface PiSubagentRuntimeOptions {
   readonly bridgeScriptPath?: string;
   readonly childPiCliPath?: string;
   readonly childPiModulePath?: string;
+  /** 当前 Pi 实际加载的本扩展入口；child 必须复用该路径。 */
+  readonly selfExtensionPath?: string;
   readonly nodeFactory?: AgentSupervisorFactoryOptions["nodeFactory"];
   /** 测试可替换本地 IPC；生产固定使用命名管道或 Unix socket。 */
   readonly localSupervisorTransportAdapter?: LocalSupervisorTransportAdapter;
@@ -524,6 +529,67 @@ function applyAgentToolVisibility(
   }
 }
 
+function activeSystemTools(api: RuntimeExtensionApi): readonly string[] {
+  let tools: unknown;
+  try {
+    tools = api.getActiveTools();
+  } catch {
+    return Object.freeze([]);
+  }
+  if (!Array.isArray(tools)) return Object.freeze([]);
+  return Object.freeze([...new Set(tools.filter(
+    (name): name is string => typeof name === "string" && SYSTEM_TOOL_NAMES.has(name),
+  ))].sort());
+}
+
+function systemToolSources(
+  api: RuntimeExtensionApi,
+  systemTools: readonly string[],
+): Readonly<Record<string, string>> {
+  const wanted = new Set(systemTools);
+  const sources: Record<string, string> = {};
+  let tools: unknown[];
+  try {
+    tools = api.getAllTools();
+  } catch {
+    tools = [];
+  }
+  for (const tool of tools) {
+    if (!isRecord(tool) || typeof tool.name !== "string" || !wanted.has(tool.name)) continue;
+    const sourceInfo = isRecord(tool.sourceInfo) ? tool.sourceInfo : undefined;
+    sources[tool.name] = typeof sourceInfo?.path === "string" ? sourceInfo.path : "<missing>";
+  }
+  for (const name of wanted) sources[name] ??= "<missing>";
+  return Object.freeze(sources);
+}
+
+function defaultSelfExtensionPath(): string {
+  try {
+    return fileURLToPath(new URL("../extensions/pi-subagents-wj.ts", import.meta.url));
+  } catch {
+    throw new Error("子代理扩展入口不可用");
+  }
+}
+
+function childCapabilityManifest(
+  api: RuntimeExtensionApi,
+  context: RuntimeContextView,
+  selfExtensionPath: string,
+): SupervisorCapabilityManifest {
+  const systemTools = activeSystemTools(api);
+  const model = readRuntimeModel(context.model);
+  const thinking = typeof context.thinkingLevel === "string" ? context.thinkingLevel : undefined;
+  return Object.freeze({
+    protocol_version: SUPERVISOR_PROTOCOL_VERSION,
+    business_active_tools: Object.freeze([...activeBusinessTools(api)].sort()),
+    system_active_tools: systemTools,
+    system_tool_sources: systemToolSources(api, systemTools),
+    ...(model === undefined ? {} : { provider: model.provider, model: model.id }),
+    ...(thinking === undefined ? {} : { thinking }),
+    self_extension_path: resolvePath(selfExtensionPath),
+  });
+}
+
 function splitModelReference(value: string | undefined): readonly [string, string] | undefined {
   if (value === undefined) return undefined;
   const separator = value.indexOf("/");
@@ -811,7 +877,6 @@ export function createPiSubagentRuntimeActivator(
       if (current.isChild) return;
       const templates = new TemplateSnapshotController({
         root: current.rootRuntime,
-        knownTools: knownBusinessTools(api),
         ...(options.templateFileSystem === undefined ? {} : { fileSystem: options.templateFileSystem }),
       });
       const snapshot = templates.initialize(context);
@@ -986,7 +1051,6 @@ export function createPiSubagentRuntimeActivator(
       });
       const templates = new TemplateSnapshotController({
         root: rootRuntime,
-        knownTools: knownBusinessTools(api),
         ...(options.templateFileSystem === undefined ? {} : { fileSystem: options.templateFileSystem }),
       });
       const templateSnapshot = templates.initialize(context);
@@ -1149,6 +1213,7 @@ export function createPiSubagentRuntimeActivator(
         ...(options.bridgeScriptPath === undefined ? {} : { bridgeScriptPath: options.bridgeScriptPath }),
         ...(options.childPiCliPath === undefined ? {} : { childPiCliPath: options.childPiCliPath }),
         ...(options.childPiModulePath === undefined ? {} : { childPiModulePath: options.childPiModulePath }),
+        ...(options.selfExtensionPath === undefined ? {} : { childExtensionPath: options.selfExtensionPath }),
         ...(options.nodeFactory === undefined ? {} : { nodeFactory: options.nodeFactory }),
       });
       const controller = new AgentController({
@@ -1157,7 +1222,6 @@ export function createPiSubagentRuntimeActivator(
         createSupervisor,
         templateSnapshot,
         activeTools: () => activeBusinessTools(state.bindings.api),
-        validateTemplate: (template) => validateTemplateAgainstContext(template, state.bindings.context),
         waitTimeoutMs: rootRuntime.config.waitTimeoutMs,
         onTerminal: (agentId) => state.replyInbox.acceptTerminal(agentId),
         authority,
@@ -1188,6 +1252,13 @@ export function createPiSubagentRuntimeActivator(
         }));
       }
       applyAgentToolVisibility(api, state.managementEnabled, state.isChild);
+      if (state.upstream !== undefined) {
+        await state.upstream.channel.publishCapability(childCapabilityManifest(
+          api,
+          context,
+          options.selfExtensionPath ?? defaultSelfExtensionPath(),
+        ));
+      }
       bindRuntimeUi(state, context);
       try {
         options.onController?.(controller);

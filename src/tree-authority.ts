@@ -9,12 +9,12 @@ import {
   type TreeActor,
   type TreeController,
 } from "./tree-controller.ts";
-import type {
-  AgentTemplateListItem,
-  TemplateDefinition,
-  TemplateDiscoverySnapshot,
+import {
+  listAgentTemplates,
+  type AgentTemplateListItem,
+  type TemplateDefinition,
+  type TemplateDiscoverySnapshot,
 } from "./template-discovery-snapshot.ts";
-import { listAgentTemplates } from "./template-discovery-snapshot.ts";
 
 /** 根权威返回的模板副本；正文只允许在受认证的创建控制请求中传输。 */
 export interface ResolvedTemplateGrant {
@@ -167,7 +167,7 @@ export class RootTreeAuthority implements TreeAuthorityPort {
     const reservation: ReserveStartingChildInput = Object.freeze({
       templateId: input.template_id,
       name: input.name,
-      subagents: resolved.template.subagents,
+      allowSubagents: resolved.template.allowSubagents,
     });
     const reserved = this.tree.reserveStartingChild(actor, reservation);
     if (!reserved.ok) return reserved;
@@ -251,9 +251,16 @@ function cloneTemplate(template: TemplateDefinition): TemplateDefinition {
   return Object.freeze({
     templateId: template.templateId,
     source: template.source,
-    tools: Object.freeze([...template.tools]),
-    ...(template.description === undefined ? {} : { description: template.description }),
-    subagents: template.subagents,
+    templateDirectory: template.templateDirectory,
+    description: template.description,
+    tools: template.tools === undefined ? undefined : Object.freeze([...template.tools]),
+    extensions: template.extensions === undefined
+      ? undefined
+      : Object.freeze(template.extensions.map((extension) => Object.freeze({
+        source: extension.source,
+        displaySource: extension.displaySource,
+      }))),
+    allowSubagents: template.allowSubagents,
     contextFiles: template.contextFiles,
     systemPromptMode: template.systemPromptMode,
     ...(template.model === undefined ? {} : { model: template.model }),

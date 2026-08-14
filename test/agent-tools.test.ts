@@ -121,7 +121,11 @@ test("模板查询与创建通过注册渲染接口提供语义化调用和结�
       description: "快速探索",
       tools: Object.freeze(["read", "bash"]),
     }),
-    Object.freeze({ template_id: "review", tools: Object.freeze([]) }),
+    Object.freeze({
+      template_id: "review",
+      description: "审查结果",
+      tools: Object.freeze([]),
+    }),
   ]);
   registerAgentTools({ registerTool: (tool) => registrations.push(tool as Record<string, unknown>) }, async () => ({
     getAgentTemplates: async () => ({ ok: true, data: templates }),
@@ -172,6 +176,7 @@ test("模板查询与创建通过注册渲染接口提供语义化调用和结�
       "description: 快速探索",
       "tools: read, bash",
       "template_id: review",
+      "description: 审查结果",
       "tools: 无",
     ],
   );

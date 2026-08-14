@@ -12,7 +12,9 @@ import {
   type SupervisorByteTransport,
 } from "../src/stream-supervisor-channel.ts";
 import {
+  SUPERVISOR_PROTOCOL_VERSION,
   SupervisorRequestIdRegistry,
+  type SupervisorCapabilityManifest,
   type SupervisorReply,
 } from "../src/supervisor-channel.ts";
 import type { AgentSnapshot } from "../src/tree-controller.ts";
@@ -48,6 +50,19 @@ function finalReply(text: string): ChildFinalEnvelope {
     run_state: "settled",
     output_state: "present",
     text,
+  };
+}
+
+function capabilityManifest(): SupervisorCapabilityManifest {
+  return {
+    protocol_version: SUPERVISOR_PROTOCOL_VERSION,
+    business_active_tools: ["bash", "read"],
+    system_active_tools: ["reply_to_parent"],
+    system_tool_sources: { reply_to_parent: "extension:pi-subagents" },
+    provider: "openai",
+    model: "gpt-5.2-codex",
+    thinking: "high",
+    self_extension_path: "C:\\pi\\extensions\\pi-subagents.ts",
   };
 }
 
@@ -128,6 +143,35 @@ test("真实字节流完成 child hello、首快照、ACK 和 ready 双握手", 
   assert.equal(pair.child.isReady(), true);
   assert.equal(pair.parent.getPublicState().snapshot_node_count, 1);
   assert.equal(pair.parent.getPublicState().subtree_revision, 1);
+  await pair.parent.release();
+  await pair.child.release();
+});
+
+test("stream transport 在 ready 后转发一次 capability 并缓存给迟到观察者", async () => {
+  const pair = channelPair();
+  const observed: SupervisorCapabilityManifest[] = [];
+  pair.parent.onCapability(() => {
+    throw new Error("capability observer");
+  });
+  pair.parent.onCapability((capability) => observed.push(capability));
+  await pair.parent.bind(new AbortController().signal);
+  await pair.child.bind(new AbortController().signal);
+  await Promise.all([
+    pair.parent.waitForReady(new AbortController().signal),
+    pair.child.waitForReady(new AbortController().signal),
+  ]);
+  assert.equal(pair.parent.getCapability(), undefined);
+
+  await pair.child.publishCapability(capabilityManifest());
+  await settleIo();
+  assert.deepEqual(observed, [capabilityManifest()]);
+  assert.deepEqual(pair.parent.getCapability(), capabilityManifest());
+  assert.equal("capability" in pair.parent.getPublicState(), false);
+
+  const replayed: SupervisorCapabilityManifest[] = [];
+  pair.parent.onCapability((capability) => replayed.push(capability));
+  assert.deepEqual(replayed, [capabilityManifest()]);
+  await assert.rejects(pair.child.publishCapability(capabilityManifest()));
   await pair.parent.release();
   await pair.child.release();
 });

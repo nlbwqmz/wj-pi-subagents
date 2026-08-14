@@ -21,6 +21,7 @@ import type {
 import type {
   AgentTemplateListItem,
   TemplateDefinition,
+  TemplateExtension,
   TemplateThinkingLevel,
 } from "./template-discovery-snapshot.ts";
 import type {
@@ -391,8 +392,9 @@ function resultResponse<T>(
 function templateListToJson(value: readonly AgentTemplateListItem[]): SupervisorJsonValue {
   return Object.freeze(value.map((item) => Object.freeze({
     template_id: item.template_id,
-    ...(item.description === undefined ? {} : { description: item.description }),
-    tools: Object.freeze([...item.tools]),
+    description: item.description,
+    ...(item.tools === undefined ? {} : { tools: Object.freeze([...item.tools]) }),
+    ...(item.extensions === undefined ? {} : { extensions: Object.freeze([...item.extensions]) }),
   })));
 }
 
@@ -407,9 +409,16 @@ function templateToJson(value: TemplateDefinition): SupervisorJsonValue {
   return Object.freeze({
     template_id: value.templateId,
     source: value.source,
-    tools: Object.freeze([...value.tools]),
-    ...(value.description === undefined ? {} : { description: value.description }),
-    subagents: value.subagents,
+    template_directory: value.templateDirectory,
+    description: value.description,
+    ...(value.tools === undefined ? {} : { tools: Object.freeze([...value.tools]) }),
+    ...(value.extensions === undefined ? {} : {
+      extensions: Object.freeze(value.extensions.map((extension) => Object.freeze({
+        source: extension.source,
+        display_source: extension.displaySource,
+      }))),
+    }),
+    allow_subagents: value.allowSubagents,
     context_files: value.contextFiles,
     system_mode: value.systemPromptMode,
     ...(value.model === undefined ? {} : { model: value.model }),
@@ -475,18 +484,21 @@ function parseTemplateList(value: SupervisorJsonValue): readonly AgentTemplateLi
   for (const item of value) {
     if (typeof item !== "object" || item === null || Array.isArray(item)) return undefined;
     const record = item as Record<string, unknown>;
-    const allowed = ["template_id", "description", "tools"];
+    const allowed = ["template_id", "description", "tools", "extensions"];
+    const tools = parseOptionalStringList(record.tools);
+    const extensions = parseOptionalStringList(record.extensions);
     if (
       Object.keys(record).some((key) => !allowed.includes(key))
       || typeof record.template_id !== "string"
-      || (record.description !== undefined && typeof record.description !== "string")
-      || !Array.isArray(record.tools)
-      || record.tools.some((tool) => typeof tool !== "string")
+      || typeof record.description !== "string"
+      || (record.tools !== undefined && tools === undefined)
+      || (record.extensions !== undefined && extensions === undefined)
     ) return undefined;
     templates.push(Object.freeze({
       template_id: record.template_id,
-      ...(record.description === undefined ? {} : { description: record.description as string }),
-      tools: Object.freeze([...(record.tools as string[])]),
+      description: record.description,
+      ...(tools === undefined ? {} : { tools }),
+      ...(extensions === undefined ? {} : { extensions }),
     }));
   }
   return Object.freeze(templates);
@@ -496,18 +508,21 @@ function parseTemplate(value: unknown): TemplateDefinition | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
   const allowed = [
-    "template_id", "source", "tools", "description", "subagents", "context_files",
-    "system_mode", "model", "thinking", "body",
+    "template_id", "source", "template_directory", "description", "tools", "extensions",
+    "allow_subagents", "context_files", "system_mode", "model", "thinking", "body",
   ];
-  if (Object.keys(record).some((key) => !allowed.includes(key))) return undefined;
+  const tools = parseOptionalStringList(record.tools);
+  const extensions = parseOptionalTemplateExtensions(record.extensions);
   if (
-    typeof record.template_id !== "string"
+    Object.keys(record).some((key) => !allowed.includes(key))
+    || typeof record.template_id !== "string"
     || (record.source !== "user" && record.source !== "project")
-    || !Array.isArray(record.tools)
-    || record.tools.some((tool) => typeof tool !== "string")
-    || (record.description !== undefined && typeof record.description !== "string")
-    || (record.subagents !== "inherit" && record.subagents !== "disabled")
-    || (record.context_files !== "enabled" && record.context_files !== "disabled")
+    || typeof record.template_directory !== "string"
+    || typeof record.description !== "string"
+    || (record.tools !== undefined && tools === undefined)
+    || (record.extensions !== undefined && extensions === undefined)
+    || typeof record.allow_subagents !== "boolean"
+    || typeof record.context_files !== "boolean"
     || (record.system_mode !== "append" && record.system_mode !== "replace")
     || (record.model !== undefined && typeof record.model !== "string")
     || (record.thinking !== undefined && ![
@@ -520,15 +535,35 @@ function parseTemplate(value: unknown): TemplateDefinition | undefined {
   return Object.freeze({
     templateId: record.template_id,
     source: record.source,
-    tools: Object.freeze([...(record.tools as string[])]),
-    ...(record.description === undefined ? {} : { description: record.description }),
-    subagents: record.subagents,
+    templateDirectory: record.template_directory,
+    description: record.description,
+    tools,
+    extensions,
+    allowSubagents: record.allow_subagents,
     contextFiles: record.context_files,
     systemPromptMode: record.system_mode,
     ...(model === undefined ? {} : { model }),
     ...(thinking === undefined ? {} : { thinking }),
     body: record.body,
   });
+}
+
+function parseOptionalStringList(value: unknown): readonly string[] | undefined {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) return undefined;
+  return Object.freeze([...value] as string[]);
+}
+
+function parseOptionalTemplateExtensions(value: unknown): readonly TemplateExtension[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const extensions: TemplateExtension[] = [];
+  for (const item of value) {
+    const record = exactRecord(item, ["source", "display_source"]);
+    if (record === undefined || typeof record.source !== "string" || typeof record.display_source !== "string") {
+      return undefined;
+    }
+    extensions.push(Object.freeze({ source: record.source, displaySource: record.display_source }));
+  }
+  return Object.freeze(extensions);
 }
 
 function parseSpawnGrant(value: SupervisorJsonValue): SpawnGrant | undefined {

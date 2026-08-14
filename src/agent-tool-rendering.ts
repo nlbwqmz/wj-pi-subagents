@@ -348,13 +348,19 @@ function renderTemplateResult(
   const lines: SafeRenderLine[] = [{ text: `可用模板 ${templates.length}`, color: "success" }];
   for (const template of templates) {
     lines.push({ text: `template_id: ${template.templateId}`, color: "muted" });
-    if (template.description !== undefined) {
-      lines.push({ text: `description: ${template.description}`, color: "dim" });
-    }
+    lines.push({ text: `description: ${template.description}`, color: "dim" });
     lines.push({
-      text: `tools: ${template.tools.length === 0 ? "无" : template.tools.join(", ")}`,
+      text: template.tools === undefined
+        ? "tools: Pi 默认"
+        : `tools: ${template.tools.length === 0 ? "无" : template.tools.join(", ")}`,
       color: "dim",
     });
+    if (template.extensions !== undefined) {
+      lines.push({
+        text: `extensions: ${template.extensions.length === 0 ? "无" : template.extensions.join(", ")}`,
+        color: "dim",
+      });
+    }
   }
   return createSafeTextComponent(lines, theme, context);
 }
@@ -716,29 +722,35 @@ function formatTreeNode(node: AgentSnapshot): string {
 
 function readTemplates(value: unknown): readonly {
   readonly templateId: string;
-  readonly description?: string;
-  readonly tools: readonly string[];
+  readonly description: string;
+  readonly tools?: readonly string[];
+  readonly extensions?: readonly string[];
 }[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const templates: Array<{
     readonly templateId: string;
-    readonly description?: string;
-    readonly tools: readonly string[];
+    readonly description: string;
+    readonly tools?: readonly string[];
+    readonly extensions?: readonly string[];
   }> = [];
   for (const item of value) {
     const record = readRecord(item);
     const templateId = readOptionalString(record, "template_id");
     const description = readOptionalString(record, "description");
     const tools = readProperty(record, "tools");
+    const extensions = readProperty(record, "extensions");
     if (
       templateId === undefined
-      || !Array.isArray(tools)
-      || !tools.every((tool) => typeof tool === "string")
+      || description === undefined
+      || (tools !== undefined && (!Array.isArray(tools) || !tools.every((tool) => typeof tool === "string")))
+      || (extensions !== undefined
+        && (!Array.isArray(extensions) || !extensions.every((extension) => typeof extension === "string")))
     ) return undefined;
     templates.push({
       templateId,
-      ...(description === undefined ? {} : { description }),
-      tools: tools as readonly string[],
+      description,
+      ...(tools === undefined ? {} : { tools: tools as readonly string[] }),
+      ...(extensions === undefined ? {} : { extensions: extensions as readonly string[] }),
     });
   }
   return templates;

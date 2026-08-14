@@ -44,6 +44,7 @@ export const PUBLIC_ERROR_CODES = Object.freeze([
   "template_not_found",
   "template_invalid",
   "template_capability_unavailable",
+  "capability_mismatch",
   "max_depth_reached",
   "max_children_reached",
   "max_tree_agents_reached",
@@ -88,6 +89,7 @@ const ERROR_METADATA: Readonly<Record<PublicErrorCode, Readonly<{
   template_not_found: Object.freeze({ message: "未找到代理模板", retryable: false }),
   template_invalid: Object.freeze({ message: "代理模板无效", retryable: false }),
   template_capability_unavailable: Object.freeze({ message: "模板所需能力不可用", retryable: false }),
+  capability_mismatch: AGENT_FAULT_METADATA.capability_mismatch,
   max_depth_reached: Object.freeze({ message: "已达到最大代理深度", retryable: false }),
   max_children_reached: Object.freeze({ message: "直接子代理名额已满", retryable: true }),
   max_tree_agents_reached: Object.freeze({ message: "代理树名额已满", retryable: true }),
@@ -144,12 +146,11 @@ export type TreeActor = RootTreeActor | AgentTreeActor;
 /** 根会话不是代理节点，使用此值表示其直接子代理作用域。 */
 export const ROOT_TREE_ACTOR: RootTreeActor = Object.freeze({ kind: "root" });
 
-export type TemplateSubagentCapability = "inherit" | "disabled";
-
 export interface ReserveStartingChildInput {
   readonly templateId: string;
   readonly name: string;
-  readonly subagents?: TemplateSubagentCapability;
+  /** 未校验创建路径省略时沿用默认的递归管理能力。 */
+  readonly allowSubagents?: boolean;
 }
 
 export interface AgentTreeSnapshot {
@@ -417,10 +418,16 @@ function isLifecycleEvent(value: unknown): value is AgentLifecycleEvent {
 }
 
 function validReserveInput(value: unknown): value is ReserveStartingChildInput {
-  if (typeof value !== "object" || value === null) return false;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const candidate = value as Record<string, unknown>;
-  if (typeof candidate.templateId !== "string" || typeof candidate.name !== "string") return false;
-  return candidate.subagents === undefined || candidate.subagents === "inherit" || candidate.subagents === "disabled";
+  return Object.keys(candidate).every((key) => ["templateId", "name", "allowSubagents"].includes(key))
+    && typeof candidate.templateId === "string"
+    && typeof candidate.name === "string"
+    && (candidate.allowSubagents === undefined || typeof candidate.allowSubagents === "boolean");
+}
+
+function reservationAllowsSubagents(input: ReserveStartingChildInput): boolean {
+  return input.allowSubagents ?? true;
 }
 
 function isPublicAgentSnapshot(value: unknown): value is AgentSnapshot {
@@ -761,7 +768,7 @@ export class TreeController {
       name: input.name,
       depth,
       managementEnabled: parent.managementEnabled
-        && input.subagents !== "disabled"
+        && reservationAllowsSubagents(input)
         && depth < this.config.maxDepth,
       state: "starting",
       mailboxPendingCount: 0,

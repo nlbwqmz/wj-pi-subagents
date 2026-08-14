@@ -80,9 +80,12 @@ function template(overrides: Partial<TemplateDefinition> = {}): TemplateDefiniti
   return Object.freeze({
     templateId: "researcher",
     source: "user",
-    tools: Object.freeze([]),
-    subagents: "inherit",
-    contextFiles: "disabled",
+    templateDirectory: "C:/pi-subagents-wj/.pi/agents",
+    description: "研究任务",
+    tools: undefined,
+    extensions: undefined,
+    allowSubagents: true,
+    contextFiles: false,
     systemPromptMode: "append",
     body: "",
     ...overrides,
@@ -118,7 +121,7 @@ function factoryHarness(deliverReply?: (agentId: string, reply: ManagedRpcReply)
     rootArguments: { maxDepth: 2 },
     controllerMetadata: {
       rootId: "root-factory",
-      protocolVersion: "pi-subagent/10",
+      protocolVersion: "pi-subagent/11",
     },
   });
   const options = {
@@ -150,7 +153,7 @@ test("受管 RPC 选项按模板覆盖或在创建瞬间继承模型与 thinking
   assert.deepEqual(inherited, {
     provider: "openai",
     model: "gpt-current",
-    args: ["--no-session", "--no-context-files", "--thinking", "medium", "--tools", ""],
+    args: ["--no-session", "--no-context-files", "--thinking", "medium"],
   });
 
   currentModel = "anthropic/claude-latest";
@@ -166,12 +169,10 @@ test("受管 RPC 选项按模板覆盖或在创建瞬间继承模型与 thinking
     "--no-context-files",
     "--thinking",
     "high",
-    "--tools",
-    "",
   ]);
 
   const explicit = buildManagedRpcOptions(template({
-    contextFiles: "enabled",
+    contextFiles: true,
     systemPromptMode: "replace",
     body: "固定提示",
     tools: Object.freeze(["read", "grep"]),
@@ -200,8 +201,6 @@ test("受管 RPC 选项按模板覆盖或在创建瞬间继承模型与 thinking
   assert.deepEqual(withManagement.args, [
     "--no-session",
     "--no-context-files",
-    "--tools",
-    "spawn_agent,send_message",
   ]);
 
   const withExtension = buildManagedRpcOptions(template(), {
@@ -214,16 +213,14 @@ test("受管 RPC 选项按模板覆盖或在创建瞬间继承模型与 thinking
     "-e",
     "C:/pi-subagents-wj/extensions/pi-subagents-wj.ts",
     "--no-context-files",
-    "--tools",
-    "",
   ]);
   assert.equal(withExtension.cliPath, "C:/pi/dist/cli.js");
   assert.equal(withExtension.piModulePath, "C:/pi/dist/index.js");
 
   const trusted = buildManagedRpcOptions(template(), { projectTrust: true });
   const untrusted = buildManagedRpcOptions(template(), { projectTrust: false });
-  assert.deepEqual(trusted.args, ["--no-session", "--approve", "--no-context-files", "--tools", ""]);
-  assert.deepEqual(untrusted.args, ["--no-session", "--no-approve", "--no-context-files", "--tools", ""]);
+  assert.deepEqual(trusted.args, ["--no-session", "--approve", "--no-context-files"]);
+  assert.deepEqual(untrusted.args, ["--no-session", "--no-approve", "--no-context-files"]);
 });
 
 test("身份预留后才建立监督上下文并追加最终子代理环境", async () => {
@@ -247,7 +244,7 @@ test("身份预留后才建立监督上下文并追加最终子代理环境", as
   assert.equal(context.environment?.PI_SUBAGENT_AGENT_ID, AGENT_ID);
   assert.equal(context.environment?.PI_SUBAGENT_DEPTH, "1");
   assert.equal(context.environment?.PI_SUBAGENT_MAX_DEPTH, "2");
-  assert.equal(context.environment?.PI_SUBAGENT_PROTOCOL_VERSION, "pi-subagent/10");
+  assert.equal(context.environment?.PI_SUBAGENT_PROTOCOL_VERSION, "pi-subagent/11");
   await supervisor.terminate();
 });
 

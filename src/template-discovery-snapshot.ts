@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { isMap, isScalar, parseDocument } from "yaml";
+import { isMap, isScalar, isSeq, LineCounter, parseDocument } from "yaml";
 import type { RuntimeUiContext } from "./root-runtime-context.ts";
 
 export type TemplateSource = "user" | "project";
@@ -32,24 +32,37 @@ export interface TemplateDiscoveryFileSystem {
   readonly readFile: (path: string) => Uint8Array;
 }
 
+export interface TemplateExtension {
+  /** YAML 解析后的原始 source，交由运行时按 Pi 的规则解释。 */
+  readonly source: string;
+  /** 面向目录和 UI 的规范化 source，不泄露模板目录。 */
+  readonly displaySource: string;
+}
+
 export interface TemplateDefinition {
   readonly templateId: string;
   readonly source: TemplateSource;
-  readonly tools: readonly string[];
-  readonly description?: string;
-  readonly subagents: "inherit" | "disabled";
-  readonly contextFiles: "enabled" | "disabled";
+  /** 仅供运行时将相对 extension source 解析到模板所属目录。 */
+  readonly templateDirectory: string;
+  readonly description: string;
+  /** undefined 表示 frontmatter 未声明，[] 表示显式空工具集。 */
+  readonly tools: readonly string[] | undefined;
+  /** undefined 表示 frontmatter 未声明，[] 表示显式未加载扩展。 */
+  readonly extensions: readonly TemplateExtension[] | undefined;
+  readonly allowSubagents: boolean;
+  readonly contextFiles: boolean;
   readonly systemPromptMode: "append" | "replace";
   readonly model?: string;
   readonly thinking?: TemplateThinkingLevel;
   readonly body: string;
 }
 
-/** 模型可见的有效模板目录条目；不暴露正文、来源、模型或其他运行配置。 */
+/** 模型可见的有效模板目录条目；不暴露正文、来源、目录、模型或其他运行配置。 */
 export interface AgentTemplateListItem {
   readonly template_id: string;
-  readonly description?: string;
-  readonly tools: readonly string[];
+  readonly description: string;
+  readonly tools?: readonly string[];
+  readonly extensions?: readonly string[];
 }
 
 export type TemplateCandidateDiagnosticReason =
@@ -57,10 +70,16 @@ export type TemplateCandidateDiagnosticReason =
   | "invalid_utf8"
   | "frontmatter_missing"
   | "frontmatter_invalid"
-  | "tools_invalid"
-  | "unknown_tool"
+  | "frontmatter_non_string_key"
+  | "frontmatter_merge_key"
+  | "unknown_field"
+  | "description_missing"
   | "description_invalid"
-  | "subagents_invalid"
+  | "description_too_long"
+  | "tools_invalid"
+  | "reserved_tool"
+  | "extensions_invalid"
+  | "allow_subagents_invalid"
   | "context_files_invalid"
   | "system_prompt_mode_invalid"
   | "model_invalid"
@@ -73,6 +92,10 @@ export interface TemplateCandidateDiagnostic {
   readonly templateId: string;
   readonly fileName: string;
   readonly reason: TemplateCandidateDiagnosticReason;
+  /** UI 可用的 frontmatter 定位信息，不进入模型目录。 */
+  readonly field?: string;
+  readonly line?: number;
+  readonly column?: number;
 }
 
 export interface TemplateSourceDiagnostic {
@@ -98,22 +121,39 @@ export interface TemplateDiscoveryOptions {
     readonly cwd: string;
     readonly projectTrust: boolean;
   };
-  /** 当前 Pi 已注册的业务工具集合；发现时未知工具属于模板格式错误。 */
-  readonly knownTools: ReadonlySet<string>;
   readonly fileSystem?: TemplateDiscoveryFileSystem;
 }
 
 export type TemplateSnapshotControllerOptions = TemplateDiscoveryOptions;
 
+interface FrontmatterLocation {
+  readonly line?: number;
+  readonly column?: number;
+}
+
+interface ParsedFrontmatterField extends FrontmatterLocation {
+  readonly value: unknown;
+}
+
 interface ParsedFrontmatter {
-  readonly values: ReadonlyMap<unknown, unknown>;
-  readonly emptyToolsIsDoubleQuoted: boolean;
+  readonly fields: ReadonlyMap<string, ParsedFrontmatterField>;
   readonly body: string;
+}
+
+type FrontmatterParseIssueReason =
+  | "frontmatter_invalid"
+  | "frontmatter_non_string_key"
+  | "frontmatter_merge_key"
+  | "unknown_field";
+
+interface FrontmatterParseIssue extends FrontmatterLocation {
+  readonly reason: FrontmatterParseIssueReason;
+  readonly field?: string;
 }
 
 type FrontmatterParseResult =
   | { readonly kind: "missing" }
-  | { readonly kind: "invalid" }
+  | { readonly kind: "invalid"; readonly issue: FrontmatterParseIssue }
   | { readonly kind: "valid"; readonly frontmatter: ParsedFrontmatter };
 
 interface ValidCandidate {
@@ -127,6 +167,29 @@ interface InvalidCandidate {
 }
 
 type Candidate = ValidCandidate | InvalidCandidate;
+
+const TEMPLATE_FRONTMATTER_FIELDS = new Set<string>([
+  "description",
+  "extensions",
+  "tools",
+  "allowSubagents",
+  "contextFiles",
+  "systemPromptMode",
+  "model",
+  "thinking",
+]);
+
+const RESERVED_SYSTEM_TOOL_NAMES = new Set<string>([
+  "get_agent_templates",
+  "spawn_agent",
+  "send_message",
+  "wait_agent",
+  "interrupt_agent",
+  "terminate_agent",
+  "get_agent_status",
+  "get_agent_tree",
+  "reply_to_parent",
+]);
 
 const nativeFileSystem: TemplateDiscoveryFileSystem = {
   readDirectory(path): readonly TemplateDirectoryEntry[] {
@@ -150,14 +213,17 @@ function freezeRecord<T extends object>(value: T): Readonly<T> {
   return Object.freeze(value);
 }
 
-/** 模板正文只供创建流程使用；序列化快照时不能进入 UI、日志或模型上下文。 */
+/** 模板正文、目录和 extension 原始 source 只供创建流程使用，不能进入模型目录。 */
 function templateJsonView(template: TemplateDefinition): Record<string, unknown> {
   return {
     templateId: template.templateId,
     source: template.source,
-    tools: [...template.tools],
-    ...(template.description === undefined ? {} : { description: template.description }),
-    subagents: template.subagents,
+    description: template.description,
+    ...(template.tools === undefined ? {} : { tools: [...template.tools] }),
+    ...(template.extensions === undefined
+      ? {}
+      : { extensions: template.extensions.map((extension) => extension.displaySource) }),
+    allowSubagents: template.allowSubagents,
     contextFiles: template.contextFiles,
     systemPromptMode: template.systemPromptMode,
     ...(template.model === undefined ? {} : { model: template.model }),
@@ -182,8 +248,11 @@ export function listAgentTemplates(
 ): readonly AgentTemplateListItem[] {
   return Object.freeze(snapshot.templates.map((template) => freezeRecord({
     template_id: template.templateId,
-    ...(template.description === undefined ? {} : { description: template.description }),
-    tools: Object.freeze([...template.tools]),
+    description: template.description,
+    ...(template.tools === undefined ? {} : { tools: Object.freeze([...template.tools]) }),
+    ...(template.extensions === undefined
+      ? {}
+      : { extensions: Object.freeze(template.extensions.map((extension) => extension.displaySource)) }),
   })));
 }
 
@@ -215,6 +284,17 @@ function decodeUtf8(bytes: Uint8Array): string | undefined {
   }
 }
 
+function scalarLocation(
+  lineCounter: LineCounter,
+  scalar: { readonly range?: readonly number[] | null },
+): FrontmatterLocation {
+  const offset = scalar.range?.[0];
+  if (offset === undefined) return {};
+  const position = lineCounter.linePos(offset);
+  // frontmatter 从 Markdown 的第二行开始。
+  return { line: position.line + 1, column: position.col };
+}
+
 function parseFrontmatter(markdown: string): FrontmatterParseResult {
   const opening = /^(?:---)[ \t]*(?:\r?\n)/.exec(markdown);
   if (opening === null) return { kind: "missing" };
@@ -222,58 +302,108 @@ function parseFrontmatter(markdown: string): FrontmatterParseResult {
   const closing = /^---[ \t]*(?:\r?\n|$)/gm;
   closing.lastIndex = opening[0].length;
   const delimiter = closing.exec(markdown);
-  if (delimiter === null) return { kind: "invalid" };
+  if (delimiter === null) return { kind: "invalid", issue: { reason: "frontmatter_invalid" } };
 
   const frontmatter = markdown.slice(opening[0].length, delimiter.index);
+  const lineCounter = new LineCounter();
   let document: ReturnType<typeof parseDocument>;
   try {
     document = parseDocument(frontmatter, {
+      lineCounter,
       prettyErrors: false,
       strict: true,
       uniqueKeys: true,
     });
   } catch {
-    return { kind: "invalid" };
+    return { kind: "invalid", issue: { reason: "frontmatter_invalid" } };
   }
-  if (document.errors.length !== 0 || document.warnings.length !== 0) return { kind: "invalid" };
+  if (document.errors.length !== 0 || document.warnings.length !== 0) {
+    return { kind: "invalid", issue: { reason: "frontmatter_invalid" } };
+  }
+  if (!isMap(document.contents)) {
+    return { kind: "invalid", issue: { reason: "frontmatter_invalid" } };
+  }
 
-  let parsed: unknown;
-  try {
-    parsed = document.toJS({ mapAsMap: true });
-  } catch {
-    return { kind: "invalid" };
-  }
-  if (!(parsed instanceof Map)) return { kind: "invalid" };
-  let emptyToolsIsDoubleQuoted = false;
-  if (isMap(document.contents)) {
-    const toolsPair = document.contents.items.find((pair) => (
-      isScalar(pair.key) && pair.key.value === "tools"
-    ));
-    emptyToolsIsDoubleQuoted = toolsPair !== undefined
-      && isScalar(toolsPair.value)
-      && toolsPair.value.value === ""
-      && toolsPair.value.type === "QUOTE_DOUBLE";
+  const fields = new Map<string, ParsedFrontmatterField>();
+  for (const pair of document.contents.items) {
+    if (!isScalar(pair.key) || typeof pair.key.value !== "string") {
+      return {
+        kind: "invalid",
+        issue: {
+          reason: "frontmatter_non_string_key",
+          ...(isScalar(pair.key) ? scalarLocation(lineCounter, pair.key) : {}),
+        },
+      };
+    }
+    const field = pair.key.value;
+    const location = scalarLocation(lineCounter, pair.key);
+    if (
+      field === "<<"
+      || pair.key.tag === "tag:yaml.org,2002:merge"
+      || pair.key.addToJSMap !== undefined
+    ) {
+      return {
+        kind: "invalid",
+        issue: { reason: "frontmatter_merge_key", field, ...location },
+      };
+    }
+    if (!TEMPLATE_FRONTMATTER_FIELDS.has(field)) {
+      return {
+        kind: "invalid",
+        issue: { reason: "unknown_field", field, ...location },
+      };
+    }
+    fields.set(field, { value: pair.value, ...location });
   }
   return {
     kind: "valid",
     frontmatter: {
-      values: parsed,
-      emptyToolsIsDoubleQuoted,
+      fields,
       body: markdown.slice(delimiter.index + delimiter[0].length),
     },
   };
 }
 
-function normalizeTools(value: unknown, emptyToolsIsDoubleQuoted: boolean): readonly string[] | undefined {
-  if (typeof value !== "string") return undefined;
-  if (value === "") return emptyToolsIsDoubleQuoted ? Object.freeze([]) : undefined;
+interface ParsedStringArrayValue {
+  readonly source: string;
+  readonly displayValue: string;
+}
 
-  const tools: string[] = [];
-  for (const part of value.split(",")) {
-    const tool = part.trim();
-    if (tool !== "" && !tools.includes(tool)) tools.push(tool);
+type StringArrayParseResult =
+  | { readonly kind: "absent" }
+  | { readonly kind: "invalid" }
+  | { readonly kind: "valid"; readonly values: readonly ParsedStringArrayValue[] };
+
+function parseStringArray(field: ParsedFrontmatterField | undefined): StringArrayParseResult {
+  if (field === undefined) return { kind: "absent" };
+  if (!isSeq(field.value)) return { kind: "invalid" };
+
+  const values: ParsedStringArrayValue[] = [];
+  const seen = new Set<string>();
+  for (const item of field.value.items) {
+    if (!isScalar(item) || typeof item.value !== "string") return { kind: "invalid" };
+    const displayValue = item.value.trim();
+    if (displayValue === "" || seen.has(displayValue)) return { kind: "invalid" };
+    seen.add(displayValue);
+    values.push({ source: item.value, displayValue });
   }
-  return tools.length === 0 ? undefined : Object.freeze(tools);
+  return { kind: "valid", values: Object.freeze(values) };
+}
+
+function stringScalarValue(field: ParsedFrontmatterField): string | undefined {
+  return isScalar(field.value) && typeof field.value.value === "string"
+    ? field.value.value
+    : undefined;
+}
+
+function booleanScalarValue(field: ParsedFrontmatterField): boolean | undefined {
+  return isScalar(field.value) && typeof field.value.value === "boolean"
+    ? field.value.value
+    : undefined;
+}
+
+function unicodeCodePointLength(value: string): number {
+  return Array.from(value).length;
 }
 
 function isThinkingLevel(value: unknown): value is TemplateThinkingLevel {
@@ -284,10 +414,28 @@ function isProviderModel(value: unknown): value is string {
   return typeof value === "string" && /^[^\s/]+\/[^\s/][^\s]*$/.test(value);
 }
 
+interface CandidateDiagnosticDetails {
+  readonly field?: string;
+  readonly line?: number;
+  readonly column?: number;
+}
+
+function fieldDiagnosticDetails(
+  fieldName: string,
+  field: ParsedFrontmatterField | undefined,
+): CandidateDiagnosticDetails {
+  return {
+    field: fieldName,
+    ...(field?.line === undefined ? {} : { line: field.line }),
+    ...(field?.column === undefined ? {} : { column: field.column }),
+  };
+}
+
 function invalidCandidate(
   source: TemplateSource,
   fileName: string,
   reason: TemplateCandidateDiagnosticReason,
+  details: CandidateDiagnosticDetails = {},
 ): InvalidCandidate {
   return {
     kind: "invalid",
@@ -296,6 +444,9 @@ function invalidCandidate(
       templateId: fileName.slice(0, -".md".length),
       fileName,
       reason,
+      ...(details.field === undefined ? {} : { field: details.field }),
+      ...(details.line === undefined ? {} : { line: details.line }),
+      ...(details.column === undefined ? {} : { column: details.column }),
     }),
   };
 }
@@ -305,7 +456,6 @@ function parseCandidate(
   fileName: string,
   directory: string,
   fileSystem: TemplateDiscoveryFileSystem,
-  knownTools: ReadonlySet<string>,
 ): Candidate {
   let bytes: Uint8Array;
   try {
@@ -322,70 +472,158 @@ function parseCandidate(
     return invalidCandidate(source, fileName, "frontmatter_missing");
   }
   if (parsedFrontmatter.kind === "invalid") {
-    return invalidCandidate(source, fileName, "frontmatter_invalid");
+    return invalidCandidate(
+      source,
+      fileName,
+      parsedFrontmatter.issue.reason,
+      parsedFrontmatter.issue,
+    );
   }
   const frontmatter = parsedFrontmatter.frontmatter;
 
-  const tools = normalizeTools(
-    frontmatter.values.get("tools"),
-    frontmatter.emptyToolsIsDoubleQuoted,
-  );
-  if (tools === undefined) return invalidCandidate(source, fileName, "tools_invalid");
-  if (tools.some((tool) => !knownTools.has(tool))) {
-    return invalidCandidate(source, fileName, "unknown_tool");
+  const descriptionField = frontmatter.fields.get("description");
+  if (descriptionField === undefined) {
+    return invalidCandidate(source, fileName, "description_missing", { field: "description" });
+  }
+  const descriptionValue = stringScalarValue(descriptionField);
+  if (descriptionValue === undefined) {
+    return invalidCandidate(
+      source,
+      fileName,
+      "description_invalid",
+      fieldDiagnosticDetails("description", descriptionField),
+    );
+  }
+  const description = descriptionValue.trim();
+  if (description === "") {
+    return invalidCandidate(
+      source,
+      fileName,
+      "description_invalid",
+      fieldDiagnosticDetails("description", descriptionField),
+    );
+  }
+  if (unicodeCodePointLength(description) > 512) {
+    return invalidCandidate(
+      source,
+      fileName,
+      "description_too_long",
+      fieldDiagnosticDetails("description", descriptionField),
+    );
   }
 
-  let description: string | undefined;
-  if (frontmatter.values.has("description")) {
-    const descriptionValue = frontmatter.values.get("description");
-    if (typeof descriptionValue !== "string") {
-      return invalidCandidate(source, fileName, "description_invalid");
-    }
-    const normalizedDescription = descriptionValue.trim();
-    description = normalizedDescription === "" ? undefined : normalizedDescription;
+  const toolsField = frontmatter.fields.get("tools");
+  const parsedTools = parseStringArray(toolsField);
+  if (parsedTools.kind === "invalid") {
+    return invalidCandidate(
+      source,
+      fileName,
+      "tools_invalid",
+      fieldDiagnosticDetails("tools", toolsField),
+    );
+  }
+  const tools = parsedTools.kind === "absent"
+    ? undefined
+    : Object.freeze(parsedTools.values.map((tool) => tool.displayValue));
+  if (tools?.some((tool) => RESERVED_SYSTEM_TOOL_NAMES.has(tool)) === true) {
+    return invalidCandidate(
+      source,
+      fileName,
+      "reserved_tool",
+      fieldDiagnosticDetails("tools", toolsField),
+    );
   }
 
-  let subagents: TemplateDefinition["subagents"] = "inherit";
-  if (frontmatter.values.has("subagents")) {
-    const subagentsValue = frontmatter.values.get("subagents");
-    if (subagentsValue !== "inherit" && subagentsValue !== "disabled") {
-      return invalidCandidate(source, fileName, "subagents_invalid");
+  const extensionsField = frontmatter.fields.get("extensions");
+  const parsedExtensions = parseStringArray(extensionsField);
+  if (parsedExtensions.kind === "invalid") {
+    return invalidCandidate(
+      source,
+      fileName,
+      "extensions_invalid",
+      fieldDiagnosticDetails("extensions", extensionsField),
+    );
+  }
+  const extensions = parsedExtensions.kind === "absent"
+    ? undefined
+    : Object.freeze(parsedExtensions.values.map((extension) => freezeRecord({
+      source: extension.source,
+      displaySource: extension.displayValue,
+    })));
+
+  let allowSubagents = true;
+  const allowSubagentsField = frontmatter.fields.get("allowSubagents");
+  if (allowSubagentsField !== undefined) {
+    const value = booleanScalarValue(allowSubagentsField);
+    if (value === undefined) {
+      return invalidCandidate(
+        source,
+        fileName,
+        "allow_subagents_invalid",
+        fieldDiagnosticDetails("allowSubagents", allowSubagentsField),
+      );
     }
-    subagents = subagentsValue;
+    allowSubagents = value;
   }
 
-  let contextFiles: TemplateDefinition["contextFiles"] = "enabled";
-  if (frontmatter.values.has("contextFiles")) {
-    const contextFilesValue = frontmatter.values.get("contextFiles");
-    if (contextFilesValue !== "enabled" && contextFilesValue !== "disabled") {
-      return invalidCandidate(source, fileName, "context_files_invalid");
+  let contextFiles = true;
+  const contextFilesField = frontmatter.fields.get("contextFiles");
+  if (contextFilesField !== undefined) {
+    const value = booleanScalarValue(contextFilesField);
+    if (value === undefined) {
+      return invalidCandidate(
+        source,
+        fileName,
+        "context_files_invalid",
+        fieldDiagnosticDetails("contextFiles", contextFilesField),
+      );
     }
-    contextFiles = contextFilesValue;
+    contextFiles = value;
   }
 
   let systemPromptMode: TemplateDefinition["systemPromptMode"] = "append";
-  if (frontmatter.values.has("systemPromptMode")) {
-    const systemPromptModeValue = frontmatter.values.get("systemPromptMode");
-    if (systemPromptModeValue !== "append" && systemPromptModeValue !== "replace") {
-      return invalidCandidate(source, fileName, "system_prompt_mode_invalid");
+  const systemPromptModeField = frontmatter.fields.get("systemPromptMode");
+  if (systemPromptModeField !== undefined) {
+    const value = stringScalarValue(systemPromptModeField);
+    if (value !== "append" && value !== "replace") {
+      return invalidCandidate(
+        source,
+        fileName,
+        "system_prompt_mode_invalid",
+        fieldDiagnosticDetails("systemPromptMode", systemPromptModeField),
+      );
     }
-    systemPromptMode = systemPromptModeValue;
+    systemPromptMode = value;
   }
 
   let model: string | undefined;
-  if (frontmatter.values.has("model")) {
-    const modelValue = frontmatter.values.get("model");
-    if (!isProviderModel(modelValue)) return invalidCandidate(source, fileName, "model_invalid");
-    model = modelValue;
+  const modelField = frontmatter.fields.get("model");
+  if (modelField !== undefined) {
+    const value = stringScalarValue(modelField);
+    if (!isProviderModel(value)) {
+      return invalidCandidate(
+        source,
+        fileName,
+        "model_invalid",
+        fieldDiagnosticDetails("model", modelField),
+      );
+    }
+    model = value;
   }
 
   let thinking: TemplateThinkingLevel | undefined;
-  if (frontmatter.values.has("thinking")) {
-    const thinkingValue = frontmatter.values.get("thinking");
-    if (!isThinkingLevel(thinkingValue)) {
-      return invalidCandidate(source, fileName, "thinking_invalid");
+  const thinkingField = frontmatter.fields.get("thinking");
+  if (thinkingField !== undefined) {
+    const value = stringScalarValue(thinkingField);
+    if (!isThinkingLevel(value)) {
+      return invalidCandidate(
+        source,
+        fileName,
+        "thinking_invalid",
+        fieldDiagnosticDetails("thinking", thinkingField),
+      );
     }
-    thinking = thinkingValue;
+    thinking = value;
   }
   if (utf8Length(frontmatter.body) > MAX_TEMPLATE_BODY_BYTES) {
     return invalidCandidate(source, fileName, "body_too_large");
@@ -395,9 +633,11 @@ function parseCandidate(
     template: createTemplateDefinition({
       templateId: fileName.slice(0, -".md".length),
       source,
+      templateDirectory: directory,
+      description,
       tools,
-      ...(description === undefined ? {} : { description }),
-      subagents,
+      extensions,
+      allowSubagents,
       contextFiles,
       systemPromptMode,
       ...(model === undefined ? {} : { model }),
@@ -411,7 +651,6 @@ function scanSource(
   source: TemplateSource,
   directory: string,
   fileSystem: TemplateDiscoveryFileSystem,
-  knownTools: ReadonlySet<string>,
   sourceDiagnostics: TemplateSourceDiagnostic[],
 ): readonly Candidate[] {
   let entries: readonly TemplateDirectoryEntry[];
@@ -429,7 +668,7 @@ function scanSource(
     if (!entry.name.endsWith(".md") || (entry.kind !== "file" && entry.kind !== "symbolic_link")) {
       continue;
     }
-    candidates.push(parseCandidate(source, entry.name, directory, fileSystem, knownTools));
+    candidates.push(parseCandidate(source, entry.name, directory, fileSystem));
   }
   return Object.freeze(candidates);
 }
@@ -452,7 +691,6 @@ export function discoverTemplateSnapshot(
     "user",
     sourceDirectory("user", options.root),
     fileSystem,
-    options.knownTools,
     sourceDiagnostics,
   );
   const projectCandidates = options.root.projectTrust
@@ -460,7 +698,6 @@ export function discoverTemplateSnapshot(
       "project",
       sourceDirectory("project", options.root),
       fileSystem,
-      options.knownTools,
       sourceDiagnostics,
     )
     : Object.freeze([] as Candidate[]);
@@ -508,6 +745,9 @@ export function discoverTemplateSnapshot(
         templateId: diagnostic.templateId,
         fileName: diagnostic.fileName,
         reason: diagnostic.reason,
+        ...(diagnostic.field === undefined ? {} : { field: diagnostic.field }),
+        ...(diagnostic.line === undefined ? {} : { line: diagnostic.line }),
+        ...(diagnostic.column === undefined ? {} : { column: diagnostic.column }),
       })),
       sourceDiagnostics: frozenSourceDiagnostics.map((diagnostic) => ({
         source: diagnostic.source,
@@ -527,14 +767,26 @@ function candidateReasonLabel(reason: TemplateCandidateDiagnosticReason): string
       return "缺少 frontmatter";
     case "frontmatter_invalid":
       return "frontmatter 无法解析";
-    case "tools_invalid":
-      return "tools 配置无效";
-    case "unknown_tool":
-      return "包含未知业务工具";
+    case "frontmatter_non_string_key":
+      return "frontmatter 键必须是字符串";
+    case "frontmatter_merge_key":
+      return "不允许 YAML merge 键";
+    case "unknown_field":
+      return "包含未知字段";
+    case "description_missing":
+      return "缺少 description";
     case "description_invalid":
       return "description 配置无效";
-    case "subagents_invalid":
-      return "subagents 配置无效";
+    case "description_too_long":
+      return "description 超过 512 个 Unicode code points";
+    case "tools_invalid":
+      return "tools 配置无效";
+    case "reserved_tool":
+      return "tools 包含系统保留工具";
+    case "extensions_invalid":
+      return "extensions 配置无效";
+    case "allow_subagents_invalid":
+      return "allowSubagents 配置无效";
     case "context_files_invalid":
       return "contextFiles 配置无效";
     case "system_prompt_mode_invalid":
@@ -596,7 +848,6 @@ export class TemplateSnapshotController {
     });
     this.options = freezeRecord({
       root,
-      knownTools: options.knownTools,
       ...(options.fileSystem === undefined ? {} : { fileSystem: options.fileSystem }),
     });
   }
@@ -608,14 +859,7 @@ export class TemplateSnapshotController {
 
   reload(
     context: RuntimeUiContext | null | undefined = undefined,
-    knownTools?: ReadonlySet<string>,
   ): TemplateDiscoverySnapshot {
-    if (knownTools !== undefined) {
-      this.options = freezeRecord({
-        ...this.options,
-        knownTools,
-      });
-    }
     return this.publish(context);
   }
 

@@ -66,6 +66,7 @@ export interface AgentLastTask {
 export const AGENT_FAULT_CODES = Object.freeze([
   "spawn_failed",
   "spawn_timeout",
+  "capability_mismatch",
   "message_delivery_failed",
   "termination_incomplete",
   "internal_error",
@@ -116,6 +117,7 @@ export const AGENT_FAULT_METADATA: Readonly<Record<AgentFaultCode, Readonly<{
 }>>> = Object.freeze({
   spawn_failed: Object.freeze({ message: "代理启动失败", retryable: false }),
   spawn_timeout: Object.freeze({ message: "代理启动超时", retryable: true }),
+  capability_mismatch: Object.freeze({ message: "代理能力不匹配", retryable: false }),
   message_delivery_failed: Object.freeze({ message: "消息交付状态不确定", retryable: false }),
   termination_incomplete: Object.freeze({ message: "代理资源尚未完全回收", retryable: true }),
   internal_error: Object.freeze({ message: "控制器内部错误", retryable: false }),

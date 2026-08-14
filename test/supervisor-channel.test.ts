@@ -7,7 +7,9 @@ import {
   type ChildMessageEnvelope,
 } from "../src/child-reply-envelope.ts";
 import {
+  SUPERVISOR_CAPABILITY_LIMITS,
   SUPERVISOR_CHANNEL_LIMITS,
+  SUPERVISOR_PROTOCOL_VERSION,
   SupervisorFrameDecoder,
   FakeSupervisorChannel,
   SupervisorProtocolError,
@@ -15,6 +17,7 @@ import {
   decodeSupervisorFrame,
   encodeSupervisorFrame,
   createFakeSupervisorChannelPair,
+  type SupervisorCapabilityManifest,
   type SupervisorFrame,
 } from "../src/supervisor-channel.ts";
 
@@ -51,6 +54,22 @@ function finalReply(text: string): ChildFinalEnvelope {
     run_state: "settled",
     output_state: "present",
     text,
+  };
+}
+
+function capabilityManifest(
+  overrides: Partial<SupervisorCapabilityManifest> = {},
+): SupervisorCapabilityManifest {
+  return {
+    protocol_version: SUPERVISOR_PROTOCOL_VERSION,
+    business_active_tools: ["bash", "read"],
+    system_active_tools: ["reply_to_parent"],
+    system_tool_sources: { reply_to_parent: "extension:pi-subagents" },
+    provider: "openai",
+    model: "gpt-5.2-codex",
+    thinking: "high",
+    self_extension_path: "C:\\pi\\extensions\\pi-subagents.ts",
+    ...overrides,
   };
 }
 
@@ -144,7 +163,7 @@ test("task assignment 与 task_started 在同一累计 ACK 顺序域传递 UUIDv
   }), "invalid_frame");
 });
 
-test("v10 压缩帧只允许 child 请求和 parent 响应", () => {
+test("v11 压缩帧只允许 child 请求和 parent 响应", () => {
   const pair = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,
     childAgentId: CHILD_ID,
@@ -207,7 +226,7 @@ test("v10 压缩帧只允许 child 请求和 parent 响应", () => {
   }), "invalid_frame");
 });
 
-test("v10 拒绝已移除的 compaction_resume 帧", () => {
+test("v11 拒绝已移除的 compaction_resume 帧", () => {
   const pair = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,
     childAgentId: CHILD_ID,
@@ -229,7 +248,7 @@ test("v10 拒绝已移除的 compaction_resume 帧", () => {
 
 test("长度边界 UTF-8 JSON 可处理分块与拼接帧，拒绝截断/损坏载荷", () => {
   const frame: SupervisorFrame = {
-    protocol: "pi-subagent/10",
+    protocol: SUPERVISOR_PROTOCOL_VERSION,
     kind: "event",
     stream_id: "stream_test",
     sender_agent_id: CHILD_ID,
@@ -323,6 +342,136 @@ test("child 仅在首个完整快照被父端确认后进入 ready", () => {
 
   pair.parent.deliverNext();
   assert.equal(pair.child.getPublicState().state, "ready");
+});
+
+test("capability manifest 在 ready 后仅接受一次、去重并保持在公开状态之外", () => {
+  const pair = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+  });
+  handshake(pair);
+  assert.equal(pair.parent.getCapability(), undefined);
+  assert.equal("capability" in pair.parent.getPublicState(), false);
+
+  const frame = pair.child.publishCapability(capabilityManifest({
+    business_active_tools: ["bash", "bash", "read"],
+    system_active_tools: ["reply_to_parent", "reply_to_parent"],
+  }));
+  assert.equal(frame.kind, "capability");
+  pair.child.send(frame);
+  const accepted = pair.child.deliverNext();
+  assert.equal(accepted?.kind, "accepted");
+  if (accepted?.kind === "accepted") {
+    assert.deepEqual(accepted.capability, capabilityManifest({
+      business_active_tools: ["bash", "read"],
+      system_active_tools: ["reply_to_parent"],
+    }));
+    assert.equal(accepted.applied, true);
+  }
+  pair.flush();
+
+  const cached = pair.parent.getCapability();
+  assert.deepEqual(cached, capabilityManifest());
+  assert.equal(Object.isFrozen(cached), true);
+  assert.equal(Object.isFrozen(cached?.business_active_tools), true);
+  assert.equal(Object.isFrozen(cached?.system_tool_sources), true);
+  assert.equal("capability" in pair.parent.getPublicState(), false);
+  assertProtocolError(() => pair.child.publishCapability(capabilityManifest()), "closed");
+  assertProtocolError(() => pair.parent.publishCapability(capabilityManifest()), "closed");
+
+  const next = pair.child.publishEvent({ type: "startup_ready" });
+  const repeated = {
+    ...next,
+    kind: "capability",
+    payload: capabilityManifest({ model: "gpt-5.3-codex" }),
+  } as unknown as SupervisorFrame;
+  assert.deepEqual(pair.parent.receive(repeated), {
+    kind: "protocol_fault",
+    error: "sequence_violation",
+  });
+});
+
+test("capability manifest 严格拒绝越界、危险字符和不一致来源", () => {
+  const invalidPayloads: ReadonlyArray<{
+    readonly manifest: unknown;
+    readonly error: SupervisorProtocolError["code"];
+  }> = [
+    {
+      manifest: capabilityManifest({ protocol_version: "pi-subagent/10" as never }),
+      error: "protocol_mismatch",
+    },
+    {
+      manifest: capabilityManifest({ business_active_tools: ["bad\nname"] }),
+      error: "invalid_frame",
+    },
+    {
+      manifest: capabilityManifest({
+        business_active_tools: ["x".repeat(SUPERVISOR_CAPABILITY_LIMITS.maxToolNameBytes + 1)],
+      }),
+      error: "invalid_frame",
+    },
+    {
+      manifest: capabilityManifest({ self_extension_path: "../private-extension.ts" }),
+      error: "invalid_frame",
+    },
+    {
+      manifest: capabilityManifest({
+        business_active_tools: ["bash"],
+        system_active_tools: ["bash"],
+      }),
+      error: "invalid_frame",
+    },
+    {
+      manifest: capabilityManifest({
+        system_tool_sources: { missing_tool: "extension:pi-subagents" },
+      }),
+      error: "invalid_frame",
+    },
+    {
+      manifest: capabilityManifest({
+        system_tool_sources: { reply_to_parent: "C:\\pi\\..\\private-extension.ts" },
+      }),
+      error: "invalid_frame",
+    },
+    {
+      manifest: capabilityManifest({
+        business_active_tools: Array.from(
+          { length: SUPERVISOR_CAPABILITY_LIMITS.maxToolsPerCategory + 1 },
+          () => "bash",
+        ),
+      }),
+      error: "invalid_frame",
+    },
+  ];
+
+  for (const { manifest, error } of invalidPayloads) {
+    const pair = createFakeSupervisorChannelPair({
+      rootId: ROOT_ID,
+      childAgentId: CHILD_ID,
+      credential: CREDENTIAL,
+    });
+    handshake(pair);
+    const normal = pair.child.publishCapability(capabilityManifest());
+    const forged = { ...normal, payload: manifest } as SupervisorFrame;
+    assert.deepEqual(pair.parent.receive(forged), { kind: "protocol_fault", error });
+  }
+
+  const extraFieldPair = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+  });
+  handshake(extraFieldPair);
+  const normal = extraFieldPair.child.publishCapability(capabilityManifest());
+  const forged = {
+    ...normal,
+    payload: { ...normal.payload, unexpected: "reject" },
+  } as SupervisorFrame;
+  assert.deepEqual(extraFieldPair.parent.receive(forged), {
+    kind: "protocol_fault",
+    error: "invalid_frame",
+  });
 });
 
 test("完整握手后快照按 subtree_revision 原子替换并分配 tree_revision", () => {
@@ -564,7 +713,7 @@ test("工作中 message 为 final 预留窗口槽位，二者按同一 reply_seq
   assert.equal(pair.child.getPublicState().pending_reply_count, 0);
 });
 
-test("v10 reply 必须携带合法 envelope，且 message/final 都拒绝图片字段", () => {
+test("v11 reply 必须携带合法 envelope，且 message/final 都拒绝图片字段", () => {
   const missingEnvelope = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,
     childAgentId: CHILD_ID,
