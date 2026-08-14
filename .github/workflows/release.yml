@@ -1,0 +1,74 @@
+name: 发布 npm 包与 GitHub Release
+
+on:
+  push:
+    tags:
+      - "**"
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish_npm:
+    name: 校验并发布 npm 包
+    if: github.event.deleted == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: 检出 tag 对应提交
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: 配置 Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: 校验 tag 与包版本
+        run: npm run release:validate -- "$GITHUB_REF_NAME"
+
+      - name: 安装依赖
+        run: npm ci --ignore-scripts --legacy-peer-deps
+
+      - name: 运行发布前检查
+        run: npm run check
+
+      - name: 构建 RPC bridge
+        run: npm run build:bridge
+
+      - name: 发布到 npm
+        shell: bash
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [[ -n "${NPM_TOKEN:-}" ]]; then
+            export NODE_AUTH_TOKEN="$NPM_TOKEN"
+          fi
+          unset NPM_TOKEN
+          npm publish --ignore-scripts --access public --provenance
+
+  create_github_release:
+    name: 创建 GitHub Release
+    if: github.event.deleted == false
+    needs: publish_npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 创建 Release 并生成发行说明
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            --title "$GITHUB_REF_NAME"

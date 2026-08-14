@@ -2,9 +2,21 @@
   "name": "wj-pi-subagents",
   "version": "1.0.0",
   "description": "wj-pi-subagents：Pi 递归子代理扩展包",
+  "homepage": "https://github.com/nlbwqmz/wj-pi-subagents#readme",
+  "bugs": {
+    "url": "https://github.com/nlbwqmz/wj-pi-subagents/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nlbwqmz/wj-pi-subagents.git"
+  },
   "type": "module",
-  "keywords": ["pi-package"],
+  "keywords": ["pi-package", "pi", "subagents", "ai-agents"],
   "files": ["dist", "extensions", "src"],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "engines": {
     "node": ">=22.19.0"
   },
@@ -25,6 +37,8 @@
   "scripts": {
     "build:bridge": "tsc -p tsconfig.bridge.json",
     "pack:smoke": "node scripts/package-smoke.mjs",
+    "release:validate": "node scripts/validate-release-tag.mjs",
+    "prepublishOnly": "npm run check",
     "prepack": "npm run build:bridge",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test test/*.test.ts",

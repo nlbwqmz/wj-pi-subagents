@@ -3,7 +3,7 @@
 `wj-pi-subagents` 为 [Pi](https://github.com/earendil-works/pi) 提供递归子代理能力。它在一个根 Pi 会话内创建受监督的临时代理树：每个子代理运行在独立的 Pi RPC 进程中，拥有自己的上下文，并且只能由直接父会话管理。
 
 > [!IMPORTANT]
-> 当前版本处于开发阶段，主要通过本地源码 package 使用，尚未执行 npm 正式发布。Windows 是当前原生验收平台；macOS 和 Linux 已包含进程树适配代码及自动化测试，但尚未完成独立的原生端到端验收。
+> macOS 和 Linux 平台未测试。
 
 ## 目录
 
@@ -118,7 +118,31 @@ pi --version
 
 先通过 `/login` 或 API Key 完成 Pi 的 provider 配置，并确认普通 Pi 会话可以正常调用模型。
 
-### 2. 获取源码并安装运行依赖
+### 2. 从 npm 安装正式版本
+
+首个 npm 版本发布后，可以直接安装用户级 package：
+
+```bash
+pi install npm:wj-pi-subagents
+```
+
+只在当前项目中安装：
+
+```bash
+cd <PROJECT_DIR>
+pi install npm:wj-pi-subagents -l
+```
+
+只为当前进程临时加载，不写入设置：
+
+```bash
+cd <PROJECT_DIR>
+pi -e npm:wj-pi-subagents
+```
+
+指定 `npm:wj-pi-subagents@X.X.X` 可以固定版本；不带版本时由 Pi 按 npm package 更新规则管理。
+
+### 3. 获取源码并安装运行依赖
 
 ```bash
 git clone https://github.com/nlbwqmz/wj-pi-subagents.git
@@ -128,7 +152,7 @@ npm ci --omit=dev --legacy-peer-deps
 
 Pi 是本 package 的宿主 peer dependency。本地路径 package 不会由 Pi 自动执行依赖安装，因此必须保留仓库目录及其中的 `node_modules`。
 
-### 3. 一次性加载
+### 4. 一次性加载本地源码
 
 在目标项目目录启动 Pi：
 
@@ -139,7 +163,7 @@ pi -e "<REPOSITORY_PATH>"
 
 `-e` / `--extension` 只影响当前 Pi 进程，不写入持久设置。子代理的工作目录是启动 Pi 时的 `<PROJECT_DIR>`，不是扩展仓库目录。
 
-### 4. 持久安装
+### 5. 持久安装本地源码
 
 用户级安装会在所有项目中启用本 package：
 

@@ -11,10 +11,19 @@ const REQUIRED_PI_RANGE = ">=0.84.1";
 test("package manifest 只暴露一个显式 Pi 扩展入口", () => {
   const manifest = JSON.parse(readFileSync(join(repositoryRoot, "package.json"), "utf8")) as {
     name?: string;
+    description?: string;
+    homepage?: string;
+    bugs?: { url?: string };
+    repository?: { type?: string; url?: string };
     private?: boolean;
     files?: string[];
+    publishConfig?: { access?: string; registry?: string };
     engines?: { node?: string };
-    scripts?: { "pack:smoke"?: string };
+    scripts?: {
+      "pack:smoke"?: string;
+      "release:validate"?: string;
+      prepublishOnly?: string;
+    };
     devDependencies?: Record<string, string>;
     peerDependencies?: Record<string, string>;
     dependencies?: Record<string, string>;
@@ -23,10 +32,25 @@ test("package manifest 只暴露一个显式 Pi 扩展入口", () => {
   };
 
   assert.equal(manifest.name, "wj-pi-subagents");
+  assert.equal(manifest.description, "wj-pi-subagents：Pi 递归子代理扩展包");
+  assert.equal(manifest.homepage, "https://github.com/nlbwqmz/wj-pi-subagents#readme");
+  assert.deepEqual(manifest.bugs, {
+    url: "https://github.com/nlbwqmz/wj-pi-subagents/issues",
+  });
+  assert.deepEqual(manifest.repository, {
+    type: "git",
+    url: "git+https://github.com/nlbwqmz/wj-pi-subagents.git",
+  });
   assert.equal(manifest.private, undefined);
   assert.deepEqual(manifest.files, ["dist", "extensions", "src"]);
+  assert.deepEqual(manifest.publishConfig, {
+    access: "public",
+    registry: "https://registry.npmjs.org/",
+  });
   assert.equal(manifest.engines?.node, REQUIRED_NODE_RANGE);
   assert.equal(manifest.scripts?.["pack:smoke"], "node scripts/package-smoke.mjs");
+  assert.equal(manifest.scripts?.["release:validate"], "node scripts/validate-release-tag.mjs");
+  assert.equal(manifest.scripts?.prepublishOnly, "npm run check");
   assert.equal(manifest.peerDependencies?.["@earendil-works/pi-coding-agent"], "*");
   assert.equal(manifest.peerDependencies?.["@earendil-works/pi-tui"], "*");
   assert.equal(manifest.devDependencies?.["@earendil-works/pi-tui"], "0.84.1");
