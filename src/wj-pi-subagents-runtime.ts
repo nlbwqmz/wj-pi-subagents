@@ -296,13 +296,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Pi 的 customPrompt 分支不会合入工具 promptGuidelines，需在运行时恢复父角色协议。 */
-function hasCustomSystemPrompt(event: unknown): boolean {
-  if (!isRecord(event) || !isRecord(event.systemPromptOptions)) return false;
-  const customPrompt = event.systemPromptOptions.customPrompt;
-  return typeof customPrompt === "string" && customPrompt.length > 0;
-}
-
 function reloadIdentity(bootstrap: ChildRuntimeBootstrap | undefined): RuntimeReloadIdentity {
   if (bootstrap === undefined) {
     return Object.freeze({ isChild: false, protocolVersion: SUPERVISOR_PROTOCOL_VERSION });
@@ -753,7 +746,7 @@ export function createWjPiSubagentsRuntimeActivator(
       if (current === undefined || current.handoffPending === true) return;
       if (!isRecord(event) || typeof event.systemPrompt !== "string") return;
       const guidance: string[] = [];
-      if (current.managementEnabled && hasCustomSystemPrompt(event)) {
+      if (current.managementEnabled) {
         guidance.push(PARENT_COORDINATION_GUIDANCE);
       }
       if (current.isChild) guidance.push(CHILD_FINAL_REPLY_GUIDANCE);

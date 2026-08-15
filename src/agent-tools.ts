@@ -159,18 +159,18 @@ const schemas: Readonly<Record<AgentToolName, JsonSchema>> = Object.freeze({
 });
 
 const descriptions: Readonly<Record<AgentToolName, string>> = Object.freeze({
-  get_agent_templates: "列出当前发现且格式有效的子代理模板，直接返回 JSON 数组。每项包含 template_id、可选 description 和模板声明的子代理初始业务 tools；tools 不要求向父会话当前活动工具向下缩减。返回 [] 表示当前没有有效模板，此时不能调用 spawn_agent。非空模板仍须通过 spawn_agent 的模板格式、工具注册、模型、thinking 和管理能力预检。",
-  spawn_agent: "使用有效模板创建一个直接子代理并等待它完成启动握手。调用前先调用 get_agent_templates；template_id 必须从当前返回数组中原样复制、区分大小写，不得猜测、裁剪、改写或用 description 代替。模板 tools 是子代理的初始业务工具请求，不要求是父会话活动工具的子集。若 get_agent_templates 返回 []，则不能调用 spawn_agent。创建成功后使用 send_message 发送首项任务。",
-  send_message: "向直接子代理发送纯文本任务消息或当前处理的 steering；不支持 images，也不要构造或附带图片 Base64。返回 accepted: true 只表示插件 mailbox 已接纳并分配 message_id/task_id，不表示 Pi 或模型已经读取，更不表示任务完成；若返回 message_delivery_failed，交付状态可能无法确认，不要盲目重发。",
-  wait_agent: "等待一个或多个直接子代理中的任意一个发来工作中回复、提交当前任务结果、进入 suspended 或终态。应在一次调用的 agent_ids 中传入全部目标，不要为同一批次分别调用本工具。outcome: reply 表示获胜子代理仍在处理；task_completed、task_failed 和 task_interrupted 表示其最近逻辑任务已提交；suspended 表示需要查询状态并人工裁决；batch_released 表示本调用被同一工具批次中另一个 wait_agent 的结果协同解除；timeout 只结束本批次等待，不改变节点生命周期。",
-  interrupt_agent: "协作式中断直接子代理当前处理，保留节点和上下文；调用成功后仍需使用 wait_agent 确认处理真正结束。",
-  terminate_agent: "永久终止直接子代理及其已登记子树并确认资源回收；只有确定不再复用该分支时使用。",
+  get_agent_templates: "列出当前发现且格式有效的子代理模板，返回 JSON 数组；每项包含 template_id、可选 description 和模板声明的业务 tools。返回 [] 时不能调用 spawn_agent。",
+  spawn_agent: "使用有效 template_id 创建一个直接子代理并完成启动握手。必须先调用 get_agent_templates；template_id 必须原样复制、区分大小写，不能猜测、改写或用 description 替代。若 get_agent_templates 返回 []，则不能调用 spawn_agent。创建成功后再用 send_message 发送首项任务。",
+  send_message: "向直接子代理发送任务消息或 steering。accepted: true 只表示 mailbox 已接纳并分配 message_id/task_id，不表示模型已读取或任务完成；若返回 message_delivery_failed，先查询状态并结合已有回复核对，不要盲目重发。",
+  wait_agent: "等待一个或多个直接子代理的工作中回复、任务提交、suspended 或终态。一次调用传入本批次全部 agent_ids，不要为同一批次分别调用；outcome: reply 表示仍在处理，task_completed/task_failed/task_interrupted 表示最近任务已提交，suspended 需要查询并裁决，batch_released 表示被同批次其他 wait_agent 协同解除，timeout 只结束本次等待。",
+  interrupt_agent: "协作式中断直接子代理当前任务并保留上下文。",
+  terminate_agent: "永久终止直接子代理及其已登记子树，并确认资源回收；仅在确定不再复用该分支时使用。",
   get_agent_status: "读取直接子代理最近确认的安全状态快照。",
-  get_agent_tree: "读取当前调用者作用域内的安全代理树快照。",
+  get_agent_tree: "读取当前调用者作用域内的只读代理树快照。",
 });
 
 const DELIVERY_AND_WAITING_GUIDELINE =
-  "交付与等待：accepted: true 只表示 mailbox 已接收，不代表模型已读或任务完成；message_delivery_failed 时不要盲目重发，先结合 get_agent_status 和已有回复核对。一次 wait_agent 应传入本批次全部目标；reply 表示仍在处理，task_completed/task_failed/task_interrupted 表示任务已提交，suspended 需要查询并裁决，batch_released 表示被同批次的其他 wait_agent 协同解除，timeout 只结束本次等待。";
+  "交付与等待：消息被接纳不等于模型已读或任务完成；交付不确定时先核对状态和已有回复，不要盲目重发。一次 wait_agent 等待本批次全部目标。";
 const TAKEOVER_GUIDELINE =
   "需要接管时，先 interrupt_agent，再 wait_agent 确认子代理已结束。";
 
@@ -184,29 +184,12 @@ export const PARENT_COORDINATION_GUIDELINES = Object.freeze({
   interruptAgent: TAKEOVER_GUIDELINE,
 });
 
-const promptGuidelines: Readonly<Partial<Record<AgentToolName, readonly string[]>>> = Object.freeze({
-  send_message: Object.freeze([
-    PARENT_COORDINATION_GUIDELINES.taskOwnership,
-    PARENT_COORDINATION_GUIDELINES.sendMessage,
-    PARENT_COORDINATION_GUIDELINES.slowProgress,
-    PARENT_COORDINATION_GUIDELINES.taskRecovery,
-    PARENT_COORDINATION_GUIDELINES.retryPolicy,
-  ]),
-  wait_agent: Object.freeze([
-    PARENT_COORDINATION_GUIDELINES.waitAgent,
-    PARENT_COORDINATION_GUIDELINES.slowProgress,
-    PARENT_COORDINATION_GUIDELINES.taskRecovery,
-    PARENT_COORDINATION_GUIDELINES.retryPolicy,
-  ]),
-  interrupt_agent: Object.freeze([PARENT_COORDINATION_GUIDELINES.interruptAgent]),
-});
-
 const childReplySchema: JsonSchema = Object.freeze({
   type: "object",
   properties: Object.freeze({
     message: Object.freeze({
       type: "string",
-      description: "发给创建你的直接父会话的必要工作中回复正文。",
+      description: "工作中回复正文。",
       minLength: 1,
       maxLength: 16 * 1024,
     }),
@@ -219,7 +202,7 @@ export const CHILD_REPLY_GUIDELINE =
   "仅在直接父代理明确要求你回报，或遇到必须由父代理处理或裁决的阻塞时调用 reply_to_parent。不要将其用于完成通知或替代最终答复。消息被接纳后继续当前任务，任务完成时仍须提交正常的最终答复。";
 
 const childReplyDescription =
-  `${CHILD_REPLY_GUIDELINE} 本工具只发送文本，不支持 images，也不要构造或附带图片 Base64；无需提供 agent_id 或目标。`;
+  "仅在直接父代理明确要求你回报，或遇到必须由父代理处理或裁决的阻塞时调用 reply_to_parent。";
 
 /** 返回给 Pi 的固定工具结果；details 只包含控制器安全数据。 */
 function toolResult<T>(result: ControlResult<T>, dataOnly = false): unknown {
@@ -258,12 +241,10 @@ function executeTool(
   dataOnly = false,
   lookups: AgentToolRenderLookups = {},
 ): Record<string, unknown> {
-  const guidelines = promptGuidelines[name];
   return {
     name,
     label: name,
     description: descriptions[name],
-    ...(guidelines === undefined ? {} : { promptGuidelines: guidelines }),
     parameters: schemas[name],
     executionMode: name === "wait_agent" ? "parallel" : "sequential",
     renderCall: (
@@ -347,7 +328,6 @@ export function registerReplyToParentTool(
     name: CHILD_REPLY_TOOL_NAME,
     label: CHILD_REPLY_TOOL_NAME,
     description: childReplyDescription,
-    promptGuidelines: Object.freeze([CHILD_REPLY_GUIDELINE]),
     parameters: childReplySchema,
     executionMode: "sequential",
     renderCall: (

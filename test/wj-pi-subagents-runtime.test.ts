@@ -1712,7 +1712,14 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
     "- 压缩或自动续轮后继续同一逻辑任务，不重复已经完成的副作用。",
     "- 结束前必须输出非空且可用的最终 assistant 答复，说明完成内容、关键结果和产物路径。不要以工具调用、工具结果、reply_to_parent 或空白消息结束；没有可用结果时简要说明原因。",
   ].join("\n");
-  assert.equal(await rootPromptHandler({ systemPrompt: "根会话提示" }, rootContext), undefined);
+  const rootPromptResult = await rootPromptHandler({ systemPrompt: "根会话提示" }, rootContext) as {
+    readonly systemPrompt?: unknown;
+  };
+  assert.equal(rootPromptResult.systemPrompt, [
+    "根会话提示",
+    "",
+    parentCoordinationGuidance,
+  ].join("\n"));
   const rootCustomPromptResult = await rootPromptHandler({
     systemPrompt: "自定义根会话提示",
     systemPromptOptions: { customPrompt: "自定义根会话提示" },
@@ -1770,6 +1777,8 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   };
   assert.equal(childPromptResult.systemPrompt, [
     "模板与项目提示",
+    "",
+    parentCoordinationGuidance,
     "",
     childFinalReplyGuidance,
   ].join("\n"));

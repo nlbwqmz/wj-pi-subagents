@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   AGENT_TOOL_NAMES,
-  CHILD_REPLY_GUIDELINE,
   CHILD_REPLY_TOOL_NAME,
   PARENT_COORDINATION_GUIDELINES,
   registerAgentTools,
@@ -70,25 +69,12 @@ test("管理工具系统提示约束任务所有权并覆盖慢任务和异常�
     { registerTool: (tool) => registrations.push(tool as Record<string, unknown>) },
     async () => ({} as never),
   );
-  const readGuidelines = (name: string): unknown =>
-    registrations.find((tool) => tool.name === name)?.promptGuidelines;
-
-  assert.deepEqual(readGuidelines("send_message"), [
-    PARENT_COORDINATION_GUIDELINES.taskOwnership,
-    PARENT_COORDINATION_GUIDELINES.sendMessage,
-    PARENT_COORDINATION_GUIDELINES.slowProgress,
-    PARENT_COORDINATION_GUIDELINES.taskRecovery,
-    PARENT_COORDINATION_GUIDELINES.retryPolicy,
-  ]);
-  assert.deepEqual(readGuidelines("wait_agent"), [
-    PARENT_COORDINATION_GUIDELINES.waitAgent,
-    PARENT_COORDINATION_GUIDELINES.slowProgress,
-    PARENT_COORDINATION_GUIDELINES.taskRecovery,
-    PARENT_COORDINATION_GUIDELINES.retryPolicy,
-  ]);
-  assert.deepEqual(readGuidelines("interrupt_agent"), [
-    PARENT_COORDINATION_GUIDELINES.interruptAgent,
-  ]);
+  assert.equal(
+    registrations.every((tool) => tool.promptGuidelines === undefined),
+    true,
+    "管理工具不应注册重复的 promptGuidelines",
+  );
+  assert.match(PARENT_COORDINATION_GUIDELINES.sendMessage, /消息被接纳不等于模型已读或任务完成/);
   assert.match(PARENT_COORDINATION_GUIDELINES.slowProgress, /不代表失败/);
   assert.match(PARENT_COORDINATION_GUIDELINES.slowProgress, /interrupt_agent 或 terminate_agent/);
   assert.match(PARENT_COORDINATION_GUIDELINES.taskRecovery, /复用已有上下文/);
@@ -98,17 +84,15 @@ test("管理工具系统提示约束任务所有权并覆盖慢任务和异常�
   assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /默认重试 3 次/);
   assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /最多扩展到 5 次/);
   assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /不要自动切换模型或创建替代代理/);
-  for (const name of AGENT_TOOL_NAMES) {
-    if (name === "send_message" || name === "wait_agent" || name === "interrupt_agent") continue;
-    assert.equal(readGuidelines(name), undefined, `${name} 不应重复携带委派规则`);
-  }
-
   const readDescription = (name: string): string =>
     String(registrations.find((tool) => tool.name === name)?.description ?? "");
+  assert.match(readDescription("get_agent_templates"), /返回 JSON 数组/);
+  assert.doesNotMatch(readDescription("get_agent_templates"), /向父会话当前活动工具|能力预检/);
   assert.match(readDescription("send_message"), /accepted: true/);
   assert.match(readDescription("send_message"), /message_delivery_failed/);
+  assert.doesNotMatch(readDescription("send_message"), /images|Base64/);
   assert.match(readDescription("wait_agent"), /timeout/);
-  assert.match(readDescription("interrupt_agent"), /wait_agent/);
+  assert.doesNotMatch(readDescription("interrupt_agent"), /wait_agent/);
   assert.match(readDescription("terminate_agent"), /永久/);
 });
 
@@ -999,7 +983,7 @@ test("代理工具调用行显示入参并安全折叠长消息", () => {
     readonly properties?: Readonly<Record<string, unknown>>;
   };
   assert.deepEqual(Object.keys(sendParameters.properties ?? {}), ["agent_id", "message"]);
-  assert.match(String(sendTool.description), /不支持 images/);
+  assert.doesNotMatch(String(sendTool.description), /images|Base64/);
 
   for (const line of waitLines) {
     assert.ok(displayWidth(line) <= 80, `工具调用行超出终端宽度：${line}`);
@@ -1037,11 +1021,12 @@ test("reply_to_parent 只展示文本且 schema 不暴露图片字段", () => {
   } | undefined;
   assert.deepEqual(parameters?.required, ["message"]);
   assert.deepEqual(Object.keys(parameters?.properties ?? {}), ["message"]);
-  assert.deepEqual(registration?.promptGuidelines, [CHILD_REPLY_GUIDELINE]);
-  assert.match(String(registration?.description ?? ""), /必须由父代理处理或裁决的阻塞/);
-  assert.match(String(registration?.description ?? ""), /完成通知或替代最终答复/);
+  assert.equal(registration?.promptGuidelines, undefined);
+  assert.equal(
+    registration?.description,
+    "仅在直接父代理明确要求你回报，或遇到必须由父代理处理或裁决的阻塞时调用 reply_to_parent。",
+  );
   assert.doesNotMatch(JSON.stringify(registration?.parameters), /requires_response/);
-  assert.match(String(registration?.description ?? ""), /不支持 images/);
 });
 
 test("get_agent_templates 直接返回安全模板数组并保留空数组", async () => {
