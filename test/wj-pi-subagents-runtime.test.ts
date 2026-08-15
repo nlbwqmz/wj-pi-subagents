@@ -1702,20 +1702,15 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
     "父子任务协作要求：",
     `- ${PARENT_COORDINATION_GUIDELINES.taskOwnership}`,
     `- ${PARENT_COORDINATION_GUIDELINES.sendMessage}`,
-    `- ${PARENT_COORDINATION_GUIDELINES.waitAgent}`,
     `- ${PARENT_COORDINATION_GUIDELINES.slowProgress}`,
     `- ${PARENT_COORDINATION_GUIDELINES.taskRecovery}`,
     `- ${PARENT_COORDINATION_GUIDELINES.retryPolicy}`,
-    `- ${PARENT_COORDINATION_GUIDELINES.interruptAgent}`,
   ].join("\n");
   const childFinalReplyGuidance = [
     "子代理任务与最终答复要求：",
     `- ${CHILD_REPLY_GUIDELINE}`,
     "- 压缩或自动续轮后继续同一逻辑任务，不重复已经完成的副作用。",
-    "- 任务结束前必须输出一条非空且可用的最终 assistant 答复；运行时会以该文本准备 final。",
-    "- 如果产物已经写入文件，仍要说明完成内容、关键结果和产物路径。",
-    "- 不要以工具调用、工具结果、reply_to_parent 或空白 assistant 消息结束任务。",
-    "- 如果没有可用结果，请简短说明原因。",
+    "- 结束前必须输出非空且可用的最终 assistant 答复，说明完成内容、关键结果和产物路径。不要以工具调用、工具结果、reply_to_parent 或空白消息结束；没有可用结果时简要说明原因。",
   ].join("\n");
   assert.equal(await rootPromptHandler({ systemPrompt: "根会话提示" }, rootContext), undefined);
   const rootCustomPromptResult = await rootPromptHandler({
@@ -1727,13 +1722,11 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
     "",
     parentCoordinationGuidance,
   ].join("\n"));
-  assert.match(String(rootCustomPromptResult.systemPrompt), /只读分析和独立验证都属于重复实施/);
-  assert.match(String(rootCustomPromptResult.systemPrompt), /‘无写冲突’/);
-  assert.match(String(rootCustomPromptResult.systemPrompt), /运行缓慢/);
-  assert.match(String(rootCustomPromptResult.systemPrompt), /默认重试 3 次/);
-  assert.match(String(rootCustomPromptResult.systemPrompt), /最多 5 次/);
-  assert.match(String(rootCustomPromptResult.systemPrompt), /spawn_failed 和 internal_error/);
-  assert.match(String(rootCustomPromptResult.systemPrompt), /不要只总结当前探索内容/);
+  assert.match(String(rootCustomPromptResult.systemPrompt), /无数据依赖、无共享写资源/);
+  assert.match(String(rootCustomPromptResult.systemPrompt), /不要盲目重发/);
+  assert.match(String(rootCustomPromptResult.systemPrompt), /不代表失败/);
+  assert.match(String(rootCustomPromptResult.systemPrompt), /复用已有上下文/);
+  assert.match(String(rootCustomPromptResult.systemPrompt), /最多扩展到 5 次/);
 
   const rootTemplates = await execute(rootApi, "get_agent_templates", {}, rootContext) as {
     details?: Array<{ template_id: string; description: string; tools?: string[] }>;

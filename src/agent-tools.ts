@@ -169,14 +169,19 @@ const descriptions: Readonly<Record<AgentToolName, string>> = Object.freeze({
   get_agent_tree: "读取当前调用者作用域内的安全代理树快照。",
 });
 
+const DELIVERY_AND_WAITING_GUIDELINE =
+  "交付与等待：accepted: true 只表示 mailbox 已接收，不代表模型已读或任务完成；message_delivery_failed 时不要盲目重发，先结合 get_agent_status 和已有回复核对。一次 wait_agent 应传入本批次全部目标；reply 表示仍在处理，task_completed/task_failed/task_interrupted 表示任务已提交，suspended 需要查询并裁决，batch_released 表示被同批次的其他 wait_agent 协同解除，timeout 只结束本次等待。";
+const TAKEOVER_GUIDELINE =
+  "需要接管时，先 interrupt_agent，再 wait_agent 确认子代理已结束。";
+
 export const PARENT_COORDINATION_GUIDELINES = Object.freeze({
-  taskOwnership: "任务所有权硬约束：send_message 返回 accepted: true 后，已下发任务范围由目标直接子代理负责，直到该子代理给出最终答复或进入终态。同一任务包括为同一问题、工单或结论执行的调查、实现、测试、复现、验证、评审及其子范围；父会话不得亲自实施或再次委派这些工作。读取或搜索同一源码与文档、运行同一测试、只读分析和独立验证都属于重复实施；‘只读’‘无写冲突’‘交叉验证’不是例外。父会话只能使用 wait_agent 等待、查询状态、向同一子代理发送 steering，或处理派发前已明确拆分、产出独立、无数据依赖且无共享写资源的其他工作。",
-  sendMessage: "send_message 返回 accepted: true 只表示插件 mailbox 已接纳消息并分配 message_id/task_id，不表示 Pi 或模型已经读取，也不表示任务完成；若返回 message_delivery_failed，交付状态可能无法确认，不要盲目重发，先查询状态并结合已有回复判断。",
-  waitAgent: "wait_agent 应在一次调用的 agent_ids 中传入所有待观察的直接子代理，并在任一目标产生结果时返回。outcome: reply 时获胜子代理仍在处理；task_completed、task_failed 或 task_interrupted 表示其最近逻辑任务已提交；suspended 表示需要查询状态并人工裁决；batch_released 表示同一 assistant 工具批次的另一个 wait_agent 已取得结果；timeout 只结束共享观察窗口，不改变任何节点生命周期，也不把任务交回直接父会话。",
-  slowProgress: "耗时任务处理：wait_agent 返回 timeout，或子代理长时间处于 working / processing，只表示本次观察窗口结束或任务仍在执行，不构成失败。不得仅因运行缓慢就要求子代理基于现状提前总结，也不要因此调用 interrupt_agent 或 terminate_agent；必要时可用 send_message 向同一 agent_id 询问当前进度、阻塞点和剩余工作，该 steering 不会中断当前任务，随后继续使用 wait_agent 等待。",
-  taskRecovery: "异常任务恢复：wait_agent 返回 task_failed 或 task_interrupted，最终答复为 output_state: absent，或 output_state: present 但正文不可用时，先用 get_agent_status 核对节点状态和 last_task，再向同一 agent_id 发送恢复指令，让子代理根据自身任务完成情况继续：已完成则提交完整最终答复，未完成则从未完成步骤继续；必须复用已有上下文且不得重复已完成的副作用，不要只总结当前探索内容。",
-  retryPolicy: "协作层重试策略：除明确错误码 spawn_failed 和 internal_error 外，其他异常均视为可重试，包括 message_delivery_failed 和 suspended；此策略不改变控制面返回的 retryable 元数据。重试前必须先修正或核对导致失败的参数、配置、配额、交付和节点状态，禁止原样盲重试。建议默认重试 3 次；若每次仍有进展、状态变化或错误原因变化，可增加到最多 5 次，成功后立即停止，每次尝试后都用 wait_agent 等待真实结果。遇到 message_delivery_failed 或 suspended 时，先用 get_agent_status 检查 error、队列及 activity.phase，通过继续等待、对账或恢复 steering 消除不确定性，再决定是否重发原任务，避免因交付状态未知造成重复副作用。若出现 spawn_failed / internal_error、节点已终止、用户取消或达到 5 次上限，则停止自动重试并向用户说明或请求裁决，不要自动切换模型或创建替代代理。",
-  interruptAgent: "直接父会话需要接管已下发任务时，先使用 interrupt_agent，再使用 wait_agent 确认子代理已结束当前处理；确认后再实施相同任务或修改相同资源。",
+  taskOwnership: "任务所有权：send_message 返回 accepted: true 后，该任务由目标直接子代理负责，直到其提交最终答复或进入终态。父会话不得重复调查、实现、测试、验证、评审或再次委派同一任务；只能等待、查询状态、向该子代理发送 steering，或处理事先明确拆分且无数据依赖、无共享写资源的独立工作。需要接管时，先 interrupt_agent，再 wait_agent 确认子代理已结束。",
+  sendMessage: DELIVERY_AND_WAITING_GUIDELINE,
+  waitAgent: DELIVERY_AND_WAITING_GUIDELINE,
+  slowProgress: "慢任务：working/processing 或 timeout 不代表失败。不要仅因耗时而要求子代理提前总结、调用 interrupt_agent 或 terminate_agent；可以用 send_message 询问进度，然后继续 wait_agent。",
+  taskRecovery: "异常恢复：task_failed、task_interrupted，或最终答复缺失、不可用时，先用 get_agent_status 核对，再向同一 agent_id 发送恢复指令。复用已有上下文，从未完成步骤继续，避免重复已完成的副作用，并要求其提交完整最终答复。",
+  retryPolicy: "重试：除 spawn_failed 和 internal_error 外，其他异常均可重试，包括 message_delivery_failed 和 suspended。重试前先核对并修正原因；默认重试 3 次，若每次仍有进展、状态变化或错误变化，最多扩展到 5 次，每次尝试后都使用 wait_agent。节点终止、用户取消或达到上限时停止，并报告原因；不要自动切换模型或创建替代代理。",
+  interruptAgent: TAKEOVER_GUIDELINE,
 });
 
 const promptGuidelines: Readonly<Partial<Record<AgentToolName, readonly string[]>>> = Object.freeze({
@@ -211,7 +216,7 @@ const childReplySchema: JsonSchema = Object.freeze({
 });
 
 export const CHILD_REPLY_GUIDELINE =
-  "仅在以下情况下使用 reply_to_parent：当前任务在最终答复前遇到必须由直接父代理处理或裁决的阻塞问题；或者直接父代理已明确要求你在任务执行过程中回报某项内容。除此之外不要调用本工具，尤其不得用于常规进度、心跳、阶段性总结、完成通知或替代最终答复。消息被接纳后继续当前任务；任务完成时仍须提交正常的最终答复。";
+  "仅在直接父代理明确要求你回报，或遇到必须由父代理处理或裁决的阻塞时调用 reply_to_parent。不要将其用于完成通知或替代最终答复。消息被接纳后继续当前任务，任务完成时仍须提交正常的最终答复。";
 
 const childReplyDescription =
   `${CHILD_REPLY_GUIDELINE} 本工具只发送文本，不支持 images，也不要构造或附带图片 Base64；无需提供 agent_id 或目标。`;

@@ -89,15 +89,15 @@ test("管理工具系统提示约束任务所有权并覆盖慢任务和异常�
   assert.deepEqual(readGuidelines("interrupt_agent"), [
     PARENT_COORDINATION_GUIDELINES.interruptAgent,
   ]);
-  assert.match(PARENT_COORDINATION_GUIDELINES.slowProgress, /不构成失败/);
-  assert.match(PARENT_COORDINATION_GUIDELINES.slowProgress, /不会中断当前任务/);
-  assert.match(PARENT_COORDINATION_GUIDELINES.taskRecovery, /根据自身任务完成情况继续/);
-  assert.match(PARENT_COORDINATION_GUIDELINES.taskRecovery, /不要只总结当前探索内容/);
+  assert.match(PARENT_COORDINATION_GUIDELINES.slowProgress, /不代表失败/);
+  assert.match(PARENT_COORDINATION_GUIDELINES.slowProgress, /interrupt_agent 或 terminate_agent/);
+  assert.match(PARENT_COORDINATION_GUIDELINES.taskRecovery, /复用已有上下文/);
+  assert.match(PARENT_COORDINATION_GUIDELINES.taskRecovery, /避免重复已完成的副作用/);
   assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /spawn_failed 和 internal_error/);
   assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /message_delivery_failed 和 suspended/);
   assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /默认重试 3 次/);
-  assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /最多 5 次/);
-  assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /禁止原样盲重试/);
+  assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /最多扩展到 5 次/);
+  assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /不要自动切换模型或创建替代代理/);
   for (const name of AGENT_TOOL_NAMES) {
     if (name === "send_message" || name === "wait_agent" || name === "interrupt_agent") continue;
     assert.equal(readGuidelines(name), undefined, `${name} 不应重复携带委派规则`);
@@ -1038,8 +1038,8 @@ test("reply_to_parent 只展示文本且 schema 不暴露图片字段", () => {
   assert.deepEqual(parameters?.required, ["message"]);
   assert.deepEqual(Object.keys(parameters?.properties ?? {}), ["message"]);
   assert.deepEqual(registration?.promptGuidelines, [CHILD_REPLY_GUIDELINE]);
-  assert.match(String(registration?.description ?? ""), /必须由直接父代理处理或裁决的阻塞问题/);
-  assert.match(String(registration?.description ?? ""), /不得用于常规进度、心跳、阶段性总结、完成通知/);
+  assert.match(String(registration?.description ?? ""), /必须由父代理处理或裁决的阻塞/);
+  assert.match(String(registration?.description ?? ""), /完成通知或替代最终答复/);
   assert.doesNotMatch(JSON.stringify(registration?.parameters), /requires_response/);
   assert.match(String(registration?.description ?? ""), /不支持 images/);
 });

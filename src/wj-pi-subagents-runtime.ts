@@ -241,21 +241,16 @@ const PARENT_COORDINATION_GUIDANCE = [
   "父子任务协作要求：",
   `- ${PARENT_COORDINATION_GUIDELINES.taskOwnership}`,
   `- ${PARENT_COORDINATION_GUIDELINES.sendMessage}`,
-  `- ${PARENT_COORDINATION_GUIDELINES.waitAgent}`,
   `- ${PARENT_COORDINATION_GUIDELINES.slowProgress}`,
   `- ${PARENT_COORDINATION_GUIDELINES.taskRecovery}`,
   `- ${PARENT_COORDINATION_GUIDELINES.retryPolicy}`,
-  `- ${PARENT_COORDINATION_GUIDELINES.interruptAgent}`,
 ].join("\n");
 
 const CHILD_FINAL_REPLY_GUIDANCE = [
   "子代理任务与最终答复要求：",
   `- ${CHILD_REPLY_GUIDELINE}`,
   "- 压缩或自动续轮后继续同一逻辑任务，不重复已经完成的副作用。",
-  "- 任务结束前必须输出一条非空且可用的最终 assistant 答复；运行时会以该文本准备 final。",
-  "- 如果产物已经写入文件，仍要说明完成内容、关键结果和产物路径。",
-  "- 不要以工具调用、工具结果、reply_to_parent 或空白 assistant 消息结束任务。",
-  "- 如果没有可用结果，请简短说明原因。",
+  "- 结束前必须输出非空且可用的最终 assistant 答复，说明完成内容、关键结果和产物路径。不要以工具调用、工具结果、reply_to_parent 或空白消息结束；没有可用结果时简要说明原因。",
 ].join("\n");
 
 function asRuntimeApi(api: ExtensionApiSurface): RuntimeExtensionApi {
