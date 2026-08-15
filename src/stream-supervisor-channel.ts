@@ -213,19 +213,12 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     return () => this.taskAssignmentListeners.delete(listener);
   }
 
+  /**
+   * task_started 与后续 reply 共用同一有序监督流。这里只等待帧写入；若等待
+   * transport ACK，会把累计确认退化为 stop-and-wait，并阻塞同 turn 的 final。
+   */
   async publishTaskStarted(started: SupervisorTaskStarted): Promise<void> {
-    const frame = this.protocol.publishTaskStarted(started);
-    const waiter = createDeferred<void>();
-    void waiter.promise.catch(() => {});
-    this.transportAcknowledgements.set(frame.seq, waiter);
-    try {
-      await this.send(frame);
-      await waiter.promise;
-    } finally {
-      if (this.transportAcknowledgements.get(frame.seq) === waiter) {
-        this.transportAcknowledgements.delete(frame.seq);
-      }
-    }
+    await this.send(this.protocol.publishTaskStarted(started));
   }
 
   onTaskStarted(listener: (started: SupervisorTaskStarted) => void): () => void {

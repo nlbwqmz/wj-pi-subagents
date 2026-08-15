@@ -1074,6 +1074,82 @@ test("child manual 生命周期在 complete 先于 session_compact 到达时保�
   await listener.close();
 });
 
+test("agent_start 注入待确认回复后不等待 reply ACK 写回完成", async () => {
+  const cwd = "C:\\workspace\\nonblocking-reply-ack";
+  const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
+  const localCredential = `local_${"l".repeat(32)}`;
+  const supervisorCredential = `supervisor_${"s".repeat(32)}`;
+  const listener = await transportAdapter.listen({
+    agentId: AGENT_ID,
+    credential: localCredential,
+  });
+  const api = new FakeExtensionApi();
+  let controller: AgentController | undefined;
+  const activate = createWjPiSubagentsRuntimeActivator({
+    environment: childBootstrapEnvironment({
+      [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorEndpoint]: listener.endpoint,
+      [RUNTIME_EPHEMERAL_ENV_KEYS.localSupervisorCredential]: localCredential,
+      [RUNTIME_EPHEMERAL_ENV_KEYS.supervisorCredential]: supervisorCredential,
+    }),
+    agentIdFactory: () => DESCENDANT_ID,
+    localSupervisorTransportAdapter: transportAdapter,
+    templateFileSystem: templateFileSystem(cwd),
+    onController: (value) => { controller = value; },
+  });
+  await activate(api as never, {
+    ok: true,
+    nodeVersion: process.versions.node,
+    piVersion: "0.84.1",
+    platform: "win32",
+    processTreeAdapter: {} as never,
+  });
+  const context = extensionContext(cwd);
+  const sessionStart = api.emit("session_start", { type: "session_start", reason: "startup" }, context);
+  const transport = await listener.waitForConnection();
+  const parentChannel = new StreamSupervisorChannel({
+    role: "parent",
+    rootId: "root-bootstrap",
+    localAgentId: null,
+    peerAgentId: AGENT_ID,
+    parentAgentId: null,
+    depth: 1,
+    credential: supervisorCredential,
+    requestIdRegistry: new SupervisorRequestIdRegistry(),
+    transport,
+  });
+  const bindingAbort = new AbortController();
+  await parentChannel.bind(bindingAbort.signal);
+  await Promise.all([parentChannel.waitForReady(bindingAbort.signal), sessionStart]);
+  assert.ok(controller);
+
+  // 模拟上一轮结束时建立的 reply trigger 屏障。
+  await api.emit("agent_end", { type: "agent_end" }, context);
+  const originalRetry = controller.retryPendingReplies.bind(controller);
+  let retryCalls = 0;
+  let releaseRetry!: () => void;
+  controller.retryPendingReplies = () => {
+    retryCalls += 1;
+    return new Promise<void>((resolve) => { releaseRetry = resolve; });
+  };
+
+  let startCompleted = false;
+  const starting = api.emit("agent_start", { type: "agent_start" }, context).then(() => {
+    startCompleted = true;
+  });
+  try {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(startCompleted, true);
+    assert.equal(retryCalls, 1);
+  } finally {
+    releaseRetry();
+    await starting;
+    controller.retryPendingReplies = originalRetry;
+    await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
+    await parentChannel.release();
+    await listener.close();
+  }
+});
+
 test("final ACK 失败不阻塞 runtime settled handler，并由独立监督流收敛", async () => {
   const cwd = "C:\\workspace\\final-ack-failure";
   const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();

@@ -673,6 +673,37 @@ test("成功 complete 后同事务 not_started 撤销 continuation 等待并发�
   await participant.close();
 });
 
+test("prepare 被上游拒绝并解除本地 reply 屏障后重新驱动待确认回复", async () => {
+  const bus = new TestEventBus();
+  const upstream = new FakeUpstreamChannel();
+  let releasePrepare!: (accepted: boolean) => void;
+  upstream.prepareOperation = async () => new Promise<boolean>((resolve) => {
+    releasePrepare = resolve;
+  });
+  const value = createRuntime({ upstream });
+  const participant = new AutoCompactCoordinationParticipant({
+    eventBus: bus,
+    readRuntime: () => value.runtime,
+    participantId: "participant-rejected-reply",
+    upstreamAckTimeoutMs: 1_000,
+  });
+
+  emitPrepare(bus, "participant-rejected-reply", "compact-rejected-reply");
+  await settle();
+  assert.equal(value.replyInbox.accept(CHILD_ID, workingReply("屏障期间到达")), false);
+
+  releasePrepare(false);
+  await waitFor(() => acknowledgement(
+    bus,
+    AUTO_COMPACT_COORDINATION_CHANNELS.prepared,
+    "compact-rejected-reply",
+  ) !== undefined);
+
+  assert.equal(value.retryCount(), 1);
+  assert.equal(value.replyInbox.accept(CHILD_ID, workingReply("屏障释放后")), true);
+  await participant.close();
+});
+
 test("prepare 明确拒绝时释放本地令牌并向直接父发送 not_started", async () => {
   const bus = new TestEventBus();
   const upstream = new FakeUpstreamChannel();

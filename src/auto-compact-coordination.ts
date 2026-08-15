@@ -295,6 +295,7 @@ export class AutoCompactCoordinationParticipant {
           );
         }
         this.releaseLocal(requestId, runtime);
+        void runtime.retryPendingReplies().catch(() => {});
         return false;
       }
       this.barriers.set(requestId, Object.freeze({
@@ -308,6 +309,7 @@ export class AutoCompactCoordinationParticipant {
         await this.releaseRequestedUpstream(runtime.upstream.channel, requestId, "not_started", true);
       }
       this.releaseLocal(requestId, runtime);
+      void runtime.retryPendingReplies().catch(() => {});
       return false;
     } finally {
       this.pending.delete(requestId);

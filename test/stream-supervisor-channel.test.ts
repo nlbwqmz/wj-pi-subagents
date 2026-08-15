@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import test from "node:test";
+import { ChildReplyCoordinator } from "../src/child-reply-coordinator.ts";
 import {
   CHILD_REPLY_SCHEMA,
   CHILD_REPLY_VERSION,
@@ -176,7 +177,7 @@ test("stream transport 在 ready 后转发一次 capability 并缓存给迟到�
   await pair.child.release();
 });
 
-test("task assignment 和 task_started 都等待对端 transport ACK 后完成", async () => {
+test("task assignment 等待 transport ACK，task_started 在同一有序流传递", async () => {
   const pair = channelPair();
   const assignments: unknown[] = [];
   const starts: unknown[] = [];
@@ -204,6 +205,57 @@ test("task assignment 和 task_started 都等待对端 transport ACK 后完成",
   assert.deepEqual(starts, [{ task_id: TASK_ID, turn_id: TURN_ID }]);
   await pair.parent.release();
   await pair.child.release();
+});
+
+test("task_started 写入后 ACK 迟到不阻塞同一监督流上的 final", async () => {
+  const observed: string[] = [];
+  const pair = channelPair((reply) => {
+    observed.push(reply.envelope.kind);
+    return true;
+  });
+  pair.parent.onTaskStarted(() => observed.push("task_started"));
+  const signal = new AbortController().signal;
+  await pair.parent.bind(signal);
+  await pair.child.bind(signal);
+  await Promise.all([pair.parent.waitForReady(signal), pair.child.waitForReady(signal)]);
+
+  const coordinator = new ChildReplyCoordinator({
+    agentId: CHILD_ID,
+    port: pair.child,
+    taskIdFactory: () => TASK_ID,
+    turnIdFactory: () => TURN_ID,
+    commitIdFactory: () => COMMIT_ID,
+  });
+  coordinator.observeTaskAssignment({
+    message_id: "msg_650e8400-e29b-41d4-a716-446655440006",
+    task_id: TASK_ID,
+    mode: "prompt",
+  });
+
+  // 父端仍可读取 child 帧，只暂停返回 child 的 transport/reply ACK。
+  pair.parentToChild.pause();
+  try {
+    coordinator.observeAgentStart();
+    coordinator.observeAssistantMessageEnd({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        stopReason: "stop",
+        content: [{ type: "text", text: "ACK 迟到仍应发布" }],
+      },
+    });
+    coordinator.observeAgentEnd();
+    coordinator.settle();
+    await settleIo();
+    await settleIo();
+
+    assert.deepEqual([...observed], ["task_started", "final"]);
+  } finally {
+    pair.parentToChild.resume();
+    await settleIo();
+    await pair.parent.release();
+    await pair.child.release();
+  }
 });
 
 test("协调压缩请求只允许 child 发起，并等待 parent 业务响应", async () => {

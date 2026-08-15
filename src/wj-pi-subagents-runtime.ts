@@ -779,7 +779,9 @@ export function createWjPiSubagentsRuntimeActivator(
         throw error;
       }
       if (current.replyInbox.releaseTurnTriggers()) {
-        return current.controller.retryPendingReplies();
+        // pending reply 会在首次 transport await 前同步重新注入；ACK 写回属于后台
+        // 维护，不能让半开子通道阻塞 Pi 的 agent_start 生命周期。
+        void current.controller.retryPendingReplies().catch(() => {});
       }
     });
 
