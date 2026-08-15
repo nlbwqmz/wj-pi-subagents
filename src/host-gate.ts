@@ -232,7 +232,7 @@ async function loadDefaultProcessTreeAdapter(platform: NodeJS.Platform): Promise
 function formatHostCapabilityDiagnostic(diagnostic: HostCapabilityDiagnostic): string {
   const missingApi = diagnostic.missingApi?.join(",");
   const detail = missingApi === undefined ? diagnostic.reason : `${diagnostic.reason}:${missingApi}`;
-  return `${diagnostic.code}: Pi 子代理扩展未激活 (${detail})`;
+  return `${diagnostic.code}: Pi subagent extension was not activated (${detail})`;
 }
 
 function registerUnavailableDiagnostic(

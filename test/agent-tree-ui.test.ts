@@ -100,7 +100,7 @@ test("常驻 Agents widget 只按稳定字段顺序显示作用域直接子代�
       mailbox_pending_count: 0,
       error: Object.freeze({
         code: "internal_error",
-        message: "控制器内部错误",
+        message: "Internal controller error",
         retryable: false,
       }),
     }),
@@ -180,7 +180,7 @@ test("所有 UI 文本出口净化模板与名称中的终端控制字符", () =
         revision: item.revision + 1,
         error: Object.freeze({
           code: "internal_error",
-          message: "控制器内部错误",
+          message: "Internal controller error",
           retryable: false,
         }),
       })
@@ -234,7 +234,7 @@ test("代理树面板默认展开直接子代理、折叠深层分支并优先�
       state: "failed",
       error: Object.freeze({
         code: "internal_error",
-        message: "控制器内部错误",
+        message: "Internal controller error",
         retryable: false,
       }),
     }),
@@ -248,7 +248,7 @@ test("代理树面板默认展开直接子代理、折叠深层分支并优先�
       mailbox_pending_count: 1,
       error: Object.freeze({
         code: "termination_incomplete",
-        message: "代理资源尚未完全回收",
+        message: "Subagent resources not fully reclaimed",
         retryable: true,
       }),
     }),
@@ -473,7 +473,7 @@ test("同一树修订只刷新控制器确认的生命周期时长", () => {
       })
     : item), 5);
   assert.equal(model.refreshElapsed(forged), "error");
-  assert.deepEqual(model.render(80), ["Agent tree", "代理树暂时不可用", "Esc close"]);
+  assert.deepEqual(model.render(80), ["Agent tree", "Agent tree temporarily unavailable", "Esc close"]);
 });
 
 test("非法修订显示固定安全错误，作用域根失效时请求关闭面板", () => {
@@ -502,7 +502,7 @@ test("非法修订显示固定安全错误，作用域根失效时请求关闭�
   });
   assert.deepEqual(model.render(80), [
     "Agent tree",
-    "代理树暂时不可用",
+    "Agent tree temporarily unavailable",
     "Esc close",
   ]);
   assert.doesNotMatch(model.render(80).join("\n"), /secret-canary|TOP_SECRET|直接子代理/);
@@ -563,7 +563,7 @@ test("面板拒绝控制器不可能产生的生命周期组合与非父先拓�
   for (const nodes of impossibleNodes) {
     const model = new AgentTreePanelModel(initial);
     assert.equal(model.update(subtreeSnapshot(nodes, 4)), "error");
-    assert.deepEqual(model.render(80), ["Agent tree", "代理树暂时不可用", "Esc close"]);
+    assert.deepEqual(model.render(80), ["Agent tree", "Agent tree temporarily unavailable", "Esc close"]);
   }
 });
 
@@ -579,7 +579,7 @@ test("新故障按同一可见修订聚合为脱敏 UI-only 通知", () => {
       state: "failed",
       error: Object.freeze({
         code: "internal_error",
-        message: "控制器内部错误",
+        message: "Internal controller error",
         retryable: false,
       }),
     }),
@@ -600,7 +600,7 @@ test("新故障按同一可见修订聚合为脱敏 UI-only 通知", () => {
         state: "failed",
         error: Object.freeze({
           code: "internal_error",
-          message: "控制器内部错误",
+          message: "Internal controller error",
           retryable: false,
         }),
       })
@@ -613,7 +613,7 @@ test("新故障按同一可见修订聚合为脱敏 UI-only 通知", () => {
         state: "failed",
         error: Object.freeze({
           code: "internal_error",
-          message: "控制器内部错误",
+          message: "Internal controller error",
           retryable: false,
         }),
       }),
@@ -625,7 +625,7 @@ test("新故障按同一可见修订聚合为脱敏 UI-only 通知", () => {
         state: "terminating",
         error: Object.freeze({
           code: "termination_incomplete",
-          message: "代理资源尚未完全回收",
+          message: "Subagent resources not fully reclaimed",
           retryable: true,
         }),
       }),
@@ -637,7 +637,7 @@ test("新故障按同一可见修订聚合为脱敏 UI-only 通知", () => {
         state: "terminating",
         error: Object.freeze({
           code: "termination_incomplete",
-          message: "代理资源尚未完全回收",
+          message: "Subagent resources not fully reclaimed",
           retryable: true,
         }),
       }),
@@ -645,8 +645,8 @@ test("新故障按同一可见修订聚合为脱敏 UI-only 通知", () => {
 
   assert.equal(notifier.update(revision), "changed");
   assert.deepEqual(notifications, [
-    { message: "代理故障：worker ×2；internal_error ×2", type: "warning" },
-    { message: "代理清理不完整：cleanup ×2；termination_incomplete ×2", type: "error" },
+    { message: "Subagent failures: worker ×2; internal_error ×2", type: "warning" },
+    { message: "Subagent cleanup incomplete: cleanup ×2; termination_incomplete ×2", type: "error" },
   ]);
   assert.equal(notifier.update(revision), "ignored");
   assert.equal(notifier.update(baseline), "ignored");
@@ -680,7 +680,7 @@ test("伪造故障消息和秘密 canary 在 UI 缓存前被拒绝", () => {
   assert.equal(notifier.update(invalid), "error");
   assert.deepEqual(notifications, []);
   assert.equal(model.update(invalid), "error");
-  assert.deepEqual(model.render(80), ["Agent tree", "代理树暂时不可用", "Esc close"]);
+  assert.deepEqual(model.render(80), ["Agent tree", "Agent tree temporarily unavailable", "Esc close"]);
 });
 
 test("UI 绑定通过 widget、overlay 和 notify 跟随树修订并完整清理", async () => {
@@ -768,7 +768,7 @@ test("UI 绑定通过 widget、overlay 和 notify 跟随树修订并完整清理
         state: "failed",
         error: Object.freeze({
           code: "internal_error",
-          message: "控制器内部错误",
+          message: "Internal controller error",
           retryable: false,
         }),
       })
@@ -780,7 +780,7 @@ test("UI 绑定通过 widget、overlay 和 notify 跟随树修订并完整清理
     /REV 2/,
   );
   assert.deepEqual(notifications, [
-    { message: "代理故障：worker ×1；internal_error ×1", type: "warning" },
+    { message: "Subagent failures: worker ×1; internal_error ×1", type: "warning" },
   ]);
   assert.doesNotMatch(JSON.stringify(notifications), /binding-secret|private/i);
 
@@ -839,7 +839,7 @@ test("首次树读取失败时 agent 面板仍显示固定安全错误并可关�
   assert.equal(rendered.length, 18);
   assert.equal(plainRendered.every((line) => displayWidth(line) === 80), true);
   assert.match(plainRendered.join("\n"), /AGENT TREE/);
-  assert.match(plainRendered.join("\n"), /代理树暂时不可用/);
+  assert.match(plainRendered.join("\n"), /Agent tree temporarily unavailable/);
   assert.doesNotMatch(plainRendered.join("\n"), /private|secret-canary/i);
   overlayComponent?.handleInput?.("\x1b");
   await opened;

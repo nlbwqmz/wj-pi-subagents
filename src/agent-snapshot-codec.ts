@@ -115,12 +115,12 @@ export const AGENT_FAULT_METADATA: Readonly<Record<AgentFaultCode, Readonly<{
   readonly message: string;
   readonly retryable: boolean;
 }>>> = Object.freeze({
-  spawn_failed: Object.freeze({ message: "代理启动失败", retryable: false }),
-  spawn_timeout: Object.freeze({ message: "代理启动超时", retryable: true }),
-  capability_mismatch: Object.freeze({ message: "代理能力不匹配", retryable: false }),
-  message_delivery_failed: Object.freeze({ message: "消息交付状态不确定", retryable: false }),
-  termination_incomplete: Object.freeze({ message: "代理资源尚未完全回收", retryable: true }),
-  internal_error: Object.freeze({ message: "控制器内部错误", retryable: false }),
+  spawn_failed: Object.freeze({ message: "Subagent startup failed", retryable: false }),
+  spawn_timeout: Object.freeze({ message: "Subagent startup timed out", retryable: true }),
+  capability_mismatch: Object.freeze({ message: "Subagent capability mismatch", retryable: false }),
+  message_delivery_failed: Object.freeze({ message: "Message delivery status is uncertain", retryable: false }),
+  termination_incomplete: Object.freeze({ message: "Subagent resources not fully reclaimed", retryable: true }),
+  internal_error: Object.freeze({ message: "Internal controller error", retryable: false }),
 });
 
 export interface AgentSnapshotCodecOptions {
@@ -321,6 +321,7 @@ export function parseAgentFault(value: unknown, maxStringBytes?: number): AgentF
   ) return undefined;
   const code = record.code as AgentFaultCode;
   const metadata = AGENT_FAULT_METADATA[code];
+  // 只接受当前协议的规范字段；不兼容旧描述或伪造 retryable，语义仍由 code 识别。
   if (record.message !== metadata.message || record.retryable !== metadata.retryable) return undefined;
   return Object.freeze({ code, message: metadata.message, retryable: metadata.retryable });
 }

@@ -143,8 +143,8 @@ export class AgentTreeFailureNotifier {
       && previous.get(node.agent_id)?.error?.code !== "termination_incomplete",
     );
     this.snapshot = snapshot;
-    this.notifyAggregate("代理故障", failed, "internal_error", "warning");
-    this.notifyAggregate("代理清理不完整", incomplete, "termination_incomplete", "error");
+    this.notifyAggregate("Subagent failures", failed, "internal_error", "warning");
+    this.notifyAggregate("Subagent cleanup incomplete", incomplete, "termination_incomplete", "error");
     return "changed";
   }
 
@@ -157,7 +157,7 @@ export class AgentTreeFailureNotifier {
     if (nodes.length === 0) return;
     const templates = countBy(nodes, (node) => node.template_id);
     const codes = countBy(nodes, (node) => node.error?.code ?? fallbackCode);
-    const message = `${label}：${formatCounts(templates)}；${formatCounts(codes)}`;
+    const message = `${label}: ${formatCounts(templates)}; ${formatCounts(codes)}`;
     try {
       this.notify(message, type);
     } catch {
@@ -209,7 +209,7 @@ export function bindAgentTreeUi(
   const widgetLines = (width: number): string[] => {
     if (sourceError || snapshot === undefined) return [
       truncateToDisplayWidth("Agents", width),
-      truncateToDisplayWidth("  代理树暂时不可用", width),
+      truncateToDisplayWidth("  Agent tree temporarily unavailable", width),
     ];
     try {
       return [...renderAgentsWidget(snapshot, width)];
@@ -217,7 +217,7 @@ export function bindAgentTreeUi(
       sourceError = true;
       return [
         truncateToDisplayWidth("Agents", width),
-        truncateToDisplayWidth("  代理树暂时不可用", width),
+        truncateToDisplayWidth("  Agent tree temporarily unavailable", width),
       ];
     }
   };
@@ -452,7 +452,7 @@ export class AgentTreePanelModel {
   render(width: number): readonly string[] {
     if (this.status === "error") return Object.freeze([
       truncateToDisplayWidth("Agent tree", width),
-      truncateToDisplayWidth("代理树暂时不可用", width),
+      truncateToDisplayWidth("Agent tree temporarily unavailable", width),
       truncateToDisplayWidth("Esc close", width),
     ]);
     const rows = this.buildRows();
@@ -952,7 +952,7 @@ function countBy<T>(items: readonly T[], keyOf: (item: T) => string): ReadonlyMa
 }
 
 function formatCounts(counts: ReadonlyMap<string, number>): string {
-  return [...counts].map(([key, count]) => `${safeUiFact(key)} ×${count}`).join("、");
+  return [...counts].map(([key, count]) => `${safeUiFact(key)} ×${count}`).join(", ");
 }
 
 /** 将外部可命名事实约束为单行纯文本，阻断 ANSI、换行与方向控制注入。 */
@@ -1109,7 +1109,7 @@ function safeRequestRender(tui: AgentTreeTui): void {
 function errorPanelLines(width: number): string[] {
   return [
     truncateToDisplayWidth("Agent tree", width),
-    truncateToDisplayWidth("代理树暂时不可用", width),
+    truncateToDisplayWidth("Agent tree temporarily unavailable", width),
     truncateToDisplayWidth("Esc close", width),
   ];
 }

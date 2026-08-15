@@ -712,19 +712,19 @@ export function createChildRuntimeContext(
 }
 
 export function formatRuntimeConfigDiagnostic(diagnostic: RuntimeConfigDiagnostic): string {
-  const source = diagnostic.source === "project" ? "项目" : "用户";
+  const source = diagnostic.source === "project" ? "Project" : "User";
   const field = safeDiagnosticField(diagnostic.field);
   switch (diagnostic.reason) {
     case "unknown_field":
-      return `${source}配置中的未知字段 ${field} 已忽略；采用值 忽略`;
+      return `${source} config contains unknown field ${field}; adopted value: ignored`;
     case "file_unreadable":
-      return `${source}配置不可读；字段 ${field} 使用默认值 ${String(diagnostic.adoptedValue)}`;
+      return `${source} config is unreadable; using default value ${String(diagnostic.adoptedValue)} for ${field}`;
     case "invalid_json":
-      return `${source}配置 JSON 无法解析；字段 ${field} 使用默认值 ${String(diagnostic.adoptedValue)}`;
+      return `${source} config contains invalid JSON; using default value ${String(diagnostic.adoptedValue)} for ${field}`;
     case "invalid_shape":
-      return `${source}配置结构无效；字段 ${field} 使用默认值 ${String(diagnostic.adoptedValue)}`;
+      return `${source} config has an invalid structure; using default value ${String(diagnostic.adoptedValue)} for ${field}`;
     case "invalid_value":
-      return `${source}配置字段 ${field} 的值无效；使用默认值 ${String(diagnostic.adoptedValue)}`;
+      return `${source} config field ${field} has an invalid value; using default value ${String(diagnostic.adoptedValue)}`;
   }
 }
 
@@ -732,7 +732,7 @@ export function formatRuntimeConfigDiagnostics(
   diagnostics: readonly RuntimeConfigDiagnostic[],
 ): string {
   if (diagnostics.length === 0) return "";
-  return diagnostics.map(formatRuntimeConfigDiagnostic).join("；");
+  return diagnostics.map(formatRuntimeConfigDiagnostic).join("; ");
 }
 
 /** 只通过 UI notify 汇总一次诊断；无 UI 或通知失败时保持静默。 */

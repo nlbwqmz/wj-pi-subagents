@@ -925,7 +925,7 @@ test("父回复 renderer 隐藏原始 JSON 与协议字段并展示发送者、�
     RENDER_THEME,
   ).render(120).join("\n");
   assert.match(finalRendered, /settled \/ absent \/ no_output/);
-  assert.match(finalRendered, /无可用业务输出/);
+  assert.match(finalRendered, /No task output is available/);
 });
 
 test("工作中回复与最终答复正文按 Markdown 渲染", () => {
@@ -960,7 +960,7 @@ test("工作中回复与最终答复正文按 Markdown 渲染", () => {
     content: [{ type: "text", text: createVisibleEnvelope(collapsedEnvelope) }],
     details: { agent_id: AGENT_ID, kind: "message" },
   }, { expanded: false, outputPad: 0 }, RENDER_THEME).render(120).join("\n");
-  assert.match(collapsed, /…（展开查看完整正文）/);
+  assert.match(collapsed, /… \(expand to view full content\)/);
   assert.doesNotMatch(collapsed, /段落 10/);
 });
 
@@ -987,7 +987,7 @@ test("renderer 清理不可信名称和无效结构化正文并保持宽度", ()
     details: { agent_id: AGENT_ID, kind: "message", sender_name: "过期名称" },
   }, { expanded: true, outputPad: 0 }, RENDER_THEME);
   const malformedDisplay = malformed.render(24).join("\n");
-  assert.match(malformedDisplay, /无法解析结构化回复/);
+  assert.match(malformedDisplay, /Unable to parse\s+structured reply/);
   assert.doesNotMatch(malformedDisplay, /\u001b|\u202e/);
   assert.ok(malformed.render(24).every((line) => displayWidth(line) <= 24));
 });

@@ -335,7 +335,7 @@ function createParentReplyMessageRenderer(
       },
     );
 
-    const payload = sanitizeMultiline(visible?.payload ?? "无法解析结构化回复。");
+    const payload = sanitizeMultiline(visible?.payload ?? "Unable to parse structured reply.");
     const markdown = new Markdown(
       payload,
       0,
@@ -384,7 +384,7 @@ class ParentReplyMarkdownComponent implements AgentToolRenderComponent {
       ? payloadLines
       : [
         ...payloadLines.slice(0, MAX_COLLAPSED_PAYLOAD_LINES - 1),
-        this.theme.fg("customMessageText", "…（展开查看完整正文）"),
+        this.theme.fg("customMessageText", "… (expand to view full content)"),
       ];
     const contentLines = [
       ...this.header.render(contentWidth),
@@ -486,7 +486,7 @@ function parseVisibleEnvelope(text: string, kind: VisibleKind): VisibleEnvelope 
     return Object.freeze({
       agentId: notice.agent_id,
       status: `${notice.node_state} / ${notice.reason_code}`,
-      payload: "子代理运行时发生故障。",
+      payload: "The subagent runtime encountered a failure.",
     });
   }
   const envelope = parseChildReplyEnvelope(value);
@@ -503,7 +503,7 @@ function parseVisibleEnvelope(text: string, kind: VisibleKind): VisibleEnvelope 
     status: `${envelope.run_state} / ${envelope.output_state}${
       envelope.reason_code === undefined ? "" : ` / ${envelope.reason_code}`
     }`,
-    payload: envelope.text ?? "无可用业务输出。",
+    payload: envelope.text ?? "No task output is available.",
   });
 }
 

@@ -483,6 +483,29 @@ pi remove "<REPOSITORY_PATH>" -l
 
 ## 故障排查
 
+### 公开错误码与消息
+
+公开控制结果以 `code` 作为错误身份；`message` 和 `retryable` 必须使用该错误码对应的规范值。跨进程快照和控制响应不会兼容旧中文消息或不匹配的 `retryable` 值，收到这类数据会拒绝该载荷。
+
+| `code` | Canonical `message` | `retryable` |
+| --- | --- | ---: |
+| `invalid_argument` | `Invalid argument` | `false` |
+| `agent_not_found` | `Subagent ID is not registered` | `false` |
+| `not_direct_child` | `Target is not a direct child` | `false` |
+| `template_not_found` | `Agent template not found` | `false` |
+| `template_invalid` | `Invalid agent template` | `false` |
+| `template_capability_unavailable` | `Required template capabilities unavailable` | `false` |
+| `capability_mismatch` | `Subagent capability mismatch` | `false` |
+| `max_depth_reached` | `Maximum subagent depth reached` | `false` |
+| `max_children_reached` | `Direct child limit reached` | `true` |
+| `max_tree_agents_reached` | `Agent tree limit reached` | `true` |
+| `spawn_failed` | `Subagent startup failed` | `false` |
+| `spawn_timeout` | `Subagent startup timed out` | `true` |
+| `agent_unavailable` | `Subagent currently unavailable` | `false` |
+| `message_delivery_failed` | `Message delivery status is uncertain` | `false` |
+| `termination_incomplete` | `Subagent resources not fully reclaimed` | `true` |
+| `internal_error` | `Internal controller error` | `false` |
+
 ### 没有管理工具、`Agents` widget 或 `/agent`
 
 依次检查：

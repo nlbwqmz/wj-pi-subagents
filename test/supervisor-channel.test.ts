@@ -1049,7 +1049,7 @@ test("控制响应严格校验公开错误码和固定失败外壳", () => {
   handshake(pair);
   const validError = {
     code: "agent_unavailable",
-    message: "代理当前不可用",
+    message: "Subagent currently unavailable",
     retryable: false,
     details: {},
   } as const;
@@ -1062,7 +1062,28 @@ test("控制响应严格校验公开错误码和固定失败外壳", () => {
     {
       operation_id: "operation_error_1",
       ok: false,
-      error: { code: "agent_unavailable", message: "代理当前不可用", retryable: false },
+      error: { code: "agent_unavailable", message: "Subagent currently unavailable", retryable: false },
+    },
+    {
+      operation_id: "operation_error_1",
+      ok: false,
+      error: {
+        code: "agent_unavailable",
+        // 旧中文 wire value 必须按当前协议拒绝，不做迁移映射。
+        message: "\u4ee3\u7406\u5f53\u524d\u4e0d\u53ef\u7528",
+        retryable: false,
+        details: {},
+      },
+    },
+    {
+      operation_id: "operation_error_1",
+      ok: false,
+      error: {
+        code: "agent_unavailable",
+        message: "Subagent currently unavailable",
+        retryable: true,
+        details: {},
+      },
     },
     {
       operation_id: "operation_error_1",

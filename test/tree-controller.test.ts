@@ -211,23 +211,34 @@ test("capability_mismatch 使用固定公开故障，并由快照 codec 与生�
   const failure = controlFailure("capability_mismatch");
   assert.deepEqual(failure.error, {
     code: "capability_mismatch",
-    message: "代理能力不匹配",
+    message: "Subagent capability mismatch",
     retryable: false,
     details: {},
   });
   assert.deepEqual(parseAgentFault({
     code: "capability_mismatch",
-    message: "代理能力不匹配",
+    message: "Subagent capability mismatch",
     retryable: false,
   }), {
     code: "capability_mismatch",
-    message: "代理能力不匹配",
+    message: "Subagent capability mismatch",
     retryable: false,
   });
   assert.equal(parseAgentFault({
     code: "capability_mismatch",
-    message: "错误的故障文本",
+    message: "Invalid legacy fault text",
     retryable: false,
+  }), undefined);
+  assert.equal(parseAgentFault({
+    code: "capability_mismatch",
+    // 旧中文 wire value 不属于当前规范输入。
+    message: "\u4ee3\u7406\u80fd\u529b\u4e0d\u5339\u914d",
+    retryable: false,
+  }), undefined);
+  assert.equal(parseAgentFault({
+    code: "capability_mismatch",
+    message: "Subagent capability mismatch",
+    retryable: true,
   }), undefined);
 
   const tree = controller();
@@ -240,7 +251,7 @@ test("capability_mismatch 使用固定公开故障，并由快照 codec 与生�
   assert.equal(failed.node.state, "failed");
   assert.deepEqual(failed.node.error, {
     code: "capability_mismatch",
-    message: "代理能力不匹配",
+    message: "Subagent capability mismatch",
     retryable: false,
   });
 });
@@ -554,7 +565,7 @@ test("终止屏障不可逆，父节点必须等已登记后代确认回收后�
   const parentTerminating = expectSuccess(tree.getStatus(parent.node.agent_id));
   assert.equal(parentTerminating.state, "terminating");
   assert.equal(parentTerminating.error?.code, "termination_incomplete");
-  assert.equal(parentTerminating.error?.message, "代理资源尚未完全回收");
+  assert.equal(parentTerminating.error?.message, "Subagent resources not fully reclaimed");
   assert.equal(parentTerminating.error?.retryable, true);
   const repeatedBarrier = expectSuccess(applyEvent(tree, parent.node.agent_id, {
     type: "termination_requested",
@@ -904,7 +915,7 @@ test("递归子树的活动时长从快照基线继续累计并在终态精确�
     revision: working.revision + 1,
     error: Object.freeze({
       code: "internal_error" as const,
-      message: "控制器内部错误",
+      message: "Internal controller error",
       retryable: false,
     }),
   });
@@ -955,7 +966,7 @@ test("递归已登记节点在批量终止后保留故障与清理不完整分�
         revision: failedSnapshot.revision + 1,
         error: Object.freeze({
           code: "internal_error" as const,
-          message: "控制器内部错误",
+          message: "Internal controller error",
           retryable: false,
         }),
       }),
@@ -965,7 +976,7 @@ test("递归已登记节点在批量终止后保留故障与清理不完整分�
         revision: incompleteSnapshot.revision + 1,
         error: Object.freeze({
           code: "termination_incomplete" as const,
-          message: "代理资源尚未完全回收",
+          message: "Subagent resources not fully reclaimed",
           retryable: true,
         }),
       }),
@@ -1040,7 +1051,7 @@ test("非权威中继首次接收的故障后代在终止后保留历史分类",
     lifecycle_elapsed_ms: 5_000,
     error: Object.freeze({
       code: "internal_error" as const,
-      message: "控制器内部错误",
+      message: "Internal controller error",
       retryable: false,
     }),
   });
@@ -1059,7 +1070,7 @@ test("非权威中继首次接收的故障后代在终止后保留历史分类",
     lifecycle_elapsed_ms: 5_000,
     error: Object.freeze({
       code: "termination_incomplete" as const,
-      message: "代理资源尚未完全回收",
+      message: "Subagent resources not fully reclaimed",
       retryable: true,
     }),
   });

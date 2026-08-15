@@ -23,7 +23,7 @@ import {
 const SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const UNSAFE_DISPLAY_PATTERN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/gu;
 const MAX_COLLAPSED_BODY_LINES = 4;
-const INTERNAL_ERROR_REASON = "控制器内部错误";
+const INTERNAL_ERROR_REASON = controlFailure("internal_error").error.message;
 
 export interface AgentToolRenderTheme {
   fg(
@@ -273,7 +273,7 @@ function createMessageCallComponent(
     multiline: true,
     ...(expanded ? {} : {
       maxLines: MAX_COLLAPSED_BODY_LINES,
-      overflowText: "…（展开查看完整正文）",
+      overflowText: "… (expand to view full content)",
     }),
   }];
   return createSafeTextComponent(lines, theme, context);
@@ -289,7 +289,7 @@ export function renderAgentToolResult(
   lookups: AgentToolRenderLookups = {},
 ): AgentToolRenderComponent {
   if (options.isPartial === true) {
-    return createSafeTextComponent([{ text: "处理中", color: "warning" }], theme, context);
+    return createSafeTextComponent([{ text: "Processing", color: "warning" }], theme, context);
   }
 
   const error = readStableError(result);
@@ -312,7 +312,7 @@ export function renderAgentToolResult(
   if (name === "reply_to_parent") {
     const details = readRecord(readProperty(result, "details"));
     return readProperty(details, "accepted") === true
-      ? createSafeTextComponent([{ text: "父会话已接收", color: "success" }], theme, context)
+      ? createSafeTextComponent([{ text: "Received by parent session", color: "success" }], theme, context)
       : invalidResult(theme, context);
   }
   return invalidResult(theme, context);
@@ -323,7 +323,7 @@ function invalidResult(
   context: AgentToolRenderContext,
 ): AgentToolRenderComponent {
   return createSafeTextComponent([{
-    text: "internal_error: 控制器内部错误",
+    text: `internal_error: ${INTERNAL_ERROR_REASON}`,
     color: "error",
   }], theme, context);
 }
@@ -337,27 +337,27 @@ function renderTemplateResult(
   const templates = readTemplates(readProperty(result, "details"));
   if (templates === undefined) return invalidResult(theme, context);
   if (templates.length === 0) {
-    return createSafeTextComponent([{ text: "无可用模板", color: "muted" }], theme, context);
+    return createSafeTextComponent([{ text: "No available templates", color: "muted" }], theme, context);
   }
   if (options.expanded !== true) {
     return createSafeTextComponent([{
-      text: `可用模板 ${templates.length} · ${templates.map((item) => item.templateId).join(" · ")}`,
+      text: `Available templates: ${templates.length} · ${templates.map((item) => item.templateId).join(" · ")}`,
       color: "success",
     }], theme, context);
   }
-  const lines: SafeRenderLine[] = [{ text: `可用模板 ${templates.length}`, color: "success" }];
+  const lines: SafeRenderLine[] = [{ text: `Available templates: ${templates.length}`, color: "success" }];
   for (const template of templates) {
     lines.push({ text: `template_id: ${template.templateId}`, color: "muted" });
     lines.push({ text: `description: ${template.description}`, color: "dim" });
     lines.push({
       text: template.tools === undefined
-        ? "tools: Pi 默认"
-        : `tools: ${template.tools.length === 0 ? "无" : template.tools.join(", ")}`,
+        ? "tools: Pi default"
+        : `tools: ${template.tools.length === 0 ? "None" : template.tools.join(", ")}`,
       color: "dim",
     });
     if (template.extensions !== undefined) {
       lines.push({
-        text: `extensions: ${template.extensions.length === 0 ? "无" : template.extensions.join(", ")}`,
+        text: `extensions: ${template.extensions.length === 0 ? "None" : template.extensions.join(", ")}`,
         color: "dim",
       });
     }
@@ -393,7 +393,7 @@ function renderSendResult(
   const agentId = readAgentId(context.args);
   const name = agentId === undefined ? undefined : resolveName(agentId, lookups);
   return createSafeTextComponent([{
-    text: name === undefined ? "已发送" : `已发送给 ${name}`,
+    text: name === undefined ? "Sent" : `Sent to ${name}`,
     color: "success",
   }], theme, context);
 }
@@ -515,12 +515,12 @@ function renderTerminateResult(
   const name = resolveName(agentId, lookups) ?? agentId;
   if (!changed && count === 0) {
     return createSafeTextComponent([{
-      text: `${name} · 幂等，无新增回收`,
+      text: `${name} · Idempotent; no additional nodes reclaimed`,
       color: "muted",
     }], theme, context);
   }
   return createSafeTextComponent([{
-    text: `${name} · 新回收 ${count} 个节点${forced ? " · forced" : ""}`,
+    text: `${name} · Reclaimed ${count} new node${count === 1 ? "" : "s"}${forced ? " · forced" : ""}`,
     color: forced ? "warning" : "success",
   }], theme, context);
 }
@@ -669,7 +669,7 @@ function renderTreeResult(
       });
     }
   }
-  if (lines.length === 2) lines.push({ text: "无节点", color: "dim" });
+  if (lines.length === 2) lines.push({ text: "No nodes", color: "dim" });
   return createSafeTextComponent(lines, theme, context);
 }
 

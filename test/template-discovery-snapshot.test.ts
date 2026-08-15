@@ -575,7 +575,7 @@ test("根控制器首次发现和 reload 原子替换快照，并只通过 UI �
   assert.deepEqual(third.templates, []);
   assert.deepEqual(third.sourceDiagnostics, [{ source: "user", reason: "directory_unreadable" }]);
   assert.equal(notifications.length, 2);
-  assert.match(notifications[1]?.message ?? "", /user 模板目录/);
+  assert.match(notifications[1]?.message ?? "", /user template directory/);
   assert.doesNotMatch(notifications[1]?.message ?? "", /secret|unreadable-directory/i);
   assert.equal(sideEffects.length, 0);
 

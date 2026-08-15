@@ -14,7 +14,12 @@ import {
   type AgentToolResultRenderOptions,
   type AgentToolResultView,
 } from "./agent-tool-rendering.ts";
-import { controlFailure, type ControlResult } from "./tree-controller.ts";
+import {
+  PUBLIC_ERROR_CODES,
+  controlFailure,
+  type ControlResult,
+  type PublicErrorCode,
+} from "./tree-controller.ts";
 
 /** Pi 扩展 API 的最小结构面；生产类型由宿主包提供，核心包不复制其定义。 */
 export interface AgentToolRegistrationApi {
@@ -52,18 +57,20 @@ export class SubagentToolError extends Error {
     readonly retryable: boolean;
     readonly details?: Readonly<Record<string, never>>;
   }) {
+    // 工具边界只信任 code；message、retryable 和 details 始终重新生成。
+    const code = (PUBLIC_ERROR_CODES as readonly string[]).includes(error.code)
+      ? error.code
+      : "internal_error";
+    const canonical = controlFailure(
+      code as PublicErrorCode,
+    ).error;
     super(JSON.stringify({
       ok: false,
-      error: {
-        code: error.code,
-        message: error.message,
-        retryable: error.retryable,
-        details: error.details ?? {},
-      },
+      error: canonical,
     }));
     this.name = "SubagentToolError";
-    this.code = error.code;
-    this.retryable = error.retryable;
+    this.code = canonical.code;
+    this.retryable = canonical.retryable;
   }
 }
 
@@ -100,7 +107,7 @@ const schemas: Readonly<Record<AgentToolName, JsonSchema>> = Object.freeze({
     properties: Object.freeze({
       template_id: Object.freeze({
         type: "string",
-        description: "先调用 get_agent_templates，再原样复制其当前返回项的 template_id，两者必须完全一致；区分大小写，不得猜测、改写或使用 description 代替。",
+        description: "Call get_agent_templates first and copy its current template_id exactly. It is case-sensitive; do not guess, rewrite, or substitute description.",
         minLength: 1,
         maxLength: 256,
       }),
@@ -123,7 +130,7 @@ const schemas: Readonly<Record<AgentToolName, JsonSchema>> = Object.freeze({
     properties: Object.freeze({
       agent_ids: Object.freeze({
         type: "array",
-        description: "要观察的直接子代理 UUID；一次调用传入全部目标，重复项会被忽略。",
+        description: "Direct child subagent UUIDs to observe. Pass all targets in one call; duplicates are ignored.",
         items: uuidSchema,
         minItems: 1,
         maxItems: WAIT_AGENT_MAX_TARGETS,
@@ -159,14 +166,14 @@ const schemas: Readonly<Record<AgentToolName, JsonSchema>> = Object.freeze({
 });
 
 const descriptions: Readonly<Record<AgentToolName, string>> = Object.freeze({
-  get_agent_templates: "列出当前发现且格式有效的子代理模板，返回 JSON 数组；每项包含 template_id、可选 description 和模板声明的业务 tools。返回 [] 时不能调用 spawn_agent。",
-  spawn_agent: "使用有效 template_id 创建一个直接子代理并完成启动握手。必须先调用 get_agent_templates；template_id 必须原样复制、区分大小写，不能猜测、改写或用 description 替代。若 get_agent_templates 返回 []，则不能调用 spawn_agent。创建成功后再用 send_message 发送首项任务。",
-  send_message: "向直接子代理发送任务消息或 steering。accepted: true 只表示 mailbox 已接纳并分配 message_id/task_id，不表示模型已读取或任务完成；若返回 message_delivery_failed，先查询状态并结合已有回复核对，不要盲目重发。",
-  wait_agent: "等待一个或多个直接子代理的工作中回复、任务提交、suspended 或终态。一次调用传入本批次全部 agent_ids，不要为同一批次分别调用；outcome: reply 表示仍在处理，task_completed/task_failed/task_interrupted 表示最近任务已提交，suspended 需要查询并裁决，batch_released 表示被同批次其他 wait_agent 协同解除，timeout 只结束本次等待。",
-  interrupt_agent: "协作式中断直接子代理当前任务并保留上下文。",
-  terminate_agent: "永久终止直接子代理及其已登记子树，并确认资源回收；仅在确定不再复用该分支时使用。",
-  get_agent_status: "读取直接子代理最近确认的安全状态快照。",
-  get_agent_tree: "读取当前调用者作用域内的只读代理树快照。",
+  get_agent_templates: "List currently discovered and valid subagent templates as a JSON array. Each item includes template_id, optional description, and declared business tools. Do not call spawn_agent when the result is [].",
+  spawn_agent: "Create a direct child subagent with a valid template_id and complete the startup handshake. Call get_agent_templates first; copy template_id exactly and preserve case. Do not guess, rewrite, or substitute description. Do not call spawn_agent when get_agent_templates returns []. After creation, use send_message to send the first task.",
+  send_message: "Send a task message or steering to a direct child subagent. accepted: true means only that the mailbox accepted the message and assigned message_id/task_id; it does not mean the model read it or the task completed. If message_delivery_failed is returned, check status and existing replies before deciding; do not blindly resend.",
+  wait_agent: "Wait for a work-in-progress reply, task submission, suspended state, or terminal state from one or more direct child subagents. Pass all targets in this batch in one agent_ids call; do not call this separately for the same batch. outcome: reply means still processing; task_completed/task_failed/task_interrupted mean the latest task was submitted; suspended requires status inspection and a decision; batch_released means another wait_agent in the same batch released this call; timeout ends only this wait.",
+  interrupt_agent: "Cooperatively interrupt the current task of a direct child subagent while preserving its node and context.",
+  terminate_agent: "Permanently terminate a direct child subagent and its registered subtree, then confirm resource reclamation. Use only when you are sure the branch will not be reused.",
+  get_agent_status: "Read the most recently confirmed safe status snapshot for a direct child subagent.",
+  get_agent_tree: "Read the read-only agent tree visible to the current caller.",
 });
 
 const DELIVERY_AND_WAITING_GUIDELINE =
@@ -189,7 +196,7 @@ const childReplySchema: JsonSchema = Object.freeze({
   properties: Object.freeze({
     message: Object.freeze({
       type: "string",
-      description: "工作中回复正文。",
+      description: "Work-in-progress reply body.",
       minLength: 1,
       maxLength: 16 * 1024,
     }),
@@ -202,7 +209,7 @@ export const CHILD_REPLY_GUIDELINE =
   "仅在直接父代理明确要求你回报，或遇到必须由父代理处理或裁决的阻塞时调用 reply_to_parent。不要将其用于完成通知或替代最终答复。消息被接纳后继续当前任务，任务完成时仍须提交正常的最终答复。";
 
 const childReplyDescription =
-  "仅在直接父代理明确要求你回报，或遇到必须由父代理处理或裁决的阻塞时调用 reply_to_parent。";
+  "Call reply_to_parent only when your direct parent explicitly asks for a progress report or when blocked on an issue that the parent must handle or decide.";
 
 /** 返回给 Pi 的固定工具结果；details 只包含控制器安全数据。 */
 function toolResult<T>(result: ControlResult<T>, dataOnly = false): unknown {
@@ -218,11 +225,9 @@ async function controllerFor(
   context: unknown,
 ): Promise<AgentController> {
   const controller = await provider(context);
-  if (controller === undefined || controller === null) throw new SubagentToolError({
-    code: "agent_unavailable",
-    message: "代理控制器不可用",
-    retryable: false,
-  });
+  if (controller === undefined || controller === null) {
+    throw new SubagentToolError(controlFailure("agent_unavailable").error);
+  }
   return controller;
 }
 
@@ -350,11 +355,7 @@ export function registerReplyToParentTool(
     ) => {
       const coordinator = await provider(context);
       if (coordinator === undefined) {
-        throw new SubagentToolError({
-          code: "agent_unavailable",
-          message: "直接父会话不可用",
-          retryable: false,
-        });
+        throw new SubagentToolError(controlFailure("agent_unavailable").error);
       }
       return toolResult(await coordinator.replyToParent(params, signal));
     },

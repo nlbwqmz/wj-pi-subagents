@@ -498,7 +498,7 @@ class StartupTimeoutError extends Error {
 
 class CapabilityMismatchError extends Error {
   constructor() {
-    super("子代理能力不匹配");
+    super("Subagent capability mismatch");
     this.name = "CapabilityMismatchError";
   }
 }

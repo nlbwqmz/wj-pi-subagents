@@ -735,10 +735,14 @@ function parsePublicControlError(value: unknown, limits: SupervisorChannelLimits
   ) frameError("invalid_frame");
   const details = asPlainJsonRecord(error.details);
   if (Object.keys(details).length !== 0) frameError("invalid_frame");
+  const code = error.code as PublicErrorCode;
+  const canonical = controlFailure(code).error;
+  // 只接受当前协议的规范字段；不兼容旧描述或伪造 retryable，语义仍由 code 识别。
+  if (error.message !== canonical.message || error.retryable !== canonical.retryable) frameError("invalid_frame");
   return Object.freeze({
-    code: error.code as PublicErrorCode,
-    message: error.message,
-    retryable: error.retryable,
+    code,
+    message: canonical.message,
+    retryable: canonical.retryable,
     details: Object.freeze({}),
   });
 }

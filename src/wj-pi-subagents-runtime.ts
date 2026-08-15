@@ -727,7 +727,7 @@ export function createWjPiSubagentsRuntimeActivator(
     }
 
     api.registerCommand("agent", {
-      description: "查看当前会话作用域内的只读代理树",
+      description: "View the read-only agent tree for the current session scope",
       handler: async (_args, rawContext) => {
         const current = active;
         if (current === undefined || current.handoffPending === true) return;

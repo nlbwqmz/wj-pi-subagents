@@ -339,7 +339,7 @@ test("坏 JSON、不可读文件和未知字段只产生脱敏 UI 诊断", () =>
   assert.equal(unknown.diagnostics.length, 1);
   assert.equal(unknown.diagnostics[0]?.adoptedValue, "ignored");
   assert.match(formatRuntimeConfigDiagnostics(unknown.diagnostics), /ignored/);
-  assert.match(formatRuntimeConfigDiagnostics(unknown.diagnostics), /采用值 忽略/);
+  assert.match(formatRuntimeConfigDiagnostics(unknown.diagnostics), /adopted value: ignored/);
   assert.doesNotMatch(formatRuntimeConfigDiagnostics(unknown.diagnostics), /SECRET-123/);
 
   const invalidShapeCwd = fixtureCwd("workspace", "invalid-shape");

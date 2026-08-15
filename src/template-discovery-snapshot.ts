@@ -760,43 +760,43 @@ export function discoverTemplateSnapshot(
 function candidateReasonLabel(reason: TemplateCandidateDiagnosticReason): string {
   switch (reason) {
     case "file_unreadable":
-      return "文件不可读";
+      return "File is unreadable";
     case "invalid_utf8":
-      return "不是有效 UTF-8";
+      return "Invalid UTF-8";
     case "frontmatter_missing":
-      return "缺少 frontmatter";
+      return "Missing frontmatter";
     case "frontmatter_invalid":
-      return "frontmatter 无法解析";
+      return "Frontmatter cannot be parsed";
     case "frontmatter_non_string_key":
-      return "frontmatter 键必须是字符串";
+      return "Frontmatter keys must be strings";
     case "frontmatter_merge_key":
-      return "不允许 YAML merge 键";
+      return "YAML merge keys are not allowed";
     case "unknown_field":
-      return "包含未知字段";
+      return "Contains an unknown field";
     case "description_missing":
-      return "缺少 description";
+      return "Missing description";
     case "description_invalid":
-      return "description 配置无效";
+      return "Invalid description configuration";
     case "description_too_long":
-      return "description 超过 512 个 Unicode code points";
+      return "Description exceeds 512 Unicode code points";
     case "tools_invalid":
-      return "tools 配置无效";
+      return "Invalid tools configuration";
     case "reserved_tool":
-      return "tools 包含系统保留工具";
+      return "Tools contains a reserved system tool";
     case "extensions_invalid":
-      return "extensions 配置无效";
+      return "Invalid extensions configuration";
     case "allow_subagents_invalid":
-      return "allowSubagents 配置无效";
+      return "Invalid allowSubagents configuration";
     case "context_files_invalid":
-      return "contextFiles 配置无效";
+      return "Invalid contextFiles configuration";
     case "system_prompt_mode_invalid":
-      return "systemPromptMode 配置无效";
+      return "Invalid systemPromptMode configuration";
     case "model_invalid":
-      return "model 配置无效";
+      return "Invalid model configuration";
     case "thinking_invalid":
-      return "thinking 配置无效";
+      return "Invalid thinking configuration";
     case "body_too_large":
-      return "正文超过 64 KiB";
+      return "Body exceeds 64 KiB";
   }
 }
 
@@ -804,13 +804,15 @@ function candidateReasonLabel(reason: TemplateCandidateDiagnosticReason): string
 export function formatTemplateDiscoveryDiagnostics(snapshot: TemplateDiscoverySnapshot): string {
   const parts = [
     ...snapshot.invalidCandidates.map((diagnostic) => (
-      `${diagnostic.source}:${diagnostic.fileName}：${candidateReasonLabel(diagnostic.reason)}`
+      `${diagnostic.source}:${diagnostic.fileName}: ${candidateReasonLabel(diagnostic.reason)}`
     )),
     ...snapshot.sourceDiagnostics.map((diagnostic) => (
-      `${diagnostic.source} 模板目录：不可枚举`
+      `${diagnostic.source} template directory: cannot be listed`
     )),
   ];
-  return parts.length === 0 ? "" : `发现 ${String(parts.length)} 个代理模板问题：${parts.join("；")}`;
+  if (parts.length === 0) return "";
+  const issueLabel = parts.length === 1 ? "issue" : "issues";
+  return `Found ${String(parts.length)} agent template ${issueLabel}: ${parts.join("; ")}`;
 }
 
 /** 无 UI 或 UI 通知失败时保持静默，不创建消息、会话条目或替代输出。 */

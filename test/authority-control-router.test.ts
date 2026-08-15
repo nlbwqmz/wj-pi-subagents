@@ -327,7 +327,7 @@ test("权威响应快照接受固定的 capability_mismatch 故障", async () =>
         lifecycle_elapsed_ms: 1_000,
         error: Object.freeze({
           code: "capability_mismatch",
-          message: "代理能力不匹配",
+          message: "Subagent capability mismatch",
           retryable: false,
         }),
       }),
@@ -344,7 +344,7 @@ test("权威响应快照接受固定的 capability_mismatch 故障", async () =>
 
   assert.deepEqual(result.node.error, {
     code: "capability_mismatch",
-    message: "代理能力不匹配",
+    message: "Subagent capability mismatch",
     retryable: false,
   });
   client.close();

@@ -1482,6 +1482,7 @@ test("运行时以单数 agent 命令交付只读 TUI，并在会话关闭时清
   ]);
   const command = api.commands.get("agent");
   assert.ok(command);
+  assert.equal(command.description, "View the read-only agent tree for the current session scope");
   const opened = command.handler("", context) as Promise<void>;
   assert.deepEqual(ui.overlayOptions, {
     overlay: true,
@@ -1493,7 +1494,7 @@ test("运行时以单数 agent 命令交付只读 TUI，并在会话关闭时清
 
   node.emitTransportFault("eof");
   assert.deepEqual(ui.notifications, [{
-    message: "代理故障：researcher ×1；internal_error ×1",
+    message: "Subagent failures: researcher ×1; internal_error ×1",
     type: "warning",
   }]);
   assert.equal(api.sentMessages.length, 1);

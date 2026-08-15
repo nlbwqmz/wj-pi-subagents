@@ -86,14 +86,14 @@ test("管理工具系统提示约束任务所有权并覆盖慢任务和异常�
   assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /不要自动切换模型或创建替代代理/);
   const readDescription = (name: string): string =>
     String(registrations.find((tool) => tool.name === name)?.description ?? "");
-  assert.match(readDescription("get_agent_templates"), /返回 JSON 数组/);
-  assert.doesNotMatch(readDescription("get_agent_templates"), /向父会话当前活动工具|能力预检/);
+  assert.match(readDescription("get_agent_templates"), /JSON array/);
+  assert.doesNotMatch(readDescription("get_agent_templates"), /parent session tools|capability preflight/);
   assert.match(readDescription("send_message"), /accepted: true/);
   assert.match(readDescription("send_message"), /message_delivery_failed/);
   assert.doesNotMatch(readDescription("send_message"), /images|Base64/);
   assert.match(readDescription("wait_agent"), /timeout/);
   assert.doesNotMatch(readDescription("interrupt_agent"), /wait_agent/);
-  assert.match(readDescription("terminate_agent"), /永久/);
+  assert.match(readDescription("terminate_agent"), /Permanently/);
 });
 
 test("模板查询与创建通过注册渲染接口提供语义化调用和结果", async () => {
@@ -150,18 +150,18 @@ test("模板查询与创建通过注册渲染接口提供语义化调用和结�
   const renderTemplates = toolResultRenderer(registrations, "get_agent_templates");
   assert.deepEqual(
     renderTemplates(templateResult, { expanded: false }, RENDER_THEME, { args: {} }).render(80),
-    ["可用模板 2 · Explore · review"],
+    ["Available templates: 2 · Explore · review"],
   );
   assert.deepEqual(
     renderTemplates(templateResult, { expanded: true }, RENDER_THEME, { args: {} }).render(80),
     [
-      "可用模板 2",
+      "Available templates: 2",
       "template_id: Explore",
       "description: 快速探索",
       "tools: read, bash",
       "template_id: review",
       "description: 审查结果",
-      "tools: 无",
+      "tools: None",
     ],
   );
 
@@ -169,7 +169,7 @@ test("模板查询与创建通过注册渲染接口提供语义化调用和结�
   const emptyResult = await executeTemplates("empty", {}, undefined, undefined, {});
   assert.deepEqual(
     renderTemplates(emptyResult, { expanded: false }, RENDER_THEME, { args: {} }).render(80),
-    ["无可用模板"],
+    ["No available templates"],
   );
 
   const spawnResult = await executeSpawn(
@@ -218,7 +218,7 @@ test("消息、等待与父回复通过语义化渲染隐藏内部确认字段",
                 : "working",
           revision: 42,
           ...(outcome === "terminal" ? {
-            error: { code: "internal_error", message: "控制器内部错误", retryable: false },
+            error: { code: "internal_error", message: "Internal controller error", retryable: false },
           } : {}),
         },
       }),
@@ -266,7 +266,7 @@ test("消息、等待与父回复通过语义化渲染隐藏内部确认字段",
     RENDER_THEME,
     { args: { agent_id: agentId, message: "核对鉴权入口" } },
   ).render(80).join("\n");
-  assert.equal(sendDisplay, "已发送给 鉴权调查");
+  assert.equal(sendDisplay, "Sent to 鉴权调查");
   assert.doesNotMatch(sendDisplay, /msg-secret|550e8400|核对鉴权入口/);
 
   for (const expected of [
@@ -325,16 +325,16 @@ test("消息、等待与父回复通过语义化渲染隐藏内部确认字段",
       RENDER_THEME,
       { args: { message: "正在核对第二个实现分支。" } },
     ).render(80),
-    ["父会话已接收"],
+    ["Received by parent session"],
   );
 });
 
-test("工具失败结果只显示稳定错误码与安全中文原因", async () => {
+test("工具失败结果只显示稳定错误码与安全英文原因", async () => {
   const registrations: Array<Record<string, unknown>> = [];
   registerAgentTools({ registerTool: (tool) => registrations.push(tool as Record<string, unknown>) }, async () => ({
     sendMessage: async () => ({ ok: false, error: {
       code: "message_delivery_failed",
-      message: "消息未获确认接收",
+      message: "Delivery was not confirmed",
       retryable: false,
       details: {},
     } }),
@@ -354,6 +354,8 @@ test("工具失败结果只显示稳定错误码与安全中文原因", async ()
     caught = error;
   }
   assert.ok(caught instanceof SubagentToolError);
+  assert.match(caught.message, /Message delivery status is uncertain/);
+  assert.doesNotMatch(caught.message, /Delivery was not confirmed/);
   const display = toolResultRenderer(registrations, "send_message")(
     { content: [{ type: "text", text: caught.message }], details: {} },
     { expanded: false },
@@ -363,7 +365,7 @@ test("工具失败结果只显示稳定错误码与安全中文原因", async ()
       isError: true,
     },
   ).render(80).join("\n");
-  assert.equal(display, "message_delivery_failed: 消息交付状态不确定");
+  assert.equal(display, "message_delivery_failed: Message delivery status is uncertain");
   assert.doesNotMatch(display, /retryable|details|stack|[{}]/);
 });
 
@@ -387,7 +389,7 @@ test("九个工具失败结果统一使用稳定错误外壳并适配窄终端",
     };
     assert.equal(
       renderer(result, { expanded: false }, RENDER_THEME, { isError: true }).render(120).join("\n"),
-      "termination_incomplete: 代理资源尚未完全回收",
+      "termination_incomplete: Subagent resources not fully reclaimed",
       `${name} 未使用统一错误展示`,
     );
     const narrowLines = renderer(result, { expanded: false }, RENDER_THEME, { isError: true }).render(16);
@@ -524,18 +526,18 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
         revision: 10,
         created_at: "2026-01-02T03:04:08.006Z",
         lifecycle_elapsed_ms: 4567,
-        error: { code: "internal_error", message: "控制器内部错误", retryable: false },
+        error: { code: "internal_error", message: "Internal controller error", retryable: false },
       } },
       { expanded: true }, RENDER_THEME, { args: { agent_id: agentId } },
     ).render(100).join("\n");
     assert.match(failedStatus, /error\.code: internal_error/);
-    assert.match(failedStatus, /error\.message: 控制器内部错误/);
+    assert.match(failedStatus, /error\.message: Internal controller error/);
     assert.match(failedStatus, /error\.retryable: false/);
 
     const terminateDisplay = toolResultRenderer(registrations, "terminate_agent")(
       terminate, { expanded: false }, RENDER_THEME, { args: { agent_id: agentId } },
     ).render(100).join("\n");
-    assert.equal(terminateDisplay, "鉴权调查 · 新回收 3 个节点 · forced");
+    assert.equal(terminateDisplay, "鉴权调查 · Reclaimed 3 new nodes · forced");
     assert.doesNotMatch(terminateDisplay, /terminated|changed/);
 
     const idempotent = toolResultRenderer(registrations, "terminate_agent")(
@@ -544,7 +546,7 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
       } },
       { expanded: false }, RENDER_THEME, { args: { agent_id: agentId } },
     ).render(100).join("\n");
-    assert.equal(idempotent, "鉴权调查 · 幂等，无新增回收");
+    assert.equal(idempotent, "鉴权调查 · Idempotent; no additional nodes reclaimed");
 
     const statusCollapsed = toolResultRenderer(registrations, "get_agent_status")(
       status, { expanded: false }, RENDER_THEME, { args: { agent_id: agentId } },
@@ -617,15 +619,15 @@ test("公开注册入口一次注册完整八工具集合并说明模板选择�
   const spawnTool = registrations.find((tool) => tool.name === "spawn_agent");
   assert.ok(spawnTool);
   assert.match(String(spawnTool.description), /get_agent_templates/);
-  assert.match(String(spawnTool.description), /区分大小写/);
+  assert.match(String(spawnTool.description), /preserve case/);
   assert.match(String(spawnTool.description), /\[\]/);
-  assert.match(String(spawnTool.description), /不能调用|不得调用/);
+  assert.match(String(spawnTool.description), /Do not call/);
 
   const parameters = spawnTool.parameters as {
     readonly properties?: { readonly template_id?: { readonly description?: string } };
   };
   assert.match(parameters.properties?.template_id?.description ?? "", /get_agent_templates/);
-  assert.match(parameters.properties?.template_id?.description ?? "", /完全一致|精确/);
+  assert.match(parameters.properties?.template_id?.description ?? "", /exactly/);
 });
 
 test("同一 assistant 批次的顺序 wait 合并目标并缓存首个结果", async () => {
@@ -962,7 +964,7 @@ test("代理工具调用行显示入参并安全折叠长消息", () => {
   const collapsedDisplay = collapsedLines.join("\n");
   assert.match(collapsedDisplay, /send_message/);
   assert.ok(collapsedDisplay.replaceAll(/\s/gu, "").includes(agentId));
-  assert.match(collapsedDisplay, /展开查看完整正文/);
+  assert.match(collapsedDisplay, /expand to view full content/);
   assert.doesNotMatch(collapsedDisplay, /Ctrl\+O/);
   assert.equal(collapsedDisplay.includes("\u001b"), false);
   assert.equal(collapsedDisplay.includes("\u202e"), false);
@@ -1024,7 +1026,7 @@ test("reply_to_parent 只展示文本且 schema 不暴露图片字段", () => {
   assert.equal(registration?.promptGuidelines, undefined);
   assert.equal(
     registration?.description,
-    "仅在直接父代理明确要求你回报，或遇到必须由父代理处理或裁决的阻塞时调用 reply_to_parent。",
+    "Call reply_to_parent only when your direct parent explicitly asks for a progress report or when blocked on an issue that the parent must handle or decide.",
   );
   assert.doesNotMatch(JSON.stringify(registration?.parameters), /requires_response/);
 });
@@ -1068,7 +1070,7 @@ test("控制器失败映射为稳定 SubagentToolError 而不暴露异常", asyn
   registerAgentTools({ registerTool: (tool) => registrations.push(tool as Record<string, unknown>) }, async () => ({
     getAgentTree: () => ({ ok: false, error: {
       code: "agent_not_found",
-      message: "代理标识未注册",
+      message: "Subagent ID is not registered",
       retryable: false,
       details: {},
     } }),
