@@ -1,6 +1,6 @@
 {
   "name": "wj-pi-subagents",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "author": "WJ",
   "description": "wj-pi-subagents：Pi 递归子代理扩展包",
   "homepage": "https://github.com/nlbwqmz/wj-pi-subagents#readme",
@@ -13,8 +13,19 @@
   },
   "type": "module",
   "license": "MIT",
-  "keywords": ["pi-package", "pi", "subagents", "ai-agents", "pi-extensions"],
-  "files": ["LICENSE", "dist", "index.ts", "src"],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "subagents",
+    "ai-agents",
+    "pi-extensions"
+  ],
+  "files": [
+    "LICENSE",
+    "dist",
+    "index.ts",
+    "src"
+  ],
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
@@ -48,7 +59,9 @@
     "compat:pi": "node scripts/pi-compat-smoke.mjs"
   },
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "wjPiSubagents": {
     "requiresPi": ">=0.84.1"
