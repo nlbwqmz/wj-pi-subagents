@@ -22,6 +22,7 @@ test("package manifest 只暴露一个显式 Pi 扩展入口", () => {
     engines?: { node?: string };
     scripts?: {
       "pack:smoke"?: string;
+      "compat:pi"?: string;
       "release:validate"?: string;
       prepublishOnly?: string;
     };
@@ -51,11 +52,12 @@ test("package manifest 只暴露一个显式 Pi 扩展入口", () => {
   });
   assert.equal(manifest.engines?.node, REQUIRED_NODE_RANGE);
   assert.equal(manifest.scripts?.["pack:smoke"], "node scripts/package-smoke.mjs");
+  assert.equal(manifest.scripts?.["compat:pi"], "node scripts/pi-compat-smoke.mjs");
   assert.equal(manifest.scripts?.["release:validate"], "node scripts/validate-release-tag.mjs");
   assert.equal(manifest.scripts?.prepublishOnly, "npm run check");
   assert.equal(manifest.peerDependencies?.["@earendil-works/pi-coding-agent"], "*");
   assert.equal(manifest.peerDependencies?.["@earendil-works/pi-tui"], "*");
-  assert.equal(manifest.devDependencies?.["@earendil-works/pi-tui"], "0.84.1");
+  assert.equal(manifest.devDependencies?.["@earendil-works/pi-tui"], "0.84.2");
   assert.ok(manifest.dependencies?.semver, "生产安装必须能够解析 semver");
   assert.deepEqual(manifest.pi, {
     extensions: ["./index.ts"],

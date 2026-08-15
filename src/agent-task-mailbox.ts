@@ -26,6 +26,7 @@ export interface AgentHostDelivery {
   readonly message: string;
   readonly mode: "prompt" | "steer";
   readonly start_epoch: number;
+  readonly task_start_epoch: number;
 }
 
 export type AgentCompactionReason = "manual" | "threshold" | "overflow";
@@ -87,6 +88,8 @@ export class AgentTaskMailbox {
   private maintenanceFailed = false;
   private readonly staleFinalTurns = new Set<string>();
   private startEpoch = 0;
+  private taskStartEpoch = 0;
+  private confirmedTaskStartKey: string | undefined;
   private nextDeliveryId = 1;
 
   constructor(options: AgentTaskMailboxOptions = {}) {
@@ -132,6 +135,7 @@ export class AgentTaskMailbox {
       message: entry.message,
       mode: task.hostStarted ? "steer" as const : "prompt" as const,
       start_epoch: this.startEpoch,
+      task_start_epoch: this.taskStartEpoch,
     });
     this.inFlight = delivery;
     return delivery;
@@ -148,23 +152,30 @@ export class AgentTaskMailbox {
     const task = this.currentTask;
     const taskMatches = task?.taskId === delivery.task_id;
     const startsSinceDelivery = this.startEpoch - delivery.start_epoch;
+    const promptExecutionObserved = this.promptExecutionObserved(delivery);
     if (
       !taskMatches
-      || startsSinceDelivery < 0
-      || (delivery.mode === "steer" && (
-        startsSinceDelivery !== 0
-        || !task.hostStarted
-        || this.settlementObserved
-      ))
-      || (delivery.mode === "prompt" && (
-        startsSinceDelivery > 1
-        || this.settlementObserved
+      || (!promptExecutionObserved && (
+        startsSinceDelivery < 0
+        || (delivery.mode === "steer" && (
+          startsSinceDelivery !== 0
+          || !task.hostStarted
+          || this.settlementObserved
+        ))
+        || (delivery.mode === "prompt" && (
+          startsSinceDelivery > 1
+          || this.settlementObserved
+        ))
       ))
     ) {
       this.markDeliveryUncertain(delivery.task_id);
       return true;
     }
     if (delivery.mode === "prompt") {
+      if (promptExecutionObserved) {
+        this.reconcileObservedPromptExecution();
+        return true;
+      }
       // RPC 成功只证明 Pi 接纳了命令。agent_start 可能先于这个响应到达；
       // 只有尚未观察到真实 start 时才保留 prompt-start 栅栏。
       this.awaitingPromptStart = !task.hostStarted;
@@ -179,11 +190,15 @@ export class AgentTaskMailbox {
     return true;
   }
 
-  /** RpcClient rejection 不能证明宿主未接纳；保留为可对账的 suspended 事实。 */
+  /** RpcClient rejection 不能证明宿主未接纳；已有启动或 final 则直接按强事实对账。 */
   hostDeliveryUncertain(deliveryId: number): boolean {
     const delivery = this.claimDelivery(deliveryId);
     if (delivery === undefined) return false;
     this.removeMailboxEntry(delivery.message_id);
+    if (this.promptExecutionObserved(delivery)) {
+      this.reconcileObservedPromptExecution();
+      return true;
+    }
     this.markDeliveryUncertain(delivery.task_id);
     return true;
   }
@@ -191,6 +206,7 @@ export class AgentTaskMailbox {
   /** child 监督事实把实际轮次身份与父端占位任务对齐。 */
   observeTaskStarted(taskId: string, turnId: string): boolean {
     if (!isCanonicalUuidV4Text(taskId) || !isCanonicalUuidV4Text(turnId)) return false;
+    const taskStartKey = `${taskId}:${turnId}`;
     const current = this.currentTask;
     const reconcilesUncertainDelivery = this.deliveryUncertain
       && this.deliveryUncertainTaskId === taskId
@@ -234,6 +250,10 @@ export class AgentTaskMailbox {
     ) {
       if (!this.interruptBarrier) this.state = "working";
       this.phase = this.toolCounts.size > 0 ? "executing_tools" : "processing";
+    }
+    if (this.confirmedTaskStartKey !== taskStartKey) {
+      this.confirmedTaskStartKey = taskStartKey;
+      this.taskStartEpoch += 1;
     }
     return true;
   }
@@ -610,6 +630,24 @@ export class AgentTaskMailbox {
       || this.maintenanceFailed
       || this.phase === "maintenance_failed"
       || this.phase === "delivery_uncertain";
+  }
+
+  private promptExecutionObserved(delivery: AgentHostDelivery): boolean {
+    if (delivery.mode !== "prompt" || this.currentTask?.taskId !== delivery.task_id) return false;
+    return this.taskStartEpoch > delivery.task_start_epoch
+      || this.preparedFinal?.task_id === delivery.task_id;
+  }
+
+  private reconcileObservedPromptExecution(): void {
+    this.awaitingPromptStart = false;
+    if (this.finalCommitBlocked()) return;
+    if (this.settlementObserved) {
+      if (!this.interruptBarrier) this.state = "working";
+      this.phase = this.preparedFinal === undefined ? "finalizing" : "waiting_parent_ack";
+      return;
+    }
+    if (!this.interruptBarrier) this.state = "working";
+    this.phase = this.toolCounts.size > 0 ? "executing_tools" : "processing";
   }
 
   private markDeliveryUncertain(taskId?: string): void {

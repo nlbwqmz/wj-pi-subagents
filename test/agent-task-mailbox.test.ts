@@ -296,6 +296,45 @@ test("delivery uncertainty 只由匹配任务的真实 task_started 收敛", () 
   assert.equal(value.takeNextDelivery(), undefined);
 });
 
+test("匹配 task_started 先于 prompt rejection 时直接确认交付，不进入 suspended", () => {
+  const value = mailbox([TASK_1]);
+  const submission = value.submit("已由 Pi 建立任务");
+  const delivery = value.takeNextDelivery();
+  assert.ok(delivery);
+
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(submission.task_id, TURN_1), true);
+  assert.equal(value.hostDeliveryUncertain(delivery!.delivery_id), true);
+  assert.equal(value.projection().state, "working");
+  assert.equal(value.projection().activity?.phase, "processing");
+  assert.equal(value.takeNextDelivery(), undefined);
+});
+
+test("prompt 命令尾部晚于 task_started 与 final 时，成功或拒绝都不锁死任务", () => {
+  for (const outcome of ["accepted", "uncertain"] as const) {
+    const value = mailbox([PLACEHOLDER_TASK]);
+    const submission = value.submit("命令响应迟到");
+    const delivery = value.takeNextDelivery();
+    assert.ok(delivery);
+
+    value.observeAgentStart();
+    assert.equal(value.observeTaskStarted(submission.task_id, TURN_1), true);
+    value.observeAgentSettled();
+    const candidate = final(submission.task_id, TURN_1, COMMIT_1);
+    assert.equal(value.prepareFinal(candidate), false);
+
+    const reconciled = outcome === "accepted"
+      ? value.hostAccepted(delivery!.delivery_id)
+      : value.hostDeliveryUncertain(delivery!.delivery_id);
+    assert.equal(reconciled, true);
+    assert.equal(value.projection().state, "working");
+    assert.equal(value.projection().activity?.phase, "waiting_parent_ack");
+    assert.equal(value.commitPreparedFinal(COMMIT_1), true);
+    assert.equal(value.projection().state, "idle");
+    assert.equal(value.projection().last_task?.outcome, "completed");
+  }
+});
+
 test("final 在 settlement 前只能 prepare，父端接纳与 settlement 都满足后才能 commit", () => {
   const value = mailbox([PLACEHOLDER_TASK]);
   value.observeAgentStart();

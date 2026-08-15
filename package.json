@@ -13,7 +13,7 @@
   },
   "type": "module",
   "license": "MIT",
-  "keywords": ["pi-package", "pi", "subagents", "ai-agents"],
+  "keywords": ["pi-package", "pi", "subagents", "ai-agents", "pi-extensions"],
   "files": ["LICENSE", "dist", "index.ts", "src"],
   "publishConfig": {
     "access": "public",
@@ -31,7 +31,7 @@
     "yaml": "2.9.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-tui": "0.84.1",
+    "@earendil-works/pi-tui": "0.84.2",
     "@types/node": "24.12.4",
     "@types/semver": "7.7.1",
     "typescript": "5.9.3"
@@ -44,7 +44,8 @@
     "prepack": "npm run build:bridge",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test test/*.test.ts",
-    "check": "npm run typecheck && npm test"
+    "check": "npm run typecheck && npm test",
+    "compat:pi": "node scripts/pi-compat-smoke.mjs"
   },
   "pi": {
     "extensions": ["./index.ts"]

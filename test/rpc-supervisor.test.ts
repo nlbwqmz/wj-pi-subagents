@@ -2479,8 +2479,93 @@ test("监督传输故障释放同一直接边上的全部叠加压缩事务", as
   secondProbe.resolve();
 });
 
-test("非法 Pi 事件、重复 manual compaction、extension_error 和运行期 EOF 归一化为稳定故障", async () => {
-  for (const scenario of ["invalid_event", "duplicate_manual_compaction", "extension_error", "eof"] as const) {
+test("命令响应晚于 task_started 与 final 时自动重试并提交已完成任务", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "final 响应尾竞态" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+  const promptGate = rpcClient.deferNext("prompt");
+  const submission = await supervisor.prompt("final 先于命令响应");
+  assert.equal(submission.ok, true);
+  if (!submission.ok) return;
+  await promptGate.started;
+
+  rpcClient.emitEvent({ type: "agent_start" });
+  channel.emitTaskStarted({ task_id: submission.task_id, turn_id: TURN_ID });
+  rpcClient.emitEvent({ type: "agent_settled" });
+  const final = finalEnvelope(submission.task_id);
+  assert.equal(supervisor.acceptChildReply(final, () => true), false);
+
+  const retriesBefore = channel.pendingReplyRetries();
+  promptGate.reject();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(channel.pendingReplyRetries(), retriesBefore + 1);
+
+  const status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "working");
+    assert.equal(status.data.activity?.phase, "waiting_parent_ack");
+    assert.equal(status.data.reply_outbox_pending_count, 1);
+  }
+  assert.equal(supervisor.acceptChildReply(final, () => true), true);
+  const committed = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(committed.ok, true);
+  if (committed.ok) {
+    assert.equal(committed.data.state, "idle");
+    assert.equal(committed.data.last_task?.outcome, "completed");
+  }
+});
+
+test("Pi extension_error 不覆盖 final，但真实 EOF 仍使不可复用节点失败", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "可恢复扩展错误" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+  rpcClient.emitEvent({ type: "agent_start" });
+  channel.emitTaskStarted({ task_id: AUTONOMOUS_TASK_ID, turn_id: TURN_ID });
+  rpcClient.emitEvent({ type: "agent_settled" });
+  assert.equal(supervisor.acceptChildReply(finalEnvelope(AUTONOMOUS_TASK_ID), () => true), true);
+
+  rpcClient.emitEvent({ type: "extension_error" });
+  const status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "idle");
+    assert.equal(status.data.last_task?.outcome, "completed");
+    assert.equal(status.data.error, undefined);
+  }
+
+  rpcClient.emitTransportFault("eof");
+  const failed = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(failed.ok, true);
+  if (failed.ok) {
+    assert.equal(failed.data.state, "failed");
+    assert.equal(failed.data.last_task?.outcome, "completed");
+    assert.equal(failed.data.error?.code, "internal_error");
+  }
+});
+
+test("非法 Pi 事件、重复 manual compaction 和运行期 EOF 归一化为稳定故障", async () => {
+  for (const scenario of ["invalid_event", "duplicate_manual_compaction", "eof"] as const) {
     const tree = createController();
     const rpcClient = new FakeRpcClient();
     const managedNode = new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter());
@@ -2502,10 +2587,6 @@ test("非法 Pi 事件、重复 manual compaction、extension_error 和运行期
     } else if (scenario === "duplicate_manual_compaction") {
       rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
       rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
-    } else if (scenario === "extension_error") {
-      rpcClient.emitEvent({ type: "extension_error", error: "TOP_SECRET_STACK" });
-      // Pi 保证 handler 错误先于同一轮 agent_settled；迟到 settle 不得覆盖 failed。
-      rpcClient.emitEvent({ type: "agent_settled" });
     } else {
       rpcClient.emitTransportFault("eof");
     }
@@ -2525,9 +2606,7 @@ test("非法 Pi 事件、重复 manual compaction、extension_error 和运行期
       kind: "fault",
       code: scenario === "eof"
         ? "rpc_eof"
-        : scenario === "extension_error"
-          ? "rpc_protocol_fault"
-          : "invalid_rpc_event",
+        : "invalid_rpc_event",
     });
     assert.equal(JSON.stringify(events).includes("TOP_SECRET_STACK"), false);
   }

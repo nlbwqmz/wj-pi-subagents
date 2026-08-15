@@ -674,6 +674,12 @@ export class RpcSupervisor {
     await this.channel?.retryPendingReplies?.();
   }
 
+  private schedulePendingReplyRetry(): void {
+    void this.retryPendingReplies().catch(() => {
+      this.receiveTransportFault("protocol_fault", "supervisor");
+    });
+  }
+
   /**
    * 在父端通道 ACK 之前线性化 child reply。final 只有在 raw settled candidate
    * 已观察到且父会话同步接纳后才提交；过期 task 的回复确认后丢弃，防止 outbox
@@ -1188,7 +1194,7 @@ export class RpcSupervisor {
     }
     this.signalCompactionStateChange();
     this.drainCommandQueue();
-    void this.retryPendingReplies();
+    this.schedulePendingReplyRetry();
     return released;
   }
 
@@ -1279,7 +1285,7 @@ export class RpcSupervisor {
       return;
     }
     this.commitTaskProjection();
-    void this.retryPendingReplies();
+    this.schedulePendingReplyRetry();
   }
 
   private receiveRpcEvent(event: unknown): void {
@@ -1342,7 +1348,7 @@ export class RpcSupervisor {
         this.mailbox.observeCompactionEnd(event.reason, event.failed, event.willRetry);
         this.commitTaskProjection();
         this.drainCommandQueue();
-        void this.retryPendingReplies();
+        this.schedulePendingReplyRetry();
         return;
       case "queue_update":
         if (!Number.isSafeInteger(event.pendingMessageCount) || (event.pendingMessageCount as number) < 0) {
@@ -1362,7 +1368,8 @@ export class RpcSupervisor {
         // 回复只能由真正 child 扩展经监督通道上行；任务 RPC 事件不再发布回复。
         return;
       case "extension_error":
-        this.failRuntime("rpc_protocol_fault");
+        // Pi 会捕获扩展 handler/sendMessage 异常并继续当前会话；它是诊断事件，
+        // 不能升级为运行时或监督协议故障。关键扩展不变量通过监督通道显式失败。
         return;
       default:
         if (!IGNORED_RPC_EVENT_TYPES.has(event.type)) this.failRuntime("invalid_rpc_event");
@@ -1602,11 +1609,12 @@ export class RpcSupervisor {
       if (delivery.mode === "prompt") await this.commandClient().prompt(delivery.message);
       else await this.commandClient().steer(delivery.message);
       this.mailbox.hostAccepted(delivery.delivery_id);
-      this.commitTaskProjection();
     } catch {
       this.mailbox.hostDeliveryUncertain(delivery.delivery_id);
-      this.commitTaskProjection();
     }
+    this.commitTaskProjection();
+    // final 可能在独立监督流上先于命令响应到达；命令尾部正是其最后一个门闩。
+    this.schedulePendingReplyRetry();
   }
 
   private async executeInterruptCommand(command: QueuedInterruptCommand): Promise<void> {
@@ -1635,7 +1643,7 @@ export class RpcSupervisor {
     this.commitTaskProjection();
     // Pi 保证 agent_settled 已位于其自动重试、自动压缩和队列续轮之后。
     // final 若先到，通道仍会将它隔离至这个 candidate 建立后再投递。
-    void this.retryPendingReplies();
+    this.schedulePendingReplyRetry();
     this.drainCommandQueue();
   }
 

@@ -99,7 +99,7 @@
 | 项目 | 要求或状态 |
 | --- | --- |
 | Node.js | `>= 22.19.0` |
-| Pi | `>= 0.84.1`，包名为 `@earendil-works/pi-coding-agent` |
+| Pi | `>= 0.84.1`，当前兼容性 smoke 基线为 `0.84.2`，包名为 `@earendil-works/pi-coding-agent` |
 | 目标平台 | Windows、macOS、Linux；当前只完成 Windows 原生验收 |
 | Windows Shell | Pi 需要可用的 Bash，推荐 Git for Windows 提供的 Git Bash |
 | Windows 进程管理 | 需要可从 `PATH` 调用的 `powershell.exe`，扩展使用 Job Object 回收进程树 |
@@ -567,6 +567,7 @@ npm ci --legacy-peer-deps
 | `npm run check` | 依次执行类型检查和全部测试 |
 | `npm run build:bridge` | 将 RPC bridge 编译到 `dist/` |
 | `npm run pack:smoke` | 打包 tarball，并在 `package-smoke/` 中执行隔离生产安装 |
+| `npm run compat:pi` | 使用本机 Pi RPC 验证扩展入口、TUI widget 和 `get_state` |
 
 源码开发时，若 `dist/` 中没有编译 bridge，运行时会回退到 `src/rpc-bridge-process.ts`。打包时 `prepack` 会自动执行 `build:bridge`。
 
