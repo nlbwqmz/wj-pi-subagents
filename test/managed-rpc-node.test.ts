@@ -84,7 +84,7 @@ function capabilityManifest(): SupervisorCapabilityManifest {
     provider: "openai",
     model: "gpt-5.2-codex",
     thinking: "high",
-    self_extension_path: "C:\\pi\\extensions\\wj-pi-subagents.ts",
+    self_extension_path: "C:\\pi\\index.ts",
   };
 }
 

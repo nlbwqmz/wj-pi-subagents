@@ -53,8 +53,24 @@ try {
     "--no-save",
     archivePath,
   ]);
-  if (!existsSync(join(installedPackagePath, "package.json"))) {
+  const installedManifestPath = join(installedPackagePath, "package.json");
+  if (!existsSync(installedManifestPath)) {
     throw new Error("Smoke 测试包未安装到清单声明的包目录");
+  }
+  const installedManifest = JSON.parse(readFileSync(installedManifestPath, "utf8"));
+  if (installedManifest.license !== "MIT") {
+    throw new Error("Smoke 测试包未声明 MIT 许可证");
+  }
+  if (installedManifest.pi?.extensions?.[0] !== "./index.ts") {
+    throw new Error("Smoke 测试包未声明 ./index.ts 扩展入口");
+  }
+  for (const file of ["index.ts", "LICENSE"]) {
+    if (!existsSync(join(installedPackagePath, file))) {
+      throw new Error(`Smoke 测试包缺少 ${file}`);
+    }
+  }
+  if (existsSync(join(installedPackagePath, "extensions", "wj-pi-subagents.ts"))) {
+    throw new Error("Smoke 测试包仍包含旧扩展入口");
   }
   console.log(`Smoke 测试包已安装：${installedPackagePath}`);
 } catch (error) {

@@ -57,10 +57,10 @@ test("发布 tag 必须是与 package.json 一致的稳定 vX.X.X 版本", () =>
   assert.match(mismatch.stderr, /与 package\.json 版本 .* 不一致/);
 });
 
-test("release workflow 对所有 tag 执行校验，npm 成功后才创建 GitHub Release", () => {
+test("release workflow 只监听版本形状 tag，npm 成功后才创建 GitHub Release", () => {
   const workflow = asRecord(parse(readFileSync(workflowPath, "utf8")));
   const push = asRecord(asRecord(workflow.on).push);
-  assert.deepEqual(push.tags, ["**"]);
+  assert.deepEqual(push.tags, ["v*.*.*"]);
 
   const jobs = asRecord(workflow.jobs);
   const publish = asRecord(jobs.publish_npm);

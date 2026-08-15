@@ -3,7 +3,7 @@ name: 发布 npm 包与 GitHub Release
 on:
   push:
     tags:
-      - "**"
+      - "v*.*.*"
 
 permissions: {}
 

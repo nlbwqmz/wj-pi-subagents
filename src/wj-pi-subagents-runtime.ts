@@ -565,7 +565,7 @@ function systemToolSources(
 
 function defaultSelfExtensionPath(): string {
   try {
-    return fileURLToPath(new URL("../extensions/wj-pi-subagents.ts", import.meta.url));
+    return fileURLToPath(new URL("../index.ts", import.meta.url));
   } catch {
     throw new Error("子代理扩展入口不可用");
   }

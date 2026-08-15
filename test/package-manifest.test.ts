@@ -16,6 +16,7 @@ test("package manifest 只暴露一个显式 Pi 扩展入口", () => {
     bugs?: { url?: string };
     repository?: { type?: string; url?: string };
     private?: boolean;
+    license?: string;
     files?: string[];
     publishConfig?: { access?: string; registry?: string };
     engines?: { node?: string };
@@ -42,7 +43,8 @@ test("package manifest 只暴露一个显式 Pi 扩展入口", () => {
     url: "git+https://github.com/nlbwqmz/wj-pi-subagents.git",
   });
   assert.equal(manifest.private, undefined);
-  assert.deepEqual(manifest.files, ["dist", "extensions", "src"]);
+  assert.equal(manifest.license, "MIT");
+  assert.deepEqual(manifest.files, ["LICENSE", "dist", "index.ts", "src"]);
   assert.deepEqual(manifest.publishConfig, {
     access: "public",
     registry: "https://registry.npmjs.org/",
@@ -56,7 +58,7 @@ test("package manifest 只暴露一个显式 Pi 扩展入口", () => {
   assert.equal(manifest.devDependencies?.["@earendil-works/pi-tui"], "0.84.1");
   assert.ok(manifest.dependencies?.semver, "生产安装必须能够解析 semver");
   assert.deepEqual(manifest.pi, {
-    extensions: ["./extensions/wj-pi-subagents.ts"],
+    extensions: ["./index.ts"],
   });
   assert.equal(manifest.wjPiSubagents?.requiresPi, REQUIRED_PI_RANGE);
 });
@@ -72,9 +74,17 @@ test("package manifest 不注册额外 Pi 资源", () => {
 });
 
 test("manifest 入口存在且只导出一个 Pi factory", async () => {
-  assert.equal(existsSync(join(repositoryRoot, "extensions", "wj-pi-subagents.ts")), true);
-  const entryModule = await import("../extensions/wj-pi-subagents.ts");
+  assert.equal(existsSync(join(repositoryRoot, "index.ts")), true);
+  assert.equal(existsSync(join(repositoryRoot, "extensions", "wj-pi-subagents.ts")), false);
+  const entryModule = await import("../index.ts");
 
   assert.equal(typeof entryModule.default, "function");
   assert.deepEqual(Object.keys(entryModule), ["default"]);
+});
+
+test("package manifest 声明 MIT 许可证并包含许可证文件", () => {
+  const licenseText = readFileSync(join(repositoryRoot, "LICENSE"), "utf8");
+
+  assert.match(licenseText, /^MIT License\r?\n/);
+  assert.match(licenseText, /Copyright \(c\) 2026 WJ/);
 });

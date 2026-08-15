@@ -19,6 +19,7 @@
 - [重载、更新与卸载](#重载更新与卸载)
 - [故障排查](#故障排查)
 - [开发与调试](#开发与调试)
+- [许可证](#许可证)
 - [项目文档](#项目文档)
 
 ## 路径占位符
@@ -107,18 +108,7 @@
 扩展启动时会检查 Node、Pi、必需 API、运行依赖和平台进程树适配器。任一门禁失败时，扩展不会注册半套工具或启动子进程；普通 Pi 会话仍可继续运行，TUI 中会显示 `host_capability_unavailable` 诊断。
 
 ## 安装
-
-### 1. 安装 Pi
-
-```bash
-npm install -g --ignore-scripts @earendil-works/pi-coding-agent
-node --version
-pi --version
-```
-
-先通过 `/login` 或 API Key 完成 Pi 的 provider 配置，并确认普通 Pi 会话可以正常调用模型。
-
-### 2. 从 npm 安装正式版本
+### 1. 从 npm 安装正式版本
 
 首个 npm 版本发布后，可以直接安装用户级 package：
 
@@ -142,7 +132,7 @@ pi -e npm:wj-pi-subagents
 
 指定 `npm:wj-pi-subagents@X.X.X` 可以固定版本；不带版本时由 Pi 按 npm package 更新规则管理。
 
-### 3. 获取源码并安装运行依赖
+### 2. 获取源码并安装运行依赖
 
 ```bash
 git clone https://github.com/nlbwqmz/wj-pi-subagents.git
@@ -152,7 +142,7 @@ npm ci --omit=dev --legacy-peer-deps
 
 Pi 是本 package 的宿主 peer dependency。本地路径 package 不会由 Pi 自动执行依赖安装，因此必须保留仓库目录及其中的 `node_modules`。
 
-### 4. 一次性加载本地源码
+### 3. 一次性加载本地源码
 
 在目标项目目录启动 Pi：
 
@@ -163,7 +153,7 @@ pi -e "<REPOSITORY_PATH>"
 
 `-e` / `--extension` 只影响当前 Pi 进程，不写入持久设置。子代理的工作目录是启动 Pi 时的 `<PROJECT_DIR>`，不是扩展仓库目录。
 
-### 5. 持久安装本地源码
+### 4. 持久安装本地源码
 
 用户级安装会在所有项目中启用本 package：
 
@@ -638,6 +628,10 @@ git diff -- README.md
 ```bash
 npm run pack:smoke
 ```
+
+## 许可证
+
+本项目采用 [MIT License](./LICENSE)。
 
 ## 项目文档
 
