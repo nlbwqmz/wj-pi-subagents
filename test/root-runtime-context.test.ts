@@ -31,6 +31,10 @@ function configFilePaths(cwd: string): { project: string; user: string } {
   };
 }
 
+function fixtureCwd(...segments: string[]): string {
+  return resolve("runtime-context-fixtures", ...segments);
+}
+
 function configReader(
   files: ReadonlyMap<string, ConfigFileContent>,
   observedPaths?: string[],
@@ -57,8 +61,10 @@ test("运行时环境变量统一使用 WJ_PI_SUBAGENTS_ 前缀", () => {
 });
 
 test("根上下文只捕获一次 cwd、信任和环境，并让子代理沿用快照", () => {
+  const rootCwd = fixtureCwd("workspace", "project");
+  const otherCwd = fixtureCwd("other-project");
   const root = captureRootRuntimeContext({
-    cwd: "C:\\workspace\\project",
+    cwd: rootCwd,
     projectTrust: true,
     environment: {
       PI_SECRET_CANARY: "top-secret",
@@ -70,7 +76,7 @@ test("根上下文只捕获一次 cwd、信任和环境，并让子代理沿用�
     parentAgentId: "root",
     agentId: "child",
     depth: 1,
-    cwd: "C:\\other-project",
+    cwd: otherCwd,
     projectTrust: false,
     environment: {
       STABLE_VALUE: "overridden",
@@ -79,7 +85,7 @@ test("根上下文只捕获一次 cwd、信任和环境，并让子代理沿用�
   };
   const child = createChildRuntimeContext(root, requestedChildIdentity);
 
-  assert.equal(root.cwd, "C:\\workspace\\project");
+  assert.equal(root.cwd, rootCwd);
   assert.equal(child.cwd, root.cwd);
   assert.equal(child.projectTrust, true);
   assert.equal(child.environment.PI_SECRET_CANARY, "top-secret");
@@ -157,11 +163,15 @@ test("多层后代始终从根环境派生，不继承中间父代理的内部�
 });
 
 test("固定 cwd 只作为相对路径基点，不形成 cwd 沙箱", () => {
-  const root = captureRootRuntimeContext({ cwd: "C:\\workspace\\project" });
+  const cwd = fixtureCwd("workspace", "project");
+  const root = captureRootRuntimeContext({ cwd });
+  const relativePath = join("notes", "todo.md");
+  const parentPath = join("..", "outside.txt");
+  const externalPath = fixtureCwd("outside.txt");
 
-  assert.equal(root.resolvePath("notes\\todo.md"), "C:\\workspace\\project\\notes\\todo.md");
-  assert.equal(root.resolvePath("..\\outside.txt"), "C:\\workspace\\outside.txt");
-  assert.equal(root.resolvePath("D:\\outside.txt"), "D:\\outside.txt");
+  assert.equal(root.resolvePath(relativePath), resolve(cwd, relativePath));
+  assert.equal(root.resolvePath(parentPath), resolve(cwd, parentPath));
+  assert.equal(root.resolvePath(externalPath), externalPath);
 });
 
 test("根上下文的 JSON 表示不泄露环境秘密", () => {
@@ -174,7 +184,7 @@ test("根上下文的 JSON 表示不泄露环境秘密", () => {
 });
 
 test("根参数、可信项目、用户配置按字段优先级解析并冻结结果", () => {
-  const cwd = "C:\\workspace\\priority";
+  const cwd = fixtureCwd("workspace", "priority");
   const paths = configFilePaths(cwd);
   const result = resolveRuntimeConfig({
     cwd,
@@ -229,7 +239,7 @@ test("所有字段都有显式根参数时不读取低优先级配置", () => {
 
 test("未信任项目不读取项目配置，并使用用户层", () => {
   let projectReads = 0;
-  const cwd = "D:\\private\\project";
+  const cwd = fixtureCwd("private", "project");
   const paths = configFilePaths(cwd);
   const result = resolveRuntimeConfig({
     cwd,
@@ -248,7 +258,7 @@ test("未信任项目不读取项目配置，并使用用户层", () => {
 });
 
 test("项目层字段非法时直接采用默认值，不回退用户层", () => {
-  const cwd = "C:\\workspace\\invalid-field";
+  const cwd = fixtureCwd("workspace", "invalid-field");
   const paths = configFilePaths(cwd);
   const result = resolveRuntimeConfig({
     cwd,
@@ -266,7 +276,7 @@ test("项目层字段非法时直接采用默认值，不回退用户层", () =>
 });
 
 test("配置文件不可读时受影响字段采用默认值且不暴露底层异常", () => {
-  const cwd = "D:\\private\\project";
+  const cwd = fixtureCwd("private", "project");
   const paths = configFilePaths(cwd);
   const result = resolveRuntimeConfig({
     cwd,
@@ -291,7 +301,7 @@ test("配置文件不可读时受影响字段采用默认值且不暴露底层�
 
 test("坏 JSON、不可读文件和未知字段只产生脱敏 UI 诊断", () => {
   const paths: string[] = [];
-  const cwd = "C:\\secret\\project";
+  const cwd = fixtureCwd("secret", "project");
   const configPaths = configFilePaths(cwd);
   const result = resolveRuntimeConfig({
     cwd,
@@ -312,13 +322,14 @@ test("坏 JSON、不可读文件和未知字段只产生脱敏 UI 诊断", () =>
   });
   assert.equal(result.diagnostics.length, 4);
   const text = formatRuntimeConfigDiagnostics(result.diagnostics);
-  assert.doesNotMatch(text, /secret|SECRET-123|broken-json|C:\\secret/);
+  assert.doesNotMatch(text, /secret|SECRET-123|broken-json/);
   assert.equal(paths.length, 1);
   assert.equal(paths[0], configPaths.project);
 
-  const unknownPaths = configFilePaths("C:\\workspace\\unknown");
+  const unknownCwd = fixtureCwd("workspace", "unknown");
+  const unknownPaths = configFilePaths(unknownCwd);
   const unknown = resolveRuntimeConfig({
-    cwd: "C:\\workspace\\unknown",
+    cwd: unknownCwd,
     projectTrust: true,
   }, configReader(new Map([
     [unknownPaths.project, JSON.stringify({ maxDepth: 3, ignored: "SECRET-123" })],
@@ -331,9 +342,10 @@ test("坏 JSON、不可读文件和未知字段只产生脱敏 UI 诊断", () =>
   assert.match(formatRuntimeConfigDiagnostics(unknown.diagnostics), /采用值 忽略/);
   assert.doesNotMatch(formatRuntimeConfigDiagnostics(unknown.diagnostics), /SECRET-123/);
 
-  const invalidShapePaths = configFilePaths("C:\\workspace\\invalid-shape");
+  const invalidShapeCwd = fixtureCwd("workspace", "invalid-shape");
+  const invalidShapePaths = configFilePaths(invalidShapeCwd);
   const invalidShape = resolveRuntimeConfig({
-    cwd: "C:\\workspace\\invalid-shape",
+    cwd: invalidShapeCwd,
     projectTrust: true,
   }, configReader(new Map([
     [invalidShapePaths.project, JSON.stringify([])],
@@ -402,15 +414,15 @@ test("四个配额字段接受规范规定的边界值", () => {
 });
 
 test("配置文件只从固定项目和用户位置读取 UTF-8 JSON", () => {
-  const cwd = "C:\\workspace\\fixed-config";
+  const cwd = fixtureCwd("workspace", "fixed-config");
   const paths = configFilePaths(cwd);
   const observedPaths: string[] = [];
   const options = {
     cwd,
     projectTrust: true,
-    projectConfigPath: "D:\\attempted-override\\project.json",
-    userConfigPath: "D:\\attempted-override\\user.json",
-    homeDir: "D:\\attempted-override",
+    projectConfigPath: fixtureCwd("attempted-override", "project.json"),
+    userConfigPath: fixtureCwd("attempted-override", "user.json"),
+    homeDir: fixtureCwd("attempted-override"),
   };
   const result = resolveRuntimeConfig(options, configReader(new Map([
     [paths.project, `\ufeff${JSON.stringify({ maxDepth: 4, maxChildrenPerAgent: 9 })}`],
@@ -427,7 +439,7 @@ test("配置文件只从固定项目和用户位置读取 UTF-8 JSON", () => {
 });
 
 test("无效 UTF-8 配置不会被替换字符悄悄接受", () => {
-  const cwd = "C:\\workspace\\invalid-utf8";
+  const cwd = fixtureCwd("workspace", "invalid-utf8");
   const paths = configFilePaths(cwd);
   const result = resolveRuntimeConfig({ cwd, projectTrust: true }, configReader(new Map<string, ConfigFileContent>([
     [paths.project, Buffer.from([0x7b, 0xff, 0x7d])],
@@ -465,12 +477,13 @@ test("根上下文存储只捕获一次，配置诊断在根 UI 最多通知一�
 });
 
 test("根捕获不会在配置解析阶段再次读取 cwd 或 trust", () => {
+  const cwd = fixtureCwd("workspace", "fixed");
   let cwdReads = 0;
   let trustReads = 0;
   const options = {
     get cwd(): string {
       cwdReads += 1;
-      return "C:\\workspace\\fixed";
+      return cwd;
     },
     get projectTrust(): boolean {
       trustReads += 1;
@@ -479,7 +492,7 @@ test("根捕获不会在配置解析阶段再次读取 cwd 或 trust", () => {
   };
 
   const root = captureRootRuntimeContext(options, configReader(new Map()));
-  assert.equal(root.cwd, "C:\\workspace\\fixed");
+  assert.equal(root.cwd, cwd);
   assert.equal(root.projectTrust, true);
   assert.equal(cwdReads, 1);
   assert.equal(trustReads, 1);
@@ -496,7 +509,7 @@ test("根捕获可选地发送一次 UI-only 配置诊断，不触碰消息接�
     sendMessage: () => sideEffects.push("message"),
     sendUserMessage: () => sideEffects.push("user-message"),
   };
-  const cwd = "C:\\workspace\\ui-diagnostics";
+  const cwd = fixtureCwd("workspace", "ui-diagnostics");
   const paths = configFilePaths(cwd);
   const root = captureRootRuntimeContext({
     cwd,
@@ -518,7 +531,7 @@ test("根捕获可选地发送一次 UI-only 配置诊断，不触碰消息接�
 
 test("UI 通知抛错时也不重复尝试或泄露配置异常", () => {
   const attempts: string[] = [];
-  const cwd = "C:\\workspace\\ui-error";
+  const cwd = fixtureCwd("workspace", "ui-error");
   const paths = configFilePaths(cwd);
   const root = captureRootRuntimeContext({
     cwd,
