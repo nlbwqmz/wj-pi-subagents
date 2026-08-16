@@ -120,9 +120,10 @@ export class RpcClient {
   async steer() {}
 
   async send(command) {
-    if (command?.type !== "prompt" || command?.streamingBehavior !== "steer") {
+    if (command?.type !== "prompt" || typeof command.message !== "string") {
       return { type: "response", command: "prompt", success: false };
     }
+    await this.prompt(command.message);
     return { type: "response", command: "prompt", success: true };
   }
 

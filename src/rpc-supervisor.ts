@@ -290,7 +290,8 @@ export type RpcSupervisorFaultCode =
   | "rpc_process_exit"
   | "supervisor_eof"
   | "supervisor_protocol_fault"
-  | "invalid_rpc_event";
+  | "invalid_rpc_event"
+  | "message_delivery_failed";
 
 export type RpcSupervisorEvent =
   | {
@@ -413,6 +414,8 @@ export interface RpcSupervisorOptions {
   ) => RpcSupervisorChannelBinding;
   readonly startupTimeoutMs: number;
   readonly gracefulShutdownMs: number;
+  /** abort 已接受但 Pi 未形成 settled/final 的最长隔离窗口。 */
+  readonly interruptTimeoutMs?: number;
   /** parent 等待 child 接纳任务租约的上限；省略时沿用启动期限。 */
   readonly taskAssignmentTimeoutMs?: number;
   /** child extension bind 后的实际能力裁决；缺失 manifest 必须失败关闭。 */
@@ -518,6 +521,8 @@ class TaskAssignmentTimeoutError extends Error {
     this.name = "TaskAssignmentTimeoutError";
   }
 }
+
+const DEFAULT_INTERRUPT_SETTLEMENT_TIMEOUT_MS = 10_000;
 
 function validDuration(value: number): boolean {
   return Number.isSafeInteger(value) && value > 0;
@@ -652,11 +657,13 @@ export class RpcSupervisor {
   private channelHandleReleased = false;
   private forcedTerminationUsed = false;
   private treeConfirmationPending = false;
+  private interruptSettlementTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(options: RpcSupervisorOptions) {
     if (
       !validDuration(options.startupTimeoutMs)
       || !validDuration(options.gracefulShutdownMs)
+      || (options.interruptTimeoutMs !== undefined && !validDuration(options.interruptTimeoutMs))
       || (options.taskAssignmentTimeoutMs !== undefined && !validDuration(options.taskAssignmentTimeoutMs))
     ) {
       throw new TypeError("RPC 监督器期限无效");
@@ -720,6 +727,7 @@ export class RpcSupervisor {
       if (!accepted) return false;
       if (!this.mailbox.commitPreparedFinal(envelope.commit_id)) return false;
       this.commitTaskProjection();
+      this.clearInterruptSettlementWatchdog();
       this.emitEvent(Object.freeze({ kind: "reply", reply: envelope }));
       this.drainCommandQueue();
       return true;
@@ -751,6 +759,7 @@ export class RpcSupervisor {
     if (this.phase !== "ready") {
       return Promise.resolve(Object.freeze({ ok: false, code: "agent_unavailable" }));
     }
+    const isolateNode = this.mailbox.requiresNodeIsolationForInterrupt();
     const decision = this.mailbox.requestInterrupt();
     this.commitTaskProjection();
     if (!decision.changed || !decision.should_abort) {
@@ -758,15 +767,20 @@ export class RpcSupervisor {
     }
     try {
       const abort = this.commandClient().abort();
-      void abort.catch(() => this.failRuntime("rpc_protocol_fault"));
+      void abort.catch(() => this.quarantineRuntime("rpc_protocol_fault", true));
+      // Pi 的公共 abort 不覆盖 prompt 预检中的自动压缩；此时没有可靠的
+      // agent_settled 事实，继续保留 interrupt barrier 会永久阻塞后继任务。
+      if (isolateNode) this.quarantineRuntime("message_delivery_failed", true);
+      else this.armInterruptSettlementWatchdog();
       return Promise.resolve(Object.freeze({ ok: true, accepted: true, changed: true }));
     } catch {
-      this.failRuntime("rpc_protocol_fault");
+      this.quarantineRuntime("rpc_protocol_fault", true);
       return Promise.resolve(Object.freeze({ ok: false, code: "agent_unavailable" }));
     }
   }
 
   terminate(): Promise<RpcSupervisorTerminationResult> {
+    this.clearInterruptSettlementWatchdog();
     if (this.terminationPromise !== undefined) return this.terminationPromise;
     if (this.phase === "terminated" && this.agentId !== undefined) {
       return Promise.resolve(Object.freeze({
@@ -1394,8 +1408,7 @@ export class RpcSupervisor {
     source: "rpc" | "supervisor",
   ): void {
     if (this.phase === "starting") {
-      this.startupFault ??= fault;
-      for (const listener of [...this.startupFaultListeners]) listener();
+      this.recordStartupFault(fault);
       return;
     }
     if (this.phase !== "ready") return;
@@ -1431,6 +1444,14 @@ export class RpcSupervisor {
       if (event.agent_id === this.agentId) {
         this.lifecycleGeneration = outcome.data.lifecycle_generation;
         this.lifecycleState = outcome.data.node.state;
+        if (lifecycleEvent.type === "runtime_failed" && outcome.data.node.state === "failed") {
+          if (this.phase === "starting") {
+            this.recordStartupFault("protocol_fault");
+            this.enterFailedPhase();
+          } else if (this.phase === "ready") {
+            this.enterFailedPhase();
+          }
+        }
       }
       this.emitEvent(Object.freeze({ kind: "lifecycle", event: lifecycleEvent }));
     } catch {
@@ -1534,9 +1555,42 @@ export class RpcSupervisor {
     this.activeToolCounts.clear();
   }
 
-  private failRuntime(code: RpcSupervisorFaultCode): void {
+  private quarantineRuntime(code: RpcSupervisorFaultCode, terminate = false): void {
     if (this.phase !== "ready") return;
-    this.applyLifecycle({ type: "runtime_failed", error_code: "internal_error" });
+    this.failRuntime(code);
+    // 未知正文可能已经进入 Pi；只有该路径需要立即回收节点，避免迟到执行。
+    if (terminate) void this.terminate().catch(() => {});
+  }
+
+  private armInterruptSettlementWatchdog(): void {
+    this.clearInterruptSettlementWatchdog();
+    const timer = setTimeout(() => {
+      if (this.interruptSettlementTimer !== timer) return;
+      this.interruptSettlementTimer = undefined;
+      // abort 响应不是 settled/final 事实。超出隔离窗口仍没有提交，就不能让
+      // interrupt barrier 永久占住 mailbox；正文执行状态未知，因此只回收节点。
+      if (this.phase === "ready" && this.mailbox.hasInterruptBarrier()) {
+        this.quarantineRuntime("message_delivery_failed", true);
+      }
+    }, this.options.interruptTimeoutMs ?? DEFAULT_INTERRUPT_SETTLEMENT_TIMEOUT_MS);
+    timer.unref?.();
+    this.interruptSettlementTimer = timer;
+  }
+
+  private clearInterruptSettlementWatchdog(): void {
+    const timer = this.interruptSettlementTimer;
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    this.interruptSettlementTimer = undefined;
+  }
+
+  private recordStartupFault(fault: RpcSupervisorTransportFault | RpcSupervisorChannelFault): void {
+    this.startupFault ??= fault;
+    for (const listener of [...this.startupFaultListeners]) listener();
+  }
+
+  private enterFailedPhase(): void {
+    this.clearInterruptSettlementWatchdog();
     this.phase = "failed";
     this.releaseCoordinatedCompactions();
     this.activeTools.clear();
@@ -1546,6 +1600,17 @@ export class RpcSupervisor {
       this.resolveUnavailableCommand(this.commandQueue.shift()!);
     }
     this.resolveActiveMessageAsUnavailable();
+  }
+
+  private failRuntime(code: RpcSupervisorFaultCode): void {
+    if (this.phase !== "ready") return;
+    // applyLifecycle 会同步通知 AgentController；先固定内部失败态，确保其
+    // 立即启动的 orphan cleanup 不会在 reapOrphanedDescendants 中看到 ready。
+    this.enterFailedPhase();
+    this.applyLifecycle({
+      type: "runtime_failed",
+      error_code: code === "message_delivery_failed" ? "message_delivery_failed" : "internal_error",
+    });
     this.emitEvent(Object.freeze({ kind: "fault", code }));
   }
 
@@ -1621,7 +1686,7 @@ export class RpcSupervisor {
         if (this.phase === "ready") {
           this.mailbox.hostDeliveryUncertain(delivery.delivery_id);
           this.commitTaskProjection();
-          this.receiveTransportFault("protocol_fault", "supervisor");
+          this.quarantineRuntime("supervisor_protocol_fault");
         }
         assignmentController.abort();
       },
@@ -1642,11 +1707,15 @@ export class RpcSupervisor {
       if (failure instanceof TaskAssignmentTimeoutError && this.phase === "ready") {
         // ACK 超时发生在 prompt/steer 之前；child 只可能收到租约，不能继续复用该节点。
         this.commitTaskProjection();
-        this.receiveTransportFault("protocol_fault", "supervisor");
+        this.quarantineRuntime("supervisor_protocol_fault");
         return;
       }
       if (this.phase !== "ready") return;
       this.commitTaskProjection();
+      if (this.mailbox.hasUncertainDelivery()) {
+        this.quarantineRuntime("message_delivery_failed", true);
+        return;
+      }
       this.schedulePendingReplyRetry();
       return;
     }
@@ -1662,6 +1731,12 @@ export class RpcSupervisor {
     }
     if (this.phase !== "ready") return;
     this.commitTaskProjection();
+    if (this.mailbox.hasUncertainDelivery()) {
+      // 命令尾部没有可证明的“未执行”结果；关闭节点比留下可重用但
+      // 执行状态未知的 suspended 节点更安全，也绝不重投递正文。
+      this.quarantineRuntime("message_delivery_failed", true);
+      return;
+    }
     // final 可能在独立监督流上先于命令响应到达；命令尾部正是其最后一个门闩。
     this.schedulePendingReplyRetry();
   }

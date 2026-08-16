@@ -21,6 +21,12 @@ export class RpcClient {
     this.#timer = undefined;
   }
 
+  async send(command) {
+    if (command?.type !== "prompt" || typeof command.message !== "string") {
+      throw new Error("无效的原子 prompt 命令");
+    }
+  }
+
   async prompt() {}
   async steer() {}
   async abort() {}

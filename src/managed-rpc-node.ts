@@ -583,6 +583,7 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
   private nextRequestId = 1;
   private closed = false;
   private started = false;
+  private startRequested = false;
   private writeQueue: Promise<void> = Promise.resolve();
 
   constructor(
@@ -609,6 +610,8 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
   }
 
   async start(signal?: AbortSignal, context?: ManagedRpcNodeStartContext): Promise<void> {
+    if (this.startRequested) throw new Error("桥接进程已启动");
+    this.startRequested = true;
     await this.request(
       "start",
       context?.supervisor === undefined && this.rpcOptions === undefined
@@ -691,7 +694,11 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
 
   private request(command: string, payload: unknown, signal?: AbortSignal): Promise<unknown> {
     if (this.closed) return Promise.reject(new Error("桥接传输不可用"));
-    if (!this.started && command !== "start") return Promise.reject(new Error("桥接进程尚未启动"));
+    // start 帧已经入队时，close 必须能够跟在同一写入顺序域内送达 bridge；
+    // ManagedRpcNode 可在 start 响应前进入终止流程。
+    if (!this.started && command !== "start" && !(command === "close" && this.startRequested)) {
+      return Promise.reject(new Error("桥接进程尚未启动"));
+    }
     const id = this.nextRequestId;
     this.nextRequestId += 1;
     if (!isBridgeCommandName(command)) return Promise.reject(new Error("桥接命令无效"));

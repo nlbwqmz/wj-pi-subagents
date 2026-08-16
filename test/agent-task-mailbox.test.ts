@@ -112,7 +112,7 @@ test("新 turn 会作废旧 turn provisional final", () => {
   assert.equal(value.projection().last_task?.turn_id, TURN_2);
 });
 
-test("直接边协调令牌可叠加，旧交付排空后仍阻止新消息与 final commit", () => {
+test("直接边协调令牌可叠加，未接纳交付阻止 prepare，接纳后允许预检启动窗口", () => {
   const value = mailbox([PLACEHOLDER_TASK]);
   const current = value.submit("屏障前消息");
   const inFlight = value.takeNextDelivery();
@@ -125,7 +125,7 @@ test("直接边协调令牌可叠加，旧交付排空后仍阻止新消息与 f
   assert.equal(value.coordinationBarrierReadiness(), "waiting");
 
   assert.equal(value.hostAccepted(inFlight!.delivery_id), true);
-  assert.equal(value.coordinationBarrierReadiness(), "waiting");
+  assert.equal(value.coordinationBarrierReadiness(), "quiescent");
   value.observeAgentStart();
   assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
   assert.equal(value.coordinationBarrierReadiness(), "quiescent");

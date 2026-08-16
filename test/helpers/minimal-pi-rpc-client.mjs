@@ -34,6 +34,13 @@ export class RpcClient {
 
   async stop() {}
 
+  async send(command) {
+    if (command?.type !== "prompt" || typeof command.message !== "string") {
+      throw new Error("无效的原子 prompt 命令");
+    }
+    await this.prompt(command.message);
+  }
+
   async prompt(message) {
     this.#state = { ...this.#state, lastCommand: { type: "prompt", message } };
   }

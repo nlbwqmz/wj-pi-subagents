@@ -46,6 +46,8 @@ export interface AgentSupervisorFactoryOptions {
   readonly childExtensionPath?: string;
   readonly startupTimeoutMs?: number;
   readonly gracefulShutdownMs?: number;
+  /** abort 后缺少 settled/final 时的故障隔离期限。 */
+  readonly interruptTimeoutMs?: number;
   readonly nodeFactory?: (template: TemplateDefinition) => ManagedRpcNodeLike;
   readonly activeTools?: () => readonly string[];
   readonly currentModel?: string | (() => string | undefined);
@@ -203,6 +205,7 @@ export function createAgentSupervisorFactory(
       },
       startupTimeoutMs,
       gracefulShutdownMs,
+      ...(options.interruptTimeoutMs === undefined ? {} : { interruptTimeoutMs: options.interruptTimeoutMs }),
       onCompactionPrepare: (transactionId) => directAgentId === undefined
         ? false
         : options.onCompactionPrepare?.(directAgentId, transactionId) ?? false,

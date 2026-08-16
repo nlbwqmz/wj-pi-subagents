@@ -355,12 +355,15 @@ export class AgentTaskMailbox {
     return this.coordinationBarriers.delete(transactionId);
   }
 
-  /** prepare 只能在线性化前已开始的下行交付与 Pi 队列都静止后确认。 */
+  /**
+   * prepare 只等待旧 RPC 交付和 Pi 队列；prompt 预检已成功但尚未收到
+   * task_started 时，子端可能正等待本 prepare 响应才能进入真实启动。
+   * 把该空档继续视为等待会形成自我依赖的压缩死锁。
+   */
   coordinationBarrierReadiness(): CoordinationBarrierReadiness {
     if (this.deliveryUncertain || this.maintenanceFailed) return "unsafe";
     return this.inFlight === undefined
       && this.hostPendingCount === 0
-      && !this.awaitingPromptStart
       ? "quiescent"
       : "waiting";
   }
@@ -510,6 +513,27 @@ export class AgentTaskMailbox {
       this.phase = "reconciling";
     }
     return true;
+  }
+
+  hasInterruptBarrier(): boolean {
+    return this.interruptBarrier;
+  }
+
+  /**
+   * 当前中断无法由 Pi 公共 API 产生可验证的 settled 事实时，节点必须隔离。
+   * Pi 的 abort 不会取消 prompt 预检中的自动压缩；该阶段没有 agent loop，
+   * 继续保留 interrupt barrier 会永久阻塞后继任务。
+   */
+  requiresNodeIsolationForInterrupt(): boolean {
+    return this.compactionActive;
+  }
+
+  hasUncertainDelivery(): boolean {
+    return this.deliveryUncertain;
+  }
+
+  hasMaintenanceFailure(): boolean {
+    return this.maintenanceFailed;
   }
 
   requestInterrupt(): { readonly changed: boolean; readonly should_abort: boolean } {

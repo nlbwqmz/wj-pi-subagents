@@ -96,6 +96,146 @@ test("桥接进程在 stdout 已关闭时将异步写入失败归类为协议故
   assert.equal(code, 1);
 });
 
+test("bridge 在 start 排队期间把控制命令等待到初始化完成", async (context) => {
+  const script = fileURLToPath(new URL("../src/rpc-bridge-process.ts", import.meta.url));
+  const piModulePath = new URL("./helpers/delayed-start-pi-rpc-client.mjs", import.meta.url).href;
+  const child = spawn(process.execPath, ["--experimental-strip-types", script], {
+    env: {
+      ...process.env,
+      [MANAGED_RPC_BRIDGE_CREDENTIAL_ENV]: "bridge-credential-01234567890123456789",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  child.stdin.on("error", () => {});
+  context.after(() => {
+    if (child.exitCode === null) child.kill();
+  });
+
+  const frames: unknown[] = [];
+  let pending = Buffer.alloc(0);
+  let complete!: () => void;
+  let fail!: (error: Error) => void;
+  const responses = new Promise<void>((resolve, reject) => {
+    complete = resolve;
+    fail = reject;
+  });
+  child.stdout.on("data", (chunk: Uint8Array) => {
+    pending = Buffer.concat([pending, Buffer.from(chunk)]);
+    while (pending.byteLength >= 4) {
+      const length = pending.readUInt32BE(0);
+      if (pending.byteLength < length + 4) return;
+      try {
+        frames.push(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(
+          pending.subarray(4, length + 4),
+        )));
+      } catch {
+        fail(new Error("bridge 返回了无效帧"));
+        return;
+      }
+      pending = pending.subarray(length + 4);
+      if (frames.some((frame) => isResponse(frame, 1)) && frames.some((frame) => isResponse(frame, 2))) {
+        complete();
+      }
+    }
+  });
+
+  child.stdin.write(encodeFrame({
+    protocol: MANAGED_RPC_BRIDGE_PROTOCOL,
+    kind: "command",
+    id: 1,
+    command: "start",
+    payload: {
+      credential: "bridge-credential-01234567890123456789",
+      config: { rpc: { piModulePath } },
+    },
+  }));
+  child.stdin.write(encodeFrame({
+    protocol: MANAGED_RPC_BRIDGE_PROTOCOL,
+    kind: "command",
+    id: 2,
+    command: "get_state",
+  }));
+
+  await Promise.race([
+    responses,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("bridge 启动屏障超时")), 1_000)),
+  ]);
+  assert.deepEqual(frames.find((frame) => isResponse(frame, 1)), {
+    protocol: MANAGED_RPC_BRIDGE_PROTOCOL,
+    kind: "response",
+    id: 1,
+    ok: true,
+  });
+  assert.deepEqual(frames.find((frame) => isResponse(frame, 2)), {
+    protocol: MANAGED_RPC_BRIDGE_PROTOCOL,
+    kind: "response",
+    id: 2,
+    ok: true,
+    data: { isStreaming: false, pendingMessageCount: 0 },
+  });
+
+  const closeObservation = once(child, "close") as Promise<[number | null, NodeJS.Signals | null]>;
+  child.stdin.end();
+  const [code, signal] = await closeObservation;
+  assert.equal(code, 0);
+  assert.equal(signal, null);
+});
+
+test("bridge 可在 start 响应前接收 close 并终止", async (context) => {
+  const script = fileURLToPath(new URL("../src/rpc-bridge-process.ts", import.meta.url));
+  const piModulePath = new URL("./helpers/delayed-start-pi-rpc-client.mjs", import.meta.url).href;
+  const bridgeCredential = "bridge-credential-01234567890123456789";
+  const child = spawn(process.execPath, ["--experimental-strip-types", script], {
+    env: {
+      ...process.env,
+      [MANAGED_RPC_BRIDGE_CREDENTIAL_ENV]: bridgeCredential,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  child.stdin.on("error", () => {});
+  const bridge = new ManagedRpcBridgeClient({
+    stdin: child.stdin,
+    stdout: child.stdout,
+    stderr: child.stderr,
+  }, {
+    credential: bridgeCredential,
+    rpcOptions: { piModulePath },
+  });
+  context.after(async () => {
+    await bridge.release();
+    if (child.exitCode === null) child.kill();
+  });
+
+  const withinDeadline = async <T>(operation: Promise<T>, label: string): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        operation,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`${label} 超时`)), 1_000);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  };
+
+  const start = bridge.start();
+  const startOutcome = start.then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+  const closeObservation = once(child, "close") as Promise<[number | null, NodeJS.Signals | null]>;
+  await withinDeadline(bridge.requestClose(new AbortController().signal), "pre-start close");
+  const startError = await withinDeadline(startOutcome, "pre-start start");
+  assert.ok(startError instanceof Error);
+  const [code, signal] = await withinDeadline(closeObservation, "pre-start bridge exit");
+  assert.equal(code, 0);
+  assert.equal(signal, null);
+});
+
 test("父端持续消费 bridge stderr，避免诊断输出阻塞监督命令", async (context) => {
   const script = fileURLToPath(new URL("../src/rpc-bridge-process.ts", import.meta.url));
   const piModulePath = new URL("./helpers/stderr-flood-pi-rpc-client.mjs", import.meta.url).href;
@@ -143,6 +283,83 @@ test("父端持续消费 bridge stderr，避免诊断输出阻塞监督命令", 
   assert.equal(code, 0);
   assert.equal(signal, null);
   await bridge.release();
+});
+
+test("bridge 控制命令不会被阻塞 prompt 饿死", async (context) => {
+  const script = fileURLToPath(new URL("../src/rpc-bridge-process.ts", import.meta.url));
+  const piModulePath = new URL("./helpers/blocking-pi-rpc-client.mjs", import.meta.url).href;
+  const bridgeCredential = "bridge-credential-01234567890123456789";
+  const child = spawn(process.execPath, ["--experimental-strip-types", script], {
+    env: {
+      ...process.env,
+      [MANAGED_RPC_BRIDGE_CREDENTIAL_ENV]: bridgeCredential,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  child.stdin.on("error", () => {});
+  let closed = false;
+  child.once("close", () => {
+    closed = true;
+  });
+  const bridge = new ManagedRpcBridgeClient({
+    stdin: child.stdin,
+    stdout: child.stdout,
+    stderr: child.stderr,
+  }, {
+    credential: bridgeCredential,
+    rpcOptions: { piModulePath },
+  });
+  context.after(async () => {
+    await bridge.release();
+    if (!closed) child.kill();
+  });
+
+  const withinDeadline = async <T>(operation: Promise<T>, label: string): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        operation,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`${label} 超时`)), 1_000);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  };
+
+  let observePromptStart!: () => void;
+  const promptStarted = new Promise<void>((resolve) => {
+    observePromptStart = resolve;
+  });
+  const unsubscribe = bridge.onEvent((event) => {
+    if (typeof event === "object" && event !== null && (event as { type?: unknown }).type === "agent_start") {
+      observePromptStart();
+    }
+  });
+
+  await withinDeadline(bridge.start(), "bridge start");
+  const prompt = bridge.prompt("此 prompt 永不返回");
+  const promptRejection = prompt.then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+  await withinDeadline(promptStarted, "prompt start");
+  assert.deepEqual(await withinDeadline(bridge.getState(), "get_state"), {
+    isStreaming: true,
+    pendingMessageCount: 0,
+  });
+  await withinDeadline(bridge.abort(), "abort");
+  unsubscribe();
+
+  const closeObservation = once(child, "close") as Promise<[number | null, NodeJS.Signals | null]>;
+  await withinDeadline(bridge.requestClose(new AbortController().signal), "close");
+  const [code, signal] = await withinDeadline(closeObservation, "bridge exit");
+  assert.equal(code, 0);
+  assert.equal(signal, null);
+  const promptError = await promptRejection;
+  assert.ok(promptError instanceof Error);
 });
 
 test("生产桥接配合 fake RpcClient 完成真实本地监督握手、回复 ACK 与清理", async (context) => {
@@ -375,6 +592,14 @@ async function runBridge(input: Uint8Array): Promise<{
     frames: Object.freeze(decodeFrames(Buffer.concat(stdout))),
     stderr: Buffer.concat(stderr).toString("utf8"),
   });
+}
+
+function isResponse(value: unknown, id: number): boolean {
+  return typeof value === "object"
+    && value !== null
+    && !Array.isArray(value)
+    && (value as { kind?: unknown }).kind === "response"
+    && (value as { id?: unknown }).id === id;
 }
 
 function protocolFaultFrame(): unknown {

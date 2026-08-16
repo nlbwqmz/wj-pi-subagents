@@ -36,6 +36,8 @@ const MAX_MESSAGE_BYTES = 16 * 1024;
 interface BridgeClient {
   start(): Promise<void>;
   stop(): Promise<void>;
+  /** Pi 的原子 prompt 写入；host gate 明确要求该公开能力。 */
+  send(command: { readonly type: "prompt"; readonly message: string }): Promise<unknown>;
   prompt(message: string): Promise<void>;
   steer(message: string): Promise<void>;
   abort(): Promise<void>;
@@ -66,11 +68,16 @@ interface TemplatePromptConfig {
 
 const decoder = new LengthPrefixedFrameDecoder(MAX_FRAME_BYTES);
 let client: BridgeClient | undefined;
+let clientCreation: Promise<BridgeClient> | undefined;
 let stopping = false;
 let protocolFailed = false;
 let faultSent = false;
 let authenticated = false;
 let started = false;
+let startReady = false;
+let startSettled = false;
+let startCompletion: Promise<boolean> | undefined;
+let resolveStartCompletion: ((ready: boolean) => void) | undefined;
 let lastCommandId = 0;
 let commandQueue: Promise<void> = Promise.resolve();
 let outputQueue: Promise<void> = Promise.resolve();
@@ -89,6 +96,22 @@ try {
   delete process.env[CREDENTIAL_ENV];
 } catch {
   // 某些受限宿主可能禁止修改 process.env；此时仍不把值写入协议载荷。
+}
+
+function settleStart(ready: boolean): void {
+  if (startSettled) return;
+  startSettled = true;
+  startReady = ready;
+  const resolve = resolveStartCompletion;
+  resolveStartCompletion = undefined;
+  resolve?.(ready);
+}
+
+function reserveStartCompletion(): void {
+  if (startCompletion !== undefined) return;
+  startCompletion = new Promise<boolean>((resolve) => {
+    resolveStartCompletion = resolve;
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -182,6 +205,7 @@ function failAndExit(faultCode: "protocol_fault" | "process_exit"): void {
   if (exitScheduled) return;
   exitScheduled = true;
   stopping = true;
+  settleStart(false);
   protocolFailed = true;
   decoder.reset();
   pendingChunkedCommand = undefined;
@@ -419,6 +443,18 @@ function normalizeSupervisorInit(value: unknown): ManagedRpcSupervisorInit | und
 
 async function ensureClient(): Promise<BridgeClient> {
   if (client !== undefined) return client;
+  if (clientCreation !== undefined) return clientCreation;
+  const creation = createClient();
+  clientCreation = creation;
+  try {
+    return await creation;
+  } finally {
+    if (clientCreation === creation) clientCreation = undefined;
+  }
+}
+
+async function createClient(): Promise<BridgeClient> {
+  if (client !== undefined) return client;
   const options = isRecord(config.rpc) ? config.rpc : {};
   const configuredCliPath = typeof options.cliPath === "string" && options.cliPath.length > 0
     ? options.cliPath
@@ -505,16 +541,40 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
   if (
     !Number.isSafeInteger(command.id)
     || command.id <= 0
-    || command.id <= lastCommandId
     || typeof command.command !== "string"
     || !["start", "prompt", "steer", "abort", "get_state", "close"].includes(command.command)
   ) {
     failAndExit("protocol_fault");
     return;
   }
-  lastCommandId = command.id;
   try {
+    if (command.command === "close") {
+      // close 可以抢占已入队但尚未完成的 start。否则终止在启动窗口会被
+      // 错误拒绝，随后 bridge 仍可能继续创建 Pi 子进程。
+      if (!authenticated && startCompletion === undefined) {
+        response(command.id, false);
+        return;
+      }
+      stopping = true;
+      if (!startReady) settleStart(false);
+      const current = client;
+      const shutdown = await Promise.allSettled([
+        current?.stop() ?? Promise.resolve(),
+        closeLocalSupervisor(),
+      ]);
+      cleanupTemplatePromptFile();
+      response(command.id, shutdown.every((result) => result.status === "fulfilled"));
+      await flushOutput();
+      exitScheduled = true;
+      process.exit(0);
+      return;
+    }
     if (command.command === "start") {
+      if (stopping) {
+        settleStart(false);
+        response(command.id, false);
+        return;
+      }
       if (started || authenticated || configuredCredential === undefined) {
         failAndExit("protocol_fault");
         return;
@@ -542,6 +602,7 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
         return;
       }
       if (bridgeConfig !== undefined) config = bridgeConfig;
+      reserveStartCompletion();
       authenticated = true;
       started = true;
       if (supervisorInit !== undefined) {
@@ -568,8 +629,21 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
         cleanupTemplatePromptFile();
         clearBridgeSupervisorEnvironment();
       }
+      if (stopping) {
+        settleStart(false);
+        response(command.id, false);
+        return;
+      }
+      settleStart(true);
       response(command.id, true);
       return;
+    }
+    if (command.command !== "close" && !startReady && startCompletion !== undefined) {
+      const ready = await startCompletion;
+      if (!ready || stopping) {
+        response(command.id, false);
+        return;
+      }
     }
     if (!authenticated || !started || stopping) {
       response(command.id, false);
@@ -584,8 +658,11 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
         response(command.id, false);
         return;
       }
-      if (command.command === "prompt") await current.prompt(command.payload.message);
-      else await current.steer(command.payload.message);
+      if (command.command === "prompt") {
+        await current.send({ type: "prompt", message: command.payload.message });
+      } else {
+        await current.steer(command.payload.message);
+      }
       response(command.id, true);
       return;
     }
@@ -598,20 +675,10 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
       response(command.id, true, await current.getState());
       return;
     }
-    if (command.command === "close") {
-      stopping = true;
-      await current.stop();
-      cleanupTemplatePromptFile();
-      await closeLocalSupervisor();
-      response(command.id, true);
-      await flushOutput();
-      exitScheduled = true;
-      process.exit(0);
-      return;
-    }
     response(command.id, false);
   } catch {
     if (command.command === "start") {
+      settleStart(false);
       cleanupTemplatePromptFile();
       try {
         await closeLocalSupervisor();
@@ -623,7 +690,32 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
   }
 }
 
+function acceptCommand(command: BridgeCommand): boolean {
+  if (
+    !Number.isSafeInteger(command.id)
+    || command.id <= 0
+    || command.id <= lastCommandId
+    || typeof command.command !== "string"
+    || !["start", "prompt", "steer", "abort", "get_state", "close"].includes(command.command)
+  ) {
+    failAndExit("protocol_fault");
+    return false;
+  }
+  // 序号在读入顺序域中先行接纳；否则高优先级 abort 可能先执行，
+  // 让后排的 prompt 被误判为乱序协议帧。
+  lastCommandId = command.id;
+  return true;
+}
+
 function enqueueCommand(command: BridgeCommand): void {
+  if (!acceptCommand(command)) return;
+  if (command.command === "start") reserveStartCompletion();
+  // Pi RpcClient 的输入协议本身允许并发请求。控制命令不能排在一个
+  // 可能长期等待模型/扩展的 prompt 后面，否则关闭和中断都失去作用。
+  if (command.command === "abort" || command.command === "close" || command.command === "get_state") {
+    void handleCommand(command).catch(() => failAndExit("process_exit"));
+    return;
+  }
   commandQueue = commandQueue
     .then(() => handleCommand(command))
     .catch(() => failAndExit("process_exit"));
