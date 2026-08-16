@@ -178,7 +178,10 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
       if (signal === undefined) await waiter.promise;
       else await raceSupervisorAbort(waiter.promise, signal);
     } catch (error) {
-      this.fail("protocol_fault");
+      // 调用方的期限取消只表示租约交付未知，不能伪造为通道协议故障。
+      if (!(signal?.aborted === true && error instanceof Error && error.name === "AbortError")) {
+        this.fail("protocol_fault");
+      }
       throw error;
     } finally {
       if (this.transportAcknowledgements.get(frame.seq) === waiter) {

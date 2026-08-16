@@ -105,28 +105,54 @@ function writeFrame(value: unknown): void {
   const frame = new Uint8Array(body.byteLength + 4);
   new DataView(frame.buffer).setUint32(0, body.byteLength, false);
   frame.set(body, 4);
-  outputQueue = outputQueue.then(
+  const write = outputQueue.then(
     () => writeOutput(frame),
     () => writeOutput(frame),
   );
+  outputQueue = write.catch((error: unknown) => {
+    // stdout 写入失败意味着父 bridge 已无法观察本进程，必须让受管节点收敛。
+    if (!exitScheduled) failAndExit("protocol_fault");
+    throw error;
+  });
+  // 输出链由退出路径显式等待；这里先消费拒绝，避免异步 I/O 故障成为未处理拒绝。
+  void outputQueue.catch(() => {});
 }
 
 function writeOutput(frame: Uint8Array): Promise<void> {
-  return new Promise<void>((resolve) => {
+  return new Promise<void>((resolve, reject) => {
     let settled = false;
-    const finish = (): void => {
+    const cleanup = (): void => {
+      process.stdout.removeListener("close", onClose);
+      process.stdout.removeListener("error", onError);
+    };
+    const succeed = (): void => {
       if (settled) return;
       settled = true;
-      process.stdout.removeListener("close", finish);
-      process.stdout.removeListener("error", finish);
+      cleanup();
       resolve();
     };
-    process.stdout.once("close", finish);
-    process.stdout.once("error", finish);
+    const fail = (error: unknown): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error instanceof Error ? error : new Error("桥接标准输出不可用"));
+    };
+    const onClose = (): void => fail(new Error("桥接标准输出已关闭"));
+    const onError = (error: Error): void => fail(error);
+    const onWrite = (error?: Error | null): void => {
+      if (error !== undefined && error !== null) fail(error);
+      else succeed();
+    };
+    if (process.stdout.destroyed || !process.stdout.writable) {
+      fail(new Error("桥接标准输出不可用"));
+      return;
+    }
+    process.stdout.once("close", onClose);
+    process.stdout.once("error", onError);
     try {
-      process.stdout.write(frame, finish);
-    } catch {
-      finish();
+      process.stdout.write(frame, onWrite);
+    } catch (error) {
+      fail(error);
     }
   });
 }

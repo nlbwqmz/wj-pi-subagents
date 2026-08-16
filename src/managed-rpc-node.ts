@@ -572,6 +572,7 @@ export interface ManagedRpcBridgeClientOptions {
 export class ManagedRpcBridgeClient implements ManagedRpcBridge {
   private readonly stdin: Writable;
   private readonly stdout: Readable;
+  private readonly stderr: Readable;
   private readonly pending = new Map<number, PendingBridgeRequest>();
   private readonly eventListeners = new Set<(event: unknown) => void>();
   private readonly faultListeners = new Set<(fault: ManagedRpcTransportFault) => void>();
@@ -594,6 +595,10 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
       : copyRpcOptions(options.rpcOptions);
     this.stdin = transport.stdin;
     this.stdout = transport.stdout;
+    this.stderr = transport.stderr;
+    // bridge 会把 Pi 子进程 stderr 转发到自身 stderr；父端必须持续消费，
+    // 否则 Windows 管道反压会冻结 bridge 的事件循环和监督 ACK。
+    drainStderr(transport.stderr);
     this.stdout.on("data", (chunk: Uint8Array | string) => this.receiveBytes(
       typeof chunk === "string" ? new TextEncoder().encode(chunk) : new Uint8Array(chunk),
     ));
@@ -681,6 +686,7 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
     this.pending.clear();
     if (!this.stdin.destroyed) this.stdin.destroy();
     if (!this.stdout.destroyed) this.stdout.destroy();
+    if (!this.stderr.destroyed) this.stderr.destroy();
   }
 
   private request(command: string, payload: unknown, signal?: AbortSignal): Promise<unknown> {
@@ -903,6 +909,12 @@ function encodeBridgeJson(value: unknown): Uint8Array {
   }
   if (typeof text !== "string") throw new Error("桥接帧无效");
   return new TextEncoder().encode(text);
+}
+
+function drainStderr(stream: Readable): void {
+  stream.on("data", () => {});
+  stream.on("error", () => {});
+  stream.resume();
 }
 
 function writeChunk(stream: Writable, bytes: Uint8Array): Promise<void> {

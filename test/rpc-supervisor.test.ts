@@ -388,14 +388,23 @@ class RecordingSupervisorChannel implements RpcSupervisorChannel {
   private readonly compactionResponses: Array<SupervisorCompactionPrepared | SupervisorCompactionCompleted> = [];
   private readonly trace: string[];
   private readonly readyPromise: Promise<void> | undefined;
+  private readonly taskAssignmentHandler: ((
+    assignment: SupervisorTaskAssignment,
+    signal?: AbortSignal,
+  ) => void | Promise<void>) | undefined;
   private replyRetryCount = 0;
 
   constructor(
     trace: string[],
     readyPromise?: Promise<void>,
+    taskAssignmentHandler?: (
+      assignment: SupervisorTaskAssignment,
+      signal?: AbortSignal,
+    ) => void | Promise<void>,
   ) {
     this.trace = trace;
     this.readyPromise = readyPromise;
+    this.taskAssignmentHandler = taskAssignmentHandler;
   }
 
   async bind(): Promise<void> {
@@ -424,9 +433,13 @@ class RecordingSupervisorChannel implements RpcSupervisorChannel {
     return this.replyRetryCount;
   }
 
-  async publishTaskAssignmentAndWaitForAck(assignment: SupervisorTaskAssignment): Promise<void> {
+  async publishTaskAssignmentAndWaitForAck(
+    assignment: SupervisorTaskAssignment,
+    signal?: AbortSignal,
+  ): Promise<void> {
     this.trace.push("channel:task_assignment");
     this.taskAssignments.push(assignment);
+    await this.taskAssignmentHandler?.(assignment, signal);
   }
 
   onTaskStarted(listener: (started: SupervisorTaskStarted) => void): () => void {
@@ -769,6 +782,110 @@ test("同一节点的 prompt 与 steering 只按一个 RPC 写入顺序域执行
     assert.equal(status.data.state, "working");
     assert.equal(status.data.mailbox_pending_count, 0);
   }
+});
+
+test("任务租约 ACK 超时在正文投递前 fail-closed", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  let resolveAcknowledgementTimeout!: () => void;
+  const acknowledgementTimedOut = new Promise<void>((resolve) => {
+    resolveAcknowledgementTimeout = resolve;
+  });
+  const channel = new RecordingSupervisorChannel([], undefined, async (_assignment, signal) => {
+    await new Promise<void>((_resolve, reject) => {
+      if (signal === undefined) {
+        reject(new Error("测试租约 ACK 缺少取消信号"));
+        return;
+      }
+      signal.addEventListener("abort", () => {
+        resolveAcknowledgementTimeout();
+        reject(new Error("测试租约 ACK 超时"));
+      }, { once: true });
+    });
+  });
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "租约 ACK 期限" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+    taskAssignmentTimeoutMs: 10,
+  });
+  const events: RpcSupervisorEvent[] = [];
+  supervisor.onEvent((event) => events.push(event));
+  assert.equal((await supervisor.start()).ok, true);
+
+  const first = await supervisor.prompt("等待租约确认");
+  assert.equal(first.ok, true);
+  if (!first.ok) return;
+  await acknowledgementTimedOut;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "failed");
+    assert.equal(status.data.error?.code, "internal_error");
+    assert.equal(status.data.mailbox_pending_count, 0);
+    assert.equal(status.data.host_pending_count, 0);
+    assert.equal(status.data.reply_outbox_pending_count, 0);
+  }
+  assert.deepEqual(rpcClient.operations(), ["start", "get_state"]);
+  assert.deepEqual(await supervisor.prompt("超时后的后续消息"), {
+    ok: false,
+    code: "agent_unavailable",
+  });
+  assert.deepEqual(events.at(-1), {
+    kind: "fault",
+    code: "supervisor_protocol_fault",
+  });
+});
+
+test("任务租约 ACK 超时即使通道忽略取消也能收敛", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([], undefined, async () => {
+    // 模拟 send 本身卡住；该 Promise 不观察监督器传入的 signal。
+    await new Promise<void>(() => {});
+  });
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "忽略取消的租约" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+    taskAssignmentTimeoutMs: 10,
+  });
+  let resolveFault!: () => void;
+  const faultObserved = new Promise<void>((resolve) => { resolveFault = resolve; });
+  supervisor.onEvent((event) => {
+    if (event.kind === "fault" && event.code === "supervisor_protocol_fault") resolveFault();
+  });
+  assert.equal((await supervisor.start()).ok, true);
+
+  const delivery = await supervisor.prompt("通道忽略取消");
+  assert.equal(delivery.ok, true);
+  await faultObserved;
+
+  const status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "failed");
+    assert.equal(status.data.error?.code, "internal_error");
+    assert.equal(status.data.mailbox_pending_count, 0);
+    assert.equal(status.data.host_pending_count, 0);
+    assert.equal(status.data.reply_outbox_pending_count, 0);
+  }
+  assert.deepEqual(rpcClient.operations(), ["start", "get_state"]);
+  assert.deepEqual(await supervisor.prompt("故障后的消息"), {
+    ok: false,
+    code: "agent_unavailable",
+  });
 });
 
 test("Pi 自动重试沿用父端任务身份且不把继续执行投影为 internal_error", async () => {

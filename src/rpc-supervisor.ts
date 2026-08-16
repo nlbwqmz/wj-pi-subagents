@@ -413,6 +413,8 @@ export interface RpcSupervisorOptions {
   ) => RpcSupervisorChannelBinding;
   readonly startupTimeoutMs: number;
   readonly gracefulShutdownMs: number;
+  /** parent 等待 child 接纳任务租约的上限；省略时沿用启动期限。 */
+  readonly taskAssignmentTimeoutMs?: number;
   /** child extension bind 后的实际能力裁决；缺失 manifest 必须失败关闭。 */
   readonly validateCapability?: (capability: SupervisorCapabilityManifest) => boolean;
   readonly now?: () => number;
@@ -507,6 +509,13 @@ class StartupTransportFaultError extends Error {
   constructor() {
     super("启动期间监督传输故障");
     this.name = "StartupTransportFaultError";
+  }
+}
+
+class TaskAssignmentTimeoutError extends Error {
+  constructor() {
+    super("任务租约 ACK 超时");
+    this.name = "TaskAssignmentTimeoutError";
   }
 }
 
@@ -645,7 +654,11 @@ export class RpcSupervisor {
   private treeConfirmationPending = false;
 
   constructor(options: RpcSupervisorOptions) {
-    if (!validDuration(options.startupTimeoutMs) || !validDuration(options.gracefulShutdownMs)) {
+    if (
+      !validDuration(options.startupTimeoutMs)
+      || !validDuration(options.gracefulShutdownMs)
+      || (options.taskAssignmentTimeoutMs !== undefined && !validDuration(options.taskAssignmentTimeoutMs))
+    ) {
       throw new TypeError("RPC 监督器期限无效");
     }
     if (options.managedNode.process_binding !== "managed") {
@@ -1598,20 +1611,56 @@ export class RpcSupervisor {
     if (delivery === undefined) return;
     const channel = this.channelOrThrow();
     const publishAssignment = channel.publishTaskAssignmentAndWaitForAck;
+    const assignmentController = new AbortController();
+    let assignmentTimedOut = false;
+    const assignmentTimeout = setTimeout(
+      () => {
+        // 期限裁决由监督器自身完成，不能依赖通道的 send/ACK Promise 观察 signal；
+        // 否则底层写入也被卡住时，超时只会记录而不会真正解除队列悬挂。
+        assignmentTimedOut = true;
+        if (this.phase === "ready") {
+          this.mailbox.hostDeliveryUncertain(delivery.delivery_id);
+          this.commitTaskProjection();
+          this.receiveTransportFault("protocol_fault", "supervisor");
+        }
+        assignmentController.abort();
+      },
+      this.options.taskAssignmentTimeoutMs ?? this.options.startupTimeoutMs,
+    );
     try {
       if (typeof publishAssignment !== "function") throw new Error("任务租约通道不可用");
       await publishAssignment.call(channel, {
         message_id: delivery.message_id,
         task_id: delivery.task_id,
         mode: delivery.mode,
-      });
-      if (!this.mailbox.isDeliveryActive(delivery.delivery_id)) return;
+      }, assignmentController.signal);
+      if (assignmentTimedOut) throw new TaskAssignmentTimeoutError();
+    } catch (error) {
+      clearTimeout(assignmentTimeout);
+      if (!assignmentTimedOut) this.mailbox.hostDeliveryUncertain(delivery.delivery_id);
+      const failure = assignmentTimedOut ? new TaskAssignmentTimeoutError() : error;
+      if (failure instanceof TaskAssignmentTimeoutError && this.phase === "ready") {
+        // ACK 超时发生在 prompt/steer 之前；child 只可能收到租约，不能继续复用该节点。
+        this.commitTaskProjection();
+        this.receiveTransportFault("protocol_fault", "supervisor");
+        return;
+      }
+      if (this.phase !== "ready") return;
+      this.commitTaskProjection();
+      this.schedulePendingReplyRetry();
+      return;
+    }
+    clearTimeout(assignmentTimeout);
+    if (assignmentTimedOut || this.phase !== "ready") return;
+    if (!this.mailbox.isDeliveryActive(delivery.delivery_id)) return;
+    try {
       if (delivery.mode === "prompt") await this.commandClient().prompt(delivery.message);
       else await this.commandClient().steer(delivery.message);
       this.mailbox.hostAccepted(delivery.delivery_id);
     } catch {
       this.mailbox.hostDeliveryUncertain(delivery.delivery_id);
     }
+    if (this.phase !== "ready") return;
     this.commitTaskProjection();
     // final 可能在独立监督流上先于命令响应到达；命令尾部正是其最后一个门闩。
     this.schedulePendingReplyRetry();

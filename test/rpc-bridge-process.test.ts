@@ -71,6 +71,80 @@ test("桥接进程在只收到超长声明时立即拒绝且不会重复发送�
   assert.deepEqual(result.frames, [protocolFaultFrame()]);
 });
 
+test("桥接进程在 stdout 已关闭时将异步写入失败归类为协议故障并退出", async () => {
+  const script = fileURLToPath(new URL("../src/rpc-bridge-process.ts", import.meta.url));
+  const child = spawn(process.execPath, ["--experimental-strip-types", script], {
+    env: {
+      ...process.env,
+      [MANAGED_RPC_BRIDGE_CREDENTIAL_ENV]: "bridge-credential-01234567890123456789",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  child.stdin.on("error", () => {});
+  child.stdout.destroy();
+  child.stdin.end(encodeFrame({
+    protocol: MANAGED_RPC_BRIDGE_PROTOCOL,
+    kind: "command",
+    id: 1,
+    command: "get_state",
+    payload: null,
+  }));
+
+  const [code, signal] = await once(child, "close") as [number | null, NodeJS.Signals | null];
+  assert.equal(signal, null);
+  assert.equal(code, 1);
+});
+
+test("父端持续消费 bridge stderr，避免诊断输出阻塞监督命令", async (context) => {
+  const script = fileURLToPath(new URL("../src/rpc-bridge-process.ts", import.meta.url));
+  const piModulePath = new URL("./helpers/stderr-flood-pi-rpc-client.mjs", import.meta.url).href;
+  const bridgeCredential = "bridge-credential-01234567890123456789";
+  const child = spawn(process.execPath, ["--experimental-strip-types", script], {
+    env: {
+      ...process.env,
+      [MANAGED_RPC_BRIDGE_CREDENTIAL_ENV]: bridgeCredential,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  const bridge = new ManagedRpcBridgeClient({
+    stdin: child.stdin,
+    stdout: child.stdout,
+    stderr: child.stderr,
+  }, {
+    credential: bridgeCredential,
+    rpcOptions: { piModulePath },
+  });
+  context.after(async () => {
+    await bridge.release();
+    if (!child.killed && child.exitCode === null) child.kill();
+  });
+
+  const withinDeadline = async <T>(operation: Promise<T>): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        operation,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("bridge stderr drain timeout")), 2_000);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  };
+
+  await withinDeadline(bridge.start());
+  assert.deepEqual(await withinDeadline(bridge.getState()), {});
+  const closeObservation = once(child, "close") as Promise<[number | null, NodeJS.Signals | null]>;
+  await bridge.requestClose(new AbortController().signal);
+  const [code, signal] = await closeObservation;
+  assert.equal(code, 0);
+  assert.equal(signal, null);
+  await bridge.release();
+});
+
 test("生产桥接配合 fake RpcClient 完成真实本地监督握手、回复 ACK 与清理", async (context) => {
   const script = fileURLToPath(new URL("../src/rpc-bridge-process.ts", import.meta.url));
   const loader = new URL("./helpers/pi-rpc-client-loader.mjs", import.meta.url).href;
