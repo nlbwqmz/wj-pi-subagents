@@ -1188,7 +1188,7 @@ export class RpcSupervisor {
     if (state.phase === "closed") return true;
     let mailboxReleased = !state.mailboxPrepared;
     if (state.mailboxPrepared) {
-      mailboxReleased = this.mailbox.completeCoordinationBarrier(state.transactionId);
+      mailboxReleased = this.mailbox.completeCoordinationBarrier(state.transactionId, outcome);
       if (mailboxReleased) state.mailboxPrepared = false;
     }
     let replyReleased = !state.replyPrepared;

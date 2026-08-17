@@ -154,6 +154,37 @@ test("直接边协调令牌可叠加，未接纳交付阻止 prepare，接纳后
   assert.equal(value.beginCoordinationBarrier("x".repeat(257)), false);
 });
 
+test("协调压缩的 provisional settled 期间接纳消息仍延续当前逻辑任务", () => {
+  const value = mailbox();
+  const current = value.submit("进入协调压缩的任务");
+  const initial = value.takeNextDelivery();
+  assert.equal(value.hostAccepted(initial!.delivery_id), true);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
+
+  assert.equal(value.beginCoordinationBarrier("compact-continuation"), true);
+  assert.equal(value.observeAgentSettled(), "candidate");
+  const queued = value.submit("压缩完成后继续当前任务");
+  assert.equal(queued.task_id, current.task_id);
+  assert.equal(value.takeNextDelivery(), undefined);
+  assert.deepEqual(value.projection(), {
+    state: "working",
+    mailbox_pending_count: 1,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 1,
+    activity: { phase: "reconciling", task_id: current.task_id },
+  });
+
+  assert.equal(value.completeCoordinationBarrier("compact-continuation", "succeeded"), true);
+  assert.equal(value.takeNextDelivery(), undefined);
+  value.observeCompactionStart("manual");
+  value.observeCompactionEnd("manual", false);
+  const resumed = value.takeNextDelivery();
+  assert.equal(resumed?.message_id, queued.message_id);
+  assert.equal(resumed?.task_id, current.task_id);
+  assert.equal(resumed?.mode, "prompt");
+});
+
 test("直接边准备把 delivery uncertainty 与维护失败标记为 unsafe", () => {
   const uncertain = mailbox([PLACEHOLDER_TASK]);
   uncertain.submit("不确定交付");

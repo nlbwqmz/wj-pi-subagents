@@ -1989,6 +1989,110 @@ test("不同节点拥有独立命令顺序域并可同时写入各自 RPC", asyn
   assert.equal((await secondPrompt).ok, true);
 });
 
+test("协调压缩的 provisional settled 不阻塞当前任务消息且保持 sibling 隔离", async () => {
+  const tree = createController();
+  const firstRpc = new FakeRpcClient();
+  const secondRpc = new FakeRpcClient();
+  const firstChannel = new RecordingSupervisorChannel([]);
+  const secondChannel = new RecordingSupervisorChannel([]);
+  const first = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "正常 sibling" },
+    managedNode: new TestManagedRpcNode(firstRpc, new FakeProcessTreeAdapter()),
+    channel: firstChannel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+  });
+  const second = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "协调压缩 sibling" },
+    managedNode: new TestManagedRpcNode(secondRpc, new FakeProcessTreeAdapter()),
+    channel: secondChannel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+    onCompactionPrepare: () => true,
+    onCompactionComplete: () => true,
+  });
+  assert.equal((await first.start()).ok, true);
+  assert.equal((await second.start()).ok, true);
+
+  const firstTask = await first.prompt("first work");
+  const secondTask = await second.prompt("second work");
+  assert.equal(firstTask.ok, true);
+  assert.equal(secondTask.ok, true);
+  if (!firstTask.ok || !secondTask.ok) return;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  firstRpc.emitEvent({ type: "agent_start" });
+  firstChannel.emitTaskStarted({ task_id: firstTask.task_id, turn_id: TURN_ID });
+  secondRpc.emitEvent({ type: "agent_start" });
+  secondChannel.emitTaskStarted({ task_id: secondTask.task_id, turn_id: TURN_ID });
+
+  const firstProgress = await first.steer("first progress");
+  assert.equal(firstProgress.ok, true);
+  if (firstProgress.ok) assert.equal(firstProgress.task_id, firstTask.task_id);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(firstRpc.operations().filter((operation) => operation === "steer").length, 1);
+
+  secondChannel.emitCompactionPrepare("compact-live-stall");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(secondChannel.publishedCompactionResponses(), [{
+    transaction_id: "compact-live-stall",
+    accepted: true,
+  }]);
+  secondRpc.emitEvent({ type: "agent_settled" });
+
+  const secondProgress = await second.steer("second progress during compaction");
+  assert.equal(secondProgress.ok, true);
+  if (!secondProgress.ok) return;
+  assert.equal(secondProgress.task_id, secondTask.task_id);
+  let secondStatus = tree.getStatus(SECOND_AGENT_ID);
+  assert.equal(secondStatus.ok, true);
+  if (secondStatus.ok) {
+    assert.equal(secondStatus.data.state, "working");
+    assert.equal(secondStatus.data.mailbox_pending_count, 1);
+    assert.equal(secondStatus.data.host_pending_count, 0);
+  }
+  assert.equal(secondRpc.operations().filter((operation) => operation === "prompt").length, 1);
+  assert.equal(secondRpc.operations().filter((operation) => operation === "steer").length, 0);
+
+  secondRpc.emitEvent({ type: "compaction_start", reason: "manual" });
+  secondRpc.emitEvent({
+    type: "compaction_end",
+    reason: "manual",
+    aborted: false,
+    willRetry: false,
+    failed: false,
+  });
+  secondChannel.emitCompactionComplete("compact-live-stall", "succeeded");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(secondRpc.operations().filter((operation) => operation === "prompt").length, 2);
+  assert.deepEqual(secondChannel.publishedTaskAssignments().at(-1), {
+    message_id: secondProgress.message_id,
+    task_id: secondTask.task_id,
+    mode: "prompt",
+  });
+  secondStatus = tree.getStatus(SECOND_AGENT_ID);
+  assert.equal(secondStatus.ok, true);
+  if (secondStatus.ok) {
+    assert.equal(secondStatus.data.state, "working");
+    assert.equal(secondStatus.data.mailbox_pending_count, 0);
+    assert.equal(secondStatus.data.host_pending_count, 0);
+  }
+
+  const firstStatus = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(firstStatus.ok, true);
+  if (firstStatus.ok) {
+    assert.equal(firstStatus.data.state, "working");
+    assert.equal(firstStatus.data.mailbox_pending_count, 0);
+    assert.equal(firstStatus.data.host_pending_count, 0);
+  }
+});
+
 test("abort 响应和 agent_end 不 settle，raw settled 后仍须 final commit", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
