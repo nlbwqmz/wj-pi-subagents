@@ -515,13 +515,6 @@ class StartupTransportFaultError extends Error {
   }
 }
 
-class TaskAssignmentTimeoutError extends Error {
-  constructor() {
-    super("任务租约 ACK 超时");
-    this.name = "TaskAssignmentTimeoutError";
-  }
-}
-
 const DEFAULT_INTERRUPT_SETTLEMENT_TIMEOUT_MS = 10_000;
 
 function validDuration(value: number): boolean {
@@ -1671,70 +1664,91 @@ export class RpcSupervisor {
     void this.executeMessageCommand(command).finally(() => this.finishCommand(command));
   }
 
-  private async executeMessageCommand(command: QueuedMessageCommand): Promise<void> {
+  private executeMessageCommand(command: QueuedMessageCommand): Promise<void> {
     const delivery = command.delivery;
-    if (delivery === undefined) return;
+    if (delivery === undefined) return Promise.resolve();
     const channel = this.channelOrThrow();
     const publishAssignment = channel.publishTaskAssignmentAndWaitForAck;
     const assignmentController = new AbortController();
     let assignmentTimedOut = false;
+    let commandFinished = false;
+    let resolveCommand!: () => void;
+    const completion = new Promise<void>((resolve) => {
+      resolveCommand = resolve;
+    });
+    const finish = (): void => {
+      if (commandFinished) return;
+      commandFinished = true;
+      clearTimeout(assignmentTimeout);
+      resolveCommand();
+    };
     const assignmentTimeout = setTimeout(
       () => {
-        // 期限裁决由监督器自身完成，不能依赖通道的 send/ACK Promise 观察 signal；
-        // 否则底层写入也被卡住时，超时只会记录而不会真正解除队列悬挂。
+        if (commandFinished) return;
+        // 超时只隔离当前任务的交付；不能把没有运行时故障证据的节点升级为 failed。
         assignmentTimedOut = true;
-        if (this.phase === "ready") {
-          this.mailbox.hostDeliveryUncertain(delivery.delivery_id);
-          this.commitTaskProjection();
-          this.quarantineRuntime("supervisor_protocol_fault");
+        try {
+          if (this.phase === "ready") {
+            this.mailbox.hostDeliveryUncertain(delivery.delivery_id);
+            this.commitTaskProjection();
+          }
+        } finally {
+          assignmentController.abort();
+          finish();
         }
-        assignmentController.abort();
       },
       this.options.taskAssignmentTimeoutMs ?? this.options.startupTimeoutMs,
     );
+    const handleAssignmentFailure = (): void => {
+      if (commandFinished || assignmentTimedOut) return;
+      this.mailbox.hostDeliveryUncertain(delivery.delivery_id);
+      if (this.phase !== "ready") {
+        finish();
+        return;
+      }
+      this.commitTaskProjection();
+      this.schedulePendingReplyRetry();
+      finish();
+    };
+    const handleAssignmentAcknowledged = (): void => {
+      if (commandFinished || assignmentTimedOut) return;
+      clearTimeout(assignmentTimeout);
+      if (this.phase !== "ready" || !this.mailbox.isDeliveryActive(delivery.delivery_id)) {
+        finish();
+        return;
+      }
+      void this.executeAssignedDelivery(delivery).then(finish, finish);
+    };
     try {
       if (typeof publishAssignment !== "function") throw new Error("任务租约通道不可用");
-      await publishAssignment.call(channel, {
+      // 通道实现可能忽略 AbortSignal；本地超时会直接完成当前命令，
+      // 不让悬挂的底层写入继续占住整个命令队列。
+      const assignment = Promise.resolve(publishAssignment.call(channel, {
         message_id: delivery.message_id,
         task_id: delivery.task_id,
         mode: delivery.mode,
-      }, assignmentController.signal);
-      if (assignmentTimedOut) throw new TaskAssignmentTimeoutError();
-    } catch (error) {
-      clearTimeout(assignmentTimeout);
-      if (!assignmentTimedOut) this.mailbox.hostDeliveryUncertain(delivery.delivery_id);
-      const failure = assignmentTimedOut ? new TaskAssignmentTimeoutError() : error;
-      if (failure instanceof TaskAssignmentTimeoutError && this.phase === "ready") {
-        // ACK 超时发生在 prompt/steer 之前；child 只可能收到租约，不能继续复用该节点。
-        this.commitTaskProjection();
-        this.quarantineRuntime("supervisor_protocol_fault");
-        return;
-      }
-      if (this.phase !== "ready") return;
-      this.commitTaskProjection();
-      if (this.mailbox.hasUncertainDelivery()) {
-        this.quarantineRuntime("message_delivery_failed", true);
-        return;
-      }
-      this.schedulePendingReplyRetry();
-      return;
+      }, assignmentController.signal));
+      void assignment.then(handleAssignmentAcknowledged, handleAssignmentFailure);
+    } catch {
+      handleAssignmentFailure();
     }
-    clearTimeout(assignmentTimeout);
-    if (assignmentTimedOut || this.phase !== "ready") return;
-    if (!this.mailbox.isDeliveryActive(delivery.delivery_id)) return;
+    return completion;
+  }
+
+  private async executeAssignedDelivery(delivery: AgentHostDelivery): Promise<void> {
+    if (this.phase !== "ready" || !this.mailbox.isDeliveryActive(delivery.delivery_id)) return;
     try {
       if (delivery.mode === "prompt") await this.commandClient().prompt(delivery.message);
       else await this.commandClient().steer(delivery.message);
       this.mailbox.hostAccepted(delivery.delivery_id);
     } catch {
+      // RPC 返回异常不能证明正文未执行；只保留当前任务的交付不确定状态。
       this.mailbox.hostDeliveryUncertain(delivery.delivery_id);
     }
     if (this.phase !== "ready") return;
     this.commitTaskProjection();
     if (this.mailbox.hasUncertainDelivery()) {
-      // 命令尾部没有可证明的“未执行”结果；关闭节点比留下可重用但
-      // 执行状态未知的 suspended 节点更安全，也绝不重投递正文。
-      this.quarantineRuntime("message_delivery_failed", true);
+      this.schedulePendingReplyRetry();
       return;
     }
     // final 可能在独立监督流上先于命令响应到达；命令尾部正是其最后一个门闩。

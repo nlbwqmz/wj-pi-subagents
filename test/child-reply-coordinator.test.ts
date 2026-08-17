@@ -240,6 +240,30 @@ test("task_started 获 transport ACK 前同一 turn 的业务 reply 不得越过
   ]);
 });
 
+test("工作中回复只等待本地 outbox 写入，不同步等待远端 ACK", async () => {
+  const replies: ChildReplyEnvelope[] = [];
+  let synchronousAckWaits = 0;
+  const port: ChildReplyPort = {
+    async publishReply(reply): Promise<void> {
+      replies.push(reply);
+    },
+    async publishReplyAndWaitForAck(): Promise<void> {
+      synchronousAckWaits += 1;
+      await new Promise<void>(() => {});
+    },
+  };
+  const value = coordinator(port);
+  value.observeAgentStart();
+
+  const result = await value.replyToParent({ message: "正在处理" });
+
+  assert.deepEqual(result, { ok: true, data: { accepted: true } });
+  assert.equal(synchronousAckWaits, 0);
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0]?.kind, "message");
+  assert.equal(replies[0]?.text, "正在处理");
+});
+
 test("工作中消息与 settled final 共享运行时轮次并按 ACK 顺序发布", async () => {
   const port = new RecordingPort();
   const value = coordinator(port);

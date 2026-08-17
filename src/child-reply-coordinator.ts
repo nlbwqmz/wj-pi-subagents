@@ -32,6 +32,11 @@ export interface FinalCandidate {
 export type ChildCompactionReason = "manual" | "threshold" | "overflow";
 
 export interface ChildReplyPort {
+  /** 写入本地监督 outbox 后返回；不等待父端 reply ACK。 */
+  publishReply?(
+    reply: ChildReplyEnvelope,
+  ): Promise<void>;
+  /** 兼容旧适配器及 final 提交所需的父端接纳等待。 */
   publishReplyAndWaitForAck(
     reply: ChildReplyEnvelope,
     signal?: AbortSignal,
@@ -60,8 +65,9 @@ const MAX_ID_GENERATION_ATTEMPTS = 32;
  * child 侧任务、turn 和 final 协调器。
  *
  * Pi 的 assistant `message_end` 是正文唯一来源；只有在对应 loop 的
- * `agent_settled` 之后，正文才会进入 final outbox。父端接纳和 reply ACK
- * 仍由监督通道完成，当前回调不等待第三方扩展的任何续跑。
+ * `agent_settled` 之后，正文才会进入 final outbox。工作中回复只等待本地
+ * outbox 写入；final 的父端接纳和 reply ACK 仍由监督通道完成，当前回调不等待
+ * 第三方扩展的任何续跑。
  */
 export class ChildReplyCoordinator {
   private readonly agentId: string;
@@ -259,7 +265,12 @@ export class ChildReplyCoordinator {
     });
     if (reply === undefined) return controlFailure("invalid_argument");
     try {
-      await this.enqueue(() => this.port.publishReplyAndWaitForAck(reply, signal));
+      const publishReply = this.port.publishReply;
+      if (publishReply !== undefined) {
+        await this.enqueue(() => publishReply.call(this.port, reply));
+      } else {
+        await this.enqueue(() => this.port.publishReplyAndWaitForAck(reply, signal));
+      }
     } catch {
       return controlFailure("message_delivery_failed");
     }

@@ -795,7 +795,7 @@ test("同一节点的 prompt 与 steering 只按一个 RPC 写入顺序域执行
   }
 });
 
-test("任务租约 ACK 超时在正文投递前 fail-closed", async () => {
+test("任务租约 ACK 超时只暂停不确定投递，不把健康节点标为 failed", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
   let resolveAcknowledgementTimeout!: () => void;
@@ -838,24 +838,25 @@ test("任务租约 ACK 超时在正文投递前 fail-closed", async () => {
   const status = tree.getStatus(FIRST_AGENT_ID);
   assert.equal(status.ok, true);
   if (status.ok) {
-    assert.equal(status.data.state, "failed");
-    assert.equal(status.data.error?.code, "internal_error");
+    assert.equal(status.data.state, "suspended");
+    assert.equal(status.data.error, undefined);
+    assert.equal(status.data.activity?.phase, "delivery_uncertain");
     assert.equal(status.data.mailbox_pending_count, 0);
     assert.equal(status.data.host_pending_count, 0);
     assert.equal(status.data.reply_outbox_pending_count, 0);
   }
   assert.deepEqual(rpcClient.operations(), ["start", "get_state"]);
-  assert.deepEqual(await supervisor.prompt("超时后的后续消息"), {
-    ok: false,
-    code: "agent_unavailable",
-  });
-  assert.deepEqual(events.at(-1), {
-    kind: "fault",
-    code: "supervisor_protocol_fault",
-  });
+  const retry = await supervisor.prompt("超时后的后续消息");
+  assert.equal(retry.ok, true);
+  if (retry.ok) assert.equal(retry.task_id, first.task_id);
+  const suspended = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(suspended.ok, true);
+  if (suspended.ok) assert.equal(suspended.data.mailbox_pending_count, 1);
+  assert.equal(events.some((event) => event.kind === "fault"), false);
+  await supervisor.terminate();
 });
 
-test("任务租约 ACK 超时即使通道忽略取消也能收敛", async () => {
+test("任务租约 ACK 超时即使通道忽略取消也能收敛为 suspended", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
   const channel = new RecordingSupervisorChannel([], undefined, async () => {
@@ -872,31 +873,26 @@ test("任务租约 ACK 超时即使通道忽略取消也能收敛", async () => 
     gracefulShutdownMs: 5,
     taskAssignmentTimeoutMs: 10,
   });
-  let resolveFault!: () => void;
-  const faultObserved = new Promise<void>((resolve) => { resolveFault = resolve; });
-  supervisor.onEvent((event) => {
-    if (event.kind === "fault" && event.code === "supervisor_protocol_fault") resolveFault();
-  });
   assert.equal((await supervisor.start()).ok, true);
 
   const delivery = await supervisor.prompt("通道忽略取消");
   assert.equal(delivery.ok, true);
-  await faultObserved;
+  await new Promise<void>((resolve) => setTimeout(resolve, 30));
 
   const status = tree.getStatus(FIRST_AGENT_ID);
   assert.equal(status.ok, true);
   if (status.ok) {
-    assert.equal(status.data.state, "failed");
-    assert.equal(status.data.error?.code, "internal_error");
+    assert.equal(status.data.state, "suspended");
+    assert.equal(status.data.error, undefined);
+    assert.equal(status.data.activity?.phase, "delivery_uncertain");
     assert.equal(status.data.mailbox_pending_count, 0);
     assert.equal(status.data.host_pending_count, 0);
     assert.equal(status.data.reply_outbox_pending_count, 0);
   }
   assert.deepEqual(rpcClient.operations(), ["start", "get_state"]);
-  assert.deepEqual(await supervisor.prompt("故障后的消息"), {
-    ok: false,
-    code: "agent_unavailable",
-  });
+  const retry = await supervisor.prompt("暂停后的消息");
+  assert.equal(retry.ok, true);
+  await supervisor.terminate();
 });
 
 test("Pi 自动重试沿用父端任务身份且不把继续执行投影为 internal_error", async () => {
@@ -1378,7 +1374,7 @@ test("final 外部注入后本地提交遇到压缩屏障，重试只提交而�
   }
 });
 
-test("Pi 命令结果不确定时立即隔离节点且不重投递正文", async () => {
+test("Pi 命令结果不确定时暂停当前投递且不重投递正文", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
   const managedNode = new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter());
@@ -1404,25 +1400,27 @@ test("Pi 命令结果不确定时立即隔离节点且不重投递正文", async
   let status = tree.getStatus(FIRST_AGENT_ID);
   assert.equal(status.ok, true);
   if (status.ok) {
-    assert.equal(status.data.state, "terminated");
-    assert.equal(status.data.termination_result, "failed");
+    assert.equal(status.data.state, "suspended");
+    assert.equal(status.data.activity?.phase, "delivery_uncertain");
     assert.equal(status.data.mailbox_pending_count, 0);
   }
   assert.deepEqual(await supervisor.interrupt(), {
-    ok: false,
-    code: "agent_unavailable",
+    ok: true,
+    accepted: false,
+    changed: false,
   });
   rpcClient.emitEvent({ type: "agent_settled" });
   await new Promise<void>((resolve) => setImmediate(resolve));
   status = tree.getStatus(FIRST_AGENT_ID);
   assert.equal(status.ok, true);
   if (status.ok) {
-    assert.equal(status.data.state, "terminated");
+    assert.equal(status.data.state, "suspended");
     assert.equal(status.data.reply_outbox_pending_count, 0);
   }
+  await supervisor.terminate();
 });
 
-test("Pi 命令结果不确定时拒绝迟到 task_started 对账", async () => {
+test("Pi 命令结果不确定时允许迟到 task_started 对账恢复任务", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
   const channel = new RecordingSupervisorChannel([]);
@@ -1447,22 +1445,26 @@ test("Pi 命令结果不确定时拒绝迟到 task_started 对账", async () => 
   await new Promise<void>((resolve) => setImmediate(resolve));
   let status = tree.getStatus(FIRST_AGENT_ID);
   assert.equal(status.ok, true);
-  if (status.ok) assert.equal(status.data.state, "terminated");
+  if (status.ok) {
+    assert.equal(status.data.state, "suspended");
+    assert.equal(status.data.activity?.phase, "delivery_uncertain");
+  }
 
   channel.emitTaskStarted({ task_id: submission.task_id, turn_id: TURN_ID });
   status = tree.getStatus(FIRST_AGENT_ID);
   assert.equal(status.ok, true);
-  if (status.ok) assert.equal(status.data.state, "terminated");
+  if (status.ok) assert.equal(status.data.state, "working");
   assert.equal(rpcClient.operations().filter((operation) => operation === "prompt").length, 1);
 
   rpcClient.emitEvent({ type: "agent_settled" });
-  assert.equal(supervisor.acceptChildReply(finalEnvelope(submission.task_id), () => true), false);
+  assert.equal(supervisor.acceptChildReply(finalEnvelope(submission.task_id), () => true), true);
   status = tree.getStatus(FIRST_AGENT_ID);
   assert.equal(status.ok, true);
-  if (status.ok) assert.equal(status.data.state, "terminated");
+  if (status.ok) assert.equal(status.data.state, "idle");
+  await supervisor.terminate();
 });
 
-test("命令尾部不确定时拒绝迟到 lifecycle 对账", async () => {
+test("命令尾部不确定时暂停节点并保留真实运行时", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
   const supervisor = new RpcSupervisor({
@@ -1489,10 +1491,14 @@ test("命令尾部不确定时拒绝迟到 lifecycle 对账", async () => {
 
   const status = tree.getStatus(FIRST_AGENT_ID);
   assert.equal(status.ok, true);
-  if (status.ok) assert.equal(status.data.state, "terminated");
+  if (status.ok) {
+    assert.equal(status.data.state, "suspended");
+    assert.equal(status.data.activity?.phase, "delivery_uncertain");
+  }
+  await supervisor.terminate();
 });
 
-test("命令结果不确定时不伪造 host pending", async () => {
+test("命令结果不确定时不伪造 host pending 且不失败运行节点", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
   const supervisor = new RpcSupervisor({
@@ -1519,12 +1525,14 @@ test("命令结果不确定时不伪造 host pending", async () => {
   const status = tree.getStatus(FIRST_AGENT_ID);
   assert.equal(status.ok, true);
   if (status.ok) {
-    assert.equal(status.data.state, "terminated");
+    assert.equal(status.data.state, "suspended");
+    assert.equal(status.data.activity?.phase, "delivery_uncertain");
     assert.equal(status.data.host_pending_count, 0);
   }
+  await supervisor.terminate();
 });
 
-test("steer 交付不确定时立即隔离节点", async () => {
+test("steer 交付不确定时暂停节点而非立即隔离运行时", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
   const channel = new RecordingSupervisorChannel([]);
@@ -1556,13 +1564,15 @@ test("steer 交付不确定时立即隔离节点", async () => {
   let status = tree.getStatus(FIRST_AGENT_ID);
   assert.equal(status.ok, true);
   if (status.ok) {
-    assert.equal(status.data.state, "terminated");
+    assert.equal(status.data.state, "suspended");
+    assert.equal(status.data.activity?.phase, "delivery_uncertain");
     assert.equal(status.data.host_pending_count, 0);
   }
   rpcClient.emitEvent({ type: "agent_start" });
   status = tree.getStatus(FIRST_AGENT_ID);
   assert.equal(status.ok, true);
-  if (status.ok) assert.equal(status.data.state, "terminated");
+  if (status.ok) assert.equal(status.data.state, "suspended");
+  await supervisor.terminate();
 });
 
 test("压缩期间中断不等待缺失的 settled，而是隔离并回收节点", async () => {
