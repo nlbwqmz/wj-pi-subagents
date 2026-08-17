@@ -1464,6 +1464,51 @@ test("Pi 命令结果不确定时允许迟到 task_started 对账恢复任务", 
   await supervisor.terminate();
 });
 
+test("迟到 task_started 对账后必须重新唤醒后续 mailbox 投递", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "迟到启动唤醒" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+
+  const firstGate = rpcClient.deferNext("prompt");
+  const first = await supervisor.prompt("首条正文");
+  assert.equal(first.ok, true);
+  if (!first.ok) return;
+  await firstGate.started;
+  rpcClient.emitEvent({ type: "agent_start" });
+  firstGate.reject();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const second = await supervisor.steer("后续 steering");
+  assert.equal(second.ok, true);
+  if (!second.ok) return;
+  assert.equal(rpcClient.operations().filter((operation) => operation === "steer").length, 0);
+
+  channel.emitTaskStarted({ task_id: first.task_id, turn_id: TURN_ID });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(rpcClient.operations().filter((operation) => operation === "steer").length, 1);
+  const status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "working");
+    assert.equal(status.data.mailbox_pending_count, 0);
+    assert.equal(status.data.activity?.task_id, first.task_id);
+  }
+  await supervisor.terminate();
+});
+
 test("命令尾部不确定时暂停节点并保留真实运行时", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();

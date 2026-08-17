@@ -1306,6 +1306,8 @@ export class RpcSupervisor {
     }
     this.commitTaskProjection();
     this.schedulePendingReplyRetry();
+    // task_started 可能是解除交付不确定屏障后的唯一唤醒事实；对账后立即拉取后续 mailbox。
+    this.drainCommandQueue();
   }
 
   private receiveRpcEvent(event: unknown): void {
