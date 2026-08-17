@@ -656,10 +656,3 @@ npm run pack:smoke
 ## 许可证
 
 本项目采用 [MIT License](./LICENSE)。
-
-## 项目文档
-
-- [领域上下文](./CONTEXT.md)
-- [完整规格](./.scratch/wj-pi-subagents-spec/spec.md)
-- [架构决策记录](./docs/adr/)
-- [Issue 跟踪说明](./docs/agents/issue-tracker.md)
