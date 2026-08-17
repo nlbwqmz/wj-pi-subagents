@@ -632,6 +632,8 @@ export class RpcSupervisor {
   private readonly commandQueue: QueuedCommand[] = [];
   private activeCommand: QueuedCommand | undefined;
   private readonly eventListeners = new Set<(event: RpcSupervisorEvent) => void>();
+  private finalDeliveryInProgress = false;
+  private readonly deferredFinalDeliveryOperations: Array<() => void> = [];
   private readonly activeTools = new Map<string, RpcSupervisorActivityCategory>();
   private readonly activeToolCounts = new Map<RpcSupervisorActivityCategory, number>();
   private readonly retiredToolCallIds = new Set<string>();
@@ -700,7 +702,7 @@ export class RpcSupervisor {
    * 永久阻塞。
    */
   acceptChildReply(envelope: ChildReplyEnvelope, deliver: () => boolean): boolean {
-    if (this.phase !== "ready") return false;
+    if (this.phase !== "ready" || this.finalDeliveryInProgress) return false;
     const currentTaskId = this.mailbox.currentTaskId();
     if (currentTaskId !== undefined && currentTaskId !== envelope.task_id) return true;
     const currentTurnId = this.mailbox.currentTurnId();
@@ -712,13 +714,34 @@ export class RpcSupervisor {
         return false;
       }
       this.commitTaskProjection();
-      let accepted = false;
-      try {
-        accepted = deliver();
-      } catch {
-        accepted = false;
+      const deliveryAction = this.mailbox.beginPreparedFinalDelivery(envelope.commit_id);
+      if (deliveryAction === undefined) return false;
+      if (deliveryAction === "deliver") {
+        let committed = false;
+        this.finalDeliveryInProgress = true;
+        try {
+          let accepted = false;
+          try {
+            accepted = deliver();
+          } catch {
+            accepted = false;
+          }
+          if (this.mailbox.completePreparedFinalDelivery(envelope.commit_id, accepted) && accepted) {
+            committed = this.mailbox.commitPreparedFinal(envelope.commit_id);
+            if (committed) {
+              this.commitTaskProjection();
+              this.clearInterruptSettlementWatchdog();
+              this.emitEvent(Object.freeze({ kind: "reply", reply: envelope }));
+            }
+          }
+        } finally {
+          this.finalDeliveryInProgress = false;
+          this.flushDeferredFinalDeliveryOperations();
+        }
+        if (!committed) return false;
+        this.drainCommandQueue();
+        return true;
       }
-      if (!accepted) return false;
       if (!this.mailbox.commitPreparedFinal(envelope.commit_id)) return false;
       this.commitTaskProjection();
       this.clearInterruptSettlementWatchdog();
@@ -750,6 +773,16 @@ export class RpcSupervisor {
   }
 
   interrupt(): Promise<RpcSupervisorInterruptResult> {
+    if (this.finalDeliveryInProgress) {
+      return new Promise<RpcSupervisorInterruptResult>((resolve) => {
+        this.deferredFinalDeliveryOperations.push(() => {
+          void this.interrupt().then(
+            resolve,
+            () => resolve(Object.freeze({ ok: false, code: "agent_unavailable" })),
+          );
+        });
+      });
+    }
     if (this.phase !== "ready") {
       return Promise.resolve(Object.freeze({ ok: false, code: "agent_unavailable" }));
     }
@@ -774,6 +807,16 @@ export class RpcSupervisor {
   }
 
   terminate(): Promise<RpcSupervisorTerminationResult> {
+    if (this.finalDeliveryInProgress) {
+      return new Promise<RpcSupervisorTerminationResult>((resolve) => {
+        this.deferredFinalDeliveryOperations.push(() => {
+          void this.terminate().then(
+            resolve,
+            () => resolve(Object.freeze({ ok: false, code: "agent_unavailable" })),
+          );
+        });
+      });
+    }
     this.clearInterruptSettlementWatchdog();
     if (this.terminationPromise !== undefined) return this.terminationPromise;
     if (this.phase === "terminated" && this.agentId !== undefined) {
@@ -1063,6 +1106,9 @@ export class RpcSupervisor {
   }
 
   private async receiveCompactionPrepare(request: SupervisorCompactionPrepare): Promise<void> {
+    if (this.deferDuringFinalDelivery(() => {
+      void this.receiveCompactionPrepare(request);
+    })) return;
     const channel = this.channel;
     const respond = channel?.respondCompactionPrepared;
     if (this.phase !== "ready" || typeof respond !== "function") return;
@@ -1109,6 +1155,9 @@ export class RpcSupervisor {
   }
 
   private async receiveCompactionComplete(request: SupervisorCompactionComplete): Promise<void> {
+    if (this.deferDuringFinalDelivery(() => {
+      void this.receiveCompactionComplete(request);
+    })) return;
     const channel = this.channel;
     const respond = channel?.respondCompactionCompleted;
     if (this.phase !== "ready" || typeof respond !== "function") return;
@@ -1309,6 +1358,7 @@ export class RpcSupervisor {
   }
 
   private receiveTaskStarted(started: SupervisorTaskStarted): void {
+    if (this.deferDuringFinalDelivery(() => this.receiveTaskStarted(started))) return;
     if (this.phase !== "ready") return;
     if (!this.mailbox.observeTaskStarted(started.task_id, started.turn_id)) {
       this.failRuntime("supervisor_protocol_fault");
@@ -1321,6 +1371,7 @@ export class RpcSupervisor {
   }
 
   private receiveRpcEvent(event: unknown): void {
+    if (this.deferDuringFinalDelivery(() => this.receiveRpcEvent(event))) return;
     if (this.phase !== "ready") return;
     if (!isRecord(event) || typeof event.type !== "string") {
       this.failRuntime("invalid_rpc_event");
@@ -1427,6 +1478,7 @@ export class RpcSupervisor {
     fault: RpcSupervisorTransportFault | RpcSupervisorChannelFault,
     source: "rpc" | "supervisor",
   ): void {
+    if (this.deferDuringFinalDelivery(() => this.receiveTransportFault(fault, source))) return;
     if (this.phase === "starting") {
       this.recordStartupFault(fault);
       return;
@@ -1444,6 +1496,7 @@ export class RpcSupervisor {
 
   /** 父端只接受监督协议已脱敏的生命周期事实，并按当前代际提交。 */
   private receiveSupervisorEvent(event: SupervisorEvent): void {
+    if (this.deferDuringFinalDelivery(() => this.receiveSupervisorEvent(event))) return;
     if (this.phase !== "ready" && this.phase !== "starting") return;
     const expectedGeneration = event.expected_generation;
     if (typeof expectedGeneration !== "number" || !Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) {
@@ -1481,6 +1534,7 @@ export class RpcSupervisor {
 
   /** 完整快照先由通道校验，再由树控制器在一个修订中合并。 */
   private receiveSupervisorSnapshot(snapshot: SupervisorSnapshot): void {
+    if (this.deferDuringFinalDelivery(() => this.receiveSupervisorSnapshot(snapshot))) return;
     if (this.phase !== "ready" && this.phase !== "starting") return;
     const applySnapshot = this.options.controller.applySubtreeSnapshot;
     if (typeof applySnapshot !== "function") return;
@@ -1645,9 +1699,36 @@ export class RpcSupervisor {
     this.signalCompactionStateChange();
   }
 
+  private deferDuringFinalDelivery(operation: () => void): boolean {
+    if (!this.finalDeliveryInProgress) return false;
+    this.deferredFinalDeliveryOperations.push(operation);
+    return true;
+  }
+
+  private flushDeferredFinalDeliveryOperations(): void {
+    const operations = this.deferredFinalDeliveryOperations.splice(0);
+    for (const operation of operations) {
+      try {
+        operation();
+      } catch {
+        this.failRuntime("supervisor_protocol_fault");
+      }
+    }
+  }
+
   private enqueueMessage(message: string): Promise<RpcSupervisorCommandResult> {
     if (this.phase !== "ready" || typeof message !== "string" || message.length === 0) {
       return Promise.resolve(Object.freeze({ ok: false, code: "agent_unavailable" }));
+    }
+    if (this.finalDeliveryInProgress) {
+      return new Promise<RpcSupervisorCommandResult>((resolve) => {
+        this.deferredFinalDeliveryOperations.push(() => {
+          void this.enqueueMessage(message).then(
+            resolve,
+            () => resolve(Object.freeze({ ok: false, code: "agent_unavailable" })),
+          );
+        });
+      });
     }
     let submission: ReturnType<AgentTaskMailbox["submit"]>;
     try {

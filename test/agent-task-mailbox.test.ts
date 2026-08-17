@@ -215,6 +215,36 @@ test("协调完成声明 continuation 时，屏障前消息等待真实 start �
   assert.equal(resumed?.mode, "steer");
 });
 
+test("协调 complete 后等待 continuation start 时接纳消息仍归当前任务", () => {
+  const value = mailbox();
+  const current = value.submit("进入协调压缩的任务");
+  const initial = value.takeNextDelivery();
+  assert.equal(value.hostAccepted(initial!.delivery_id), true);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
+
+  assert.equal(value.beginCoordinationBarrier("compact-awaiting-start"), true);
+  assert.equal(value.observeAgentSettled(), "candidate");
+  value.observeCompactionStart("manual", true);
+  value.observeCompactionEnd("manual", false, false, true);
+  assert.equal(value.completeCoordinationBarrier(
+    "compact-awaiting-start",
+    "succeeded",
+    true,
+  ), true);
+
+  const queued = value.submit("complete 后补充的消息");
+  assert.equal(queued.task_id, current.task_id);
+  assert.equal(value.takeNextDelivery(), undefined);
+
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_2), true);
+  const resumed = value.takeNextDelivery();
+  assert.equal(resumed?.message_id, queued.message_id);
+  assert.equal(resumed?.task_id, current.task_id);
+  assert.equal(resumed?.mode, "steer");
+});
+
 test("协调 continuation 中已入队并消费的 steer 不被旧 settled 降级", () => {
   const value = mailbox();
   const current = value.submit("进入协调压缩的任务");
@@ -342,6 +372,31 @@ test("直接边准备把 delivery uncertainty 与维护失败标记为 unsafe", 
   failed.observeCompactionEnd("overflow", true);
   assert.equal(failed.beginCoordinationBarrier("compact-failed"), true);
   assert.equal(failed.coordinationBarrierReadiness(), "unsafe");
+});
+
+test("旧 final commit 后重放的 manual 压缩允许期间新任务在 end 后 prompt", () => {
+  const value = mailbox();
+  const current = value.submit("即将完成的任务");
+  const first = value.takeNextDelivery();
+  assert.ok(first);
+  assert.equal(value.hostAccepted(first.delivery_id), true);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
+  const candidate = final(current.task_id, TURN_1, COMMIT_1);
+  assert.equal(value.observeAgentSettled(), "candidate");
+  assert.equal(value.prepareFinal(candidate), true);
+  assert.equal(value.commitPreparedFinal(COMMIT_1), true);
+
+  value.observeCompactionStart("manual");
+  const next = value.submit("压缩结束后的新任务");
+  assert.notEqual(next.task_id, current.task_id);
+  assert.equal(value.takeNextDelivery(), undefined);
+  value.observeCompactionEnd("manual", false);
+
+  const prompt = value.takeNextDelivery();
+  assert.equal(prompt?.message_id, next.message_id);
+  assert.equal(prompt?.task_id, next.task_id);
+  assert.equal(prompt?.mode, "prompt");
 });
 
 test("native 压缩不猜测续跑，在新的真实 start 前不投递 mailbox", () => {
@@ -503,6 +558,83 @@ test("prompt 命令尾部晚于 task_started 与 final 时，成功或拒绝都�
     assert.equal(value.projection().state, "idle");
     assert.equal(value.projection().last_task?.outcome, "completed");
   }
+});
+
+test("未获父端接纳的 prepared final 仍可由 continuation 消息撤销", () => {
+  const value = mailbox();
+  const current = value.submit("当前任务");
+  const prompt = value.takeNextDelivery();
+  assert.ok(prompt);
+  assert.equal(value.hostAccepted(prompt.delivery_id), true);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
+
+  const candidate = final(current.task_id, TURN_1, COMMIT_1);
+  assert.equal(value.observeAgentSettled(), "candidate");
+  assert.equal(value.prepareFinal(candidate), true);
+  const progress = value.submit("final 未获接纳时继续任务");
+  assert.equal(progress.task_id, current.task_id);
+
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_2), true);
+  assert.equal(value.isSupersededFinal(candidate), true);
+  const steer = value.takeNextDelivery();
+  assert.equal(steer?.message_id, progress.message_id);
+  assert.equal(steer?.task_id, current.task_id);
+  assert.equal(steer?.mode, "steer");
+});
+
+test("provisional settled 后接纳的消息在 continuation start 后仍进入当前任务", () => {
+  const value = mailbox();
+  const current = value.submit("当前任务");
+  const prompt = value.takeNextDelivery();
+  assert.ok(prompt);
+  assert.equal(value.hostAccepted(prompt.delivery_id), true);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
+
+  assert.equal(value.observeAgentSettled(), "candidate");
+  const progress = value.submit("继续汇报进度");
+  assert.equal(progress.task_id, current.task_id);
+
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_2), true);
+  const steer = value.takeNextDelivery();
+  assert.equal(steer?.message_id, progress.message_id);
+  assert.equal(steer?.task_id, current.task_id);
+  assert.equal(steer?.mode, "steer");
+  assert.equal(value.hostAccepted(steer!.delivery_id), true);
+  assert.deepEqual(value.projection(), {
+    state: "working",
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
+    activity: { phase: "processing", task_id: current.task_id },
+  });
+});
+
+test("已接纳 final 被 blocker 暂缓时解除后只继续本地 commit", () => {
+  const value = mailbox();
+  const current = value.submit("当前任务");
+  const prompt = value.takeNextDelivery();
+  assert.ok(prompt);
+  assert.equal(value.hostAccepted(prompt.delivery_id), true);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
+
+  const candidate = final(current.task_id, TURN_1, COMMIT_1);
+  assert.equal(value.observeAgentSettled(), "candidate");
+  assert.equal(value.prepareFinal(candidate), true);
+  assert.equal(value.beginPreparedFinalDelivery(COMMIT_1), "deliver");
+  value.observeCompactionStart("manual");
+  assert.equal(value.completePreparedFinalDelivery(COMMIT_1, true), true);
+  assert.equal(value.commitPreparedFinal(COMMIT_1), false);
+
+  value.observeCompactionEnd("manual", false);
+  assert.equal(value.prepareFinal(candidate), true);
+  assert.equal(value.beginPreparedFinalDelivery(COMMIT_1), "commit");
+  assert.equal(value.commitPreparedFinal(COMMIT_1), true);
+  assert.equal(value.projection().last_task?.commit_id, COMMIT_1);
 });
 
 test("final 在 settlement 前只能 prepare，父端接纳与 settlement 都满足后才能 commit", () => {

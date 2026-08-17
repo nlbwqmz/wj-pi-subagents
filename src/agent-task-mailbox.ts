@@ -56,6 +56,8 @@ interface CurrentTask {
   readonly origin: "assigned" | "automatic";
 }
 
+type PreparedFinalDeliveryState = "prepared" | "delivering" | "accepted";
+
 const MAX_ID_GENERATION_ATTEMPTS = 32;
 
 /**
@@ -73,6 +75,7 @@ export class AgentTaskMailbox {
   private successorTaskId: string | undefined;
   private inFlight: AgentHostDelivery | undefined;
   private preparedFinal: ChildFinalEnvelope | undefined;
+  private preparedFinalDeliveryState: PreparedFinalDeliveryState | undefined;
   private lastTask: AgentLastTask | undefined;
   private state: AgentTaskProjection["state"] = "idle";
   private phase: AgentActivitySummary["phase"] | undefined;
@@ -132,7 +135,7 @@ export class AgentTaskMailbox {
     // 会让 child 在 quarantine 内作废旧 candidate。
     if (this.settlementObserved) {
       this.settlementObserved = false;
-      this.preparedFinal = undefined;
+      this.clearPreparedFinal();
       this.replyOutboxPendingCount = 0;
       this.clearCoordinatedSettlementWork();
       task.hostStarted = false;
@@ -220,7 +223,7 @@ export class AgentTaskMailbox {
     }
     task.hostStarted = false;
     this.settlementObserved = false;
-    this.preparedFinal = undefined;
+    this.clearPreparedFinal();
     this.replyOutboxPendingCount = 0;
     this.awaitingPromptStart = false;
     if (!this.interruptBarrier) this.state = "working";
@@ -279,7 +282,7 @@ export class AgentTaskMailbox {
     } else {
       if (current.turnId !== undefined && current.turnId !== turnId) {
         this.rememberStaleFinalTurn(current.turnId);
-        this.preparedFinal = undefined;
+        this.clearPreparedFinal();
         this.replyOutboxPendingCount = 0;
       }
       current.turnId = turnId;
@@ -330,7 +333,7 @@ export class AgentTaskMailbox {
     if (!coordinatedContinuation && this.coordinationBarriers.size === 0) {
       this.clearCoordinatedSettlementWork();
     }
-    this.preparedFinal = undefined;
+    this.clearPreparedFinal();
     this.replyOutboxPendingCount = 0;
     if (this.deliveryUncertain || this.maintenanceFailed) {
       this.applySuspendedBarrier();
@@ -347,7 +350,7 @@ export class AgentTaskMailbox {
   observeAgentSettled(): "candidate" | "superseded" {
     if (this.awaitingRetryStart) {
       this.settlementObserved = false;
-      this.preparedFinal = undefined;
+      this.clearPreparedFinal();
       this.replyOutboxPendingCount = 0;
       if (this.deliveryUncertain || this.maintenanceFailed) this.applySuspendedBarrier();
       else {
@@ -360,7 +363,7 @@ export class AgentTaskMailbox {
     const promptStartUnconfirmed = this.awaitingPromptStart;
     this.awaitingPromptStart = false;
     if (promptStartUnconfirmed) {
-      this.preparedFinal = undefined;
+      this.clearPreparedFinal();
       this.replyOutboxPendingCount = 0;
       this.markDeliveryUncertain();
       return "superseded";
@@ -379,7 +382,7 @@ export class AgentTaskMailbox {
     this.currentTask.hostStarted = false;
     if (this.hostPendingCount > 0) {
       this.settlementObserved = false;
-      this.preparedFinal = undefined;
+      this.clearPreparedFinal();
       this.replyOutboxPendingCount = 0;
       if (this.inFlight?.mode === "steer" && this.hostQueueObservedSince(this.inFlight)) {
         this.currentTask.hostStarted = true;
@@ -491,7 +494,7 @@ export class AgentTaskMailbox {
     this.awaitingRetryStart = !failed && willRetry;
     if (failed || willRetry) {
       this.settlementObserved = false;
-      this.preparedFinal = undefined;
+      this.clearPreparedFinal();
       this.replyOutboxPendingCount = 0;
     }
     if (failed) {
@@ -517,7 +520,9 @@ export class AgentTaskMailbox {
         return;
       }
       if (!this.interruptBarrier) this.state = "working";
-      this.phase = this.preparedFinal === undefined ? "finalizing" : "waiting_parent_ack";
+      this.phase = !this.settlementObserved && this.preparedFinal === undefined
+        ? "reconciling"
+        : this.preparedFinal === undefined ? "finalizing" : "waiting_parent_ack";
       this.reconcileCoordinatedSettlementWork();
       return;
     }
@@ -570,6 +575,7 @@ export class AgentTaskMailbox {
       current.turnId = final.turn_id;
     }
     this.preparedFinal = final;
+    this.preparedFinalDeliveryState = "prepared";
     this.replyOutboxPendingCount = 1;
     if (this.finalCommitBlocked()) return false;
     if (this.state === "idle") this.state = "working";
@@ -590,6 +596,24 @@ export class AgentTaskMailbox {
       && !this.mailbox.some((entry) => entry.taskId === task.taskId);
   }
 
+  /** 在 final 注入回调前固定重入路由；已接纳重试只需继续本地 commit。 */
+  beginPreparedFinalDelivery(commitId: string): "deliver" | "commit" | undefined {
+    if (this.preparedFinal?.commit_id !== commitId) return undefined;
+    if (this.preparedFinalDeliveryState === "accepted") return "commit";
+    if (this.preparedFinalDeliveryState !== "prepared" || !this.canCommitPreparedFinal()) return undefined;
+    this.preparedFinalDeliveryState = "delivering";
+    return "deliver";
+  }
+
+  completePreparedFinalDelivery(commitId: string, accepted: boolean): boolean {
+    if (
+      this.preparedFinal?.commit_id !== commitId
+      || this.preparedFinalDeliveryState !== "delivering"
+    ) return false;
+    this.preparedFinalDeliveryState = accepted ? "accepted" : "prepared";
+    return true;
+  }
+
   commitPreparedFinal(commitId: string): boolean {
     const final = this.preparedFinal;
     if (final === undefined || final.commit_id !== commitId || !this.canCommitPreparedFinal()) return false;
@@ -604,7 +628,7 @@ export class AgentTaskMailbox {
           : "interrupted",
       output_state: final.output_state,
     });
-    this.preparedFinal = undefined;
+    this.clearPreparedFinal();
     this.currentTask = undefined;
     this.settlementObserved = false;
     this.interruptBarrier = false;
@@ -741,6 +765,7 @@ export class AgentTaskMailbox {
       this.currentTask = { taskId, hostStarted: false, origin: "assigned" };
       return taskId;
     }
+    if (this.successorTaskId !== undefined) return this.successorTaskId;
     if (!this.interruptBarrier && !this.settlementObserved) {
       if (this.coordinationBarriers.size > 0) {
         this.coordinatedSettlementWorkPending = true;
@@ -748,10 +773,31 @@ export class AgentTaskMailbox {
       }
       return current.taskId;
     }
-    if (!this.interruptBarrier && this.coordinationBarriers.size > 0) {
+    if (
+      !this.interruptBarrier
+      && this.settlementObserved
+      && this.preparedFinalDeliveryState !== "delivering"
+      && this.preparedFinalDeliveryState !== "accepted"
+      && !this.finalCommitBlocked()
+    ) {
+      // raw settled 和未获父端接纳的 final 都仍可由当前逻辑任务撤销；
+      // 提前分配 successor 会让后续 continuation 无法取得该 mailbox 项。
+      this.replyOutboxPendingCount = 0;
+      this.phase = "reconciling";
+      return current.taskId;
+    }
+    if (
+      !this.interruptBarrier
+      && (this.coordinationBarriers.size > 0 || this.awaitingCoordinatedContinuationStart)
+    ) {
       // 协调压缩中的 raw settlement 不是逻辑任务终点；保持已返回 task_id
       // 稳定，并等待压缩结束或真实 continuation start 后再投递。
       this.coordinatedSettlementWorkPending = true;
+      if (
+        this.awaitingCoordinatedContinuationStart
+        && this.coordinatedPhysicalLifecycleObserved
+        && !this.compactionActive
+      ) this.coordinatedCompactionResolved = true;
       this.phase = this.compactionActive ? "compacting" : "reconciling";
       return current.taskId;
     }
@@ -811,7 +857,7 @@ export class AgentTaskMailbox {
   private reconcileAcceptedSteer(delivery: AgentHostDelivery): void {
     this.awaitingPromptStart = false;
     this.settlementObserved = false;
-    this.preparedFinal = undefined;
+    this.clearPreparedFinal();
     this.replyOutboxPendingCount = 0;
     if (this.deliveryUncertainTaskId === delivery.task_id) {
       this.deliveryUncertain = false;
@@ -851,6 +897,11 @@ export class AgentTaskMailbox {
     this.coordinatedContinuationStarted = false;
     if (!this.interruptBarrier) this.state = "working";
     this.phase = "reconciling";
+  }
+
+  private clearPreparedFinal(): void {
+    this.preparedFinal = undefined;
+    this.preparedFinalDeliveryState = undefined;
   }
 
   private clearCoordinatedSettlementWork(): void {
