@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   Markdown,
   truncateToWidth,
@@ -34,7 +35,14 @@ export interface ParentConversationApi {
 
 export interface ParentReplyInboxOptions {
   readonly readApi: () => ParentConversationApi;
-  readonly notifyMessage: (agentId: string) => void;
+  readonly notifyMessage: (
+    agentId: string,
+    notificationId: string,
+    taskId: string,
+    turnId: string,
+  ) => void;
+  /** 父模型上下文观察 custom message 后确认对应工作中通知。 */
+  readonly acknowledgeMessage?: (agentId: string, notificationId: string) => void;
   /** 只返回当前控制器确认的直接子代理名称。 */
   readonly readSenderName?: (agentId: string) => string | undefined;
 }
@@ -86,7 +94,13 @@ export interface ParentReplyMessageRendererOptions {
  */
 export class ParentReplyInbox {
   private readApi!: () => ParentConversationApi;
-  private notifyMessage!: (agentId: string) => void;
+  private notifyMessage!: (
+    agentId: string,
+    notificationId: string,
+    taskId: string,
+    turnId: string,
+  ) => void;
+  private acknowledgeMessage: ((agentId: string, notificationId: string) => void) | undefined;
   private readSenderName: ((agentId: string) => string | undefined) | undefined;
   private turnTriggerState: "open" | "blocked" | "failed" = "open";
   private turnTriggerBlockToken = Symbol("turn-trigger-block");
@@ -102,7 +116,35 @@ export class ParentReplyInbox {
   rebind(options: ParentReplyInboxOptions): void {
     this.readApi = options.readApi;
     this.notifyMessage = options.notifyMessage;
+    this.acknowledgeMessage = options.acknowledgeMessage;
     this.readSenderName = options.readSenderName;
+  }
+
+  /** 在 Pi 的 context 事件中确认已经进入父模型请求的工作中消息。 */
+  observeContext(event: unknown): void {
+    const messages = readProperty(event, "messages");
+    if (!Array.isArray(messages)) return;
+    for (const message of messages) {
+      const record = readRecord(message);
+      if (
+        record === undefined
+        || readProperty(record, "role") !== "custom"
+        || readProperty(record, "customType") !== WJ_PI_SUBAGENTS_MESSAGE_TYPE
+      ) continue;
+      const details = readRecord(readProperty(record, "details"));
+      const agentId = readProperty(details, "agent_id");
+      const notificationId = readProperty(details, "reply_notification_id");
+      if (
+        readProperty(details, "kind") !== "message"
+        || !isCanonicalUuid(agentId)
+        || !validNotificationId(notificationId)
+      ) continue;
+      try {
+        this.acknowledgeMessage?.(agentId, notificationId);
+      } catch {
+        // 上下文观察失败不影响已经接纳的会话消息；控制器可在后续事件重试。
+      }
+    }
   }
 
   /** Pi 即将结束当前 loop 时先阻止后代回复重入；重复调用返回同一屏障令牌。 */
@@ -173,6 +215,7 @@ export class ParentReplyInbox {
       || (this.childCompactionBarriers.get(agentId)?.size ?? 0) > 0
     ) return false;
     const senderName = this.safeReadSenderName(agentId);
+    const notificationId = envelope.kind === "message" ? randomUUID() : undefined;
     try {
       this.readApi().sendMessage({
         customType: envelope.kind === "message" ? WJ_PI_SUBAGENTS_MESSAGE_TYPE : WJ_PI_SUBAGENTS_FINAL_TYPE,
@@ -181,6 +224,7 @@ export class ParentReplyInbox {
         details: {
           agent_id: agentId,
           kind: envelope.kind,
+          ...(notificationId === undefined ? {} : { reply_notification_id: notificationId }),
           ...(envelope.kind === "final"
             ? { run_state: envelope.run_state, output_state: envelope.output_state }
             : {}),
@@ -195,7 +239,7 @@ export class ParentReplyInbox {
     }
     if (envelope.kind === "message") {
       try {
-        this.notifyMessage(agentId);
+        this.notifyMessage(agentId, notificationId!, envelope.task_id, envelope.turn_id);
       } catch {
         // 会话消息已经被接纳，等待观察者失败不能导致重复注入。
       }
@@ -522,6 +566,13 @@ function readMessageText(value: unknown): string {
 
 function validCompactionTransactionId(value: string): boolean {
   return typeof value === "string" && value.length > 0 && value.length <= 256;
+}
+
+function validNotificationId(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= 128
+    && /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(value);
 }
 
 function readRecord(value: unknown): Record<string, unknown> | undefined {

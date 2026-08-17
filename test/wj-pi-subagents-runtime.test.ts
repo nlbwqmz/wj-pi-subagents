@@ -1831,12 +1831,42 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
     assert.equal(progressEnvelope.agent_id, parentId);
     assert.equal(progressEnvelope.text, "正在继续工作");
   }
-  assert.deepEqual((rootApi.sentMessages[0]!.message as { details: unknown }).details, {
+  const progressMessage = rootApi.sentMessages[0]!.message as {
+    readonly customType: string;
+    readonly content: unknown;
+    readonly details: Record<string, unknown>;
+  };
+  assert.deepEqual({
+    agent_id: progressMessage.details.agent_id,
+    kind: progressMessage.details.kind,
+    sender_name: progressMessage.details.sender_name,
+  }, {
     agent_id: parentId,
     kind: "message",
     sender_name: "递归父代理",
   });
+  assert.match(String(progressMessage.details.reply_notification_id), /^[0-9a-f-]{36}$/);
   assert.deepEqual(rootApi.sentMessages[0]!.options, { triggerTurn: true, deliverAs: "steer" });
+  await rootApi.emit("context", {
+    type: "context",
+    messages: [{
+      role: "custom",
+      customType: progressMessage.customType,
+      content: progressMessage.content,
+      display: true,
+      details: progressMessage.details,
+      timestamp: Date.now(),
+    }],
+  }, rootContext);
+  let observedProgressWaitFinished = false;
+  const waitingAfterObservedProgress = execute(rootApi, "wait_agent", {
+    agent_ids: [parentId],
+  }, rootContext).then((result) => {
+    observedProgressWaitFinished = true;
+    return result as { details?: Record<string, unknown> };
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(observedProgressWaitFinished, false);
 
   const progressRenderer = rootApi.messageRenderers.get("wj-pi-subagents-message");
   assert.ok(progressRenderer);
@@ -1859,6 +1889,8 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(rootApi.sentMessages.length, 2);
+  const observedProgressWait = await waitingAfterObservedProgress;
+  assert.equal(observedProgressWait.details?.outcome, "task_completed");
   const parentFinalEnvelope = readSentReply(rootApi.sentMessages[1]!);
   assert.equal(parentFinalEnvelope.kind, "final");
   if (parentFinalEnvelope.kind === "final") {
@@ -1884,6 +1916,10 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
     new RegExp(`Sender: 递归父代理 · ${parentId}`),
   );
   assert.doesNotMatch(JSON.stringify(rootApi.sentMessages), /SECRET_CHILD_THINKING|SECRET_CALL/);
+  const completedAfterObservedReply = await execute(rootApi, "wait_agent", {
+    agent_ids: [parentId],
+  }, rootContext) as { details?: Record<string, unknown> };
+  assert.equal(completedAfterObservedReply.details?.outcome, "task_completed");
 
   const grandchildSpawn = execute(childApi, "spawn_agent", {
     template_id: "researcher",
@@ -2030,12 +2066,7 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   assert.equal(parentStatus.ok, true);
   if (parentStatus.ok) assert.equal(parentStatus.data.state, "working");
 
-  const queuedProgress = await execute(rootApi, "wait_agent", {
-    agent_ids: [parentId],
-    timeout_ms: 10_000,
-  }, rootContext) as { details?: Record<string, unknown> };
-  assert.equal(queuedProgress.details?.outcome, "reply");
-
+  // 旧 progress 已经进入前一轮父上下文，不应再次作为 reply 立即返回。
   let waitFinished = false;
   const waitingForNewTurn = execute(rootApi, "wait_agent", {
     agent_ids: [parentId],

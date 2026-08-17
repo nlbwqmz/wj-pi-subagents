@@ -775,9 +775,11 @@ const RENDER_THEME = Object.freeze({
 test("父端 inbox 对所有工作中回复和 final 使用完整唤醒矩阵", () => {
   const sent: Array<{ message: unknown; options: unknown }> = [];
   const notified: string[] = [];
+  const observed: string[] = [];
   const inbox = new ParentReplyInbox({
     readApi: () => ({ sendMessage: (message, options) => sent.push({ message, options }) }),
     notifyMessage: (agentId) => notified.push(agentId),
+    acknowledgeMessage: (agentId, notificationId) => observed.push(`${agentId}:${notificationId}`),
   });
   const firstMessage = messageEnvelope("第一条工作中回复");
   const secondMessage = messageEnvelope("第二条工作中回复");
@@ -800,8 +802,23 @@ test("父端 inbox 对所有工作中回复和 final 使用完整唤醒矩阵", 
     { triggerTurn: true, deliverAs: "steer" },
   ]);
   assert.deepEqual(notified, [AGENT_ID, AGENT_ID]);
-  const firstText = (sent[0]!.message as { content: Array<{ text: string }> }).content[0]!.text;
+  const firstSentMessage = sent[0]!.message as {
+    readonly customType: string;
+    readonly content: unknown;
+    readonly details: Record<string, unknown>;
+  };
+  const firstText = (firstSentMessage.content as Array<{ text: string }>)[0]!.text;
   assert.deepEqual(JSON.parse(firstText), firstMessage);
+  assert.match(String(firstSentMessage.details.reply_notification_id), /^[0-9a-f-]{36}$/);
+  inbox.observeContext({
+    messages: [{
+      role: "custom",
+      customType: firstSentMessage.customType,
+      content: firstSentMessage.content,
+      details: firstSentMessage.details,
+    }],
+  });
+  assert.equal(observed.length, 1);
   assert.equal((sent[2]!.message as { content: unknown[] }).content.length, 1);
   const terminal = JSON.parse(
     (sent[3]!.message as { content: Array<{ text: string }> }).content[0]!.text,

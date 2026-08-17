@@ -756,6 +756,12 @@ export function createWjPiSubagentsRuntimeActivator(
       };
     });
 
+    api.on("context", (event) => {
+      const current = active;
+      if (current === undefined || current.handoffPending === true) return;
+      current.replyInbox.observeContext(event);
+    });
+
     api.on("agent_start", () => {
       const current = active;
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
@@ -1149,9 +1155,14 @@ export function createWjPiSubagentsRuntimeActivator(
           if (current === undefined) throw new Error("父会话尚未就绪");
           return current.bindings.api;
         },
-        // wait_agent 的 reply 通知由 RpcSupervisor 已接纳事件统一登记，避免
-        // 同一 message 在注入层和监督事件层各计数一次。
-        notifyMessage: () => {},
+        // 工作中 reply 在 custom message 被 Pi 会话接纳时登记；之后由 context
+        // 事件确认是否真正进入父模型请求，避免监督事件和注入层重复计数。
+        notifyMessage: (agentId, notificationId, taskId, turnId) => {
+          stateReference?.controller.notifyAgentReply(agentId, notificationId, taskId, turnId);
+        },
+        acknowledgeMessage: (agentId, notificationId) => {
+          stateReference?.controller.acknowledgeAgentReply(agentId, notificationId);
+        },
         readSenderName: (agentId) => readDirectChildDisplayName(stateReference, agentId, false),
       });
       const replyCoordinator = upstream === undefined
@@ -1231,6 +1242,7 @@ export function createWjPiSubagentsRuntimeActivator(
         activeTools: () => activeBusinessTools(state.bindings.api),
         waitTimeoutMs: rootRuntime.config.waitTimeoutMs,
         onTerminal: (agentId) => state.replyInbox.acceptTerminal(agentId),
+        replyNotificationsHandledByInbox: true,
         authority,
       });
       state.controller = controller;

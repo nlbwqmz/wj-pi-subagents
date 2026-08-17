@@ -297,7 +297,7 @@ test("工作中 reply 通知立即唤醒 wait_agent 且不改变子代理生命�
   if (!spawned.ok) return;
   assert.equal((await controller.sendMessage({ agent_id: id, message: "开始" })).ok, true);
   const waiting = controller.waitAgents({ agent_ids: [id] });
-  assert.equal(controller.notifyAgentReply(id), true);
+  assert.equal(controller.notifyAgentReply(id, "reply-notification-1"), true);
   const result = await waiting;
   assert.equal(result.ok, true);
   if (result.ok) {
@@ -307,14 +307,105 @@ test("工作中 reply 通知立即唤醒 wait_agent 且不改变子代理生命�
   const status = controller.getAgentStatus(id);
   assert.equal(status.ok && status.data.state, "working");
 
-  assert.equal(controller.notifyAgentReply(id), true);
+  assert.equal(controller.acknowledgeAgentReply(id, "reply-notification-1"), true);
+  assert.equal(controller.notifyAgentReply(id, "reply-notification-2"), true);
   const queued = await controller.waitAgents({ agent_ids: [id] });
   assert.equal(queued.ok, true);
   if (queued.ok) {
     assert.equal(queued.data.outcome, "reply");
     assert.equal(queued.data.state, "working");
   }
+  assert.equal(controller.acknowledgeAgentReply(id, "reply-notification-2"), true);
   node?.emitEvent({ type: "agent_settled" });
+  await controller.shutdown();
+});
+
+test("已进入父模型上下文的 reply 不会再次唤醒后续 wait", async () => {
+  const id = "48484848-4848-4484-8484-484848484848";
+  const tree = makeTree(id);
+  let node: FakeManagedRpcNode | undefined;
+  const controller = new AgentController({
+    tree,
+    allowUnvalidatedTemplates: true,
+    createSupervisor: ({ actor, reservation }) => {
+      node = new FakeManagedRpcNode();
+      return new RpcSupervisor({
+        controller: tree,
+        actor,
+        reservation,
+        managedNode: node,
+        channel: new ReadyChannel(),
+        startupTimeoutMs: 100,
+        gracefulShutdownMs: 10,
+      });
+    },
+  });
+  const spawned = await controller.spawnAgent({ template_id: "researcher", name: "已观察回复代理" });
+  assert.equal(spawned.ok, true);
+  if (!spawned.ok) return;
+  assert.equal((await controller.sendMessage({ agent_id: id, message: "开始" })).ok, true);
+
+  assert.equal(controller.notifyAgentReply(id, "observed-reply"), true);
+  assert.equal(controller.acknowledgeAgentReply(id, "observed-reply"), true);
+  const abort = new AbortController();
+  const waiting = controller.waitAgents({ agent_ids: [id] }, abort.signal);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  abort.abort();
+  const aborted = await waiting;
+  assert.equal(aborted.ok, false);
+  if (!aborted.ok) assert.equal(aborted.error.code, "agent_unavailable");
+
+  assert.equal(controller.notifyAgentReply(id, "new-reply"), true);
+  const next = await controller.waitAgents({ agent_ids: [id] });
+  assert.equal(next.ok, true);
+  if (next.ok) assert.equal(next.data.outcome, "reply");
+  assert.equal(controller.acknowledgeAgentReply(id, "new-reply"), true);
+  node?.emitEvent({ type: "agent_settled" });
+  await controller.shutdown();
+});
+
+test("任务 final 到达后不会被尚未观察的旧 reply 遮挡", async () => {
+  const id = "49494949-4949-4494-8494-494949494949";
+  const tree = makeTree(id);
+  let node: FakeManagedRpcNode | undefined;
+  let supervisor: RpcSupervisor | undefined;
+  const controller = new AgentController({
+    tree,
+    allowUnvalidatedTemplates: true,
+    createSupervisor: ({ actor, reservation }) => {
+      node = new FakeManagedRpcNode();
+      supervisor = new RpcSupervisor({
+        controller: tree,
+        actor,
+        reservation,
+        managedNode: node,
+        channel: new ReadyChannel(),
+        startupTimeoutMs: 100,
+        gracefulShutdownMs: 10,
+      });
+      return supervisor;
+    },
+  });
+  const spawned = await controller.spawnAgent({ template_id: "researcher", name: "final 优先代理" });
+  assert.equal(spawned.ok, true);
+  if (!spawned.ok || node === undefined || supervisor === undefined) return;
+  const submitted = await controller.sendMessage({ agent_id: id, message: "开始" });
+  assert.equal(submitted.ok, true);
+  if (!submitted.ok) return;
+  node.emitEvent({ type: "agent_start" });
+  const taskStarted = TEST_TURN_ID;
+  const oldReply = controller.notifyAgentReply(id, "old-reply", submitted.data.task_id, taskStarted);
+  assert.equal(oldReply, true);
+  node.emitEvent({ type: "agent_settled" });
+  assert.equal(supervisor.acceptChildReply(
+    interruptedFinal(id, submitted.data.task_id),
+    () => true,
+  ), true);
+
+  const result = await controller.waitAgents({ agent_ids: [id] });
+  assert.equal(result.ok, true);
+  if (result.ok) assert.equal(result.data.outcome, "task_interrupted");
+  assert.equal(controller.acknowledgeAgentReply(id, "old-reply"), false);
   await controller.shutdown();
 });
 
@@ -401,6 +492,7 @@ test("运行时故障先注入 terminal 通知再解除 wait_agent", async () =>
   const spawned = await controller.spawnAgent({ template_id: "researcher", name: "故障代理" });
   assert.equal(spawned.ok, true);
   assert.equal((await controller.sendMessage({ agent_id: id, message: "开始" })).ok, true);
+  assert.equal(controller.notifyAgentReply(id, "stale-terminal-reply"), true);
   const waiting = controller.waitAgents({ agent_ids: [id] });
   node?.emitTransportFault("eof");
   const result = await waiting;
@@ -413,6 +505,9 @@ test("运行时故障先注入 terminal 通知再解除 wait_agent", async () =>
     assert.equal("text" in result.data, false);
     assert.equal("final" in result.data, false);
   }
+  const repeated = await controller.waitAgents({ agent_ids: [id] });
+  assert.equal(repeated.ok, true);
+  if (repeated.ok) assert.equal(repeated.data.outcome, "terminal");
   await controller.shutdown();
 });
 

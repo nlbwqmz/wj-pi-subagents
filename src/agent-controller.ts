@@ -100,6 +100,8 @@ export interface AgentControllerOptions {
   ) => void;
   /** 节点故障通知必须在 terminal waiter 解除前同步进入父会话；false 表示稍后重试。 */
   readonly onTerminal?: (agentId: string) => boolean | void;
+  /** 生产 inbox 已在消息接纳点登记 reply；避免监督事件再次登记同一通知。 */
+  readonly replyNotificationsHandledByInbox?: boolean;
   /** 生产运行时必须提供根权威端口；省略仅保留旧单节点测试 seam。 */
   readonly authority?: TreeAuthorityPort;
 }
@@ -118,6 +120,14 @@ interface PendingWaiter {
   readonly signal?: AbortSignal;
   readonly abortListener?: () => void;
 }
+
+interface PendingReplyNotification {
+  readonly taskId?: string;
+  readonly turnId?: string;
+  deliveredToWaiter: boolean;
+}
+
+const MAX_PENDING_REPLY_NOTIFICATIONS = 32;
 
 export type WaitAgentEventOutcome =
   | "reply"
@@ -190,13 +200,16 @@ export class AgentController {
   private readonly waitTimeoutMs: number;
   private readonly onReply: AgentControllerOptions["onReply"];
   private readonly onTerminal: AgentControllerOptions["onTerminal"];
+  private readonly replyNotificationsHandledByInbox: boolean;
   private readonly authority: TreeAuthorityPort | undefined;
   private readonly agents = new Map<string, ManagedAgentEntry>();
   /** start 抛出前无法取得公开身份的节点仍需保留内部回收能力。 */
   private readonly unassignedSupervisors = new Map<AgentSupervisor, () => void>();
   private readonly waiters = new Map<string, Set<PendingWaiter>>();
   private readonly pendingWaiters = new Set<PendingWaiter>();
-  private readonly pendingReplyNotifications = new Map<string, number>();
+  /** 已注入但尚未被父模型上下文观察的工作中 reply。 */
+  private readonly pendingReplyNotifications = new Map<string, Map<string, PendingReplyNotification>>();
+  private legacyReplyNotificationSequence = 0;
   private readonly terminalNotifications = new Set<string>();
   private readonly pendingTerminalNotifications = new Set<string>();
   private unsubscribeTreeChange: (() => void) | undefined;
@@ -218,6 +231,7 @@ export class AgentController {
     this.waitTimeoutMs = options.waitTimeoutMs ?? WAIT_AGENT_DEFAULT_TIMEOUT_MS;
     this.onReply = options.onReply;
     this.onTerminal = options.onTerminal;
+    this.replyNotificationsHandledByInbox = options.replyNotificationsHandledByInbox === true;
     this.authority = options.authority;
     if (!validWaitTimeout(this.waitTimeoutMs)) throw new TypeError("默认等待期限无效");
     this.unsubscribeTreeChange = this.tree.onChange(() => this.resolveAllReadyWaiters());
@@ -352,6 +366,7 @@ export class AgentController {
       return controlFailure("message_delivery_failed");
     }
     if (!result.ok) return controlFailure(result.code);
+    this.discardReplyNotificationsForOtherTasks(input.agent_id, result.task_id);
     return Object.freeze({
       ok: true,
       data: Object.freeze({
@@ -415,20 +430,60 @@ export class AgentController {
   }
 
   /** 父端 reply inbox 在工作中消息被 Pi 会话接纳后调用。 */
-  notifyAgentReply(agentId: unknown): boolean {
+  notifyAgentReply(
+    agentId: unknown,
+    notificationId?: unknown,
+    taskId?: unknown,
+    turnId?: unknown,
+  ): boolean {
     if (!isCanonicalUuid(agentId) || !this.agents.has(agentId)) return false;
     const status = this.tree.getStatus(agentId);
-    if (!status.ok || status.data.state === "failed" || status.data.state === "terminating" || status.data.state === "terminated") {
-      return false;
+    if (!status.ok || !canReceiveReplyNotifications(status.data.state)) return false;
+    const id = validReplyNotificationId(notificationId)
+      ? notificationId
+      : this.createLegacyReplyNotificationId();
+    let notifications = this.pendingReplyNotifications.get(agentId);
+    if (notifications === undefined) {
+      notifications = new Map<string, PendingReplyNotification>();
+      this.pendingReplyNotifications.set(agentId, notifications);
     }
+    let notification = notifications.get(id);
+    if (notification === undefined) {
+      if (notifications.size >= MAX_PENDING_REPLY_NOTIFICATIONS) {
+        const evictable = [...notifications.entries()].find(([, candidate]) => candidate.deliveredToWaiter);
+        if (evictable === undefined) {
+          const set = this.waiters.get(agentId);
+          if (set !== undefined && set.size > 0) {
+            const result = Object.freeze({ ok: true as const, data: makeWaitData(status.data, "reply") });
+            for (const waiter of [...set]) this.finishWaiter(waiter, result);
+          }
+          return true;
+        }
+        notifications.delete(evictable[0]);
+      }
+      notification = {
+        ...(typeof taskId === "string" ? { taskId } : {}),
+        ...(typeof turnId === "string" ? { turnId } : {}),
+        deliveredToWaiter: false,
+      };
+      notifications.set(id, notification);
+    }
+    if (notification.deliveredToWaiter) return true;
     const set = this.waiters.get(agentId);
     if (set !== undefined && set.size > 0) {
+      notification.deliveredToWaiter = true;
       const result = Object.freeze({ ok: true as const, data: makeWaitData(status.data, "reply") });
       for (const waiter of [...set]) this.finishWaiter(waiter, result);
-      return true;
     }
-    const pending = this.pendingReplyNotifications.get(agentId) ?? 0;
-    this.pendingReplyNotifications.set(agentId, Math.min(32, pending + 1));
+    return true;
+  }
+
+  /** 父模型上下文已经包含该 custom message 后确认对应通知。 */
+  acknowledgeAgentReply(agentId: unknown, notificationId: unknown): boolean {
+    if (!isCanonicalUuid(agentId) || !validReplyNotificationId(notificationId)) return false;
+    const notifications = this.pendingReplyNotifications.get(agentId);
+    if (notifications === undefined || !notifications.delete(notificationId)) return false;
+    if (notifications.size === 0) this.pendingReplyNotifications.delete(agentId);
     return true;
   }
 
@@ -809,8 +864,15 @@ export class AgentController {
         // 父会话注入失败只影响上行观察者，不破坏节点等待和生命周期。
       }
     }
-    if (event.kind === "reply" && event.reply.kind === "message" && agentId !== undefined) {
-      this.notifyAgentReply(agentId);
+    // 生产运行时由 ParentReplyInbox 在 custom message 被接纳后登记通知；独立
+    // 控制器装配仍从监督事件登记，避免同一消息在两层各计数一次。
+    if (
+      event.kind === "reply"
+      && event.reply.kind === "message"
+      && agentId !== undefined
+      && this.replyNotificationsHandledByInbox === false
+    ) {
+      this.notifyAgentReply(agentId, undefined, event.reply.task_id, event.reply.turn_id);
     }
     if (agentId !== undefined && event.kind === "activity") {
       this.tree.updateActivity(agentId, {
@@ -921,9 +983,12 @@ export class AgentController {
   }
 
   private resolveWaiters(agentId: string): void {
+    const status = this.tree.getStatus(agentId);
+    if (status.ok && !canReceiveReplyNotifications(status.data.state)) {
+      this.pendingReplyNotifications.delete(agentId);
+    }
     const set = this.waiters.get(agentId);
     if (set === undefined) return;
-    const status = this.tree.getStatus(agentId);
     if (!status.ok) {
       for (const waiter of [...set]) this.finishWaiter(waiter, status);
       return;
@@ -986,12 +1051,46 @@ export class AgentController {
   }
 
   private takeReplyNotification(agentId: string, status: AgentSnapshot): WaitAgentData | undefined {
-    const pending = this.pendingReplyNotifications.get(agentId) ?? 0;
-    if (pending <= 0) return undefined;
-    if (pending === 1) this.pendingReplyNotifications.delete(agentId);
-    else this.pendingReplyNotifications.set(agentId, pending - 1);
-    return makeWaitData(status, "reply");
+    if (!canReceiveReplyNotifications(status.state)) {
+      this.pendingReplyNotifications.delete(agentId);
+      return undefined;
+    }
+    const notifications = this.pendingReplyNotifications.get(agentId);
+    if (notifications === undefined) return undefined;
+    for (const notification of notifications.values()) {
+      if (notification.deliveredToWaiter) continue;
+      notification.deliveredToWaiter = true;
+      return makeWaitData(status, "reply");
+    }
+    return undefined;
   }
+
+  private discardReplyNotificationsForOtherTasks(agentId: string, taskId: string): void {
+    const notifications = this.pendingReplyNotifications.get(agentId);
+    if (notifications === undefined) return;
+    for (const [notificationId, notification] of notifications) {
+      if (notification.taskId !== undefined && notification.taskId !== taskId) {
+        notifications.delete(notificationId);
+      }
+    }
+    if (notifications.size === 0) this.pendingReplyNotifications.delete(agentId);
+  }
+
+  private createLegacyReplyNotificationId(): string {
+    this.legacyReplyNotificationSequence += 1;
+    return `legacy-${this.legacyReplyNotificationSequence}`;
+  }
+}
+
+function validReplyNotificationId(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= 128
+    && /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(value);
+}
+
+function canReceiveReplyNotifications(state: AgentSnapshot["state"]): boolean {
+  return state === "working" || state === "interrupting";
 }
 
 function isSpawnInput(value: unknown): value is SpawnAgentInput {
