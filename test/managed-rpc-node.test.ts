@@ -1039,6 +1039,70 @@ test("RpcSupervisor 通过真正 child 端点完成双握手和回复 ACK", asyn
   )), false);
 });
 
+test("Managed RPC final 接纳回调重入发布下一任务时保持帧序和 ACK", async () => {
+  const id = "96969696-9696-4969-8969-969696969696";
+  const credential = "supervisor-credential-0123456789012345";
+  const node = new LinkedManagedNode();
+  let channel!: ManagedRpcSupervisorChannel;
+  let assignment: Promise<void> | undefined;
+  channel = new ManagedRpcSupervisorChannel({
+    node,
+    rootId: "root-managed-reentrant-final",
+    localAgentId: null,
+    peerAgentId: id,
+    parentAgentId: null,
+    depth: 1,
+    credential,
+    requestIdRegistry: new SupervisorRequestIdRegistry(),
+    onReply: () => {
+      assignment = channel.publishTaskAssignmentAndWaitForAck({
+        message_id: "msg_650e8400-e29b-41d4-a716-446655440018",
+        task_id: "650e8400-e29b-41d4-a716-446655440019",
+        mode: "prompt",
+      });
+      return true;
+    },
+  });
+  const signal = new AbortController().signal;
+  try {
+    await channel.bind(signal);
+    await node.start(signal, {
+      supervisor: {
+        root_id: "root-managed-reentrant-final",
+        local_agent_id: id,
+        peer_agent_id: "",
+        parent_agent_id: null,
+        depth: 1,
+        credential,
+        initial_snapshot: [{
+          agent_id: id,
+          parent_agent_id: null,
+          template_id: "researcher",
+          name: "受管重入回复",
+          depth: 1,
+          state: "idle",
+          mailbox_pending_count: 0,
+          host_pending_count: 0,
+          reply_outbox_pending_count: 0,
+          revision: 1,
+        }],
+        initial_subtree_revision: 1,
+      },
+    });
+    await channel.waitForReady(signal);
+
+    await node.publishReply(finalReply(id, "完成并继续下一任务"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.ok(assignment);
+    await assignment;
+    assert.equal(channel.isReady(), true);
+    assert.equal(node.supervisorState(), "ready");
+  } finally {
+    await channel.release();
+    await node.release();
+  }
+});
+
 test("Managed RPC supervisor transport 转发并缓存 child capability manifest", async () => {
   const id = "97979797-9797-4979-8979-979797979797";
   const credential = "supervisor-credential-0123456789012345";

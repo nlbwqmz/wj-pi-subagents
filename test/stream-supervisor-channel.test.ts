@@ -477,6 +477,41 @@ test("child reply 发布等待父端累计 ACK，message 与非空 final 共用�
   await pair.child.release();
 });
 
+test("final 接纳回调重入发布下一任务时保持帧序和 reply ACK", async () => {
+  let pair!: ReturnType<typeof channelPair>;
+  let assignment: Promise<void> | undefined;
+  const assignments: Array<{ readonly task_id: string; readonly mode: string }> = [];
+  pair = channelPair(() => {
+    assignment = pair.parent.publishTaskAssignmentAndWaitForAck({
+      message_id: "msg_650e8400-e29b-41d4-a716-446655440008",
+      task_id: "650e8400-e29b-41d4-a716-446655440009",
+      mode: "prompt",
+    });
+    return true;
+  });
+  pair.child.onTaskAssignment((value) => assignments.push({
+    task_id: value.task_id,
+    mode: value.mode,
+  }));
+  await pair.child.bind(new AbortController().signal);
+  await pair.parent.waitForReady(new AbortController().signal);
+  await pair.child.waitForReady(new AbortController().signal);
+
+  const finalAck = pair.child.publishReplyAndWaitForAck(finalReply("完成并继续下一任务"));
+  await settleIo();
+  assert.ok(assignment);
+  await Promise.all([finalAck, assignment]);
+  assert.deepEqual(assignments, [{
+    task_id: "650e8400-e29b-41d4-a716-446655440009",
+    mode: "prompt",
+  }]);
+  assert.equal(pair.parent.isReady(), true);
+  assert.equal(pair.child.isReady(), true);
+
+  await pair.parent.release();
+  await pair.child.release();
+});
+
 test("reply ACK 等待在协议故障和通道释放时确定失败且不产生未处理拒绝", async () => {
   const faulted = channelPair(() => false);
   await faulted.child.bind(new AbortController().signal);

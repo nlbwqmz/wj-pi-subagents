@@ -354,14 +354,9 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
       this.fail(result.kind === "eof" ? "eof" : "protocol_fault");
       return;
     }
-    const protocolSends: Promise<void>[] = [];
-    if (result.kind === "accepted" || result.kind === "duplicate" || result.kind === "gap") {
-      for (const outbound of result.outbound) {
-        const send = this.sendDirect(outbound);
-        protocolSends.push(send);
-        void send.catch(() => this.fail("protocol_fault"));
-      }
-    }
+    // onReply 在 protocol.receive() 内同步执行，可能先创建下一条业务帧；
+    // 记录边界，确保这些较早分配序号的帧先于本次协议 ACK 写出。
+    const framesBeforeProtocolResponses = this.deferredFrameSends?.length ?? 0;
     if (result.kind === "accepted" && result.event !== undefined) {
       for (const listener of this.events) {
         try {
@@ -414,7 +409,9 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
         waiter.resolve();
       }
     }
-    this.flushDeferredFrameSends();
+    const protocolSends = result.kind === "accepted" || result.kind === "duplicate" || result.kind === "gap"
+      ? this.flushDeferredFrameSends(result.outbound, framesBeforeProtocolResponses)
+      : this.flushDeferredFrameSends([], framesBeforeProtocolResponses);
     if (
       (result.kind === "accepted" || result.kind === "duplicate" || result.kind === "gap")
       && this.isReady()
@@ -447,12 +444,25 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
     return operation;
   }
 
-  private flushDeferredFrameSends(): void {
+  private flushDeferredFrameSends(
+    protocolFrames: readonly SupervisorFrame[],
+    framesBeforeProtocolResponses: number,
+  ): readonly Promise<void>[] {
     const pending = this.deferredFrameSends ?? [];
     this.deferredFrameSends = undefined;
-    for (const item of pending) {
-      void this.sendDirect(item.frame).then(item.completion.resolve, item.completion.reject);
-    }
+    const sendDeferred = (items: typeof pending): void => {
+      for (const item of items) {
+        void this.sendDirect(item.frame).then(item.completion.resolve, item.completion.reject);
+      }
+    };
+    sendDeferred(pending.slice(0, framesBeforeProtocolResponses));
+    const protocolSends = protocolFrames.map((frame) => {
+      const send = this.sendDirect(frame);
+      void send.catch(() => this.fail("protocol_fault"));
+      return send;
+    });
+    sendDeferred(pending.slice(framesBeforeProtocolResponses));
+    return Object.freeze(protocolSends);
   }
 
   private rejectDeferredFrameSends(): void {
