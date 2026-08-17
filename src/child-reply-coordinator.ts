@@ -150,6 +150,15 @@ export class ChildReplyCoordinator {
     return this.coordinationBarriers.size > 0;
   }
 
+  expectsCoordinationContinuation(
+    transactionId: string,
+    outcome: SupervisorCompactionOutcome,
+  ): boolean {
+    return outcome === "succeeded"
+      && this.coordinationBarriers.has(transactionId)
+      && this.finalState === "interrupted";
+  }
+
   awaitsCoordinationContinuation(transactionId: string): boolean {
     return this.awaitingCoordinatedContinuationTransactionId === transactionId;
   }

@@ -20,7 +20,7 @@ import {
 } from "./tree-controller.ts";
 
 /** 父子监督通道与 Pi 任务 RPC 完全隔离的固定协议版本。 */
-export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/11";
+export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/12";
 
 export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "hello",
@@ -130,7 +130,7 @@ export interface SupervisorSnapshot {
 
 export type SupervisorReplyKind = ChildReplyEnvelope["kind"];
 
-/** v11 wire reply：传输序号与模型可见信封保持明确分层。 */
+/** v12 wire reply：传输序号与模型可见信封保持明确分层。 */
 export interface SupervisorReply {
   readonly reply_seq: number;
   readonly envelope: ChildReplyEnvelope;
@@ -165,6 +165,8 @@ export interface SupervisorCompactionPrepared extends SupervisorCompactionPrepar
 /** child 在压缩事务结束后要求直接父端释放同一屏障。 */
 export interface SupervisorCompactionComplete extends SupervisorCompactionPrepare {
   readonly outcome: SupervisorCompactionOutcome;
+  /** true 时请求方会在 complete ACK 后启动 successor run。 */
+  readonly continuation_expected: boolean;
 }
 
 export interface SupervisorCompactionCompleted extends SupervisorCompactionPrepare {
@@ -1192,14 +1194,17 @@ function parseCompactionPrepared(payload: Record<string, unknown>): SupervisorCo
 
 function parseCompactionComplete(payload: Record<string, unknown>): SupervisorCompactionComplete {
   if (
-    !hasExactObjectKeys(payload, ["transaction_id", "outcome"])
+    !hasExactObjectKeys(payload, ["transaction_id", "outcome", "continuation_expected"])
     || !validCompactionTransactionId(payload.transaction_id)
     || typeof payload.outcome !== "string"
     || !SUPERVISOR_COMPACTION_OUTCOMES.has(payload.outcome)
+    || typeof payload.continuation_expected !== "boolean"
+    || (payload.continuation_expected && payload.outcome !== "succeeded")
   ) frameError("invalid_frame");
   return Object.freeze({
     transaction_id: payload.transaction_id,
     outcome: payload.outcome as SupervisorCompactionOutcome,
+    continuation_expected: payload.continuation_expected,
   });
 }
 

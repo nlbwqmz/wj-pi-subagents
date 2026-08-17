@@ -163,7 +163,7 @@ test("task assignment 与 task_started 在同一累计 ACK 顺序域传递 UUIDv
   }), "invalid_frame");
 });
 
-test("v11 压缩帧只允许 child 请求和 parent 响应", () => {
+test("v12 压缩帧只允许 child 请求和 parent 响应并携带 continuation 所有权", () => {
   const pair = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,
     childAgentId: CHILD_ID,
@@ -188,13 +188,18 @@ test("v11 压缩帧只允许 child 请求和 parent 响应", () => {
   }
   pair.flush();
 
-  pair.child.send(pair.child.publishCompactionComplete({ transaction_id: transactionId, outcome: "not_started" }));
+  pair.child.send(pair.child.publishCompactionComplete({
+    transaction_id: transactionId,
+    outcome: "not_started",
+    continuation_expected: false,
+  }));
   const parentComplete = pair.child.deliverNext();
   assert.equal(parentComplete?.kind, "accepted");
   if (parentComplete?.kind === "accepted") {
     assert.deepEqual(parentComplete.compaction_complete, {
       transaction_id: transactionId,
       outcome: "not_started",
+      continuation_expected: false,
     });
   }
   pair.flush();
@@ -215,6 +220,7 @@ test("v11 压缩帧只允许 child 请求和 parent 响应", () => {
   assertProtocolError(() => pair.parent.publishCompactionComplete({
     transaction_id: transactionId,
     outcome: "succeeded",
+    continuation_expected: true,
   }), "closed");
   assertProtocolError(() => pair.child.publishCompactionCompleted({
     transaction_id: transactionId,
@@ -223,10 +229,16 @@ test("v11 压缩帧只允许 child 请求和 parent 响应", () => {
   assertProtocolError(() => pair.child.publishCompactionComplete({
     transaction_id: transactionId,
     outcome: "unknown" as "succeeded",
+    continuation_expected: false,
+  }), "invalid_frame");
+  assertProtocolError(() => pair.child.publishCompactionComplete({
+    transaction_id: transactionId,
+    outcome: "failed",
+    continuation_expected: true,
   }), "invalid_frame");
 });
 
-test("v11 拒绝已移除的 compaction_resume 帧", () => {
+test("v12 拒绝已移除的 compaction_resume 帧", () => {
   const pair = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,
     childAgentId: CHILD_ID,
@@ -713,7 +725,7 @@ test("工作中 message 为 final 预留窗口槽位，二者按同一 reply_seq
   assert.equal(pair.child.getPublicState().pending_reply_count, 0);
 });
 
-test("v11 reply 必须携带合法 envelope，且 message/final 都拒绝图片字段", () => {
+test("v12 reply 必须携带合法 envelope，且 message/final 都拒绝图片字段", () => {
   const missingEnvelope = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,
     childAgentId: CHILD_ID,

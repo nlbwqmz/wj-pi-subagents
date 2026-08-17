@@ -293,11 +293,16 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
     transactionId: string,
     outcome: SupervisorCompactionComplete["outcome"],
     signal?: AbortSignal,
+    continuationExpected = false,
   ): Promise<boolean> {
     return this.requestCompactionAcknowledgement(
       transactionId,
       this.compactionCompleted,
-      this.protocol.publishCompactionComplete({ transaction_id: transactionId, outcome }),
+      this.protocol.publishCompactionComplete({
+        transaction_id: transactionId,
+        outcome,
+        continuation_expected: continuationExpected,
+      }),
       signal,
     );
   }

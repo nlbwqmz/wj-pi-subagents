@@ -137,10 +137,15 @@ export class BridgeSupervisorEndpoint {
   requestCompactionComplete(
     transactionId: string,
     outcome: SupervisorCompactionComplete["outcome"],
+    continuationExpected = false,
   ): Promise<boolean> {
     if (this.compactionCompleted.has(transactionId)) throw new Error("测试压缩事务已存在");
     const result = new Promise<boolean>((resolve) => this.compactionCompleted.set(transactionId, resolve));
-    this.send(this.protocol.publishCompactionComplete({ transaction_id: transactionId, outcome }));
+    this.send(this.protocol.publishCompactionComplete({
+      transaction_id: transactionId,
+      outcome,
+      continuation_expected: continuationExpected,
+    }));
     return result;
   }
 

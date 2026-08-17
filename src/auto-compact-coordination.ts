@@ -363,7 +363,17 @@ export class AutoCompactCoordinationParticipant {
     }
 
     this.barriers.delete(request.requestId);
-    const accepted = await this.releaseBarrier(request.requestId, barrier, request.outcome);
+    const continuationExpected = barrier.runtime.replyCoordinator?.expectsCoordinationContinuation(
+      request.requestId,
+      request.outcome,
+    ) ?? false;
+    const accepted = await this.releaseBarrier(
+      request.requestId,
+      barrier,
+      request.outcome,
+      false,
+      continuationExpected,
+    );
     if (
       request.outcome !== "succeeded"
       && this.activeManualCompactionTransactionId === request.requestId
@@ -413,11 +423,17 @@ export class AutoCompactCoordinationParticipant {
     barrier: PreparedBarrier,
     outcome: SupervisorCompactionOutcome,
     cleanup = false,
+    continuationExpected = false,
   ): Promise<boolean> {
     const accepted = barrier.parentPrepared && barrier.runtime.upstream !== undefined
       ? cleanup
         ? await this.cleanupUpstream(barrier.runtime.upstream.channel, requestId)
-        : await this.completeUpstream(barrier.runtime.upstream.channel, requestId, outcome)
+        : await this.completeUpstream(
+            barrier.runtime.upstream.channel,
+            requestId,
+            outcome,
+            continuationExpected,
+          )
       : true;
     this.releaseLocal(requestId, barrier.runtime, accepted ? outcome : "not_started");
     void barrier.runtime.retryPendingReplies().catch(() => {});
@@ -428,9 +444,10 @@ export class AutoCompactCoordinationParticipant {
     channel: StreamSupervisorChannel,
     requestId: string,
     outcome: SupervisorCompactionOutcome,
+    continuationExpected: boolean,
   ): Promise<boolean> {
     const status = await requestBusinessAck(
-      (signal) => channel.requestCompactionComplete(requestId, outcome, signal),
+      (signal) => channel.requestCompactionComplete(requestId, outcome, signal, continuationExpected),
       this.upstreamAckTimeoutMs,
       this.operationAbortController.signal,
     );

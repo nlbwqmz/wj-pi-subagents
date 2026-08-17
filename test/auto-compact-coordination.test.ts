@@ -44,6 +44,7 @@ class FakeUpstreamChannel {
     readonly kind: "prepare" | "complete";
     readonly transactionId: string;
     readonly outcome?: SupervisorCompactionComplete["outcome"];
+    readonly continuationExpected?: boolean;
   }> = [];
   protocolFailures = 0;
   releases = 0;
@@ -63,8 +64,14 @@ class FakeUpstreamChannel {
     transactionId: string,
     outcome: SupervisorCompactionComplete["outcome"],
     signal?: AbortSignal,
+    continuationExpected = false,
   ): Promise<boolean> {
-    this.requests.push({ kind: "complete", transactionId, outcome });
+    this.requests.push({
+      kind: "complete",
+      transactionId,
+      outcome,
+      ...(continuationExpected ? { continuationExpected: true } : {}),
+    });
     return this.completeOperation(transactionId, outcome, signal);
   }
 
@@ -302,6 +309,48 @@ test("子会话只协调本地入口、自己的 reply 边和直接父边", asyn
   assert.equal(replyCoordinator.hasCoordinationBarrier(), false);
   assert.equal(value.replyInbox.accept(CHILD_ID, workingReply()), true);
   assert.deepEqual(replies, []);
+  await participant.close();
+});
+
+test("子会话把 interrupted 压缩的 continuation 所有权传给直接父", async () => {
+  const bus = new TestEventBus();
+  const upstream = new FakeUpstreamChannel();
+  const replyCoordinator = new ChildReplyCoordinator({
+    agentId: CHILD_ID,
+    port: { publishReplyAndWaitForAck: async () => {} },
+    taskIdFactory: () => TASK_ID,
+    turnIdFactory: () => TURN_ID,
+    commitIdFactory: () => COMMIT_ID,
+  });
+  replyCoordinator.observeAgentStart();
+  const value = createRuntime({ upstream, replyCoordinator });
+  const participant = new AutoCompactCoordinationParticipant({
+    eventBus: bus,
+    readRuntime: () => value.runtime,
+    participantId: "participant-continuation-owner",
+    upstreamAckTimeoutMs: 100,
+  });
+
+  emitPrepare(bus, "participant-continuation-owner", "compact-continuation-owner");
+  await settle();
+  replyCoordinator.observeAssistantMessageEnd({
+    type: "message_end",
+    message: { role: "assistant", stopReason: "aborted", content: [] },
+  });
+  replyCoordinator.observeAgentEnd();
+  replyCoordinator.settle();
+
+  emitComplete(bus, "participant-continuation-owner", "compact-continuation-owner", "succeeded");
+  await settle();
+  assert.deepEqual(upstream.requests, [
+    { kind: "prepare", transactionId: "compact-continuation-owner" },
+    {
+      kind: "complete",
+      transactionId: "compact-continuation-owner",
+      outcome: "succeeded",
+      continuationExpected: true,
+    },
+  ]);
   await participant.close();
 });
 

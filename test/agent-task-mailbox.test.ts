@@ -177,12 +177,151 @@ test("协调压缩的 provisional settled 期间接纳消息仍延续当前逻�
 
   assert.equal(value.completeCoordinationBarrier("compact-continuation", "succeeded"), true);
   assert.equal(value.takeNextDelivery(), undefined);
-  value.observeCompactionStart("manual");
-  value.observeCompactionEnd("manual", false);
+  value.observeCompactionStart("manual", true);
+  value.observeCompactionEnd("manual", false, false, true);
   const resumed = value.takeNextDelivery();
   assert.equal(resumed?.message_id, queued.message_id);
   assert.equal(resumed?.task_id, current.task_id);
   assert.equal(resumed?.mode, "prompt");
+});
+
+test("协调完成声明 continuation 时，屏障前消息等待真实 start 后以 steer 投递", () => {
+  const value = mailbox();
+  const current = value.submit("进入协调压缩的任务");
+  const initial = value.takeNextDelivery();
+  assert.equal(value.hostAccepted(initial!.delivery_id), true);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
+
+  assert.equal(value.beginCoordinationBarrier("compact-owned-continuation"), true);
+  const queued = value.submit("settled 之前进入屏障的消息");
+  assert.equal(value.observeAgentSettled(), "superseded");
+  assert.equal(value.completeCoordinationBarrier(
+    "compact-owned-continuation",
+    "succeeded",
+    true,
+  ), true);
+  assert.equal(value.takeNextDelivery(), undefined);
+
+  value.observeCompactionStart("manual", true);
+  value.observeCompactionEnd("manual", false, false, true);
+  assert.equal(value.takeNextDelivery(), undefined);
+
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_2), true);
+  const resumed = value.takeNextDelivery();
+  assert.equal(resumed?.message_id, queued.message_id);
+  assert.equal(resumed?.task_id, current.task_id);
+  assert.equal(resumed?.mode, "steer");
+});
+
+test("协调 continuation 中已入队并消费的 steer 不被旧 settled 降级", () => {
+  const value = mailbox();
+  const current = value.submit("进入协调压缩的任务");
+  const initial = value.takeNextDelivery();
+  assert.equal(value.hostAccepted(initial!.delivery_id), true);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
+
+  assert.equal(value.beginCoordinationBarrier("compact-reentrant-continuation"), true);
+  const queued = value.submit("压缩续跑时补充消息");
+  assert.equal(value.completeCoordinationBarrier(
+    "compact-reentrant-continuation",
+    "succeeded",
+    true,
+  ), true);
+  value.observeCompactionStart("manual", true);
+  value.observeCompactionEnd("manual", false, false, true);
+  assert.equal(value.takeNextDelivery(), undefined);
+
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_2), true);
+  value.observeAgentStart();
+  const steer = value.takeNextDelivery();
+  assert.equal(steer?.mode, "steer");
+  assert.equal(steer?.message_id, queued.message_id);
+  assert.equal(value.reconcileHostPending(1), true);
+  assert.equal(value.observeAgentSettled(), "superseded");
+  assert.equal(value.projection().state, "working");
+
+  assert.equal(value.hostAccepted(steer!.delivery_id), true);
+  assert.deepEqual(value.projection(), {
+    state: "working",
+    mailbox_pending_count: 0,
+    host_pending_count: 1,
+    reply_outbox_pending_count: 0,
+    activity: { phase: "processing", task_id: current.task_id },
+  });
+
+  assert.equal(value.reconcileHostPending(0), true);
+  assert.equal(value.projection().state, "working");
+  assert.equal(value.projection().activity?.phase, "processing");
+});
+
+test("迟到的 steer 入队事实解除 delivery uncertainty 且不重投正文", () => {
+  const value = mailbox();
+  const current = value.submit("当前任务");
+  const initial = value.takeNextDelivery();
+  assert.equal(value.hostAccepted(initial!.delivery_id), true);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
+
+  const queued = value.submit("响应丢失但已经入队");
+  const steer = value.takeNextDelivery();
+  assert.equal(steer?.mode, "steer");
+  assert.equal(value.hostDeliveryUncertain(steer!.delivery_id), true);
+  assert.equal(value.projection().state, "suspended");
+  assert.equal(value.projection().mailbox_pending_count, 0);
+
+  assert.equal(value.reconcileHostPending(1), true);
+  assert.equal(value.projection().state, "working");
+  assert.equal(value.projection().activity?.task_id, queued.task_id);
+  assert.equal(value.takeNextDelivery(), undefined);
+
+  assert.equal(value.reconcileHostPending(0), true);
+  assert.equal(value.projection().state, "working");
+  assert.equal(value.takeNextDelivery(), undefined);
+});
+
+test("先到且已归零的队列事实仍能裁决迟到的 steer uncertainty", () => {
+  const value = mailbox();
+  const current = value.submit("当前任务");
+  const initial = value.takeNextDelivery();
+  assert.equal(value.hostAccepted(initial!.delivery_id), true);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
+
+  value.submit("队列证据早于 RPC 尾部");
+  const steer = value.takeNextDelivery();
+  assert.equal(steer?.mode, "steer");
+  assert.equal(value.reconcileHostPending(1), true);
+  assert.equal(value.reconcileHostPending(0), true);
+  assert.equal(value.hostDeliveryUncertain(steer!.delivery_id), true);
+
+  assert.equal(value.projection().state, "working");
+  assert.equal(value.projection().mailbox_pending_count, 0);
+  assert.equal(value.projection().host_pending_count, 0);
+  assert.equal(value.takeNextDelivery(), undefined);
+});
+
+test("明确拒绝的 steer 保留正文并安全降级为 prompt", () => {
+  const value = mailbox();
+  const current = value.submit("当前任务");
+  const initial = value.takeNextDelivery();
+  assert.equal(value.hostAccepted(initial!.delivery_id), true);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
+
+  const queued = value.submit("steer 被明确拒绝");
+  const rejected = value.takeNextDelivery();
+  assert.equal(rejected?.mode, "steer");
+  assert.equal(value.hostRejected(rejected!.delivery_id), true);
+  assert.equal(value.projection().state, "working");
+  assert.equal(value.projection().mailbox_pending_count, 1);
+
+  const fallback = value.takeNextDelivery();
+  assert.equal(fallback?.message_id, queued.message_id);
+  assert.equal(fallback?.task_id, current.task_id);
+  assert.equal(fallback?.mode, "prompt");
 });
 
 test("直接边准备把 delivery uncertainty 与维护失败标记为 unsafe", () => {

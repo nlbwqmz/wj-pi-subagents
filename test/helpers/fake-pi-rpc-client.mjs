@@ -120,11 +120,11 @@ export class RpcClient {
   async steer() {}
 
   async send(command) {
-    if (command?.type !== "prompt" || typeof command.message !== "string") {
-      return { type: "response", command: "prompt", success: false };
+    if (!["prompt", "steer"].includes(command?.type) || typeof command.message !== "string") {
+      return { type: "response", command: command?.type, success: false };
     }
-    await this.prompt(command.message);
-    return { type: "response", command: "prompt", success: true };
+    await this[command.type](command.message);
+    return { type: "response", command: command.type, success: true };
   }
 
   async abort() {}

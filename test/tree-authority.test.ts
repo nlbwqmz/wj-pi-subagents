@@ -271,6 +271,20 @@ test("控制准入、终止屏障与资源确认都重复校验直接父关系",
   ));
   assert.equal(admitted.node.state, "idle");
 
+  expectSuccess(tree.applyTaskProjection(grant.node.agent_id, {
+    state: "suspended",
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
+    activity: { phase: "delivery_uncertain" },
+  }));
+  const buffered = expectSuccess(await authority.admitControl(
+    ROOT_TREE_ACTOR,
+    grant.node.agent_id,
+    "send_message",
+  ));
+  assert.equal(buffered.node.state, "suspended");
+
   const barrier = expectSuccess(await authority.beginTermination(ROOT_TREE_ACTOR, grant.node.agent_id));
   assert.deepEqual(barrier.agent_ids, [grant.node.agent_id]);
   const confirmed = expectSuccess(await authority.confirmResources(ROOT_TREE_ACTOR, grant.node.agent_id));

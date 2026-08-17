@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   ManagedRpcBridgeClient,
+  ManagedRpcCommandRejectedError,
   MANAGED_RPC_BRIDGE_CREDENTIAL_ENV,
   MANAGED_RPC_BRIDGE_MAX_FRAME_BYTES,
   MANAGED_RPC_BRIDGE_PROTOCOL,
@@ -515,6 +516,49 @@ test("bridge 通过首个分片 start 配置长模板，并在 Pi 启动后清�
   await bridge.requestClose(new AbortController().signal);
   const [code, signal] = await closeObservation;
   assert.equal(code, 0, Buffer.concat(stderr).toString("utf8"));
+  assert.equal(signal, null);
+  await bridge.release();
+});
+
+test("bridge 拒绝把 Pi success:false 响应当作 prompt 或 steer 成功", async (context) => {
+  const script = fileURLToPath(new URL("../src/rpc-bridge-process.ts", import.meta.url));
+  const piModulePath = new URL("./helpers/rejecting-pi-rpc-client.mjs", import.meta.url).href;
+  const bridgeCredential = "bridge-credential-01234567890123456789";
+  const child = spawn(process.execPath, ["--experimental-strip-types", script], {
+    env: {
+      ...process.env,
+      [MANAGED_RPC_BRIDGE_CREDENTIAL_ENV]: bridgeCredential,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  const bridge = new ManagedRpcBridgeClient({
+    stdin: child.stdin,
+    stdout: child.stdout,
+    stderr: child.stderr,
+  }, {
+    credential: bridgeCredential,
+    rpcOptions: { piModulePath },
+  });
+  context.after(async () => {
+    await bridge.release();
+    if (!child.killed && child.exitCode === null) child.kill();
+  });
+
+  await bridge.start();
+  await assert.rejects(
+    bridge.prompt("明确拒绝 prompt"),
+    (error: unknown) => error instanceof ManagedRpcCommandRejectedError,
+  );
+  await assert.rejects(
+    bridge.steer("明确拒绝 steer"),
+    (error: unknown) => error instanceof ManagedRpcCommandRejectedError,
+  );
+
+  const closeObservation = once(child, "close") as Promise<[number | null, NodeJS.Signals | null]>;
+  await bridge.requestClose(new AbortController().signal);
+  const [code, signal] = await closeObservation;
+  assert.equal(code, 0);
   assert.equal(signal, null);
   await bridge.release();
 });

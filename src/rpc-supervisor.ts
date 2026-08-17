@@ -4,9 +4,10 @@ import {
   type AgentCompactionReason,
   type AgentHostDelivery,
 } from "./agent-task-mailbox.ts";
-import type {
-  ManagedRpcNodeLike,
-  ManagedRpcNodeStartContext,
+import {
+  ManagedRpcCommandRejectedError,
+  type ManagedRpcNodeLike,
+  type ManagedRpcNodeStartContext,
 } from "./managed-rpc-node.ts";
 import type {
   SupervisorCapabilityManifest,
@@ -1122,7 +1123,11 @@ export class RpcSupervisor {
     } else if (state.terminalAccepted !== undefined) {
       accepted = state.terminalAccepted;
     } else {
-      accepted = this.releaseCoordinatedCompaction(state, request.outcome);
+      accepted = this.releaseCoordinatedCompaction(
+        state,
+        request.outcome,
+        request.continuation_expected,
+      );
       if (!accepted && this.coordinatedCompactions.get(request.transaction_id) === state) {
         state.terminalAccepted = false;
       }
@@ -1184,11 +1189,16 @@ export class RpcSupervisor {
   private releaseCoordinatedCompaction(
     state: CoordinatedCompactionState,
     outcome: SupervisorCompactionComplete["outcome"],
+    continuationExpected = false,
   ): boolean {
     if (state.phase === "closed") return true;
     let mailboxReleased = !state.mailboxPrepared;
     if (state.mailboxPrepared) {
-      mailboxReleased = this.mailbox.completeCoordinationBarrier(state.transactionId, outcome);
+      mailboxReleased = this.mailbox.completeCoordinationBarrier(
+        state.transactionId,
+        outcome,
+        continuationExpected,
+      );
       if (mailboxReleased) state.mailboxPrepared = false;
     }
     let replyReleased = !state.replyPrepared;
@@ -1338,16 +1348,18 @@ export class RpcSupervisor {
           this.failRuntime("invalid_rpc_event");
           return;
         }
+        const coordinatedManual = event.reason === "manual"
+          && this.beginAuthorizedManualCompaction();
         if (
           event.reason === "manual"
-          && !this.beginAuthorizedManualCompaction()
+          && !coordinatedManual
           && !this.beginUncoordinatedManualCompaction()
         ) {
           this.failRuntime("invalid_rpc_event");
           return;
         }
         if (event.reason !== "manual") this.revokePendingManualCompactionAuthorizations();
-        this.mailbox.observeCompactionStart(event.reason);
+        this.mailbox.observeCompactionStart(event.reason, coordinatedManual);
         this.commitTaskProjection();
         return;
       }
@@ -1356,6 +1368,8 @@ export class RpcSupervisor {
           this.failRuntime("invalid_rpc_event");
           return;
         }
+        const coordinatedManual = event.reason === "manual"
+          && this.activeManualCompactionTransactionId !== undefined;
         if (
           (event.reason === "manual"
             && !this.completeAuthorizedManualCompaction()
@@ -1367,19 +1381,30 @@ export class RpcSupervisor {
           this.failRuntime("invalid_rpc_event");
           return;
         }
-        this.mailbox.observeCompactionEnd(event.reason, event.failed, event.willRetry);
+        this.mailbox.observeCompactionEnd(
+          event.reason,
+          event.failed,
+          event.willRetry,
+          coordinatedManual,
+        );
         this.commitTaskProjection();
         this.drainCommandQueue();
         this.schedulePendingReplyRetry();
         return;
-      case "queue_update":
+      case "queue_update": {
         if (!Number.isSafeInteger(event.pendingMessageCount) || (event.pendingMessageCount as number) < 0) {
           this.failRuntime("invalid_rpc_event");
           return;
         }
+        const hadUncertainDelivery = this.mailbox.hasUncertainDelivery();
         this.mailbox.reconcileHostPending(event.pendingMessageCount as number);
         this.commitTaskProjection();
+        if (hadUncertainDelivery && !this.mailbox.hasUncertainDelivery()) {
+          this.schedulePendingReplyRetry();
+          this.drainCommandQueue();
+        }
         return;
+      }
       case "tool_execution_start":
         this.receiveToolStart(event);
         return;
@@ -1719,7 +1744,7 @@ export class RpcSupervisor {
         finish();
         return;
       }
-      void this.executeAssignedDelivery(delivery).then(finish, finish);
+      void this.executeAssignedDelivery(command).then(finish, finish);
     };
     try {
       if (typeof publishAssignment !== "function") throw new Error("任务租约通道不可用");
@@ -1737,15 +1762,32 @@ export class RpcSupervisor {
     return completion;
   }
 
-  private async executeAssignedDelivery(delivery: AgentHostDelivery): Promise<void> {
-    if (this.phase !== "ready" || !this.mailbox.isDeliveryActive(delivery.delivery_id)) return;
+  private async executeAssignedDelivery(command: QueuedMessageCommand): Promise<void> {
+    const delivery = command.delivery;
+    if (
+      delivery === undefined
+      || this.phase !== "ready"
+      || !this.mailbox.isDeliveryActive(delivery.delivery_id)
+    ) return;
     try {
       if (delivery.mode === "prompt") await this.commandClient().prompt(delivery.message);
       else await this.commandClient().steer(delivery.message);
       this.mailbox.hostAccepted(delivery.delivery_id);
-    } catch {
-      // RPC 返回异常不能证明正文未执行；只保留当前任务的交付不确定状态。
-      this.mailbox.hostDeliveryUncertain(delivery.delivery_id);
+    } catch (error) {
+      if (error instanceof ManagedRpcCommandRejectedError) {
+        if (this.mailbox.hostRejected(delivery.delivery_id)) {
+          // 明确拒绝证明正文未入 Pi；保留同一 message_id，并让 steer 先降级为 prompt。
+          this.commandQueue.unshift({
+            kind: command.kind,
+            message: command.message,
+            message_id: command.message_id,
+            resolve: command.resolve,
+          });
+        }
+      } else {
+        // 传输异常不能证明正文未执行；只保留当前任务的交付不确定状态。
+        this.mailbox.hostDeliveryUncertain(delivery.delivery_id);
+      }
     }
     if (this.phase !== "ready") return;
     this.commitTaskProjection();

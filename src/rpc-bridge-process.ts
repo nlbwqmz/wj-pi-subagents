@@ -36,8 +36,11 @@ const MAX_MESSAGE_BYTES = 16 * 1024;
 interface BridgeClient {
   start(): Promise<void>;
   stop(): Promise<void>;
-  /** Pi 的原子 prompt 写入；host gate 明确要求该公开能力。 */
-  send(command: { readonly type: "prompt"; readonly message: string }): Promise<unknown>;
+  /** 直接取得原始 response，避免 Pi prompt/steer 包装方法吞掉 success:false。 */
+  send(command: {
+    readonly type: "prompt" | "steer";
+    readonly message: string;
+  }): Promise<unknown>;
   prompt(message: string): Promise<void>;
   steer(message: string): Promise<void>;
   abort(): Promise<void>;
@@ -122,6 +125,16 @@ function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[])
   return Object.keys(value).every((key) => allowed.includes(key));
 }
 
+function piCommandDisposition(
+  value: unknown,
+  command: "prompt" | "steer",
+): "accepted" | "rejected" | "unknown" {
+  if (!isRecord(value) || value.type !== "response" || value.command !== command) return "unknown";
+  if (value.success === true) return "accepted";
+  if (value.success === false) return "rejected";
+  return "unknown";
+}
+
 function writeFrame(value: unknown): void {
   const body = new TextEncoder().encode(JSON.stringify(value));
   if (body.byteLength > MAX_FRAME_BYTES) throw new Error("桥接帧超限");
@@ -188,6 +201,17 @@ function response(id: number, ok: boolean, data?: unknown): void {
     id,
     ok,
     ...(data === undefined ? {} : { data }),
+  });
+}
+
+function rejectedResponse(id: number): void {
+  if (protocolFailed) return;
+  writeFrame({
+    protocol: PROTOCOL,
+    kind: "response",
+    id,
+    ok: false,
+    rejected: true,
   });
 }
 
@@ -658,12 +682,15 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
         response(command.id, false);
         return;
       }
-      if (command.command === "prompt") {
-        await current.send({ type: "prompt", message: command.payload.message });
-      } else {
-        await current.steer(command.payload.message);
-      }
-      response(command.id, true);
+      const commandName = command.command;
+      const result = await current.send({
+        type: commandName,
+        message: command.payload.message,
+      });
+      const disposition = piCommandDisposition(result, commandName);
+      if (disposition === "accepted") response(command.id, true);
+      else if (disposition === "rejected") rejectedResponse(command.id);
+      else response(command.id, false);
       return;
     }
     if (command.command === "abort") {

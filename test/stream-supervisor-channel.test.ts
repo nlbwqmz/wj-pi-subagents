@@ -286,6 +286,7 @@ test("协调压缩请求只允许 child 发起，并等待 parent 业务响应",
   assert.deepEqual(parentCompleteRequests, [{
     transaction_id: "compact-child-request",
     outcome: "failed",
+    continuation_expected: false,
   }]);
   await pair.parent.respondCompactionCompleted({ transaction_id: "compact-child-request", accepted: false });
   assert.equal(await childComplete, false);
@@ -318,7 +319,7 @@ test("complete 等待取消后允许同一事务发送 not_started 补偿", asyn
   pair.parent.onCompactionComplete((request) => requests.push(request));
   const firstController = new AbortController();
   const firstResult = pair.child
-    .requestCompactionComplete("compact-retry-after-abort", "succeeded", firstController.signal)
+    .requestCompactionComplete("compact-retry-after-abort", "succeeded", firstController.signal, true)
     .then(
       () => undefined,
       (error: unknown) => error,
@@ -331,8 +332,16 @@ test("complete 等待取消后允许同一事务发送 not_started 补偿", asyn
   const cleanup = pair.child.requestCompactionComplete("compact-retry-after-abort", "not_started");
   await settleIo();
   assert.deepEqual(requests, [
-    { transaction_id: "compact-retry-after-abort", outcome: "succeeded" },
-    { transaction_id: "compact-retry-after-abort", outcome: "not_started" },
+    {
+      transaction_id: "compact-retry-after-abort",
+      outcome: "succeeded",
+      continuation_expected: true,
+    },
+    {
+      transaction_id: "compact-retry-after-abort",
+      outcome: "not_started",
+      continuation_expected: false,
+    },
   ]);
   await pair.parent.respondCompactionCompleted({
     transaction_id: "compact-retry-after-abort",

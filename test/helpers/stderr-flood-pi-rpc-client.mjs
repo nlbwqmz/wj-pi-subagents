@@ -22,9 +22,10 @@ export class RpcClient {
   }
 
   async send(command) {
-    if (command?.type !== "prompt" || typeof command.message !== "string") {
-      throw new Error("无效的原子 prompt 命令");
+    if (!["prompt", "steer"].includes(command?.type) || typeof command.message !== "string") {
+      throw new Error("无效的原子消息命令");
     }
+    return { type: "response", command: command.type, success: true };
   }
 
   async prompt() {}

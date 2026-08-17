@@ -110,27 +110,25 @@
 ## 安装
 ### 1. 从 npm 安装正式版本
 
-首个 npm 版本发布后，可以直接安装用户级 package：
+用户级：
 
 ```bash
 pi install npm:wj-pi-subagents
 ```
 
-只在当前项目中安装：
+项目级：
 
 ```bash
 cd <PROJECT_DIR>
 pi install npm:wj-pi-subagents -l
 ```
 
-只为当前进程临时加载，不写入设置：
+临时：
 
 ```bash
 cd <PROJECT_DIR>
 pi -e npm:wj-pi-subagents
 ```
-
-指定 `npm:wj-pi-subagents@X.X.X` 可以固定版本；不带版本时由 Pi 按 npm package 更新规则管理。
 
 ### 2. 获取源码并安装运行依赖
 
