@@ -65,7 +65,6 @@ function node(overrides: Partial<AgentSnapshot> & Pick<AgentSnapshot, "agent_id"
     reply_outbox_pending_count: 0,
     revision: 1,
     created_at: "2026-08-06T07:59:00.000Z",
-    lifecycle_elapsed_ms: 60_000,
     working_elapsed_ms: 15_000,
     ...rest,
     ...(normalizedActivity === undefined ? {} : { activity: normalizedActivity }),
@@ -97,7 +96,6 @@ test("常驻 Agents widget 只按稳定字段顺序显示作用域直接子代�
       template_id: "研🙂e\u0301究员",
       name: "直接子代理",
       state: "failed",
-      lifecycle_elapsed_ms: 65_000,
       mailbox_pending_count: 0,
       error: Object.freeze({
         code: "internal_error",
@@ -125,7 +123,7 @@ test("常驻 Agents widget 只按稳定字段顺序显示作用域直接子代�
 
   assert.deepEqual(renderAgentsWidget(snapshot, 120), [
     "Agents",
-    "  研🙂e\u0301究员 · 直接子代理 · failed · 15s/1m 05s · internal_error",
+    "  研🙂e\u0301究员 · 直接子代理 · failed · 15s · internal_error",
   ]);
   assert.deepEqual(renderAgentsWidget(snapshot, 8), ["Agents", "  研🙂e\u0301…"]);
   assert.doesNotMatch(renderAgentsWidget(snapshot, 120).join("\n"), /secret-canary|terminate|interrupt|reload/i);
@@ -153,12 +151,12 @@ test("常驻 Agents widget 隐藏活动类别计数但代理树面板保留", ()
   const widget = renderAgentsWidget(snapshot, 120);
   assert.deepEqual(widget, [
     "Agents",
-    "  worker · 活动子代理 · working · executing_tools · 33.8%/272k · 15s/1m 00s",
+    "  worker · 活动子代理 · working · executing_tools · 33.8%/272k · 15s",
   ]);
   assert.doesNotMatch(widget.join("\n"), /reading 2/);
   assert.match(
     new AgentTreePanelModel(snapshot).render(120).join("\n"),
-    /worker · 活动子代理 · working · executing_tools · reading 2 · 33\.8%\/272k · 15s\/1m 00s/,
+    /worker · 活动子代理 · working · executing_tools · reading 2 · 33\.8%\/272k · 15s/,
   );
 
   const afterCompaction = subtreeSnapshot([
@@ -180,7 +178,7 @@ test("常驻 Agents widget 隐藏活动类别计数但代理树面板保留", ()
   ], 3);
   assert.deepEqual(renderAgentsWidget(afterCompaction, 120), [
     "Agents",
-    "  worker · 活动子代理 · working · executing_tools · ?/272k · 15s/1m 00s",
+    "  worker · 活动子代理 · working · executing_tools · ?/272k · 15s",
   ]);
 });
 
@@ -309,9 +307,9 @@ test("代理树面板默认展开直接子代理、折叠深层分支并优先�
   const model = new AgentTreePanelModel(snapshot, { viewport_height: 10 });
   assert.deepEqual(model.render(120), [
     "Agent tree · revision 7",
-    "› ▾ worker · 活跃分支 · idle · 15s/1m 00s",
-    "    ▸ deep · 深层分支 · idle · 15s/1m 00s · descendants 3 · working 1 · failed 1 · pending 3",
-    "  · idle · 纯空闲分支 · idle · 15s/1m 00s",
+    "› ▾ worker · 活跃分支 · idle · 15s",
+    "    ▸ deep · 深层分支 · idle · 15s · descendants 3 · working 1 · failed 1 · pending 3",
+    "  · idle · 纯空闲分支 · idle · 15s",
     "  ▸ finished · completed 1 · failed 1 · incomplete 1",
     "↑↓ scroll · ←→ fold · Esc close",
   ]);
@@ -389,8 +387,8 @@ test("代理树面板支持上下滚动、左右展开折叠和 Esc 关闭", () 
   });
   assert.deepEqual(model.render(80), [
     "Agent tree · revision 8",
-    "    ▾ deep · 深层分支 · idle · 15s/1m 00s",
-    "›     · runner · 工作后代 · working · processing · 15s/1m 00s",
+    "    ▾ deep · 深层分支 · idle · 15s",
+    "›     · runner · 工作后代 · working · processing · 15s",
     "↑↓ scroll · ←→ fold · Esc close",
   ]);
 
@@ -435,7 +433,6 @@ test("新树修订原子刷新全部事实并保留展开集合与滚动位置",
       state: "working",
       activity: Object.freeze({ phase: "reconciling" }),
       mailbox_pending_count: 4,
-      lifecycle_elapsed_ms: 125_000,
       revision: item.revision + 1,
     });
     return item;
@@ -458,14 +455,14 @@ test("新树修订原子刷新全部事实并保留展开集合与滚动位置",
     expanded_agent_ids: [ACTIVE_PARENT_ID, DEEP_BRANCH_ID],
     finished_expanded: false,
   });
-  assert.match(model.render(100).join("\n"), /runner · 工作后代 · working · reconciling · 15s\/2m 05s · queues 4\/0\/0/);
+  assert.match(model.render(100).join("\n"), /runner · 工作后代 · working · reconciling · 15s · queues 4\/0\/0/);
   assert.equal(model.handleInput("\x1b[B"), "changed");
   assert.match(model.render(100).join("\n"), /finished · completed 1/);
   assert.equal(model.update(initial), "ignored");
   assert.equal(model.getPublicState().tree_revision, 9);
 });
 
-test("同一树修订只刷新控制器确认的生命周期与工作时长", () => {
+test("同一树修订只刷新控制器确认的工作时长", () => {
   const initial = subtreeSnapshot([
     node({ agent_id: PARENT_ID, parent_agent_id: null, template_id: "parent", name: "当前会话" }),
     node({
@@ -474,7 +471,6 @@ test("同一树修订只刷新控制器确认的生命周期与工作时长", ()
       template_id: "worker",
       name: "计时代理",
       state: "working",
-      lifecycle_elapsed_ms: 60_000,
       working_elapsed_ms: 30_000,
     }),
   ], 5);
@@ -484,12 +480,11 @@ test("同一树修订只刷新控制器确认的生命周期与工作时长", ()
         ...item,
         agent_id: item.agent_id,
         parent_agent_id: item.parent_agent_id,
-        lifecycle_elapsed_ms: 65_000,
         working_elapsed_ms: 35_000,
       })
     : item), 5);
   assert.equal(model.refreshElapsed(elapsed), "changed");
-  assert.match(model.render(80).join("\n"), /35s\/1m 05s/);
+  assert.match(model.render(80).join("\n"), /35s/);
 
   const forged = subtreeSnapshot(elapsed.nodes.map((item) => item.agent_id === CHILD_ID
     ? node({
@@ -776,7 +771,7 @@ test("UI 绑定通过 widget、overlay 和 notify 跟随树修订并完整清理
   })(tui);
   assert.deepEqual(widget.render(80), [
     "Agents",
-    "  worker · 直接子代理 · idle · 15s/1m 00s",
+    "  worker · 直接子代理 · idle · 15s",
   ]);
   const opened = binding.openPanel({ hasUI: true, mode: "tui", ui });
   assert.deepEqual(overlayOptions, {

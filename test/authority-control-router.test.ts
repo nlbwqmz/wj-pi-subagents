@@ -214,7 +214,6 @@ test("远程端口拒绝夹带未声明节点字段的权威响应", async () =>
         reply_outbox_pending_count: 0,
         revision: 1,
         created_at: "2026-08-06T07:59:59.000Z",
-        lifecycle_elapsed_ms: 1_000,
         activity: Object.freeze({ phase: "executing_tools", category: "reading", active_count: 1 }),
         metadata: "不属于安全快照闭集",
       }),
@@ -324,7 +323,6 @@ test("权威响应快照接受固定的 capability_mismatch 故障", async () =>
         reply_outbox_pending_count: 0,
         revision: 2,
         created_at: "2026-08-06T07:59:59.000Z",
-        lifecycle_elapsed_ms: 1_000,
         error: Object.freeze({
           code: "capability_mismatch",
           message: "Subagent capability mismatch",

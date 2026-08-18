@@ -565,9 +565,6 @@ function collapsedStatusLines(snapshot: AgentSnapshot): readonly SafeRenderLine[
   if (snapshot.context_usage_percent !== undefined) {
     lines.push({ text: `context_usage_percent: ${snapshot.context_usage_percent}`, color: "dim" });
   }
-  if (snapshot.lifecycle_elapsed_ms !== undefined) {
-    lines.push({ text: `lifecycle_elapsed_ms: ${snapshot.lifecycle_elapsed_ms}`, color: "dim" });
-  }
   if (snapshot.working_elapsed_ms !== undefined) {
     lines.push({ text: `working_elapsed_ms: ${snapshot.working_elapsed_ms}`, color: "dim" });
   }
@@ -610,9 +607,6 @@ function expandedStatusLines(snapshot: AgentSnapshot): readonly SafeRenderLine[]
   }
   if (snapshot.context_usage_percent !== undefined) {
     lines.push({ text: `context_usage_percent: ${snapshot.context_usage_percent}`, color: "dim" });
-  }
-  if (snapshot.lifecycle_elapsed_ms !== undefined) {
-    lines.push({ text: `lifecycle_elapsed_ms: ${snapshot.lifecycle_elapsed_ms}`, color: "dim" });
   }
   if (snapshot.working_elapsed_ms !== undefined) {
     lines.push({ text: `working_elapsed_ms: ${snapshot.working_elapsed_ms}`, color: "dim" });

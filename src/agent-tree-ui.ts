@@ -905,8 +905,8 @@ function formatAgentFacts(node: AgentSnapshot, options: FormatAgentFactsOptions 
       : `${node.context_usage_percent.toFixed(1)}%`;
     facts.push(`${percent}/${formatTokens(node.context_window_tokens)}`);
   }
-  if (node.state !== "starting" && node.lifecycle_elapsed_ms !== undefined) {
-    facts.push(`${formatElapsed(node.working_elapsed_ms ?? 0)}/${formatElapsed(node.lifecycle_elapsed_ms)}`);
+  if (node.state !== "starting" && node.working_elapsed_ms !== undefined) {
+    facts.push(formatElapsed(node.working_elapsed_ms));
   }
   const pending = pendingQueueCount(node);
   if (pending > 0) {
@@ -985,19 +985,6 @@ function compareElapsedRefresh(
     const before = previous.nodes[index]!;
     const after = next.nodes[index]!;
     if (!sameAgentFactsExceptElapsed(before, after)) return "error";
-    const beforeElapsed = before.lifecycle_elapsed_ms;
-    const afterElapsed = after.lifecycle_elapsed_ms;
-    if (beforeElapsed !== afterElapsed) {
-      if (
-        before.state === "starting"
-        || before.state === "failed"
-        || before.state === "terminated"
-        || beforeElapsed === undefined
-        || afterElapsed === undefined
-        || afterElapsed < beforeElapsed
-      ) return "error";
-      changed = true;
-    }
     const beforeWorkingElapsed = before.working_elapsed_ms;
     const afterWorkingElapsed = after.working_elapsed_ms;
     if (beforeWorkingElapsed !== afterWorkingElapsed) {

@@ -207,7 +207,7 @@ test("管理能力沿直接父、模板禁用与深度逐级收窄，不能由�
   );
 });
 
-test("capability_mismatch 使用固定公开故障，并由快照 codec 与生命周期接受", () => {
+test("capability_mismatch 使用固定公开故障，并由快照 codec 接受", () => {
   const failure = controlFailure("capability_mismatch");
   assert.deepEqual(failure.error, {
     code: "capability_mismatch",
@@ -334,46 +334,31 @@ test("启动失败立即建立终止屏障，资源确认完成后才释放预�
   assert.equal(expectSuccess(tree.getQuotaSnapshot()).active_tree_agents, 0);
 });
 
-test("生命周期时间从 idle 线性化点开始，并在故障后由单调时钟冻结", () => {
-  let monotonic = 0;
-  const tree = controller([FIRST_ID], {
-    monotonicNow: () => {
-      monotonic += 100;
-      return monotonic;
-    },
-  });
+test("created_at 在 idle 线性化点记录并在后续状态保持稳定", () => {
+  const tree = controller([FIRST_ID]);
   const created = reserveRootChild(tree);
-  assert.equal(expectSuccess(tree.getStatus(created.node.agent_id)).created_at, undefined);
+  const beforeReady = expectSuccess(tree.getStatus(created.node.agent_id));
+  assert.equal(beforeReady.created_at, undefined);
+
   const ready = expectSuccess(applyEvent(tree, created.node.agent_id, { type: "startup_ready" }));
   assert.match(ready.node.created_at ?? "", /Z$/);
-  assert.equal(typeof ready.node.lifecycle_elapsed_ms, "number");
-  const active = expectSuccess(tree.getStatus(created.node.agent_id));
-  assert.equal((active.lifecycle_elapsed_ms ?? 0) >= (ready.node.lifecycle_elapsed_ms ?? 0), true);
+  const createdAt = ready.node.created_at;
 
   const failed = expectSuccess(applyEvent(tree, created.node.agent_id, {
     type: "runtime_failed",
     error_code: "spawn_failed",
   }));
-  const frozen = failed.node.lifecycle_elapsed_ms;
-  assert.equal(typeof frozen, "number");
-  const later = expectSuccess(tree.getStatus(created.node.agent_id));
-  assert.equal(later.lifecycle_elapsed_ms, frozen);
+  assert.equal(failed.node.created_at, createdAt);
 
   const terminating = expectSuccess(applyEvent(tree, created.node.agent_id, {
     type: "termination_requested",
   }));
   assert.equal(terminating.node.state, "terminating");
-  assert.equal((terminating.node.lifecycle_elapsed_ms ?? 0) >= (frozen ?? 0), true);
-  const duringCleanup = expectSuccess(tree.getStatus(created.node.agent_id));
-  assert.equal((duringCleanup.lifecycle_elapsed_ms ?? 0) > (terminating.node.lifecycle_elapsed_ms ?? 0), true);
-
   const terminated = expectSuccess(applyEvent(tree, created.node.agent_id, {
     type: "resources_confirmed",
   }));
-  const terminatedElapsed = terminated.node.lifecycle_elapsed_ms;
   assert.equal(terminated.node.state, "terminated");
-  assert.equal(typeof terminatedElapsed, "number");
-  assert.equal(expectSuccess(tree.getStatus(created.node.agent_id)).lifecycle_elapsed_ms, terminatedElapsed);
+  assert.equal(terminated.node.created_at, createdAt);
 });
 
 test("工作时间只累计任务处理与中断收尾，并在空闲或挂起期间暂停", () => {
@@ -386,7 +371,6 @@ test("工作时间只累计任务处理与中断收尾，并在空闲或挂起�
 
   monotonic = 2_500;
   const idleBeforeWork = expectSuccess(tree.getStatus(id));
-  assert.equal(idleBeforeWork.lifecycle_elapsed_ms, 1_500);
   assert.equal(idleBeforeWork.working_elapsed_ms, 0);
 
   const working = expectSuccess(tree.applyTaskProjection(id, {
@@ -420,7 +404,6 @@ test("工作时间只累计任务处理与中断收尾，并在空闲或挂起�
 
   monotonic = 6_500;
   const suspended = expectSuccess(tree.getStatus(id));
-  assert.equal(suspended.lifecycle_elapsed_ms, 5_500);
   assert.equal(suspended.working_elapsed_ms, 2_000);
   expectSuccess(tree.applyTaskProjection(id, {
     state: "working",
@@ -439,11 +422,14 @@ test("工作时间只累计任务处理与中断收尾，并在空闲或挂起�
   }));
   monotonic = 9_500;
   const idleAfterWork = expectSuccess(tree.getStatus(id));
-  assert.equal(idleAfterWork.lifecycle_elapsed_ms, 8_500);
   assert.equal(idleAfterWork.working_elapsed_ms, 3_000);
-  assert.equal(parseAgentSnapshot({
+  assert.deepEqual(parseAgentSnapshot({
     ...idleAfterWork,
     working_elapsed_ms: 8_501,
+  })?.working_elapsed_ms, 8_501);
+  assert.equal(parseAgentSnapshot({
+    ...idleAfterWork,
+    created_at: undefined,
   }), undefined);
 });
 
@@ -595,7 +581,7 @@ test("安全活动阶段和工具摘要只以闭集字段原子进入树快照",
   assert.deepEqual(finished.node.activity, { phase: "processing" });
 });
 
-test("starting 节点不接纳活动，递归快照也不能注入不可能的生命周期组合", () => {
+test("starting 节点不接纳活动，递归快照也不能注入不可能的状态组合", () => {
   const tree = controller();
   const created = reserveRootChild(tree);
 
@@ -1006,7 +992,6 @@ test("递归快照只允许作用域根补充上下文窗口事实", () => {
     state: "idle" as const,
     revision: child.node.revision + 1,
     created_at: "2026-01-02T03:04:05.000Z",
-    lifecycle_elapsed_ms: 1_000,
     context_window_tokens: 128_000,
     context_usage_percent: 24.5,
   });
@@ -1065,7 +1050,7 @@ test("递归快照只允许作用域根补充上下文窗口事实", () => {
   assert.equal(frozenFailure.context_usage_percent, undefined);
 });
 
-test("递归子树的生命周期与工作时长从快照基线继续累计并在终态精确冻结", () => {
+test("递归子树的工作时长从快照基线继续累计并在终态精确冻结", () => {
   let monotonic = 10_000;
   const tree = controller([FIRST_ID, SECOND_ID], {
     config: {
@@ -1091,7 +1076,6 @@ test("递归子树的生命周期与工作时长从快照基线继续累计并�
     ...childSnapshot,
     state: "working" as const,
     activity: Object.freeze({ phase: "processing" as const }),
-    lifecycle_elapsed_ms: 5_000,
     working_elapsed_ms: 2_000,
     revision: childSnapshot.revision + 1,
   });
@@ -1100,17 +1084,14 @@ test("递归子树的生命周期与工作时长从快照基线继续累计并�
     subtree_revision: 1,
     nodes: Object.freeze([parentSnapshot, working]),
   }));
-  assert.equal(expectSuccess(tree.getStatus(child.node.agent_id)).lifecycle_elapsed_ms, 5_000);
   assert.equal(expectSuccess(tree.getStatus(child.node.agent_id)).working_elapsed_ms, 2_000);
   monotonic = 12_000;
-  assert.equal(expectSuccess(tree.getStatus(child.node.agent_id)).lifecycle_elapsed_ms, 7_000);
   assert.equal(expectSuccess(tree.getStatus(child.node.agent_id)).working_elapsed_ms, 4_000);
 
   const failed = Object.freeze({
     ...working,
     state: "failed" as const,
     activity: undefined,
-    lifecycle_elapsed_ms: 7_000,
     working_elapsed_ms: 4_000,
     revision: working.revision + 1,
     error: Object.freeze({
@@ -1125,7 +1106,6 @@ test("递归子树的生命周期与工作时长从快照基线继续累计并�
     nodes: Object.freeze([parentSnapshot, failed]),
   }));
   monotonic = 20_000;
-  assert.equal(expectSuccess(tree.getStatus(child.node.agent_id)).lifecycle_elapsed_ms, 7_000);
   assert.equal(expectSuccess(tree.getStatus(child.node.agent_id)).working_elapsed_ms, 4_000);
 });
 
@@ -1249,7 +1229,6 @@ test("非权威中继首次接收的故障后代在终止后保留历史分类",
     reply_outbox_pending_count: 0,
     revision: 2,
     created_at: "2026-01-02T03:04:02.000Z",
-    lifecycle_elapsed_ms: 5_000,
     error: Object.freeze({
       code: "internal_error" as const,
       message: "Internal controller error",
@@ -1268,7 +1247,6 @@ test("非权威中继首次接收的故障后代在终止后保留历史分类",
     reply_outbox_pending_count: 0,
     revision: 2,
     created_at: "2026-01-02T03:04:02.000Z",
-    lifecycle_elapsed_ms: 5_000,
     error: Object.freeze({
       code: "termination_incomplete" as const,
       message: "Subagent resources not fully reclaimed",
@@ -1298,7 +1276,7 @@ test("非权威中继首次接收的故障后代在终止后保留历史分类",
   );
 });
 
-test("递归子树其他节点变化时允许 terminating 节点在同一节点修订继续计时", () => {
+test("递归子树其他节点变化时允许 terminating 节点保持同一节点修订", () => {
   let monotonic = 10_000;
   const tree = controller([FIRST_ID, SECOND_ID, THIRD_ID], {
     config: {
@@ -1330,7 +1308,6 @@ test("递归子树其他节点变化时允许 terminating 节点在同一节点�
   const terminating = Object.freeze({
     ...firstSnapshot,
     state: "terminating" as const,
-    lifecycle_elapsed_ms: 5_000,
     revision: firstSnapshot.revision + 1,
   });
   expectSuccess(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
@@ -1344,20 +1321,15 @@ test("递归子树其他节点变化时允许 terminating 节点在同一节点�
     ...secondSnapshot,
     state: "working" as const,
     activity: Object.freeze({ phase: "processing" as const }),
-    lifecycle_elapsed_ms: 7_000,
     revision: secondSnapshot.revision + 1,
   });
   const accepted = expectSuccess(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
     scope_agent_id: parent.node.agent_id,
     subtree_revision: 2,
-    nodes: Object.freeze([
-      parentSnapshot,
-      Object.freeze({ ...terminating, lifecycle_elapsed_ms: 7_000 }),
-      workingSecond,
-    ]),
+    nodes: Object.freeze([parentSnapshot, terminating, workingSecond]),
   }));
   assert.equal(accepted.applied, true);
-  assert.equal(expectSuccess(tree.getStatus(first.node.agent_id)).lifecycle_elapsed_ms, 7_000);
+  assert.equal(expectSuccess(tree.getStatus(first.node.agent_id)).state, "terminating");
 });
 
 test("非权威中继兼容缺少工作时长的旧快照并继续本地累计", () => {
@@ -1414,7 +1386,6 @@ test("非权威中继兼容缺少工作时长的旧快照并继续本地累计",
     activity: Object.freeze({ phase: "processing" as const }),
     revision: 2,
     created_at: "2026-01-02T03:04:02.000Z",
-    lifecycle_elapsed_ms: 5_000,
   });
 
   expectSuccess(tree.applySubtreeSnapshot(actor, {
@@ -1422,10 +1393,8 @@ test("非权威中继兼容缺少工作时长的旧快照并继续本地累计",
     subtree_revision: 1,
     nodes: Object.freeze([child, newDescendant]),
   }));
-  assert.equal(expectSuccess(tree.getStatus(THIRD_ID)).lifecycle_elapsed_ms, 5_000);
   assert.equal(expectSuccess(tree.getStatus(THIRD_ID)).working_elapsed_ms, 0);
   monotonic = 12_000;
-  assert.equal(expectSuccess(tree.getStatus(THIRD_ID)).lifecycle_elapsed_ms, 7_000);
   assert.equal(expectSuccess(tree.getStatus(THIRD_ID)).working_elapsed_ms, 2_000);
 
   expectSuccess(tree.applySubtreeSnapshot(actor, {
@@ -1436,7 +1405,6 @@ test("非权威中继兼容缺少工作时长的旧快照并继续本地累计",
       state: "idle" as const,
       activity: undefined,
       revision: newDescendant.revision + 1,
-      lifecycle_elapsed_ms: 7_000,
     })]),
   }));
   monotonic = 20_000;
@@ -1470,7 +1438,6 @@ test("根快照拒绝未经过 reserve_child 预登记的未知身份", () => {
       reply_outbox_pending_count: 0,
       revision: 1,
       created_at: "2026-01-02T03:04:06.000Z",
-      lifecycle_elapsed_ms: 0,
     })]),
   }), "invalid_argument");
   assert.deepEqual(expectSuccess(tree.getTreeSnapshot()).nodes.map((node) => node.agent_id), [FIRST_ID]);

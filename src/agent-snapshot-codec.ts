@@ -102,8 +102,6 @@ export interface AgentSnapshot {
   readonly revision: number;
   /** 成功创建的线性化点；starting 节点没有该时间。 */
   readonly created_at?: string;
-  /** 由单调时钟派生，活动节点持续累加，终态节点固定。 */
-  readonly lifecycle_elapsed_ms?: number;
   /** 由单调时钟派生，仅在工作或中断收尾阶段累加，空闲和终态节点固定。 */
   readonly working_elapsed_ms?: number;
   /** 当前 Pi 模型上下文窗口上限，单位为 token。 */
@@ -149,7 +147,6 @@ const SNAPSHOT_KEYS = new Set([
   "reply_outbox_pending_count",
   "revision",
   "created_at",
-  "lifecycle_elapsed_ms",
   "working_elapsed_ms",
   "context_window_tokens",
   "context_usage_percent",
@@ -202,7 +199,6 @@ export function parseAgentSnapshot(
       || !nonNegativeSafeInteger(record.reply_outbox_pending_count)
       || !positiveSafeInteger(record.revision)
       || (record.created_at !== undefined && !isRfc3339Millis(record.created_at))
-      || (record.lifecycle_elapsed_ms !== undefined && !nonNegativeSafeInteger(record.lifecycle_elapsed_ms))
       || (record.working_elapsed_ms !== undefined && !nonNegativeSafeInteger(record.working_elapsed_ms))
       || (record.context_window_tokens !== undefined && !positiveSafeInteger(record.context_window_tokens))
       || (record.context_usage_percent !== undefined && !validContextUsagePercent(record.context_usage_percent))
@@ -252,21 +248,13 @@ export function parseAgentSnapshot(
     if (state !== "terminated" && terminationResult !== undefined) return undefined;
     if (state === "starting" && (
       record.created_at !== undefined
-      || record.lifecycle_elapsed_ms !== undefined
       || record.working_elapsed_ms !== undefined
       || record.context_window_tokens !== undefined
       || record.context_usage_percent !== undefined
       || lastTask !== undefined
       || fault !== undefined
     )) return undefined;
-    if ((record.created_at === undefined) !== (record.lifecycle_elapsed_ms === undefined)) return undefined;
-    if (
-      record.working_elapsed_ms !== undefined
-      && (
-        record.lifecycle_elapsed_ms === undefined
-        || (record.working_elapsed_ms as number) > (record.lifecycle_elapsed_ms as number)
-      )
-    ) return undefined;
+    if (record.working_elapsed_ms !== undefined && record.created_at === undefined) return undefined;
     if (record.context_usage_percent !== undefined && record.context_window_tokens === undefined) return undefined;
 
     return Object.freeze({
@@ -281,9 +269,6 @@ export function parseAgentSnapshot(
       reply_outbox_pending_count: replyPending,
       revision: record.revision as number,
       ...(record.created_at === undefined ? {} : { created_at: record.created_at as string }),
-      ...(record.lifecycle_elapsed_ms === undefined
-        ? {}
-        : { lifecycle_elapsed_ms: record.lifecycle_elapsed_ms as number }),
       ...(record.working_elapsed_ms === undefined
         ? {}
         : { working_elapsed_ms: record.working_elapsed_ms as number }),

@@ -1478,7 +1478,7 @@ test("运行时以单数 agent 命令交付只读 TUI，并在会话关闭时清
   await execute(api, "spawn_agent", { template_id: "researcher", name: "TUI 子代理" }, context);
   assert.deepEqual(widget.render(80), [
     "Agents",
-    "  researcher · TUI 子代理 · idle · 0s/0s",
+    "  researcher · TUI 子代理 · idle · 0s",
   ]);
   const command = api.commands.get("agent");
   assert.ok(command);

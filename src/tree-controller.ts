@@ -311,8 +311,6 @@ interface AgentRecord {
   revision: number;
   lifecycleGeneration: number;
   createdAt: string | undefined;
-  lifecycleStartedAt: number | undefined;
-  frozenLifecycleElapsedMs: number | undefined;
   workingStartedAt: number | undefined;
   accumulatedWorkingElapsedMs: number;
   contextWindowTokens: number | undefined;
@@ -517,17 +515,6 @@ function sameSnapshot(
 ): boolean {
   const currentFault = record.error;
   const nextFault = node.error;
-  const lifecycleMatches = record.frozenLifecycleElapsedMs === node.lifecycle_elapsed_ms
-    || (
-      (
-        record.state === "idle"
-        || record.state === "working"
-        || record.state === "interrupting"
-        || record.state === "suspended"
-        || record.state === "terminating"
-      )
-      && node.lifecycle_elapsed_ms !== undefined
-    );
   const workingMatches = node.working_elapsed_ms === undefined
     || Math.max(0, Math.round(record.accumulatedWorkingElapsedMs)) === node.working_elapsed_ms
     || isWorkingTimeState(record.state);
@@ -547,7 +534,6 @@ function sameSnapshot(
     && record.replyOutboxPendingCount === node.reply_outbox_pending_count
     && record.revision === node.revision
     && record.createdAt === node.created_at
-    && lifecycleMatches
     && workingMatches
     && contextMatches
     && JSON.stringify(record.activity) === JSON.stringify(node.activity)
@@ -636,7 +622,6 @@ export class TreeController {
         || typeof initialActor.managementEnabled !== "boolean"
       ) throw new TypeError("子运行时身份无效");
       const createdAt = safeWallClockNow(this.now);
-      const monotonicAt = this.safeMonotonicNow();
       this.agents.set(initialActor.agentId, {
         agentId: initialActor.agentId,
         parentAgentId: initialActor.parentAgentId,
@@ -651,8 +636,6 @@ export class TreeController {
         revision: 1,
         lifecycleGeneration: 0,
         createdAt,
-        lifecycleStartedAt: monotonicAt,
-        frozenLifecycleElapsedMs: undefined,
         workingStartedAt: undefined,
         accumulatedWorkingElapsedMs: 0,
         contextWindowTokens: undefined,
@@ -830,8 +813,6 @@ export class TreeController {
       revision: 1,
       lifecycleGeneration: 0,
       createdAt: undefined,
-      lifecycleStartedAt: undefined,
-      frozenLifecycleElapsedMs: undefined,
       workingStartedAt: undefined,
       accumulatedWorkingElapsedMs: 0,
       contextWindowTokens: undefined,
@@ -902,8 +883,6 @@ export class TreeController {
       revision: node.revision,
       lifecycleGeneration: input.lifecycle_generation,
       createdAt: undefined,
-      lifecycleStartedAt: undefined,
-      frozenLifecycleElapsedMs: undefined,
       workingStartedAt: undefined,
       accumulatedWorkingElapsedMs: 0,
       contextWindowTokens: undefined,
@@ -1257,13 +1236,6 @@ export class TreeController {
           revision: node.revision,
           lifecycleGeneration: 0,
           createdAt: node.created_at,
-          lifecycleStartedAt: node.lifecycle_elapsed_ms === undefined
-            ? undefined
-            : monotonicAt - node.lifecycle_elapsed_ms,
-          frozenLifecycleElapsedMs: node.lifecycle_elapsed_ms !== undefined
-            && (node.state === "failed" || node.state === "terminated")
-              ? node.lifecycle_elapsed_ms
-              : undefined,
           workingStartedAt: isWorkingTimeState(node.state) ? monotonicAt : undefined,
           accumulatedWorkingElapsedMs: node.working_elapsed_ms ?? 0,
           contextWindowTokens: node.context_window_tokens,
@@ -1400,16 +1372,6 @@ export class TreeController {
         )
       : undefined;
     if (stateChanged) record.lifecycleGeneration += 1;
-    const elapsed = node.lifecycle_elapsed_ms;
-    if (elapsed === undefined) {
-      record.lifecycleStartedAt = undefined;
-      record.frozenLifecycleElapsedMs = undefined;
-    } else {
-      record.lifecycleStartedAt = monotonicAt - elapsed;
-      record.frozenLifecycleElapsedMs = node.state === "failed" || node.state === "terminated"
-        ? elapsed
-        : undefined;
-    }
     record.accumulatedWorkingElapsedMs = node.working_elapsed_ms ?? previousWorkingElapsed;
     record.workingStartedAt = isWorkingTimeState(node.state) ? monotonicAt : undefined;
     if (node.context_window_tokens !== undefined) {
@@ -1725,7 +1687,6 @@ export class TreeController {
     const lastTaskChanged = JSON.stringify(nextLastTask) !== JSON.stringify(record.lastTask);
     if (!stateChanged && !queuesChanged && !contextChanged && !errorChanged && !activityChanged && !lastTaskChanged) return false;
 
-    const elapsedAtMutation = this.lifecycleElapsed(record, monotonicAt);
     const workingElapsedAtMutation = this.workingElapsedValue(record, monotonicAt);
     const nextError = mutation.errorCode === undefined
       ? (mutation.clearError === true ? undefined : record.error)
@@ -1756,22 +1717,8 @@ export class TreeController {
     // 生命周期代际只随状态转换推进。pending 事件仍在节点顺序域内串行处理，
     // 允许同一状态快照上并行获准的多条消息各自完成，不互相误判为迟到。
     if (stateChanged) record.lifecycleGeneration += 1;
-    if (stateChanged && nextState === "idle" && record.lifecycleStartedAt === undefined) {
+    if (stateChanged && nextState === "idle" && record.createdAt === undefined) {
       record.createdAt = createdAt;
-      record.lifecycleStartedAt = monotonicAt;
-    }
-    if (stateChanged && nextState === "terminating" && record.frozenLifecycleElapsedMs !== undefined) {
-      // failed 的展示时长固定；开始清理后从该固定值继续累计，但不把停留在
-      // failed 的时间误算为清理时长。
-      record.lifecycleStartedAt = monotonicAt - record.frozenLifecycleElapsedMs;
-      record.frozenLifecycleElapsedMs = undefined;
-    }
-    if (
-      stateChanged
-      && (nextState === "failed" || nextState === "terminated")
-      && elapsedAtMutation !== undefined
-    ) {
-      record.frozenLifecycleElapsedMs = elapsedAtMutation;
     }
     if (stateChanged && (nextState === "failed" || nextState === "terminating" || nextState === "terminated")) {
       record.activity = undefined;
@@ -1828,12 +1775,6 @@ export class TreeController {
     }
   }
 
-  private lifecycleElapsed(record: AgentRecord, monotonicAt: number): number | undefined {
-    if (record.lifecycleStartedAt === undefined) return undefined;
-    if (record.frozenLifecycleElapsedMs !== undefined) return record.frozenLifecycleElapsedMs;
-    return Math.max(0, Math.round(monotonicAt - record.lifecycleStartedAt));
-  }
-
   private workingElapsedValue(record: AgentRecord, monotonicAt: number): number {
     if (!isWorkingTimeState(record.state) || record.workingStartedAt === undefined) {
       return record.accumulatedWorkingElapsedMs;
@@ -1864,7 +1805,6 @@ export class TreeController {
       : {
           ...common,
           created_at: record.createdAt,
-          lifecycle_elapsed_ms: this.lifecycleElapsed(record, monotonicAt) ?? 0,
           working_elapsed_ms: this.workingElapsed(record, monotonicAt),
         };
     const withContextUsage = record.createdAt === undefined || record.contextWindowTokens === undefined

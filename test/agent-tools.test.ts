@@ -423,7 +423,6 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
     reply_outbox_pending_count: 0,
     revision: 7,
     created_at: "2026-01-02T03:04:05.006Z",
-    lifecycle_elapsed_ms: 1234,
     working_elapsed_ms: 789,
     context_window_tokens: 200_000,
     context_usage_percent: 42.3,
@@ -441,7 +440,6 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
     reply_outbox_pending_count: 0,
     revision: 8,
     created_at: "2026-01-02T03:04:06.006Z",
-    lifecycle_elapsed_ms: 2345,
     working_elapsed_ms: 1_500,
     context_window_tokens: 128_000,
     activity: { phase: "reconciling" },
@@ -458,7 +456,6 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
     reply_outbox_pending_count: 0,
     revision: 9,
     created_at: "2026-01-02T03:04:07.006Z",
-    lifecycle_elapsed_ms: 3456,
     working_elapsed_ms: 2_000,
     termination_result: "completed",
   } as const;
@@ -552,7 +549,6 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
         reply_outbox_pending_count: 0,
         revision: 10,
         created_at: "2026-01-02T03:04:08.006Z",
-        lifecycle_elapsed_ms: 4567,
         working_elapsed_ms: 3_000,
         error: { code: "internal_error", message: "Internal controller error", retryable: false },
       } },
@@ -594,7 +590,6 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
     assert.match(statusExpanded, /agent_id: 550e8400-e29b-41d4-a716-446655440000/);
     assert.match(statusExpanded, /parent_agent_id: null/);
     assert.match(statusExpanded, /revision: 7/);
-    assert.match(statusExpanded, /lifecycle_elapsed_ms: 1234/);
     assert.match(statusExpanded, /working_elapsed_ms: 789/);
     assert.match(statusExpanded, /context_window_tokens: 200000/);
     assert.match(statusExpanded, /context_usage_percent: 42\.3/);
