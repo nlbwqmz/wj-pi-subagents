@@ -75,7 +75,12 @@ test("管理工具系统提示约束任务所有权并覆盖慢任务和异常�
     "管理工具不应注册重复的 promptGuidelines",
   );
   assert.match(PARENT_COORDINATION_GUIDELINES.sendMessage, /消息被接纳不等于模型已读或任务完成/);
-  assert.match(PARENT_COORDINATION_GUIDELINES.sendMessageReply, /send_message.*reply_to_parent 工具回复/);
+  assert.match(
+    PARENT_COORDINATION_GUIDELINES.sendMessageReply,
+    /仅当.*任务完成前.*reply_to_parent 进行回复/,
+  );
+  assert.match(PARENT_COORDINATION_GUIDELINES.sendMessageReply, /首次下发任务.*不添加 reply_to_parent 提示/);
+  assert.match(PARENT_COORDINATION_GUIDELINES.sendMessageReply, /不是目标子代理是否处于 working\/processing 状态/);
   assert.match(PARENT_COORDINATION_GUIDELINES.slowProgress, /不代表失败/);
   assert.match(PARENT_COORDINATION_GUIDELINES.slowProgress, /interrupt_agent 或 terminate_agent/);
   assert.match(PARENT_COORDINATION_GUIDELINES.taskRecovery, /复用已有上下文/);
