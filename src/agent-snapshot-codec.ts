@@ -104,6 +104,12 @@ export interface AgentSnapshot {
   readonly created_at?: string;
   /** 由单调时钟派生，活动节点持续累加，终态节点固定。 */
   readonly lifecycle_elapsed_ms?: number;
+  /** 由单调时钟派生，仅在工作或中断收尾阶段累加，空闲和终态节点固定。 */
+  readonly working_elapsed_ms?: number;
+  /** 当前 Pi 模型上下文窗口上限，单位为 token。 */
+  readonly context_window_tokens?: number;
+  /** 当前上下文占用百分比；压缩后尚未获得新 usage 时暂缺。 */
+  readonly context_usage_percent?: number;
   readonly activity?: AgentActivitySummary;
   readonly last_task?: AgentLastTask;
   readonly error?: AgentFault;
@@ -144,6 +150,9 @@ const SNAPSHOT_KEYS = new Set([
   "revision",
   "created_at",
   "lifecycle_elapsed_ms",
+  "working_elapsed_ms",
+  "context_window_tokens",
+  "context_usage_percent",
   "activity",
   "last_task",
   "error",
@@ -194,6 +203,9 @@ export function parseAgentSnapshot(
       || !positiveSafeInteger(record.revision)
       || (record.created_at !== undefined && !isRfc3339Millis(record.created_at))
       || (record.lifecycle_elapsed_ms !== undefined && !nonNegativeSafeInteger(record.lifecycle_elapsed_ms))
+      || (record.working_elapsed_ms !== undefined && !nonNegativeSafeInteger(record.working_elapsed_ms))
+      || (record.context_window_tokens !== undefined && !positiveSafeInteger(record.context_window_tokens))
+      || (record.context_usage_percent !== undefined && !validContextUsagePercent(record.context_usage_percent))
     ) return undefined;
 
     const activity = record.activity === undefined
@@ -241,10 +253,21 @@ export function parseAgentSnapshot(
     if (state === "starting" && (
       record.created_at !== undefined
       || record.lifecycle_elapsed_ms !== undefined
+      || record.working_elapsed_ms !== undefined
+      || record.context_window_tokens !== undefined
+      || record.context_usage_percent !== undefined
       || lastTask !== undefined
       || fault !== undefined
     )) return undefined;
     if ((record.created_at === undefined) !== (record.lifecycle_elapsed_ms === undefined)) return undefined;
+    if (
+      record.working_elapsed_ms !== undefined
+      && (
+        record.lifecycle_elapsed_ms === undefined
+        || (record.working_elapsed_ms as number) > (record.lifecycle_elapsed_ms as number)
+      )
+    ) return undefined;
+    if (record.context_usage_percent !== undefined && record.context_window_tokens === undefined) return undefined;
 
     return Object.freeze({
       agent_id: record.agent_id,
@@ -261,6 +284,15 @@ export function parseAgentSnapshot(
       ...(record.lifecycle_elapsed_ms === undefined
         ? {}
         : { lifecycle_elapsed_ms: record.lifecycle_elapsed_ms as number }),
+      ...(record.working_elapsed_ms === undefined
+        ? {}
+        : { working_elapsed_ms: record.working_elapsed_ms as number }),
+      ...(record.context_window_tokens === undefined
+        ? {}
+        : { context_window_tokens: record.context_window_tokens as number }),
+      ...(record.context_usage_percent === undefined
+        ? {}
+        : { context_usage_percent: record.context_usage_percent as number }),
       ...(activity === undefined ? {} : { activity }),
       ...(lastTask === undefined ? {} : { last_task: lastTask }),
       ...(fault === undefined ? {} : { error: fault }),
@@ -353,4 +385,12 @@ function positiveSafeInteger(value: unknown): boolean {
 
 function nonNegativeSafeInteger(value: unknown): boolean {
   return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+/** 允许超过 100% 表示 provider/估算在压缩前短暂超过窗口，但限制异常大值。 */
+function validContextUsagePercent(value: unknown): boolean {
+  return typeof value === "number"
+    && Number.isFinite(value)
+    && value >= 0
+    && value <= 1_000;
 }

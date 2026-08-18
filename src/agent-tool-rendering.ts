@@ -549,8 +549,17 @@ function collapsedStatusLines(snapshot: AgentSnapshot): readonly SafeRenderLine[
     { text: `host_pending_count: ${snapshot.host_pending_count}`, color: "dim" },
     { text: `reply_outbox_pending_count: ${snapshot.reply_outbox_pending_count}`, color: "dim" },
   ];
+  if (snapshot.context_window_tokens !== undefined) {
+    lines.push({ text: `context_window_tokens: ${snapshot.context_window_tokens}`, color: "dim" });
+  }
+  if (snapshot.context_usage_percent !== undefined) {
+    lines.push({ text: `context_usage_percent: ${snapshot.context_usage_percent}`, color: "dim" });
+  }
   if (snapshot.lifecycle_elapsed_ms !== undefined) {
     lines.push({ text: `lifecycle_elapsed_ms: ${snapshot.lifecycle_elapsed_ms}`, color: "dim" });
+  }
+  if (snapshot.working_elapsed_ms !== undefined) {
+    lines.push({ text: `working_elapsed_ms: ${snapshot.working_elapsed_ms}`, color: "dim" });
   }
   if (snapshot.activity !== undefined) {
     lines.push({ text: `activity.phase: ${snapshot.activity.phase}`, color: "dim" });
@@ -586,8 +595,17 @@ function expandedStatusLines(snapshot: AgentSnapshot): readonly SafeRenderLine[]
     { text: `revision: ${snapshot.revision}`, color: "dim" },
   ];
   if (snapshot.created_at !== undefined) lines.push({ text: `created_at: ${snapshot.created_at}`, color: "dim" });
+  if (snapshot.context_window_tokens !== undefined) {
+    lines.push({ text: `context_window_tokens: ${snapshot.context_window_tokens}`, color: "dim" });
+  }
+  if (snapshot.context_usage_percent !== undefined) {
+    lines.push({ text: `context_usage_percent: ${snapshot.context_usage_percent}`, color: "dim" });
+  }
   if (snapshot.lifecycle_elapsed_ms !== undefined) {
     lines.push({ text: `lifecycle_elapsed_ms: ${snapshot.lifecycle_elapsed_ms}`, color: "dim" });
+  }
+  if (snapshot.working_elapsed_ms !== undefined) {
+    lines.push({ text: `working_elapsed_ms: ${snapshot.working_elapsed_ms}`, color: "dim" });
   }
   if (snapshot.activity !== undefined) {
     lines.push({ text: `activity.phase: ${snapshot.activity.phase}`, color: "dim" });
@@ -717,7 +735,18 @@ function formatScope(tree: ScopedAgentTreeSnapshot): string {
 }
 
 function formatTreeNode(node: AgentSnapshot): string {
-  return `${node.template_id} · ${node.name} · ${node.state} · ${node.agent_id}`;
+  const context = node.context_window_tokens === undefined
+    ? ""
+    : ` · ${node.context_usage_percent === undefined ? "?" : `${node.context_usage_percent.toFixed(1)}%`}/${formatTokens(node.context_window_tokens)}`;
+  return `${node.template_id} · ${node.name} · ${node.state} · ${node.agent_id}${context}`;
+}
+
+function formatTokens(count: number): string {
+  if (count < 1_000) return String(count);
+  if (count < 10_000) return `${(count / 1_000).toFixed(1)}k`;
+  if (count < 1_000_000) return `${Math.round(count / 1_000)}k`;
+  if (count < 10_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+  return `${Math.round(count / 1_000_000)}M`;
 }
 
 function readTemplates(value: unknown): readonly {

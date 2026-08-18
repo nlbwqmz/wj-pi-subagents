@@ -246,6 +246,12 @@ export interface AgentTaskProjectionInput {
   readonly last_task?: AgentLastTask;
 }
 
+/** 来自 Pi ExtensionContext 的安全上下文用量投影。 */
+export interface AgentContextUsageInput {
+  readonly context_window_tokens: number;
+  readonly context_usage_percent?: number;
+}
+
 /** 监督器可以归一化并提交给树控制器的资源生命周期事实闭集。 */
 export const AGENT_LIFECYCLE_EVENT_TYPES = Object.freeze([
   "startup_ready",
@@ -307,6 +313,10 @@ interface AgentRecord {
   createdAt: string | undefined;
   lifecycleStartedAt: number | undefined;
   frozenLifecycleElapsedMs: number | undefined;
+  workingStartedAt: number | undefined;
+  accumulatedWorkingElapsedMs: number;
+  contextWindowTokens: number | undefined;
+  contextUsagePercent: number | undefined;
   activity: AgentActivitySummary | undefined;
   activityCounts: Map<AgentActivityCategory, number>;
   lastTask: AgentLastTask | undefined;
@@ -342,6 +352,10 @@ interface PublicMutation {
   readonly activity?: AgentActivitySummary | null;
   /** undefined 表示保持，null 表示清除。 */
   readonly lastTask?: AgentLastTask | null;
+  /** undefined 表示保持，null 表示清除。 */
+  readonly contextWindowTokens?: number | null;
+  /** undefined 表示保持，null 表示清除。 */
+  readonly contextUsagePercent?: number | null;
 }
 
 function isAgentTaskProjection(value: unknown): value is AgentTaskProjectionInput {
@@ -376,6 +390,26 @@ function isAgentTaskProjection(value: unknown): value is AgentTaskProjectionInpu
   )) return false;
   if (candidate.state !== "idle" && activity === undefined) return false;
   return true;
+}
+
+function isAgentContextUsageInput(value: unknown): value is AgentContextUsageInput {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  return Number.isSafeInteger(candidate.context_window_tokens)
+    && (candidate.context_window_tokens as number) > 0
+    && (
+      candidate.context_usage_percent === undefined
+      || (
+        typeof candidate.context_usage_percent === "number"
+        && Number.isFinite(candidate.context_usage_percent)
+        && candidate.context_usage_percent >= 0
+        && candidate.context_usage_percent <= 1_000
+      )
+    )
+    && Object.keys(candidate).every((key) => [
+      "context_window_tokens",
+      "context_usage_percent",
+    ].includes(key));
 }
 
 function isAgentActivitySummary(value: unknown): value is AgentActivitySummary {
@@ -494,6 +528,14 @@ function sameSnapshot(
       )
       && node.lifecycle_elapsed_ms !== undefined
     );
+  const workingMatches = node.working_elapsed_ms === undefined
+    || Math.max(0, Math.round(record.accumulatedWorkingElapsedMs)) === node.working_elapsed_ms
+    || isWorkingTimeState(record.state);
+  const contextMatches = node.context_window_tokens === undefined
+    || (
+      record.contextWindowTokens === node.context_window_tokens
+      && record.contextUsagePercent === node.context_usage_percent
+    );
   return (
     record.parentAgentId === (hiddenParent ? record.parentAgentId : node.parent_agent_id)
     && record.templateId === node.template_id
@@ -506,6 +548,8 @@ function sameSnapshot(
     && record.revision === node.revision
     && record.createdAt === node.created_at
     && lifecycleMatches
+    && workingMatches
+    && contextMatches
     && JSON.stringify(record.activity) === JSON.stringify(node.activity)
     && JSON.stringify(record.lastTask) === JSON.stringify(node.last_task)
     && JSON.stringify(currentFault) === JSON.stringify(nextFault)
@@ -528,6 +572,11 @@ function isManagementState(state: AgentLifecycleState): boolean {
     || state === "working"
     || state === "interrupting"
     || state === "suspended";
+}
+
+/** 工作时长覆盖任务实际处理和中断收尾，不计入静止、挂起或资源清理。 */
+function isWorkingTimeState(state: AgentLifecycleState): boolean {
+  return state === "working" || state === "interrupting";
 }
 
 function isQuotaConsumingState(state: AgentLifecycleState): boolean {
@@ -604,6 +653,10 @@ export class TreeController {
         createdAt,
         lifecycleStartedAt: monotonicAt,
         frozenLifecycleElapsedMs: undefined,
+        workingStartedAt: undefined,
+        accumulatedWorkingElapsedMs: 0,
+        contextWindowTokens: undefined,
+        contextUsagePercent: undefined,
         activity: undefined,
         activityCounts: new Map(),
         lastTask: undefined,
@@ -779,6 +832,10 @@ export class TreeController {
       createdAt: undefined,
       lifecycleStartedAt: undefined,
       frozenLifecycleElapsedMs: undefined,
+      workingStartedAt: undefined,
+      accumulatedWorkingElapsedMs: 0,
+      contextWindowTokens: undefined,
+      contextUsagePercent: undefined,
       activity: undefined,
       activityCounts: new Map(),
       lastTask: undefined,
@@ -847,6 +904,10 @@ export class TreeController {
       createdAt: undefined,
       lifecycleStartedAt: undefined,
       frozenLifecycleElapsedMs: undefined,
+      workingStartedAt: undefined,
+      accumulatedWorkingElapsedMs: 0,
+      contextWindowTokens: undefined,
+      contextUsagePercent: undefined,
       activity: undefined,
       activityCounts: new Map(),
       lastTask: undefined,
@@ -980,6 +1041,30 @@ export class TreeController {
       return controlSuccess(this.outcome(record, false));
     }
     const applied = this.mutate(record, { activity: parsed });
+    return controlSuccess(this.outcome(record, applied));
+  }
+
+  /** 更新当前子代理的 Pi 上下文窗口事实；undefined 清除当前可用度量。 */
+  updateContextUsage(
+    agentId: unknown,
+    usage: unknown,
+  ): ControlResult<LifecycleEventOutcome> {
+    const resolved = this.findAgent(agentId);
+    if (!resolved.ok) return resolved;
+    if (usage !== undefined && !isAgentContextUsageInput(usage)) {
+      return controlFailure("invalid_argument");
+    }
+    const record = resolved.data;
+    if (record.state === "starting"
+      || record.state === "failed"
+      || record.state === "terminating"
+      || record.state === "terminated") {
+      return controlSuccess(this.outcome(record, false));
+    }
+    const applied = this.mutate(record, {
+      contextWindowTokens: usage?.context_window_tokens ?? null,
+      contextUsagePercent: usage?.context_usage_percent ?? null,
+    });
     return controlSuccess(this.outcome(record, applied));
   }
 
@@ -1149,6 +1234,7 @@ export class TreeController {
     const changes: Array<{ readonly record: AgentRecord; readonly node: AgentSnapshot }> = [];
     const additions: AgentRecord[] = [];
     const additionById = new Map<string, AgentRecord>();
+    let scopeContextUsage: AgentContextUsageInput | undefined;
     for (const node of parsed.data) {
       const current = this.agents.get(node.agent_id);
       if (current === undefined) {
@@ -1178,6 +1264,10 @@ export class TreeController {
             && (node.state === "failed" || node.state === "terminated")
               ? node.lifecycle_elapsed_ms
               : undefined,
+          workingStartedAt: isWorkingTimeState(node.state) ? monotonicAt : undefined,
+          accumulatedWorkingElapsedMs: node.working_elapsed_ms ?? 0,
+          contextWindowTokens: node.context_window_tokens,
+          contextUsagePercent: node.context_usage_percent,
           activity: node.activity,
           activityCounts: node.activity?.category === undefined || node.activity.active_count === undefined
             ? new Map()
@@ -1194,8 +1284,18 @@ export class TreeController {
         continue;
       }
       // 作用域根的生命周期只由其直接父 RpcSupervisor 裁决。child 快照中的
-      // 同一节点只证明不可变身份，不能把 starting 提前改成 idle，或越过屏障。
-      if (current.agentId === scope.agentId) continue;
+      // 同一节点只允许补充 Pi 自身提供的上下文窗口事实，不能越过生命周期屏障。
+      if (current.agentId === scope.agentId) {
+        if (node.context_window_tokens !== undefined) {
+          scopeContextUsage = Object.freeze({
+            context_window_tokens: node.context_window_tokens,
+            ...(node.context_usage_percent === undefined
+              ? {}
+              : { context_usage_percent: node.context_usage_percent }),
+          });
+        }
+        continue;
+      }
       if (node.revision < current.revision) return controlFailure("invalid_argument");
       if (node.revision === current.revision && !sameSnapshot(
         current,
@@ -1211,13 +1311,22 @@ export class TreeController {
       this.issuedAgentIds.add(record.agentId);
     }
     for (const change of changes) this.applySnapshotToRecord(change.record, change.node, monotonicAt);
+    const scopeContextChanged = scopeContextUsage === undefined
+      || scope.state === "failed"
+      || scope.state === "terminating"
+      || scope.state === "terminated"
+      ? false
+      : this.applyMutation(scope, {
+          contextWindowTokens: scopeContextUsage.context_window_tokens,
+          contextUsagePercent: scopeContextUsage.context_usage_percent ?? null,
+        }, safeWallClockNow(this.now), monotonicAt);
     this.subtreeRevisions.set(scope.agentId, input.subtree_revision);
-    if (additions.length > 0 || changes.length > 0) {
+    if (additions.length > 0 || changes.length > 0 || scopeContextChanged) {
       this.treeRevision += 1;
       this.notifyChange();
     }
     return controlSuccess(Object.freeze({
-      applied: additions.length > 0 || changes.length > 0,
+      applied: additions.length > 0 || changes.length > 0 || scopeContextChanged,
       scope_agent_id: scope.agentId,
       subtree_revision: input.subtree_revision,
       tree_revision: this.treeRevision,
@@ -1269,6 +1378,7 @@ export class TreeController {
     monotonicAt: number,
   ): void {
     const stateChanged = record.state !== node.state;
+    const previousWorkingElapsed = this.workingElapsedValue(record, monotonicAt);
     record.state = node.state;
     record.mailboxPendingCount = node.mailbox_pending_count;
     record.hostPendingCount = node.host_pending_count;
@@ -1299,6 +1409,12 @@ export class TreeController {
       record.frozenLifecycleElapsedMs = node.state === "failed" || node.state === "terminated"
         ? elapsed
         : undefined;
+    }
+    record.accumulatedWorkingElapsedMs = node.working_elapsed_ms ?? previousWorkingElapsed;
+    record.workingStartedAt = isWorkingTimeState(node.state) ? monotonicAt : undefined;
+    if (node.context_window_tokens !== undefined) {
+      record.contextWindowTokens = node.context_window_tokens;
+      record.contextUsagePercent = node.context_usage_percent;
     }
   }
 
@@ -1575,13 +1691,25 @@ export class TreeController {
     const nextMailboxPending = mutation.mailboxPendingCount ?? record.mailboxPendingCount;
     const nextHostPending = mutation.hostPendingCount ?? record.hostPendingCount;
     const nextReplyPending = mutation.replyOutboxPendingCount ?? record.replyOutboxPendingCount;
+    const nextContextWindowTokens = mutation.contextWindowTokens === undefined
+      ? record.contextWindowTokens
+      : mutation.contextWindowTokens === null ? undefined : mutation.contextWindowTokens;
+    const nextContextUsagePercent = nextContextWindowTokens === undefined
+      ? undefined
+      : mutation.contextUsagePercent === undefined
+        ? record.contextUsagePercent
+        : mutation.contextUsagePercent === null ? undefined : mutation.contextUsagePercent;
     const nextErrorCode = mutation.errorCode === undefined
       ? (mutation.clearError === true ? undefined : record.error?.code)
       : mutation.errorCode;
     const stateChanged = nextState !== record.state;
+    const wasWorking = isWorkingTimeState(record.state);
+    const willBeWorking = isWorkingTimeState(nextState);
     const queuesChanged = nextMailboxPending !== record.mailboxPendingCount
       || nextHostPending !== record.hostPendingCount
       || nextReplyPending !== record.replyOutboxPendingCount;
+    const contextChanged = nextContextWindowTokens !== record.contextWindowTokens
+      || nextContextUsagePercent !== record.contextUsagePercent;
     const errorChanged = nextErrorCode !== record.error?.code;
     const nextActivity = mutation.activity === undefined
       ? record.activity
@@ -1595,9 +1723,10 @@ export class TreeController {
         : mutation.lastTask;
     const activityChanged = JSON.stringify(nextActivity) !== JSON.stringify(record.activity);
     const lastTaskChanged = JSON.stringify(nextLastTask) !== JSON.stringify(record.lastTask);
-    if (!stateChanged && !queuesChanged && !errorChanged && !activityChanged && !lastTaskChanged) return false;
+    if (!stateChanged && !queuesChanged && !contextChanged && !errorChanged && !activityChanged && !lastTaskChanged) return false;
 
     const elapsedAtMutation = this.lifecycleElapsed(record, monotonicAt);
+    const workingElapsedAtMutation = this.workingElapsedValue(record, monotonicAt);
     const nextError = mutation.errorCode === undefined
       ? (mutation.clearError === true ? undefined : record.error)
       : this.createFault(mutation.errorCode);
@@ -1607,7 +1736,15 @@ export class TreeController {
     record.replyOutboxPendingCount = nextReplyPending;
     record.activity = nextActivity;
     record.lastTask = nextLastTask;
+    record.contextWindowTokens = nextContextWindowTokens;
+    record.contextUsagePercent = nextContextUsagePercent;
     record.error = nextError;
+    if (wasWorking && !willBeWorking) {
+      record.accumulatedWorkingElapsedMs = workingElapsedAtMutation;
+      record.workingStartedAt = undefined;
+    } else if (!wasWorking && willBeWorking) {
+      record.workingStartedAt = monotonicAt;
+    }
     if (nextState === "failed") record.terminationHadFailure = true;
     if (nextErrorCode === "termination_incomplete") record.terminationHadIncompleteCleanup = true;
     if (stateChanged && nextState === "terminated") {
@@ -1697,6 +1834,18 @@ export class TreeController {
     return Math.max(0, Math.round(monotonicAt - record.lifecycleStartedAt));
   }
 
+  private workingElapsedValue(record: AgentRecord, monotonicAt: number): number {
+    if (!isWorkingTimeState(record.state) || record.workingStartedAt === undefined) {
+      return record.accumulatedWorkingElapsedMs;
+    }
+    return record.accumulatedWorkingElapsedMs
+      + Math.max(0, monotonicAt - record.workingStartedAt);
+  }
+
+  private workingElapsed(record: AgentRecord, monotonicAt: number): number {
+    return Math.max(0, Math.round(this.workingElapsedValue(record, monotonicAt)));
+  }
+
   private snapshot(record: AgentRecord, monotonicAt = this.safeMonotonicNow()): AgentSnapshot {
     const common = {
       agent_id: record.agentId,
@@ -1716,10 +1865,20 @@ export class TreeController {
           ...common,
           created_at: record.createdAt,
           lifecycle_elapsed_ms: this.lifecycleElapsed(record, monotonicAt) ?? 0,
+          working_elapsed_ms: this.workingElapsed(record, monotonicAt),
+        };
+    const withContextUsage = record.createdAt === undefined || record.contextWindowTokens === undefined
+      ? base
+      : {
+          ...base,
+          context_window_tokens: record.contextWindowTokens,
+          ...(record.contextUsagePercent === undefined
+            ? {}
+            : { context_usage_percent: record.contextUsagePercent }),
         };
     const withTerminationResult = record.terminationResult === undefined
-      ? base
-      : { ...base, termination_result: record.terminationResult };
+      ? withContextUsage
+      : { ...withContextUsage, termination_result: record.terminationResult };
     const withLastTask = record.lastTask === undefined
       ? withTerminationResult
       : { ...withTerminationResult, last_task: Object.freeze({ ...record.lastTask }) };

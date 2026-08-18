@@ -1478,7 +1478,7 @@ test("运行时以单数 agent 命令交付只读 TUI，并在会话关闭时清
   await execute(api, "spawn_agent", { template_id: "researcher", name: "TUI 子代理" }, context);
   assert.deepEqual(widget.render(80), [
     "Agents",
-    "  researcher · TUI 子代理 · idle · 0s",
+    "  researcher · TUI 子代理 · idle · 0s/0s",
   ]);
   const command = api.commands.get("agent");
   assert.ok(command);
@@ -1771,6 +1771,12 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   let followingSettleDelay: Promise<void> | undefined;
   childApi.on("agent_settled", () => followingSettleDelay);
   const childContext = extensionContext(cwd);
+  let childContextUsage: unknown = Object.freeze({
+    tokens: 91_968,
+    contextWindow: 272_000,
+    percent: 33.84,
+  });
+  childContext.getContextUsage = () => childContextUsage;
   await childApi.emit("session_start", { type: "session_start", reason: "startup" }, childContext);
   const childPromptHandler = childApi.handlers.get("before_agent_start")?.[0];
   assert.ok(childPromptHandler);
@@ -1801,6 +1807,56 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   assert.ok(childController);
   assert.deepEqual(childController.actor, { kind: "agent", agent_id: parentId });
   assert.equal(childController.getAgentTree().ok, true);
+
+  let contextPropagated = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const status = rootController.getAgentStatus(parentId);
+    if (
+      status.ok
+      && status.data.context_window_tokens === 272_000
+      && status.data.context_usage_percent === 33.8
+    ) {
+      contextPropagated = true;
+      break;
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  assert.equal(contextPropagated, true);
+
+  childContextUsage = Object.freeze({
+    tokens: null,
+    contextWindow: 272_000,
+    percent: null,
+  });
+  await childApi.emit("context", { type: "context", messages: [] }, childContext);
+  let unknownUsagePropagated = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const status = rootController.getAgentStatus(parentId);
+    if (
+      status.ok
+      && status.data.context_window_tokens === 272_000
+      && status.data.context_usage_percent === undefined
+    ) {
+      unknownUsagePropagated = true;
+      break;
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  assert.equal(unknownUsagePropagated, true);
+
+  childContextUsage = Object.freeze({
+    tokens: null,
+    contextWindow: 272_000,
+    percent: 40,
+  });
+  await childApi.emit("context", { type: "context", messages: [] }, childContext);
+  const rejectedMalformedUsage = rootController.getAgentStatus(parentId);
+  assert.equal(rejectedMalformedUsage.ok, true);
+  if (rejectedMalformedUsage.ok) {
+    assert.equal(rejectedMalformedUsage.data.context_window_tokens, 272_000);
+    assert.equal(rejectedMalformedUsage.data.context_usage_percent, undefined);
+  }
+
   const childTemplates = await execute(childApi, "get_agent_templates", {}, childContext) as {
     details?: Array<{ template_id: string; tools: string[] }>;
   };

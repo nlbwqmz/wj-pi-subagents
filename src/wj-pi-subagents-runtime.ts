@@ -121,6 +121,12 @@ interface RuntimeContextView extends AgentTreeUiContext {
   readonly modelRegistry?: unknown;
   readonly scopedModels?: unknown;
   readonly isProjectTrusted?: unknown;
+  readonly getContextUsage?: unknown;
+}
+
+interface RuntimeContextUsageSnapshot {
+  readonly context_window_tokens: number;
+  readonly context_usage_percent?: number;
 }
 
 interface RuntimeSessionStartEvent {
@@ -337,6 +343,46 @@ function reloadIdentityOfTransfer(transfer: RuntimeTransfer): RuntimeReloadIdent
 
 function readContext(value: unknown): RuntimeContextView {
   return isRecord(value) ? value as RuntimeContextView : {};
+}
+
+/** 从 Pi ExtensionContext 读取可安全跨进程传播的上下文窗口事实。 */
+function readContextUsage(context: RuntimeContextView): RuntimeContextUsageSnapshot | undefined {
+  if (typeof context.getContextUsage !== "function") return undefined;
+  let value: unknown;
+  try {
+    value = (context.getContextUsage as () => unknown).call(context);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(value)
+    || !Number.isSafeInteger(value.contextWindow)
+    || (value.contextWindow as number) <= 0
+  ) return undefined;
+  const tokens = value.tokens;
+  const percent = value.percent;
+  if (
+    (
+      tokens !== null
+      && (!Number.isSafeInteger(tokens) || (tokens as number) < 0)
+    )
+    || (
+      percent !== null
+      && (
+        typeof percent !== "number"
+        || !Number.isFinite(percent)
+        || percent < 0
+        || percent > 1_000
+      )
+    )
+    || (tokens === null) !== (percent === null)
+  ) return undefined;
+  const roundedPercent = percent === null
+    ? undefined
+    : Math.max(0, Math.round(percent * 10) / 10);
+  return Object.freeze({
+    context_window_tokens: value.contextWindow as number,
+    ...(roundedPercent === undefined ? {} : { context_usage_percent: roundedPercent }),
+  });
 }
 
 function environmentValue(
@@ -684,6 +730,15 @@ export function createWjPiSubagentsRuntimeActivator(
       });
     };
 
+    const refreshContextUsage = (current: ActiveRuntime | undefined, rawContext?: unknown): void => {
+      if (current === undefined || !current.isChild || current.handoffPending === true) return;
+      const context = rawContext === undefined ? current.bindings.context : readContext(rawContext);
+      current.bindings.context = context;
+      const usage = readContextUsage(context);
+      if (usage === undefined || current.controller.actor.kind !== "agent") return;
+      current.tree.updateContextUsage(current.controller.actor.agent_id, usage);
+    };
+
     const relinquishAuthority = (current: ActiveRuntime): boolean => {
       disposeRuntimeUi(current);
       if (current.isChild) return false;
@@ -757,13 +812,14 @@ export function createWjPiSubagentsRuntimeActivator(
       };
     });
 
-    api.on("context", (event) => {
+    api.on("context", (event, rawContext) => {
       const current = active;
       if (current === undefined || current.handoffPending === true) return;
       current.replyInbox.observeContext(event);
+      refreshContextUsage(current, rawContext);
     });
 
-    api.on("agent_start", () => {
+    api.on("agent_start", (_event, rawContext) => {
       const current = active;
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
       coordinationParticipant?.observeAgentStart();
@@ -773,6 +829,7 @@ export function createWjPiSubagentsRuntimeActivator(
         current.replyInbox.failTurnTriggers();
         throw error;
       }
+      refreshContextUsage(current, rawContext);
       if (current.replyInbox.releaseTurnTriggers()) {
         // pending reply 会在首次 transport await 前同步重新注入；ACK 写回属于后台
         // 维护，不能让半开子通道阻塞 Pi 的 agent_start 生命周期。
@@ -780,30 +837,34 @@ export function createWjPiSubagentsRuntimeActivator(
       }
     });
 
-    api.on("turn_end", () => {
+    api.on("turn_end", (_event, rawContext) => {
       waitBatchCoordinator.clear();
+      refreshContextUsage(active, rawContext);
     });
 
-    api.on("message_end", (event) => {
+    api.on("message_end", (event, rawContext) => {
       const current = active;
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
       current.replyCoordinator?.observeAssistantMessageEnd(event);
+      refreshContextUsage(current, rawContext);
     });
 
-    api.on("agent_end", () => {
+    api.on("agent_end", (_event, rawContext) => {
       const current = active;
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
       current.replyCoordinator?.observeAgentEnd();
       current.replyInbox.blockTurnTriggers();
+      refreshContextUsage(current, rawContext);
     });
 
-    api.on("agent_settled", () => {
+    api.on("agent_settled", (_event, rawContext) => {
       const current = active;
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
       // raw settled 只建立 child coordinator 的 provisional candidate；发布和父端
       // ACK 均由独立 outbox 完成，不阻塞同一 lifecycle 事件上的其他 handler。
       current.replyInbox.blockTurnTriggers();
       current.replyCoordinator?.settle();
+      refreshContextUsage(current, rawContext);
     });
 
     const failChildCompactionInvariant = (current: ActiveRuntime): void => {
@@ -838,9 +899,10 @@ export function createWjPiSubagentsRuntimeActivator(
       current.replyCoordinator?.observeCompactionStart(reason, willRetry);
     });
 
-    api.on("session_compact", (event) => {
+    api.on("session_compact", (event, rawContext) => {
       const current = active;
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
+      refreshContextUsage(current, rawContext);
       const reason = isRecord(event) ? event.reason : undefined;
       if (reason === "manual") {
         const coordinated = coordinationParticipant?.completeManualCompaction() === true;
@@ -994,6 +1056,7 @@ export function createWjPiSubagentsRuntimeActivator(
         active.bindings.context = context;
         publishReloadSnapshot(active, context);
         applyAgentToolVisibility(api, active.managementEnabled, active.isChild);
+        refreshContextUsage(active, context);
         bindRuntimeUi(active, context);
         await active.controller.retryPendingReplies();
         return;
@@ -1021,6 +1084,7 @@ export function createWjPiSubagentsRuntimeActivator(
           reloadCoordinator.commitIncoming(incoming);
           active = current;
           applyAgentToolVisibility(api, current.managementEnabled, current.isChild);
+          refreshContextUsage(current, context);
           bindRuntimeUi(current, context);
           try {
             options.onController?.(current.controller);
@@ -1272,6 +1336,7 @@ export function createWjPiSubagentsRuntimeActivator(
         }));
       }
       applyAgentToolVisibility(api, state.managementEnabled, state.isChild);
+      refreshContextUsage(state, context);
       if (state.upstream !== undefined) {
         await state.upstream.channel.publishCapability(childCapabilityManifest(
           api,

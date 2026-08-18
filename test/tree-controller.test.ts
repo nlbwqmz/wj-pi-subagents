@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseAgentFault } from "../src/agent-snapshot-codec.ts";
+import { parseAgentFault, parseAgentSnapshot } from "../src/agent-snapshot-codec.ts";
 import {
   ROOT_TREE_ACTOR,
   TreeController,
@@ -374,6 +374,135 @@ test("生命周期时间从 idle 线性化点开始，并在故障后由单调�
   assert.equal(terminated.node.state, "terminated");
   assert.equal(typeof terminatedElapsed, "number");
   assert.equal(expectSuccess(tree.getStatus(created.node.agent_id)).lifecycle_elapsed_ms, terminatedElapsed);
+});
+
+test("工作时间只累计任务处理与中断收尾，并在空闲或挂起期间暂停", () => {
+  let monotonic = 1_000;
+  const tree = controller([FIRST_ID], { monotonicNow: () => monotonic });
+  const created = reserveRootChild(tree);
+  const id = created.node.agent_id;
+  const ready = expectSuccess(applyEvent(tree, id, { type: "startup_ready" }));
+  assert.equal(ready.node.working_elapsed_ms, 0);
+
+  monotonic = 2_500;
+  const idleBeforeWork = expectSuccess(tree.getStatus(id));
+  assert.equal(idleBeforeWork.lifecycle_elapsed_ms, 1_500);
+  assert.equal(idleBeforeWork.working_elapsed_ms, 0);
+
+  const working = expectSuccess(tree.applyTaskProjection(id, {
+    state: "working",
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
+    activity: { phase: "processing" },
+  }));
+  assert.equal(working.node.working_elapsed_ms, 0);
+
+  monotonic = 4_000;
+  assert.equal(expectSuccess(tree.getStatus(id)).working_elapsed_ms, 1_500);
+  expectSuccess(tree.applyTaskProjection(id, {
+    state: "interrupting",
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
+    activity: { phase: "processing" },
+  }));
+
+  monotonic = 4_500;
+  assert.equal(expectSuccess(tree.getStatus(id)).working_elapsed_ms, 2_000);
+  expectSuccess(tree.applyTaskProjection(id, {
+    state: "suspended",
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
+    activity: { phase: "maintenance_failed" },
+  }));
+
+  monotonic = 6_500;
+  const suspended = expectSuccess(tree.getStatus(id));
+  assert.equal(suspended.lifecycle_elapsed_ms, 5_500);
+  assert.equal(suspended.working_elapsed_ms, 2_000);
+  expectSuccess(tree.applyTaskProjection(id, {
+    state: "working",
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
+    activity: { phase: "processing" },
+  }));
+
+  monotonic = 7_500;
+  expectSuccess(tree.applyTaskProjection(id, {
+    state: "idle",
+    mailbox_pending_count: 0,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
+  }));
+  monotonic = 9_500;
+  const idleAfterWork = expectSuccess(tree.getStatus(id));
+  assert.equal(idleAfterWork.lifecycle_elapsed_ms, 8_500);
+  assert.equal(idleAfterWork.working_elapsed_ms, 3_000);
+  assert.equal(parseAgentSnapshot({
+    ...idleAfterWork,
+    working_elapsed_ms: 8_501,
+  }), undefined);
+});
+
+test("上下文窗口与占用百分比作为安全事实更新并在压缩未知时保留窗口", () => {
+  const tree = controller([FIRST_ID]);
+  const created = reserveRootChild(tree);
+  const id = created.node.agent_id;
+  expectSuccess(applyEvent(tree, id, { type: "startup_ready" }));
+
+  const usage = expectSuccess(tree.updateContextUsage(id, {
+    context_window_tokens: 200_000,
+    context_usage_percent: 37.46,
+  }));
+  assert.equal(usage.node.context_window_tokens, 200_000);
+  assert.equal(usage.node.context_usage_percent, 37.46);
+  assert.deepEqual(parseAgentSnapshot(usage.node), usage.node);
+  assert.equal(parseAgentSnapshot({
+    ...usage.node,
+    context_window_tokens: 0,
+  }), undefined);
+  assert.equal(parseAgentSnapshot({
+    ...usage.node,
+    context_usage_percent: Number.POSITIVE_INFINITY,
+  }), undefined);
+  const duplicate = expectSuccess(tree.updateContextUsage(id, {
+    context_window_tokens: 200_000,
+    context_usage_percent: 37.46,
+  }));
+  assert.equal(duplicate.applied, false);
+  assert.equal(duplicate.node.revision, usage.node.revision);
+
+  expectFailure(tree.updateContextUsage(id, {
+    context_window_tokens: 200_000,
+    context_usage_percent: 1_001,
+  }), "invalid_argument");
+  expectFailure(tree.updateContextUsage(id, {
+    context_window_tokens: 200_000,
+    context_usage_percent: 12,
+    extra: true,
+  } as unknown), "invalid_argument");
+
+  const afterCompaction = expectSuccess(tree.updateContextUsage(id, {
+    context_window_tokens: 200_000,
+  }));
+  assert.equal(afterCompaction.node.context_window_tokens, 200_000);
+  assert.equal(afterCompaction.node.context_usage_percent, undefined);
+  assert.equal(parseAgentSnapshot({
+    ...afterCompaction.node,
+    context_window_tokens: undefined,
+    context_usage_percent: 10,
+  }), undefined);
+
+  const failed = expectSuccess(applyEvent(tree, id, {
+    type: "runtime_failed",
+    error_code: "internal_error",
+  }));
+  assert.equal(failed.node.context_window_tokens, 200_000);
+  assert.equal(expectSuccess(tree.updateContextUsage(id, undefined)).applied, false);
+  assert.equal(expectSuccess(tree.getStatus(id)).context_window_tokens, 200_000);
 });
 
 test("三类队列、revision 与 tree_revision 在一个任务投影中原子更新", () => {
@@ -869,7 +998,74 @@ test("根端只合入已预留完整子树并丢弃旧修订，查询保持稳�
   assert.equal(stale.subtree_revision, 1);
 });
 
-test("递归子树的活动时长从快照基线继续累计并在终态精确冻结", () => {
+test("递归快照只允许作用域根补充上下文窗口事实", () => {
+  const tree = controller([FIRST_ID]);
+  const child = reserveRootChild(tree, "上下文子代理");
+  const childSnapshot = Object.freeze({
+    ...child.node,
+    state: "idle" as const,
+    revision: child.node.revision + 1,
+    created_at: "2026-01-02T03:04:05.000Z",
+    lifecycle_elapsed_ms: 1_000,
+    context_window_tokens: 128_000,
+    context_usage_percent: 24.5,
+  });
+
+  const acceptedWhileStarting = expectSuccess(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
+    scope_agent_id: child.node.agent_id,
+    subtree_revision: 1,
+    nodes: Object.freeze([childSnapshot]),
+  }));
+  assert.equal(acceptedWhileStarting.applied, true);
+  const stillStarting = expectSuccess(tree.getStatus(child.node.agent_id));
+  assert.equal(stillStarting.state, "starting");
+  assert.equal(stillStarting.context_window_tokens, undefined);
+
+  const ready = expectSuccess(applyEvent(tree, child.node.agent_id, { type: "startup_ready" }));
+  assert.equal(ready.node.state, "idle");
+  assert.equal(ready.node.context_window_tokens, 128_000);
+  assert.equal(ready.node.context_usage_percent, 24.5);
+
+  const afterCompaction = Object.freeze({
+    ...childSnapshot,
+    state: "working" as const,
+    activity: Object.freeze({ phase: "compacting" as const }),
+    revision: childSnapshot.revision + 1,
+    context_usage_percent: undefined,
+  });
+  expectSuccess(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
+    scope_agent_id: child.node.agent_id,
+    subtree_revision: 2,
+    nodes: Object.freeze([afterCompaction]),
+  }));
+  const parentOwned = expectSuccess(tree.getStatus(child.node.agent_id));
+  assert.equal(parentOwned.state, "idle");
+  assert.equal(parentOwned.activity, undefined);
+  assert.equal(parentOwned.context_window_tokens, 128_000);
+  assert.equal(parentOwned.context_usage_percent, undefined);
+
+  expectSuccess(applyEvent(tree, child.node.agent_id, {
+    type: "runtime_failed",
+    error_code: "internal_error",
+  }));
+  const beforeLateContext = expectSuccess(tree.getTreeSnapshot()).tree_revision;
+  const ignoredLateContext = expectSuccess(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
+    scope_agent_id: child.node.agent_id,
+    subtree_revision: 3,
+    nodes: Object.freeze([Object.freeze({
+      ...afterCompaction,
+      revision: afterCompaction.revision + 1,
+      context_usage_percent: 50,
+    })]),
+  }));
+  assert.equal(ignoredLateContext.applied, false);
+  assert.equal(ignoredLateContext.tree_revision, beforeLateContext);
+  const frozenFailure = expectSuccess(tree.getStatus(child.node.agent_id));
+  assert.equal(frozenFailure.state, "failed");
+  assert.equal(frozenFailure.context_usage_percent, undefined);
+});
+
+test("递归子树的生命周期与工作时长从快照基线继续累计并在终态精确冻结", () => {
   let monotonic = 10_000;
   const tree = controller([FIRST_ID, SECOND_ID], {
     config: {
@@ -896,6 +1092,7 @@ test("递归子树的活动时长从快照基线继续累计并在终态精确�
     state: "working" as const,
     activity: Object.freeze({ phase: "processing" as const }),
     lifecycle_elapsed_ms: 5_000,
+    working_elapsed_ms: 2_000,
     revision: childSnapshot.revision + 1,
   });
   expectSuccess(tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, {
@@ -904,14 +1101,17 @@ test("递归子树的活动时长从快照基线继续累计并在终态精确�
     nodes: Object.freeze([parentSnapshot, working]),
   }));
   assert.equal(expectSuccess(tree.getStatus(child.node.agent_id)).lifecycle_elapsed_ms, 5_000);
+  assert.equal(expectSuccess(tree.getStatus(child.node.agent_id)).working_elapsed_ms, 2_000);
   monotonic = 12_000;
   assert.equal(expectSuccess(tree.getStatus(child.node.agent_id)).lifecycle_elapsed_ms, 7_000);
+  assert.equal(expectSuccess(tree.getStatus(child.node.agent_id)).working_elapsed_ms, 4_000);
 
   const failed = Object.freeze({
     ...working,
     state: "failed" as const,
     activity: undefined,
     lifecycle_elapsed_ms: 7_000,
+    working_elapsed_ms: 4_000,
     revision: working.revision + 1,
     error: Object.freeze({
       code: "internal_error" as const,
@@ -926,6 +1126,7 @@ test("递归子树的活动时长从快照基线继续累计并在终态精确�
   }));
   monotonic = 20_000;
   assert.equal(expectSuccess(tree.getStatus(child.node.agent_id)).lifecycle_elapsed_ms, 7_000);
+  assert.equal(expectSuccess(tree.getStatus(child.node.agent_id)).working_elapsed_ms, 4_000);
 });
 
 test("递归已登记节点在批量终止后保留故障与清理不完整分类", () => {
@@ -1159,7 +1360,7 @@ test("递归子树其他节点变化时允许 terminating 节点在同一节点�
   assert.equal(expectSuccess(tree.getStatus(first.node.agent_id)).lifecycle_elapsed_ms, 7_000);
 });
 
-test("非权威中继首次接收的新活动后代从快照时长继续累计", () => {
+test("非权威中继兼容缺少工作时长的旧快照并继续本地累计", () => {
   let monotonic = 10_000;
   const tree = controller([], {
     config: {
@@ -1222,8 +1423,24 @@ test("非权威中继首次接收的新活动后代从快照时长继续累计",
     nodes: Object.freeze([child, newDescendant]),
   }));
   assert.equal(expectSuccess(tree.getStatus(THIRD_ID)).lifecycle_elapsed_ms, 5_000);
+  assert.equal(expectSuccess(tree.getStatus(THIRD_ID)).working_elapsed_ms, 0);
   monotonic = 12_000;
   assert.equal(expectSuccess(tree.getStatus(THIRD_ID)).lifecycle_elapsed_ms, 7_000);
+  assert.equal(expectSuccess(tree.getStatus(THIRD_ID)).working_elapsed_ms, 2_000);
+
+  expectSuccess(tree.applySubtreeSnapshot(actor, {
+    scope_agent_id: SECOND_ID,
+    subtree_revision: 2,
+    nodes: Object.freeze([child, Object.freeze({
+      ...newDescendant,
+      state: "idle" as const,
+      activity: undefined,
+      revision: newDescendant.revision + 1,
+      lifecycle_elapsed_ms: 7_000,
+    })]),
+  }));
+  monotonic = 20_000;
+  assert.equal(expectSuccess(tree.getStatus(THIRD_ID)).working_elapsed_ms, 2_000);
 });
 
 test("根快照拒绝未经过 reserve_child 预登记的未知身份", () => {

@@ -419,6 +419,9 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
     revision: 7,
     created_at: "2026-01-02T03:04:05.006Z",
     lifecycle_elapsed_ms: 1234,
+    working_elapsed_ms: 789,
+    context_window_tokens: 200_000,
+    context_usage_percent: 42.3,
     activity: { phase: "executing_tools", category: "reading", active_count: 1 },
   } as const;
   const child = {
@@ -434,6 +437,8 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
     revision: 8,
     created_at: "2026-01-02T03:04:06.006Z",
     lifecycle_elapsed_ms: 2345,
+    working_elapsed_ms: 1_500,
+    context_window_tokens: 128_000,
     activity: { phase: "reconciling" },
   } as const;
   const finished = {
@@ -449,6 +454,7 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
     revision: 9,
     created_at: "2026-01-02T03:04:07.006Z",
     lifecycle_elapsed_ms: 3456,
+    working_elapsed_ms: 2_000,
     termination_result: "completed",
   } as const;
   registerAgentTools(
@@ -527,6 +533,7 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
         revision: 10,
         created_at: "2026-01-02T03:04:08.006Z",
         lifecycle_elapsed_ms: 4567,
+        working_elapsed_ms: 3_000,
         error: { code: "internal_error", message: "Internal controller error", retryable: false },
       } },
       { expanded: true }, RENDER_THEME, { args: { agent_id: agentId } },
@@ -554,6 +561,9 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
     ).render(100).join("\n");
     assert.match(statusCollapsed, /template_id: Explore/);
     assert.match(statusCollapsed, /name: 鉴权调查/);
+    assert.match(statusCollapsed, /working_elapsed_ms: 789/);
+    assert.match(statusCollapsed, /context_window_tokens: 200000/);
+    assert.match(statusCollapsed, /context_usage_percent: 42\.3/);
     assert.match(statusCollapsed, /activity\.phase: executing_tools/);
     assert.match(statusCollapsed, /activity\.category: reading/);
     assert.doesNotMatch(statusCollapsed, /agent_id:|parent_agent_id:|revision: 7|created_at:/);
@@ -565,6 +575,9 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
     assert.match(statusExpanded, /parent_agent_id: null/);
     assert.match(statusExpanded, /revision: 7/);
     assert.match(statusExpanded, /lifecycle_elapsed_ms: 1234/);
+    assert.match(statusExpanded, /working_elapsed_ms: 789/);
+    assert.match(statusExpanded, /context_window_tokens: 200000/);
+    assert.match(statusExpanded, /context_usage_percent: 42\.3/);
 
     const treeCollapsed = toolResultRenderer(registrations, "get_agent_tree")(
       tree, { expanded: false }, RENDER_THEME, { args: {} },
@@ -585,8 +598,8 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
     ).render(160);
     const treeExpanded = treeExpandedLines.join("\n");
     assert.match(treeExpanded, /tree_revision: 12/);
-    assert.match(treeExpanded, /Explore · 鉴权调查 · working · 550e8400/);
-    assert.match(treeExpanded, /  - review · 复核分支 · working · 650e8400/);
+    assert.match(treeExpanded, /Explore · 鉴权调查 · working · 550e8400[^\n]+42\.3%\/200k/);
+    assert.match(treeExpanded, /  - review · 复核分支 · working · 650e8400[^\n]+\?\/128k/);
     assert.match(treeExpanded, /finished · completed 1/);
     assert.ok(treeExpandedLines.every((line) => displayWidth(line) <= 160));
   });

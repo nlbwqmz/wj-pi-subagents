@@ -899,8 +899,14 @@ function formatAgentFacts(node: AgentSnapshot, options: FormatAgentFactsOptions 
       facts.push(`${node.activity.category} ${node.activity.active_count}`);
     }
   }
+  if (node.context_window_tokens !== undefined) {
+    const percent = node.context_usage_percent === undefined
+      ? "?"
+      : `${node.context_usage_percent.toFixed(1)}%`;
+    facts.push(`${percent}/${formatTokens(node.context_window_tokens)}`);
+  }
   if (node.state !== "starting" && node.lifecycle_elapsed_ms !== undefined) {
-    facts.push(formatElapsed(node.lifecycle_elapsed_ms));
+    facts.push(`${formatElapsed(node.working_elapsed_ms ?? 0)}/${formatElapsed(node.lifecycle_elapsed_ms)}`);
   }
   const pending = pendingQueueCount(node);
   if (pending > 0) {
@@ -981,16 +987,28 @@ function compareElapsedRefresh(
     if (!sameAgentFactsExceptElapsed(before, after)) return "error";
     const beforeElapsed = before.lifecycle_elapsed_ms;
     const afterElapsed = after.lifecycle_elapsed_ms;
-    if (beforeElapsed === afterElapsed) continue;
-    if (
-      before.state === "starting"
-      || before.state === "failed"
-      || before.state === "terminated"
-      || beforeElapsed === undefined
-      || afterElapsed === undefined
-      || afterElapsed < beforeElapsed
-    ) return "error";
-    changed = true;
+    if (beforeElapsed !== afterElapsed) {
+      if (
+        before.state === "starting"
+        || before.state === "failed"
+        || before.state === "terminated"
+        || beforeElapsed === undefined
+        || afterElapsed === undefined
+        || afterElapsed < beforeElapsed
+      ) return "error";
+      changed = true;
+    }
+    const beforeWorkingElapsed = before.working_elapsed_ms;
+    const afterWorkingElapsed = after.working_elapsed_ms;
+    if (beforeWorkingElapsed !== afterWorkingElapsed) {
+      if (
+        (before.state !== "working" && before.state !== "interrupting")
+        || beforeWorkingElapsed === undefined
+        || afterWorkingElapsed === undefined
+        || afterWorkingElapsed < beforeWorkingElapsed
+      ) return "error";
+      changed = true;
+    }
   }
   return changed ? "changed" : "ignored";
 }
@@ -1007,6 +1025,8 @@ function sameAgentFactsExceptElapsed(left: AgentSnapshot, right: AgentSnapshot):
     && left.reply_outbox_pending_count === right.reply_outbox_pending_count
     && left.revision === right.revision
     && left.created_at === right.created_at
+    && left.context_window_tokens === right.context_window_tokens
+    && left.context_usage_percent === right.context_usage_percent
     && JSON.stringify(left.activity) === JSON.stringify(right.activity)
     && JSON.stringify(left.last_task) === JSON.stringify(right.last_task)
     && JSON.stringify(left.error) === JSON.stringify(right.error)
@@ -1048,6 +1068,14 @@ function isValidScopedSnapshot(value: unknown): value is ScopedAgentTreeSnapshot
     nodes.push(node);
   }
   return true;
+}
+
+function formatTokens(count: number): string {
+  if (count < 1_000) return String(count);
+  if (count < 10_000) return `${(count / 1_000).toFixed(1)}k`;
+  if (count < 1_000_000) return `${Math.round(count / 1_000)}k`;
+  if (count < 10_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+  return `${Math.round(count / 1_000_000)}M`;
 }
 
 function formatElapsed(value: number): string {
