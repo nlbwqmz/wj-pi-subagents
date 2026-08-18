@@ -54,7 +54,7 @@
     "prepublishOnly": "npm run check",
     "prepack": "npm run build:bridge",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "test": "node --experimental-strip-types --test-reporter=dot --test test/*.test.ts",
     "check": "npm run typecheck && npm test",
     "compat:pi": "node scripts/pi-compat-smoke.mjs"
   },
