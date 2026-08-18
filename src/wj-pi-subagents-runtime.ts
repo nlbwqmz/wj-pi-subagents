@@ -244,7 +244,7 @@ const SYSTEM_TOOL_NAMES = new Set<string>([
 ]);
 
 const PARENT_COORDINATION_GUIDANCE = [
-  "父子任务协作要求：",
+  "父子任务协作要求（必须遵守）：",
   `- ${PARENT_COORDINATION_GUIDELINES.taskOwnership}`,
   `- ${PARENT_COORDINATION_GUIDELINES.sendMessage}`,
   `- ${PARENT_COORDINATION_GUIDELINES.sendMessageReply}`,
