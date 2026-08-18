@@ -460,6 +460,7 @@ export type RpcSupervisorInterruptResult =
       readonly ok: true;
       readonly accepted: boolean;
       readonly changed: boolean;
+      readonly blocked_reason?: "compaction_active";
     }
   | {
       readonly ok: false;
@@ -786,7 +787,14 @@ export class RpcSupervisor {
     if (this.phase !== "ready") {
       return Promise.resolve(Object.freeze({ ok: false, code: "agent_unavailable" }));
     }
-    const isolateNode = this.mailbox.requiresNodeIsolationForInterrupt();
+    if (this.mailbox.isCompactionActive()) {
+      return Promise.resolve(Object.freeze({
+        ok: true,
+        accepted: true,
+        changed: false,
+        blocked_reason: "compaction_active" as const,
+      }));
+    }
     const decision = this.mailbox.requestInterrupt();
     this.commitTaskProjection();
     if (!decision.changed || !decision.should_abort) {
@@ -795,10 +803,7 @@ export class RpcSupervisor {
     try {
       const abort = this.commandClient().abort();
       void abort.catch(() => this.quarantineRuntime("rpc_protocol_fault", true));
-      // Pi 的公共 abort 不覆盖 prompt 预检中的自动压缩；此时没有可靠的
-      // agent_settled 事实，继续保留 interrupt barrier 会永久阻塞后继任务。
-      if (isolateNode) this.quarantineRuntime("message_delivery_failed", true);
-      else this.armInterruptSettlementWatchdog();
+      this.armInterruptSettlementWatchdog();
       return Promise.resolve(Object.freeze({ ok: true, accepted: true, changed: true }));
     } catch {
       this.quarantineRuntime("rpc_protocol_fault", true);

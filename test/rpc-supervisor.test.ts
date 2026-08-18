@@ -1729,19 +1729,21 @@ test("明确拒绝的 steer 只重用一次正文并降级为 prompt", async () 
   await supervisor.terminate();
 });
 
-test("压缩期间中断不等待缺失的 settled，而是隔离并回收节点", async () => {
+test("压缩期间中断返回可重试提示，压缩结束后仍可正常中断", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
   const channel = new RecordingSupervisorChannel([]);
   const supervisor = new RpcSupervisor({
     controller: tree,
     actor: ROOT_TREE_ACTOR,
-    reservation: { templateId: "researcher", name: "压缩中断隔离" },
+    reservation: { templateId: "researcher", name: "压缩中断提示" },
     managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
     channel,
     startupTimeoutMs: 100,
     gracefulShutdownMs: 5,
   });
+  const events: RpcSupervisorEvent[] = [];
+  supervisor.onEvent((event) => events.push(event));
   assert.equal((await supervisor.start()).ok, true);
   const task = await supervisor.prompt("进入压缩状态");
   assert.equal(task.ok, true);
@@ -1754,16 +1756,30 @@ test("压缩期间中断不等待缺失的 settled，而是隔离并回收节点
   assert.deepEqual(await supervisor.interrupt(), {
     ok: true,
     accepted: true,
+    changed: false,
+    blocked_reason: "compaction_active",
+  });
+  assert.equal(rpcClient.operations().includes("abort"), false);
+  assert.equal(events.some((event) => event.kind === "fault"), false);
+  const workingStatus = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(workingStatus.ok, true);
+  if (workingStatus.ok) assert.equal(workingStatus.data.state, "working");
+
+  rpcClient.emitEvent({
+    type: "compaction_end",
+    reason: "threshold",
+    aborted: false,
+    willRetry: false,
+    failed: false,
+  });
+  assert.deepEqual(await supervisor.interrupt(), {
+    ok: true,
+    accepted: true,
     changed: true,
   });
+  assert.equal(rpcClient.operations().includes("abort"), true);
   const termination = await supervisor.terminate();
   assert.equal(termination.ok, true);
-  const status = tree.getStatus(FIRST_AGENT_ID);
-  assert.equal(status.ok, true);
-  if (status.ok) {
-    assert.equal(status.data.state, "terminated");
-    assert.equal(status.data.termination_result, "failed");
-  }
 });
 
 test("中断缺失 settled/final 时在隔离期限后回收节点", async () => {

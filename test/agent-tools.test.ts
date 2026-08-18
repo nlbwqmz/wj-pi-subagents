@@ -519,6 +519,21 @@ test("中断、终止、状态和树结果只投影必要的安全字段", () =>
     ).render(100).join("\n");
     assert.equal(unchanged, "鉴权调查 · unchanged · working");
 
+    const compactionBlocked = toolResultRenderer(registrations, "interrupt_agent")(
+      { content: [{ type: "text", text: "unused" }], details: {
+        agent_id: agentId,
+        accepted: true,
+        changed: false,
+        state: "working",
+        blocked_reason: "compaction_active",
+      } },
+      { expanded: false }, RENDER_THEME, { args: { agent_id: agentId } },
+    ).render(100).join("\n");
+    assert.equal(
+      compactionBlocked,
+      "鉴权调查 · unchanged · working · Compaction active; retry after it finishes",
+    );
+
     const failedStatus = toolResultRenderer(registrations, "get_agent_status")(
       { content: [{ type: "text", text: "unused" }], details: {
         agent_id: agentId,

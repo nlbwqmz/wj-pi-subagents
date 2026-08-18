@@ -460,7 +460,6 @@ function renderWaitResult(
   const errorCode = outcome === "terminal" ? readFaultCode(readProperty(details, "error")) : undefined;
   const warning = errorCode !== undefined
     || outcome === "task_failed"
-    || outcome === "task_interrupted"
     || outcome === "suspended";
   const name = resolveName(agentId, lookups) ?? agentId;
   return createSafeTextComponent([{
@@ -485,7 +484,18 @@ function renderInterruptResult(
     || state === undefined
     || !(AGENT_LIFECYCLE_STATES as readonly string[]).includes(state)
   ) return invalidResult(theme, context);
+  const blockedReason = readOptionalString(details, "blocked_reason");
+  if (
+    blockedReason !== undefined
+    && blockedReason !== "compaction_active"
+  ) return invalidResult(theme, context);
   const name = resolveName(agentId, lookups) ?? agentId;
+  if (blockedReason === "compaction_active") {
+    return createSafeTextComponent([{
+      text: `${name} · unchanged · ${state} · Compaction active; retry after it finishes`,
+      color: "warning",
+    }], theme, context);
+  }
   return createSafeTextComponent([{
     text: `${name} · ${changed ? "changed" : "unchanged"} · ${state}`,
     color: "success",

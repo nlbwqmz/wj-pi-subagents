@@ -160,6 +160,7 @@ export interface InterruptAgentData {
   readonly accepted: true;
   readonly changed: boolean;
   readonly state: AgentSnapshot["state"];
+  readonly blocked_reason?: "compaction_active";
   readonly error?: AgentSnapshot["error"];
 }
 
@@ -505,7 +506,7 @@ export class AgentController {
     if (!result.ok) return controlFailure(result.code);
     const latest = this.tree.getStatus(target.data.agent_id);
     if (!latest.ok) return controlFailure("agent_not_found");
-    return Object.freeze({ ok: true, data: interruptData(latest.data, result.changed) });
+    return Object.freeze({ ok: true, data: interruptData(latest.data, result.changed, result.blocked_reason) });
   }
 
   async terminateAgent(agentId: unknown): Promise<ControlResult<TerminateAgentData>> {
@@ -1164,12 +1165,17 @@ function utf8Length(value: string): number {
   return new TextEncoder().encode(value).byteLength;
 }
 
-function interruptData(status: AgentSnapshot, changed: boolean): InterruptAgentData {
+function interruptData(
+  status: AgentSnapshot,
+  changed: boolean,
+  blockedReason?: "compaction_active",
+): InterruptAgentData {
   return Object.freeze({
     agent_id: status.agent_id,
     accepted: true,
     changed,
     state: status.state,
+    ...(blockedReason === undefined ? {} : { blocked_reason: blockedReason }),
     ...(status.error === undefined ? {} : { error: status.error }),
   });
 }

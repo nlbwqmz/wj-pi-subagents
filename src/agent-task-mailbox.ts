@@ -660,11 +660,10 @@ export class AgentTaskMailbox {
   }
 
   /**
-   * 当前中断无法由 Pi 公共 API 产生可验证的 settled 事实时，节点必须隔离。
-   * Pi 的 abort 不会取消 prompt 预检中的自动压缩；该阶段没有 agent loop，
-   * 继续保留 interrupt barrier 会永久阻塞后继任务。
+   * Pi 的公共 abort 不会取消正在执行的自动压缩；压缩期间拒绝普通中断，
+   * 由调用方在 compaction_end 后重新发起请求。
    */
-  requiresNodeIsolationForInterrupt(): boolean {
+  isCompactionActive(): boolean {
     return this.compactionActive;
   }
 

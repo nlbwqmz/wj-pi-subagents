@@ -2,7 +2,7 @@
   "name": "wj-pi-subagents",
   "version": "0.0.10",
   "author": "WJ",
-  "description": "wj-pi-subagents：Pi 递归子代理扩展包",
+  "description": "Create and manage recursive subagents in Pi",
   "homepage": "https://github.com/nlbwqmz/wj-pi-subagents#readme",
   "bugs": {
     "url": "https://github.com/nlbwqmz/wj-pi-subagents/issues"
