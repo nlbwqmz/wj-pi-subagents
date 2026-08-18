@@ -184,7 +184,7 @@ const TAKEOVER_GUIDELINE =
 export const PARENT_COORDINATION_GUIDELINES = Object.freeze({
   taskOwnership: "任务所有权：send_message 返回 accepted: true 后，该任务由目标直接子代理负责，直到其提交最终答复或进入终态。父会话不得重复调查、实现、测试、验证、评审或再次委派同一任务；只能等待、查询状态、向该子代理发送 steering，或处理事先明确拆分且无数据依赖、无共享写资源的独立工作。需要接管时，先 interrupt_agent，再 wait_agent 确认子代理已结束。",
   sendMessage: DELIVERY_AND_WAITING_GUIDELINE,
-  sendMessageReply: "使用 send_message 向工作中的子代理发消息且需要其在任务中回复时，提示其使用 reply_to_parent 工具回复。",
+  sendMessageReply: "任务中交互（强制要求）：使用 send_message 向工作中的子代理发消息且需要其在任务中回复时，需要在发送的消息中提示其使用 reply_to_parent 工具回复。",
   waitAgent: DELIVERY_AND_WAITING_GUIDELINE,
   slowProgress: "慢任务：working/processing 或 timeout 不代表失败。不要仅因耗时而要求子代理提前总结、调用 interrupt_agent 或 terminate_agent；可以用 send_message 询问进度，然后继续 wait_agent。",
   taskRecovery: "异常恢复：task_failed、task_interrupted，或最终答复缺失、不可用时，先用 get_agent_status 核对，再向同一 agent_id 发送恢复指令。复用已有上下文，从未完成步骤继续，避免重复已完成的副作用，并要求其提交完整最终答复。",
