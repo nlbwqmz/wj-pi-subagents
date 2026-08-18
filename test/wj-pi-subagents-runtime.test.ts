@@ -1703,6 +1703,7 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
     "父子任务协作要求：",
     `- ${PARENT_COORDINATION_GUIDELINES.taskOwnership}`,
     `- ${PARENT_COORDINATION_GUIDELINES.sendMessage}`,
+    `- ${PARENT_COORDINATION_GUIDELINES.sendMessageReply}`,
     `- ${PARENT_COORDINATION_GUIDELINES.slowProgress}`,
     `- ${PARENT_COORDINATION_GUIDELINES.taskRecovery}`,
     `- ${PARENT_COORDINATION_GUIDELINES.retryPolicy}`,
