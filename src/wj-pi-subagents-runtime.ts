@@ -782,7 +782,7 @@ export function createWjPiSubagentsRuntimeActivator(
       });
     }
 
-    api.registerCommand("agent", {
+    api.registerCommand("agents", {
       description: "View the read-only agent tree for the current session scope",
       handler: async (_args, rawContext) => {
         const current = active;

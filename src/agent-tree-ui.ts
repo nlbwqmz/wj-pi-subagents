@@ -107,7 +107,14 @@ export interface AgentTreeUiBinding {
 }
 
 const AGENTS_WIDGET_KEY = "wj-pi-subagents-agents";
+const AGENTS_WIDGET_TITLE = "● Agents";
 const ELAPSED_REFRESH_INTERVAL_MS = 1_000;
+/** 与 Pi Loader 默认 Working 指示器保持一致。 */
+const WORKING_SPINNER_FRAMES = Object.freeze([
+  "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+]);
+const WORKING_SPINNER_INTERVAL_MS = 80;
+const INITIAL_WORKING_SPINNER_FRAME = WORKING_SPINNER_FRAMES[0] ?? "⠋";
 const DEFAULT_PANEL_VIEWPORT_HEIGHT = 12;
 const AGENT_TREE_OVERLAY_OPTIONS = Object.freeze({
   width: 96,
@@ -183,6 +190,8 @@ export function bindAgentTreeUi(
     readonly done: () => void;
   } | undefined;
   let panelPromise: Promise<void> | undefined;
+  let workingSpinnerFrame = 0;
+  let widgetHasWorkingAgent = false;
   const widgetTuis = new Set<AgentTreeTui>();
 
   const read = (): ControlResult<ScopedAgentTreeSnapshot> | undefined => {
@@ -195,6 +204,7 @@ export function bindAgentTreeUi(
   const initial = read();
   if (initial?.ok === true && isValidScopedSnapshot(initial.data)) {
     snapshot = initial.data;
+    widgetHasWorkingAgent = hasWorkingWidgetRows(initial.data);
     notifier = typeof ui.notify === "function"
       ? new AgentTreeFailureNotifier(initial.data, (message, type) => ui.notify?.(message, type))
       : undefined;
@@ -208,16 +218,17 @@ export function bindAgentTreeUi(
   };
   const widgetLines = (width: number): string[] => {
     if (sourceError || snapshot === undefined) return [
-      truncateToDisplayWidth("Agents", width),
-      truncateToDisplayWidth("  Agent tree temporarily unavailable", width),
+      truncateToDisplayWidth(AGENTS_WIDGET_TITLE, width),
+      truncateToDisplayWidth("└─ × Agent tree temporarily unavailable", width),
     ];
     try {
-      return [...renderAgentsWidget(snapshot, width)];
+      const frame = WORKING_SPINNER_FRAMES[workingSpinnerFrame] ?? INITIAL_WORKING_SPINNER_FRAME;
+      return [...renderAgentsWidget(snapshot, width, frame)];
     } catch {
       sourceError = true;
       return [
-        truncateToDisplayWidth("Agents", width),
-        truncateToDisplayWidth("  Agent tree temporarily unavailable", width),
+        truncateToDisplayWidth(AGENTS_WIDGET_TITLE, width),
+        truncateToDisplayWidth("└─ × Agent tree temporarily unavailable", width),
       ];
     }
   };
@@ -242,10 +253,19 @@ export function bindAgentTreeUi(
   };
   setWidget();
 
+  const spinnerTimer = setInterval(() => {
+    if (disposed || !widgetHasWorkingAgent) return;
+    workingSpinnerFrame = (workingSpinnerFrame + 1) % WORKING_SPINNER_FRAMES.length;
+    for (const tui of widgetTuis) safeRequestRender(tui);
+    if (context.mode === "rpc") setWidget();
+  }, WORKING_SPINNER_INTERVAL_MS);
+  spinnerTimer.unref?.();
+
   const handleChange = (): void => {
     if (disposed) return;
     const result = read();
     if (result?.ok !== true || !isValidScopedSnapshot(result.data)) {
+      widgetHasWorkingAgent = false;
       if (result?.ok === false && result.error.code === "agent_not_found") {
         activePanel?.done();
         activePanel = undefined;
@@ -258,7 +278,10 @@ export function bindAgentTreeUi(
       return;
     }
     if (snapshot !== undefined && result.data.tree_revision <= snapshot.tree_revision) return;
+    const previousWidgetHasWorkingAgent = widgetHasWorkingAgent;
     snapshot = result.data;
+    widgetHasWorkingAgent = hasWorkingWidgetRows(result.data);
+    if (!previousWidgetHasWorkingAgent && widgetHasWorkingAgent) workingSpinnerFrame = 0;
     sourceError = false;
     if (notifier === undefined && typeof ui.notify === "function") {
       notifier = new AgentTreeFailureNotifier(result.data, (message, type) => ui.notify?.(message, type));
@@ -377,6 +400,7 @@ export function bindAgentTreeUi(
       if (disposed) return;
       disposed = true;
       clearInterval(elapsedTimer);
+      clearInterval(spinnerTimer);
       try { unsubscribe?.(); } catch {}
       unsubscribe = undefined;
       activePanel?.done();
@@ -420,20 +444,21 @@ export function truncateToDisplayWidth(value: string, width: number): string {
 export function renderAgentsWidget(
   snapshot: ScopedAgentTreeSnapshot,
   width: number,
+  workingFrame: string = INITIAL_WORKING_SPINNER_FRAME,
 ): readonly string[] {
-  const parentAgentId = snapshot.scope.kind === "root"
-    ? null
-    : snapshot.scope.agent_id ?? null;
-  const rows = snapshot.nodes
-    .filter((node) => node.parent_agent_id === parentAgentId && node.state !== "terminated")
-    .map((node) => truncateToDisplayWidth(`  ${formatAgentFacts(node, {
+  const nodes = directWidgetNodes(snapshot);
+  const rows = nodes.map((node, index) => {
+    const branch = index === nodes.length - 1 ? "└─" : "├─";
+    const icon = formatAgentStateIcon(node, workingFrame);
+    return truncateToDisplayWidth(`${branch} ${icon} ${formatAgentFacts(node, {
       includeActivityCategoryCount: false,
-    })}`, width));
+    })}`, width);
+  });
   if (rows.length === 0) return Object.freeze([]);
-  return Object.freeze([truncateToDisplayWidth("Agents", width), ...rows]);
+  return Object.freeze([truncateToDisplayWidth(AGENTS_WIDGET_TITLE, width), ...rows]);
 }
 
-/** `/agent` 的纯交互投影；它只消费一次完整的作用域树快照。 */
+/** `/agents` 的纯交互投影；它只消费一次完整的作用域树快照。 */
 export class AgentTreePanelModel {
   private snapshot: ScopedAgentTreeSnapshot;
   private status: "ready" | "error" = "ready";
@@ -880,6 +905,42 @@ function themeBold(theme: unknown, text: string): string {
     return typeof styled === "string" ? styled : text;
   } catch {
     return text;
+  }
+}
+
+function directWidgetNodes(snapshot: ScopedAgentTreeSnapshot): readonly AgentSnapshot[] {
+  const parentAgentId = snapshot.scope.kind === "root"
+    ? null
+    : snapshot.scope.agent_id ?? null;
+  return snapshot.nodes.filter((node) =>
+    node.parent_agent_id === parentAgentId && node.state !== "terminated",
+  );
+}
+
+function hasWorkingWidgetRows(snapshot: ScopedAgentTreeSnapshot): boolean {
+  return directWidgetNodes(snapshot).some((node) => node.state === "working");
+}
+
+function formatAgentStateIcon(node: AgentSnapshot, workingFrame: string): string {
+  switch (node.state) {
+    case "starting":
+      return "◌";
+    case "idle":
+      return "○";
+    case "working": {
+      const frame = truncateToDisplayWidth(safeUiFact(workingFrame), 1);
+      return frame.length === 0 ? INITIAL_WORKING_SPINNER_FRAME : frame;
+    }
+    case "interrupting":
+      return "↻";
+    case "suspended":
+      return "Ⅱ";
+    case "failed":
+      return "×";
+    case "terminating":
+      return "…";
+    case "terminated":
+      return "·";
   }
 }
 

@@ -87,6 +87,66 @@ test("常驻 Agents widget 在没有直接子代理时不显示", () => {
   assert.deepEqual(renderAgentsWidget(snapshot, 120), []);
 });
 
+test("常驻 Agents widget 显示 Pi Working spinner 帧和生命周期图标", () => {
+  const startingWithDefaults = node({
+    agent_id: CHILD_ID,
+    parent_agent_id: PARENT_ID,
+    state: "starting",
+  });
+  const {
+    created_at: _startingCreatedAt,
+    working_elapsed_ms: _startingWorkingElapsed,
+    ...starting
+  } = startingWithDefaults;
+  const snapshot = subtreeSnapshot([
+    node({ agent_id: PARENT_ID, parent_agent_id: null }),
+    starting,
+    node({ agent_id: ACTIVE_PARENT_ID, parent_agent_id: PARENT_ID, state: "idle" }),
+    node({ agent_id: WORKING_ID, parent_agent_id: PARENT_ID, state: "working" }),
+    node({ agent_id: DEEP_BRANCH_ID, parent_agent_id: PARENT_ID, state: "interrupting" }),
+    node({ agent_id: FAILED_ID, parent_agent_id: PARENT_ID, state: "suspended" }),
+    node({
+      agent_id: INCOMPLETE_ID,
+      parent_agent_id: PARENT_ID,
+      state: "failed",
+      error: Object.freeze({
+        code: "internal_error",
+        message: "Internal controller error",
+        retryable: false,
+      }),
+    }),
+    node({
+      agent_id: FINISHED_FAILED_ID,
+      parent_agent_id: PARENT_ID,
+      state: "terminating",
+      error: Object.freeze({
+        code: "termination_incomplete",
+        message: "Subagent resources not fully reclaimed",
+        retryable: true,
+      }),
+    }),
+  ]);
+  const initial = renderAgentsWidget(snapshot, 240);
+
+  assert.equal(initial[0], "● Agents");
+  assert.match(initial[1]!, /^├─ ◌ /);
+  assert.match(initial[2]!, /^├─ ○ /);
+  assert.match(initial[3]!, /^├─ ⠋ /);
+  assert.match(initial[4]!, /^├─ ↻ /);
+  assert.match(initial[5]!, /^├─ Ⅱ /);
+  assert.match(initial[6]!, /^├─ × /);
+  assert.match(initial[7]!, /^└─ … /);
+  assert.match(renderAgentsWidget(snapshot, 240, "⠹")[3]!, /^├─ ⠹ /);
+
+  for (const width of [1, 2, 3, 8, 24]) {
+    assert.equal(
+      renderAgentsWidget(snapshot, width).every((line) => displayWidth(line) <= width),
+      true,
+      `常驻 widget 在 ${width} 列下不得超出行宽`,
+    );
+  }
+});
+
 test("常驻 Agents widget 只按稳定字段顺序显示作用域直接子代理并安全截断", () => {
   const snapshot = subtreeSnapshot([
     node({ agent_id: PARENT_ID, parent_agent_id: null, template_id: "parent", name: "当前会话" }),
@@ -122,10 +182,10 @@ test("常驻 Agents widget 只按稳定字段顺序显示作用域直接子代�
   ]);
 
   assert.deepEqual(renderAgentsWidget(snapshot, 120), [
-    "Agents",
-    "  研🙂e\u0301究员 · 直接子代理 · failed · 15s · internal_error",
+    "● Agents",
+    "└─ × 研🙂e\u0301究员 · 直接子代理 · failed · 15s · internal_error",
   ]);
-  assert.deepEqual(renderAgentsWidget(snapshot, 8), ["Agents", "  研🙂e\u0301…"]);
+  assert.deepEqual(renderAgentsWidget(snapshot, 8), ["● Agents", "└─ × 研…"]);
   assert.doesNotMatch(renderAgentsWidget(snapshot, 120).join("\n"), /secret-canary|terminate|interrupt|reload/i);
 });
 
@@ -150,8 +210,8 @@ test("常驻 Agents widget 隐藏活动类别计数但代理树面板保留", ()
 
   const widget = renderAgentsWidget(snapshot, 120);
   assert.deepEqual(widget, [
-    "Agents",
-    "  worker · 活动子代理 · working · executing_tools · 33.8%/272k · 15s",
+    "● Agents",
+    "└─ ⠋ worker · 活动子代理 · working · executing_tools · 33.8%/272k · 15s",
   ]);
   assert.doesNotMatch(widget.join("\n"), /reading 2/);
   assert.match(
@@ -177,8 +237,8 @@ test("常驻 Agents widget 隐藏活动类别计数但代理树面板保留", ()
     }),
   ], 3);
   assert.deepEqual(renderAgentsWidget(afterCompaction, 120), [
-    "Agents",
-    "  worker · 活动子代理 · working · executing_tools · ?/272k · 15s",
+    "● Agents",
+    "└─ ⠋ worker · 活动子代理 · working · executing_tools · ?/272k · 15s",
   ]);
 });
 
@@ -770,8 +830,8 @@ test("UI 绑定通过 widget、overlay 和 notify 跟随树修订并完整清理
     dispose?(): void;
   })(tui);
   assert.deepEqual(widget.render(80), [
-    "Agents",
-    "  worker · 直接子代理 · idle · 15s",
+    "● Agents",
+    "└─ ○ worker · 直接子代理 · idle · 15s",
   ]);
   const opened = binding.openPanel({ hasUI: true, mode: "tui", ui });
   assert.deepEqual(overlayOptions, {

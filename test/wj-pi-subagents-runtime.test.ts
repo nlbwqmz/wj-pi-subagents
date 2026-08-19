@@ -1439,7 +1439,7 @@ test("生产运行时闭合直接父子的创建、消息、回复、等待、�
   assert.doesNotMatch(terminatedDisplay, /运行时子代理/);
 });
 
-test("运行时以单数 agent 命令交付只读 TUI，并在会话关闭时清理 UI", async () => {
+test("运行时以复数 agents 命令交付只读 TUI，并在会话关闭时清理 UI", async () => {
   const cwd = "C:\\workspace\\agent-tree-ui";
   const api = new FakeExtensionApi();
   const ui = new FakeRuntimeUi();
@@ -1464,7 +1464,7 @@ test("运行时以单数 agent 命令交付只读 TUI，并在会话关闭时清
     platform: "win32",
     processTreeAdapter: {} as never,
   });
-  assert.deepEqual([...api.commands.keys()], ["agent"]);
+  assert.deepEqual([...api.commands.keys()], ["agents"]);
   await api.emit("session_start", { type: "session_start", reason: "startup" }, context);
   const firstWidget = ui.widgetCalls.at(-1);
   assert.equal(firstWidget?.key, "wj-pi-subagents-agents");
@@ -1477,10 +1477,10 @@ test("运行时以单数 agent 命令交付只读 TUI，并在会话关闭时清
 
   await execute(api, "spawn_agent", { template_id: "researcher", name: "TUI 子代理" }, context);
   assert.deepEqual(widget.render(80), [
-    "Agents",
-    "  researcher · TUI 子代理 · idle · 0s",
+    "● Agents",
+    "└─ ○ researcher · TUI 子代理 · idle · 0s",
   ]);
-  const command = api.commands.get("agent");
+  const command = api.commands.get("agents");
   assert.ok(command);
   assert.equal(command.description, "View the read-only agent tree for the current session scope");
   const opened = command.handler("", context) as Promise<void>;
