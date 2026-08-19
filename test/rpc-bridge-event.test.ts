@@ -62,7 +62,7 @@ test("桥接严格规范化 Pi 的完整压缩原因闭集，非法原因拒绝"
   }), { kind: "invalid" });
 });
 
-test("compaction_end 只公开完成裁决，失败由 aborted 或 errorMessage 推导", () => {
+test("compaction_end 分离取消与真实错误，且不公开 provider 错误正文", () => {
   assert.deepEqual(normalizeRpcBridgeEvent({
     type: "compaction_end",
     reason: "threshold",
@@ -107,7 +107,7 @@ test("compaction_end 只公开完成裁决，失败由 aborted 或 errorMessage 
       reason: "manual",
       aborted: true,
       willRetry: false,
-      failed: true,
+      failed: false,
     },
   });
   assert.deepEqual(normalizeRpcBridgeEvent({

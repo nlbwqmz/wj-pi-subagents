@@ -17,6 +17,7 @@ import {
   MANAGED_RPC_BRIDGE_MAX_FRAME_BYTES,
   MANAGED_RPC_BRIDGE_PROTOCOL,
   MANAGED_RPC_SUPERVISOR_MAX_FRAME_BYTES,
+  type ManagedRpcCommandRejectionReason,
   type ManagedRpcSupervisorInit,
 } from "./managed-rpc-node.ts";
 import { LengthPrefixedFrameDecoder } from "./length-prefixed-frame-decoder.ts";
@@ -32,6 +33,8 @@ const MAX_FRAME_BYTES = MANAGED_RPC_BRIDGE_MAX_FRAME_BYTES;
 const PROTOCOL = MANAGED_RPC_BRIDGE_PROTOCOL;
 const CREDENTIAL_ENV = MANAGED_RPC_BRIDGE_CREDENTIAL_ENV;
 const MAX_MESSAGE_BYTES = 16 * 1024;
+const COMPACTION_ACTIVE_PROMPT_ERROR =
+  "Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.";
 
 interface BridgeClient {
   start(): Promise<void>;
@@ -125,14 +128,27 @@ function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[])
   return Object.keys(value).every((key) => allowed.includes(key));
 }
 
+type PiCommandDisposition =
+  | { readonly kind: "accepted" }
+  | { readonly kind: "rejected"; readonly reason?: ManagedRpcCommandRejectionReason }
+  | { readonly kind: "unknown" };
+
 function piCommandDisposition(
   value: unknown,
   command: "prompt" | "steer",
-): "accepted" | "rejected" | "unknown" {
-  if (!isRecord(value) || value.type !== "response" || value.command !== command) return "unknown";
-  if (value.success === true) return "accepted";
-  if (value.success === false) return "rejected";
-  return "unknown";
+): PiCommandDisposition {
+  if (!isRecord(value) || value.type !== "response" || value.command !== command) {
+    return Object.freeze({ kind: "unknown" });
+  }
+  if (value.success === true) return Object.freeze({ kind: "accepted" });
+  if (value.success !== false) return Object.freeze({ kind: "unknown" });
+  const reason = command === "prompt" && value.error === COMPACTION_ACTIVE_PROMPT_ERROR
+    ? "compaction_active" as const
+    : undefined;
+  return Object.freeze({
+    kind: "rejected",
+    ...(reason === undefined ? {} : { reason }),
+  });
 }
 
 function writeFrame(value: unknown): void {
@@ -204,7 +220,7 @@ function response(id: number, ok: boolean, data?: unknown): void {
   });
 }
 
-function rejectedResponse(id: number): void {
+function rejectedResponse(id: number, reason?: ManagedRpcCommandRejectionReason): void {
   if (protocolFailed) return;
   writeFrame({
     protocol: PROTOCOL,
@@ -212,6 +228,7 @@ function rejectedResponse(id: number): void {
     id,
     ok: false,
     rejected: true,
+    ...(reason === undefined ? {} : { rejection_reason: reason }),
   });
 }
 
@@ -688,8 +705,8 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
         message: command.payload.message,
       });
       const disposition = piCommandDisposition(result, commandName);
-      if (disposition === "accepted") response(command.id, true);
-      else if (disposition === "rejected") rejectedResponse(command.id);
+      if (disposition.kind === "accepted") response(command.id, true);
+      else if (disposition.kind === "rejected") rejectedResponse(command.id, disposition.reason);
       else response(command.id, false);
       return;
     }

@@ -719,7 +719,153 @@ test("成功 complete 后同事务 not_started 撤销 continuation 等待并发�
       completed: true,
     },
   ]);
+  assert.deepEqual(upstream.requests, [
+    { kind: "prepare", transactionId: "compact-compensated" },
+    {
+      kind: "complete",
+      transactionId: "compact-compensated",
+      outcome: "succeeded",
+      continuationExpected: true,
+    },
+    { kind: "complete", transactionId: "compact-compensated", outcome: "not_started" },
+  ]);
   await participant.close();
+});
+
+test("同事务补偿被上游明确拒绝时，本地释放等待但 completed 返回 false", async () => {
+  const bus = new TestEventBus();
+  const upstream = new FakeUpstreamChannel();
+  upstream.completeOperation = async (_transactionId, outcome) => outcome === "succeeded";
+  const replyCoordinator = new ChildReplyCoordinator({
+    agentId: CHILD_ID,
+    port: { publishReplyAndWaitForAck: async () => {} },
+    taskIdFactory: () => TASK_ID,
+    turnIdFactory: () => TURN_ID,
+    commitIdFactory: () => COMMIT_ID,
+  });
+  replyCoordinator.observeAgentStart();
+  const value = createRuntime({ upstream, replyCoordinator });
+  const participant = new AutoCompactCoordinationParticipant({
+    eventBus: bus,
+    readRuntime: () => value.runtime,
+    participantId: "participant-rejected-compensation",
+    upstreamAckTimeoutMs: 100,
+  });
+
+  emitPrepare(bus, "participant-rejected-compensation", "compact-rejected-compensation");
+  await settle();
+  replyCoordinator.observeAssistantMessageEnd({
+    type: "message_end",
+    message: { role: "assistant", stopReason: "aborted", content: [] },
+  });
+  replyCoordinator.observeAgentEnd();
+  replyCoordinator.settle();
+  emitComplete(bus, "participant-rejected-compensation", "compact-rejected-compensation", "succeeded");
+  await settle();
+  assert.equal(replyCoordinator.awaitsCoordinationContinuation("compact-rejected-compensation"), true);
+
+  emitComplete(bus, "participant-rejected-compensation", "compact-rejected-compensation", "not_started");
+  await settle();
+  assert.equal(replyCoordinator.awaitsCoordinationContinuation("compact-rejected-compensation"), false);
+  const completed = bus.emitted
+    .filter((event) => event.channel === AUTO_COMPACT_COORDINATION_CHANNELS.completed)
+    .map((event) => event.value as { requestId: string; completed: boolean })
+    .filter((event) => event.requestId === "compact-rejected-compensation");
+  assert.deepEqual(completed.map((event) => event.completed), [true, false]);
+  await participant.close();
+});
+
+test("close 在自动 continuation 尚未启动时向上游补偿 not_started", async () => {
+  const bus = new TestEventBus();
+  const upstream = new FakeUpstreamChannel();
+  const replies: Array<{ readonly kind: string; readonly run_state?: string }> = [];
+  const replyCoordinator = new ChildReplyCoordinator({
+    agentId: CHILD_ID,
+    port: { publishReplyAndWaitForAck: async (reply) => { replies.push(reply); } },
+    taskIdFactory: () => TASK_ID,
+    turnIdFactory: () => TURN_ID,
+    commitIdFactory: () => COMMIT_ID,
+  });
+  replyCoordinator.observeAgentStart();
+  const value = createRuntime({ upstream, replyCoordinator });
+  const participant = new AutoCompactCoordinationParticipant({
+    eventBus: bus,
+    readRuntime: () => value.runtime,
+    participantId: "participant-close-continuation",
+    upstreamAckTimeoutMs: 100,
+  });
+
+  emitPrepare(bus, "participant-close-continuation", "compact-close-continuation");
+  await settle();
+  replyCoordinator.observeAssistantMessageEnd({
+    type: "message_end",
+    message: { role: "assistant", stopReason: "aborted", content: [] },
+  });
+  replyCoordinator.observeAgentEnd();
+  replyCoordinator.settle();
+  emitComplete(bus, "participant-close-continuation", "compact-close-continuation", "succeeded");
+  await settle();
+  assert.equal(replyCoordinator.awaitsCoordinationContinuation("compact-close-continuation"), true);
+
+  await participant.close();
+  await settle();
+  assert.deepEqual(upstream.requests, [
+    { kind: "prepare", transactionId: "compact-close-continuation" },
+    {
+      kind: "complete",
+      transactionId: "compact-close-continuation",
+      outcome: "succeeded",
+      continuationExpected: true,
+    },
+    { kind: "complete", transactionId: "compact-close-continuation", outcome: "not_started" },
+  ]);
+  assert.deepEqual(replies.map((reply) => ({ kind: reply.kind, run_state: reply.run_state })), [
+    { kind: "final", run_state: "interrupted" },
+  ]);
+});
+
+test("真实 continuation 启动后 close 不再发送 not_started 补偿", async () => {
+  const bus = new TestEventBus();
+  const upstream = new FakeUpstreamChannel();
+  const replyCoordinator = new ChildReplyCoordinator({
+    agentId: CHILD_ID,
+    port: { publishReplyAndWaitForAck: async () => {} },
+    taskIdFactory: () => TASK_ID,
+    turnIdFactory: () => TURN_ID,
+    commitIdFactory: () => COMMIT_ID,
+  });
+  replyCoordinator.observeAgentStart();
+  const value = createRuntime({ upstream, replyCoordinator });
+  const participant = new AutoCompactCoordinationParticipant({
+    eventBus: bus,
+    readRuntime: () => value.runtime,
+    participantId: "participant-started-continuation",
+    upstreamAckTimeoutMs: 100,
+  });
+
+  emitPrepare(bus, "participant-started-continuation", "compact-started-continuation");
+  await settle();
+  replyCoordinator.observeAssistantMessageEnd({
+    type: "message_end",
+    message: { role: "assistant", stopReason: "aborted", content: [] },
+  });
+  replyCoordinator.observeAgentEnd();
+  replyCoordinator.settle();
+  emitComplete(bus, "participant-started-continuation", "compact-started-continuation", "succeeded");
+  await settle();
+  assert.equal(replyCoordinator.awaitsCoordinationContinuation("compact-started-continuation"), true);
+
+  participant.observeAgentStart();
+  await participant.close();
+  assert.deepEqual(upstream.requests, [
+    { kind: "prepare", transactionId: "compact-started-continuation" },
+    {
+      kind: "complete",
+      transactionId: "compact-started-continuation",
+      outcome: "succeeded",
+      continuationExpected: true,
+    },
+  ]);
 });
 
 test("prepare 被上游拒绝并解除本地 reply 屏障后重新驱动待确认回复", async () => {

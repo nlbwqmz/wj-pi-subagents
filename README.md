@@ -249,8 +249,6 @@ pi install npm:wj-pi-subagents -l
 pi install npm:wj-pi-auto-compact -l
 ```
 
-两者同时加载后会自动协作，不需要额外配置。压缩开始前，本插件会暂存父子代理的回复交付；压缩完成、取消或失败后再释放等待并继续处理，避免压缩过程与父子消息同时推进。
-
 `wj-pi-auto-compact` 默认在上下文使用率达到 `90%` 时触发。需要调整时创建：
 
 ```text

@@ -571,6 +571,12 @@ function readPendingMessageCount(value: unknown): number | undefined {
   return pending >= 0 ? pending : undefined;
 }
 
+function readIsCompacting(value: unknown): boolean | undefined {
+  return isRecord(value) && typeof value.isCompacting === "boolean"
+    ? value.isCompacting
+    : undefined;
+}
+
 type MessageCommandKind = "submit";
 
 type CoordinatedCompactionPhase = "preparing" | "prepared" | "release_failed" | "closed";
@@ -584,6 +590,13 @@ interface CoordinatedCompactionState {
   terminalAccepted?: boolean;
 }
 
+interface ClosedCoordinatedCompaction {
+  readonly accepted: boolean;
+  readonly outcome: SupervisorCompactionComplete["outcome"];
+  readonly continuationExpected: boolean;
+  compensationAccepted?: boolean;
+}
+
 interface CompactionStateWaiter {
   readonly version: number;
   readonly resolve: () => void;
@@ -594,6 +607,7 @@ interface QueuedMessageCommand {
   readonly message: string;
   readonly message_id: string;
   readonly delivery?: AgentHostDelivery;
+  readonly compaction_rejection_count?: number;
   resolve(result: RpcSupervisorCommandResult): void;
 }
 
@@ -639,7 +653,7 @@ export class RpcSupervisor {
   private readonly activeToolCounts = new Map<RpcSupervisorActivityCategory, number>();
   private readonly retiredToolCallIds = new Set<string>();
   private readonly coordinatedCompactions = new Map<string, CoordinatedCompactionState>();
-  private readonly closedCoordinatedCompactions = new Map<string, boolean>();
+  private readonly closedCoordinatedCompactions = new Map<string, ClosedCoordinatedCompaction>();
   private readonly manualCompactionAuthorizations = new Set<string>();
   private activeManualCompactionTransactionId: string | undefined;
   private uncoordinatedManualCompactionActive = false;
@@ -1170,9 +1184,34 @@ export class RpcSupervisor {
     let accepted: boolean;
     if (state === undefined) {
       const remembered = this.closedCoordinatedCompactions.get(request.transaction_id);
-      accepted = remembered ?? false;
       if (remembered === undefined) {
-        this.rememberClosedCoordinatedCompaction(request.transaction_id, false);
+        accepted = false;
+        this.rememberClosedCoordinatedCompaction(
+          request.transaction_id,
+          request.outcome,
+          false,
+          request.continuation_expected,
+        );
+      } else if (
+        request.outcome === "not_started"
+        && remembered.accepted
+        && remembered.outcome !== "not_started"
+      ) {
+        if (remembered.compensationAccepted === undefined) {
+          const changed = remembered.continuationExpected
+            ? this.mailbox.compensateCoordinationContinuation(request.transaction_id)
+            : false;
+          remembered.compensationAccepted = !remembered.continuationExpected || changed;
+          if (changed) {
+            this.commitTaskProjection();
+            this.signalCompactionStateChange();
+            this.drainCommandQueue();
+            this.schedulePendingReplyRetry();
+          }
+        }
+        accepted = remembered.compensationAccepted;
+      } else {
+        accepted = remembered.accepted;
       }
     } else if (state.terminalAccepted !== undefined) {
       accepted = state.terminalAccepted;
@@ -1274,7 +1313,12 @@ export class RpcSupervisor {
     state.phase = released ? "closed" : "release_failed";
     if (released) {
       this.coordinatedCompactions.delete(state.transactionId);
-      this.rememberClosedCoordinatedCompaction(state.transactionId);
+      this.rememberClosedCoordinatedCompaction(
+        state.transactionId,
+        outcome,
+        true,
+        continuationExpected,
+      );
     }
     this.signalCompactionStateChange();
     this.drainCommandQueue();
@@ -1284,10 +1328,16 @@ export class RpcSupervisor {
 
   private rememberClosedCoordinatedCompaction(
     transactionId: string,
+    outcome: SupervisorCompactionComplete["outcome"],
     accepted = true,
+    continuationExpected = false,
   ): void {
     if (!this.closedCoordinatedCompactions.has(transactionId)) {
-      this.closedCoordinatedCompactions.set(transactionId, accepted);
+      this.closedCoordinatedCompactions.set(transactionId, {
+        accepted,
+        outcome,
+        continuationExpected,
+      });
     }
     while (this.closedCoordinatedCompactions.size > 64) {
       const oldest = this.closedCoordinatedCompactions.keys().next().value;
@@ -1440,7 +1490,8 @@ export class RpcSupervisor {
         this.mailbox.observeCompactionEnd(
           event.reason,
           event.failed,
-          event.willRetry,
+          // Pi 会在取消帧中保留原始 willRetry 意图，但取消后不会启动续跑。
+          event.willRetry && !event.aborted,
           coordinatedManual,
         );
         this.commitTaskProjection();
@@ -1861,12 +1912,34 @@ export class RpcSupervisor {
       this.mailbox.hostAccepted(delivery.delivery_id);
     } catch (error) {
       if (error instanceof ManagedRpcCommandRejectedError) {
-        if (this.mailbox.hostRejected(delivery.delivery_id)) {
-          // 明确拒绝证明正文未入 Pi；保留同一 message_id，并让 steer 先降级为 prompt。
+        let requeue = false;
+        let nextCompactionRejectionCount = command.compaction_rejection_count;
+        if (delivery.mode === "prompt" && error.reason === "compaction_active") {
+          const priorRejections = command.compaction_rejection_count ?? 0;
+          // compaction_end 与命令响应分属不同通道；首次只读宿主状态用于收敛乱序。
+          // 若立即重试仍得到同一拒绝，不再信任失配探针，等待真实生命周期以禁止忙等。
+          const hostCompacting = priorRejections > 0
+            ? true
+            : await this.probeHostCompactionAfterRejection();
+          if (this.phase === "ready" && this.mailbox.isDeliveryActive(delivery.delivery_id)) {
+            requeue = this.mailbox.hostRejectedForCompaction(
+              delivery.delivery_id,
+              hostCompacting,
+            );
+            nextCompactionRejectionCount = priorRejections + 1;
+          }
+        } else {
+          requeue = this.mailbox.hostRejected(delivery.delivery_id);
+        }
+        if (requeue) {
+          // 明确拒绝证明正文未入 Pi；保留原投递身份，由 mailbox 仲裁 prompt/steer 与续跑顺序。
           this.commandQueue.unshift({
             kind: command.kind,
             message: command.message,
             message_id: command.message_id,
+            ...(nextCompactionRejectionCount === undefined
+              ? {}
+              : { compaction_rejection_count: nextCompactionRejectionCount }),
             resolve: command.resolve,
           });
         }
@@ -1883,6 +1956,15 @@ export class RpcSupervisor {
     }
     // final 可能在独立监督流上先于命令响应到达；命令尾部正是其最后一个门闩。
     this.schedulePendingReplyRetry();
+  }
+
+  private async probeHostCompactionAfterRejection(): Promise<boolean> {
+    try {
+      return readIsCompacting(await this.commandClient().getState()) !== false;
+    } catch {
+      // 探针失败不能证明压缩已经结束；保守等待生命周期事实，禁止忙等重投。
+      return true;
+    }
   }
 
   private async executeInterruptCommand(command: QueuedInterruptCommand): Promise<void> {

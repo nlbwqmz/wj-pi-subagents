@@ -20,7 +20,7 @@ export type ManagedRpcReply = ChildReplyEnvelope;
 
 export type ManagedRpcTransportFault = "eof" | "protocol_fault" | "process_exit";
 
-export const MANAGED_RPC_BRIDGE_PROTOCOL = "wj-pi-subagents/managed-rpc/4" as const;
+export const MANAGED_RPC_BRIDGE_PROTOCOL = "wj-pi-subagents/managed-rpc/5" as const;
 /** 只用于节点启动事务的一次性本地认证，不进入公开控制面。 */
 export const MANAGED_RPC_BRIDGE_CREDENTIAL_ENV = "WJ_PI_SUBAGENTS_MANAGED_RPC_CREDENTIAL" as const;
 /** 外层桥接 JSON 正文的硬边界。 */
@@ -524,11 +524,16 @@ function abortError(): Error {
   return error;
 }
 
+export type ManagedRpcCommandRejectionReason = "compaction_active";
+
 /** Pi 已明确拒绝命令；与可能已经入队的传输不确定结果严格区分。 */
 export class ManagedRpcCommandRejectedError extends Error {
-  constructor() {
+  readonly reason: ManagedRpcCommandRejectionReason | undefined;
+
+  constructor(reason?: ManagedRpcCommandRejectionReason) {
     super("受管 RPC 命令被明确拒绝");
     this.name = "ManagedRpcCommandRejectedError";
+    this.reason = reason;
   }
 }
 
@@ -541,6 +546,7 @@ interface BridgeResponse {
   readonly ok: boolean;
   readonly data?: unknown;
   readonly rejected?: true;
+  readonly rejection_reason?: ManagedRpcCommandRejectionReason;
 }
 
 interface BridgeEventFrame {
@@ -780,13 +786,15 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
     }
     if (value.kind === "response") {
       if (
-        !hasOnlyKeys(value, ["protocol", "kind", "id", "ok", "data", "rejected"])
+        !hasOnlyKeys(value, ["protocol", "kind", "id", "ok", "data", "rejected", "rejection_reason"])
         || !Number.isSafeInteger(value.id)
         || (value.id as number) <= 0
         || typeof value.ok !== "boolean"
         || (value.ok === false && Object.hasOwn(value, "data"))
         || (Object.hasOwn(value, "rejected") && value.rejected !== true)
-        || (value.ok === true && Object.hasOwn(value, "rejected"))
+        || (Object.hasOwn(value, "rejection_reason") && value.rejection_reason !== "compaction_active")
+        || (Object.hasOwn(value, "rejection_reason") && value.rejected !== true)
+        || (value.ok === true && (Object.hasOwn(value, "rejected") || Object.hasOwn(value, "rejection_reason")))
       ) {
         this.failTransport("protocol_fault");
         return;
@@ -796,7 +804,11 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
       if (pending === undefined) return;
       this.pending.delete(responseId);
       if (value.ok) pending.resolve(value.data);
-      else if (value.rejected === true) pending.reject(new ManagedRpcCommandRejectedError());
+      else if (value.rejected === true) {
+        pending.reject(new ManagedRpcCommandRejectedError(
+          value.rejection_reason as ManagedRpcCommandRejectionReason | undefined,
+        ));
+      }
       else pending.reject(new Error("桥接命令失败"));
       return;
     }

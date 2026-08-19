@@ -131,6 +131,10 @@ export class AutoCompactCoordinationParticipant {
       const completed = this.completedLocalSuccess;
       this.completedLocalSuccess = undefined;
       if (completed !== undefined) {
+        const upstream = completed.runtime.upstream;
+        if (upstream !== undefined) {
+          await this.cleanupUpstream(upstream.channel, completed.requestId);
+        }
         this.releaseLocal(completed.requestId, completed.runtime, "not_started");
         void completed.runtime.retryPendingReplies().catch(() => {});
       }
@@ -156,6 +160,8 @@ export class AutoCompactCoordinationParticipant {
   /** 新轮开始后不再可能收到上一轮失败压缩的成功 session_compact。 */
   observeAgentStart(): void {
     this.completedManualCompactionTransactionId = undefined;
+    // 真实新轮已经取得续跑所有权，close 不得再把该事务补偿为 not_started。
+    this.completedLocalSuccess = undefined;
     this.pruneTransactionHistory();
   }
 
@@ -338,13 +344,18 @@ export class AutoCompactCoordinationParticipant {
         && terminal.accepted
       ) {
         if (terminal.compensationAccepted === undefined) {
-          terminal.compensationAccepted = true;
           const completed = this.completedLocalSuccess;
+          let accepted = true;
           if (completed?.requestId === request.requestId) {
+            const upstream = completed.runtime.upstream;
+            if (upstream !== undefined) {
+              accepted = await this.cleanupUpstream(upstream.channel, request.requestId);
+            }
             this.completedLocalSuccess = undefined;
             this.releaseLocal(request.requestId, completed.runtime, "not_started");
             void completed.runtime.retryPendingReplies().catch(() => {});
           }
+          terminal.compensationAccepted = accepted;
         }
         this.pendingManualCompactionAuthorizations.delete(request.requestId);
         this.emitCompleted(request.requestId, terminal.compensationAccepted);
@@ -471,7 +482,7 @@ export class AutoCompactCoordinationParticipant {
       this.cleanupAckTimeoutMs,
     );
     if (status === "uncertain") await failUncertainUpstreamResponse(channel);
-    return status !== "uncertain";
+    return status === "accepted";
   }
 
   private async releaseRequestedUpstream(

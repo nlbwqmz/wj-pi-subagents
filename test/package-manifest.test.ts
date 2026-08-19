@@ -25,6 +25,14 @@ test("manifest 入口存在且只导出一个 Pi factory", async () => {
   assert.deepEqual(Object.keys(entryModule), ["default"]);
 });
 
+test("npm test 先重建 bridge，避免源码协议与旧 dist 进程不一致", () => {
+  const manifest = JSON.parse(readFileSync(join(repositoryRoot, "package.json"), "utf8")) as {
+    scripts?: Record<string, unknown>;
+  };
+
+  assert.equal(manifest.scripts?.pretest, "npm run build:bridge");
+});
+
 test("package manifest 声明 MIT 许可证并包含许可证文件", () => {
   const licenseText = readFileSync(join(repositoryRoot, "LICENSE"), "utf8");
 

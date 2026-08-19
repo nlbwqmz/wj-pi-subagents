@@ -16,7 +16,9 @@ export class RpcClient {
       type: "response",
       command: command?.type,
       success: false,
-      error: "explicit rejection",
+      error: command?.type === "prompt" && command?.message === "压缩期间 prompt"
+        ? "Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry."
+        : "explicit rejection",
     };
   }
 

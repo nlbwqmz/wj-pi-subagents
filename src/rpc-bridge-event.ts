@@ -67,7 +67,7 @@ export function normalizeRpcBridgeEvent(event: unknown): RpcBridgeEventNormaliza
         reason: event.reason,
         aborted: event.aborted,
         willRetry: event.willRetry,
-        failed: event.aborted || event.errorMessage !== undefined,
+        failed: event.errorMessage !== undefined,
       }));
     case "queue_update":
       if (!Array.isArray(event.steering) || !Array.isArray(event.followUp)) return INVALID_EVENT;

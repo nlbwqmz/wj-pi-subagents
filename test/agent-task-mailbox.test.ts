@@ -245,6 +245,64 @@ test("协调 complete 后等待 continuation start 时接纳消息仍归当前�
   assert.equal(resumed?.mode, "steer");
 });
 
+test("同事务 not_started 补偿撤销自动 continuation 等待并回退为 prompt", () => {
+  const value = mailbox();
+  const current = value.submit("进入协调压缩的任务");
+  const initial = value.takeNextDelivery();
+  assert.equal(value.hostAccepted(initial!.delivery_id), true);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
+
+  assert.equal(value.beginCoordinationBarrier("compact-compensation"), true);
+  const queued = value.submit("continuation 未启动时仍要处理");
+  assert.equal(value.observeAgentSettled(), "superseded");
+  value.observeCompactionStart("manual", true);
+  value.observeCompactionEnd("manual", false, false, true);
+  assert.equal(value.completeCoordinationBarrier(
+    "compact-compensation",
+    "succeeded",
+    true,
+  ), true);
+  assert.equal(value.takeNextDelivery(), undefined);
+
+  assert.equal(value.compensateCoordinationContinuation("compact-other"), false);
+  assert.equal(value.takeNextDelivery(), undefined);
+  assert.equal(value.compensateCoordinationContinuation("compact-compensation"), true);
+  const fallback = value.takeNextDelivery();
+  assert.equal(fallback?.message_id, queued.message_id);
+  assert.equal(fallback?.task_id, current.task_id);
+  assert.equal(fallback?.mode, "prompt");
+  assert.equal(value.compensateCoordinationContinuation("compact-compensation"), false);
+});
+
+test("同事务 continuation 补偿在没有待投递正文时释放旧 interrupted final", () => {
+  const value = mailbox();
+  const current = value.submit("被压缩中断的任务");
+  const initial = value.takeNextDelivery();
+  assert.equal(value.hostAccepted(initial!.delivery_id), true);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
+
+  assert.equal(value.beginCoordinationBarrier("compact-final-compensation"), true);
+  assert.equal(value.observeAgentSettled(), "candidate");
+  value.observeCompactionStart("manual", true);
+  value.observeCompactionEnd("manual", false, false, true);
+  const interrupted = final(current.task_id, TURN_1, COMMIT_1, "interrupted", "absent");
+  assert.equal(value.prepareFinal(interrupted), false);
+  assert.equal(value.completeCoordinationBarrier(
+    "compact-final-compensation",
+    "succeeded",
+    true,
+  ), true);
+  assert.equal(value.prepareFinal(interrupted), false);
+
+  assert.equal(value.compensateCoordinationContinuation("compact-final-compensation"), true);
+  assert.equal(value.prepareFinal(interrupted), true);
+  assert.equal(value.commitPreparedFinal(COMMIT_1), true);
+  assert.equal(value.projection().state, "idle");
+  assert.equal(value.projection().last_task?.outcome, "interrupted");
+});
+
 test("协调 continuation 中已入队并消费的 steer 不被旧 settled 降级", () => {
   const value = mailbox();
   const current = value.submit("进入协调压缩的任务");
@@ -354,7 +412,89 @@ test("明确拒绝的 steer 保留正文并安全降级为 prompt", () => {
   assert.equal(fallback?.mode, "prompt");
 });
 
-test("直接边准备把 delivery uncertainty 与维护失败标记为 unsafe", () => {
+test("压缩期明确拒绝的 prompt 保留正文，等待物理压缩和真实 settled 后只重试一次", () => {
+  const value = mailbox([TASK_1]);
+  const submission = value.submit("压缩竞争正文");
+  const rejected = value.takeNextDelivery();
+  assert.equal(rejected?.mode, "prompt");
+
+  value.observeCompactionStart("threshold");
+  assert.equal(value.hostRejectedForCompaction(rejected!.delivery_id, true), true);
+  assert.deepEqual(value.projection(), {
+    state: "working",
+    mailbox_pending_count: 1,
+    host_pending_count: 0,
+    reply_outbox_pending_count: 0,
+    activity: { phase: "compacting", task_id: submission.task_id },
+  });
+  assert.equal(value.takeNextDelivery(), undefined);
+
+  value.observeCompactionEnd("threshold", false, false);
+  assert.equal(value.takeNextDelivery(), undefined);
+  assert.equal(value.observeAgentSettled(), "superseded");
+  const retried = value.takeNextDelivery();
+  assert.equal(retried?.message_id, submission.message_id);
+  assert.equal(retried?.task_id, submission.task_id);
+  assert.equal(retried?.mode, "prompt");
+  assert.equal(value.takeNextDelivery(), undefined);
+});
+
+test("自动 continuation 先于压缩拒绝响应启动时，被拒正文仍以 steer 投入同一任务", () => {
+  const value = mailbox([TASK_1]);
+  const submission = value.submit("不得被自动 continuation 冒充已送达");
+  const rejected = value.takeNextDelivery();
+  assert.equal(rejected?.mode, "prompt");
+
+  assert.equal(value.beginCoordinationBarrier("compact-late-rejection"), true);
+  value.observeCompactionStart("manual", true);
+  value.observeCompactionEnd("manual", false, false, true);
+  assert.equal(value.completeCoordinationBarrier(
+    "compact-late-rejection",
+    "succeeded",
+    true,
+  ), true);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(submission.task_id, TURN_1), true);
+
+  assert.equal(value.hostRejectedForCompaction(rejected!.delivery_id, false), true);
+  const steered = value.takeNextDelivery();
+  assert.equal(steered?.message_id, submission.message_id);
+  assert.equal(steered?.task_id, submission.task_id);
+  assert.equal(steered?.mode, "steer");
+});
+
+test("压缩前旧 final 在待投递正文完成续跑前只作为候选，下一 turn 后按 stale ACK", () => {
+  const value = mailbox([TASK_1]);
+  const current = value.submit("原任务");
+  const initial = value.takeNextDelivery();
+  assert.equal(value.hostAccepted(initial!.delivery_id), true);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
+  assert.equal(value.observeAgentSettled(), "candidate");
+  const oldFinal = final(current.task_id, TURN_1, COMMIT_1, "interrupted", "absent");
+  assert.equal(value.prepareFinal(oldFinal), true);
+
+  const queued = value.submit("压缩后必须继续处理的正文");
+  const rejected = value.takeNextDelivery();
+  assert.equal(rejected?.mode, "prompt");
+  assert.equal(value.beginCoordinationBarrier("compact-old-final"), true);
+  value.observeCompactionStart("manual", true);
+  assert.equal(value.hostRejectedForCompaction(rejected!.delivery_id, true), true);
+  assert.equal(value.prepareFinal(oldFinal), false);
+  assert.equal(value.commitPreparedFinal(COMMIT_1), false);
+
+  value.observeCompactionEnd("manual", false, false, true);
+  assert.equal(value.completeCoordinationBarrier("compact-old-final", "succeeded", true), true);
+  assert.equal(value.takeNextDelivery(), undefined);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_2), true);
+  assert.equal(value.shouldAcknowledgeSupersededFinal(oldFinal), true);
+  const steered = value.takeNextDelivery();
+  assert.equal(steered?.message_id, queued.message_id);
+  assert.equal(steered?.mode, "steer");
+});
+
+test("直接边准备只把真实 delivery uncertainty 标记为 unsafe", () => {
   const uncertain = mailbox([PLACEHOLDER_TASK]);
   uncertain.submit("不确定交付");
   const delivery = uncertain.takeNextDelivery();
@@ -371,7 +511,7 @@ test("直接边准备把 delivery uncertainty 与维护失败标记为 unsafe", 
   failed.observeCompactionStart("overflow");
   failed.observeCompactionEnd("overflow", true);
   assert.equal(failed.beginCoordinationBarrier("compact-failed"), true);
-  assert.equal(failed.coordinationBarrierReadiness(), "unsafe");
+  assert.equal(failed.coordinationBarrierReadiness(), "quiescent");
 });
 
 test("旧 final commit 后重放的 manual 压缩允许期间新任务在 end 后 prompt", () => {
@@ -481,16 +621,25 @@ test("overflow willRetry 撤销旧候选并由下一真实 turn 取代", () => {
   assert.equal(value.projection().last_task?.turn_id, TURN_2);
 });
 
-test("automatic compaction failure 与 delivery uncertainty 都不自动重投递", () => {
+test("automatic compaction failure 等待真实 settled 后恢复，而 delivery uncertainty 继续隔离", () => {
   const failed = mailbox([PLACEHOLDER_TASK]);
-  failed.submit("压缩失败任务");
+  const current = failed.submit("压缩失败任务");
   const first = failed.takeNextDelivery();
   assert.equal(failed.hostAccepted(first!.delivery_id), true);
+  failed.observeAgentStart();
+  assert.equal(failed.observeTaskStarted(current.task_id, TURN_1), true);
   failed.observeCompactionStart("overflow");
+  const queued = failed.submit("压缩失败后继续");
   failed.observeCompactionEnd("overflow", true, false);
-  assert.equal(failed.projection().state, "suspended");
-  assert.equal(failed.projection().activity?.phase, "maintenance_failed");
+  assert.equal(failed.projection().state, "working");
+  assert.notEqual(failed.projection().activity?.phase, "maintenance_failed");
   assert.equal(failed.takeNextDelivery(), undefined);
+
+  failed.observeAgentSettled();
+  const retried = failed.takeNextDelivery();
+  assert.equal(retried?.message_id, queued.message_id);
+  assert.equal(retried?.task_id, current.task_id);
+  assert.equal(retried?.mode, "prompt");
 
   const uncertain = mailbox([PLACEHOLDER_TASK]);
   uncertain.submit("不确定交付");
@@ -498,6 +647,24 @@ test("automatic compaction failure 与 delivery uncertainty 都不自动重投�
   assert.equal(uncertain.hostDeliveryUncertain(delivery!.delivery_id), true);
   assert.equal(uncertain.projection().activity?.phase, "delivery_uncertain");
   assert.equal(uncertain.takeNextDelivery(), undefined);
+});
+
+test("compaction failure 不阻止已完成任务的 final 提交", () => {
+  const value = mailbox([PLACEHOLDER_TASK]);
+  const current = value.submit("压缩失败但任务已产出结果");
+  const prompt = value.takeNextDelivery();
+  assert.equal(value.hostAccepted(prompt!.delivery_id), true);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
+
+  value.observeCompactionStart("threshold");
+  value.observeCompactionEnd("threshold", true, false);
+  assert.equal(value.observeAgentSettled(), "candidate");
+  const candidate = final(current.task_id, TURN_1, COMMIT_1);
+  assert.equal(value.prepareFinal(candidate), true);
+  assert.equal(value.commitPreparedFinal(COMMIT_1), true);
+  assert.equal(value.projection().state, "idle");
+  assert.equal(value.projection().last_task?.commit_id, COMMIT_1);
 });
 
 test("delivery uncertainty 只由匹配任务的真实 task_started 收敛", () => {

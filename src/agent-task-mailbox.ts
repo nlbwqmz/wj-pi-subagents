@@ -90,14 +90,14 @@ export class AgentTaskMailbox {
   private coordinatedCompactionResolved = false;
   private coordinatedPhysicalLifecycleObserved = false;
   private coordinatedContinuationStarted = false;
-  private awaitingCoordinatedContinuationStart = false;
+  private awaitingCoordinatedContinuationTransactionId: string | undefined;
   private awaitingNativeCompactionOutcome = false;
   private awaitingRetryStart = false;
   private awaitingPromptStart = false;
+  private awaitingCompactionPromptRetry = false;
   private deliveryUncertain = false;
   private deliveryUncertainTaskId: string | undefined;
   private uncertainDelivery: AgentHostDelivery | undefined;
-  private maintenanceFailed = false;
   private readonly staleFinalTurns = new Set<string>();
   private startEpoch = 0;
   private taskStartEpoch = 0;
@@ -231,6 +231,25 @@ export class AgentTaskMailbox {
     return true;
   }
 
+  /**
+   * 压缩期明确拒绝证明 prompt 正文未进入 Pi。保留同一 mailbox 条目，
+   * 物理压缩结束前冻结重试；若 continuation 已启动，正常 reducer 会改用 steer。
+   */
+  hostRejectedForCompaction(deliveryId: number, hostCompacting: boolean): boolean {
+    const delivery = this.claimDelivery(deliveryId);
+    if (delivery === undefined) return false;
+    const task = this.currentTask;
+    if (delivery.mode !== "prompt" || task?.taskId !== delivery.task_id) {
+      this.markDeliveryUncertain(delivery.task_id, delivery);
+      return true;
+    }
+    this.awaitingPromptStart = false;
+    this.awaitingCompactionPromptRetry = hostCompacting || this.compactionActive;
+    if (!this.interruptBarrier) this.state = "working";
+    this.phase = this.awaitingCompactionPromptRetry ? "compacting" : "reconciling";
+    return true;
+  }
+
   /** RpcClient 传输异常不能证明宿主未接纳；已有启动或 final 则按强事实对账。 */
   hostDeliveryUncertain(deliveryId: number): boolean {
     const delivery = this.claimDelivery(deliveryId);
@@ -292,11 +311,11 @@ export class AgentTaskMailbox {
       !this.settlementObserved
       && !this.compactionActive
       && !this.deliveryUncertain
-      && !this.maintenanceFailed
     ) {
       if (!this.interruptBarrier) this.state = "working";
       this.phase = this.toolCounts.size > 0 ? "executing_tools" : "processing";
     }
+    this.awaitingCompactionPromptRetry = false;
     if (this.confirmedTaskStartKey !== taskStartKey) {
       this.confirmedTaskStartKey = taskStartKey;
       this.taskStartEpoch += 1;
@@ -315,7 +334,7 @@ export class AgentTaskMailbox {
     } else {
       this.currentTask.hostStarted = true;
     }
-    const coordinatedContinuation = this.awaitingCoordinatedContinuationStart
+    const coordinatedContinuation = this.awaitingCoordinatedContinuationTransactionId !== undefined
       || (
         this.coordinatedSettlementWorkPending
         && this.coordinatedPhysicalLifecycleObserved
@@ -323,19 +342,20 @@ export class AgentTaskMailbox {
       );
     if (coordinatedContinuation) {
       this.coordinatedContinuationStarted = true;
-      this.awaitingCoordinatedContinuationStart = false;
+      this.awaitingCoordinatedContinuationTransactionId = undefined;
     }
     this.compactionActive = false;
     this.awaitingNativeCompactionOutcome = false;
     this.awaitingRetryStart = false;
     this.awaitingPromptStart = false;
+    this.awaitingCompactionPromptRetry = false;
     this.settlementObserved = false;
     if (!coordinatedContinuation && this.coordinationBarriers.size === 0) {
       this.clearCoordinatedSettlementWork();
     }
     this.clearPreparedFinal();
     this.replyOutboxPendingCount = 0;
-    if (this.deliveryUncertain || this.maintenanceFailed) {
+    if (this.deliveryUncertain) {
       this.applySuspendedBarrier();
       return;
     }
@@ -348,11 +368,12 @@ export class AgentTaskMailbox {
 
   /** raw settled 只形成 candidate；没有 final commit 时绝不进入 idle。 */
   observeAgentSettled(): "candidate" | "superseded" {
+    this.awaitingCompactionPromptRetry = false;
     if (this.awaitingRetryStart) {
       this.settlementObserved = false;
       this.clearPreparedFinal();
       this.replyOutboxPendingCount = 0;
-      if (this.deliveryUncertain || this.maintenanceFailed) this.applySuspendedBarrier();
+      if (this.deliveryUncertain) this.applySuspendedBarrier();
       else {
         if (!this.interruptBarrier) this.state = "working";
         this.phase = "reconciling";
@@ -368,7 +389,7 @@ export class AgentTaskMailbox {
       this.markDeliveryUncertain();
       return "superseded";
     }
-    if (this.deliveryUncertain || this.maintenanceFailed) {
+    if (this.deliveryUncertain) {
       this.applySuspendedBarrier();
       return "superseded";
     }
@@ -418,7 +439,7 @@ export class AgentTaskMailbox {
       this.coordinatedCompactionResolved = false;
       this.coordinatedPhysicalLifecycleObserved = false;
       this.coordinatedContinuationStarted = false;
-      this.awaitingCoordinatedContinuationStart = false;
+      this.awaitingCoordinatedContinuationTransactionId = undefined;
     }
     this.coordinationBarriers.add(transactionId);
     if (this.hasCurrentTaskMailboxWork()) this.coordinatedSettlementWorkPending = true;
@@ -435,10 +456,24 @@ export class AgentTaskMailbox {
     if (this.coordinationBarriers.size === 0) {
       // not_started 或无物理结果的通用屏障都不会再出现本事务的压缩生命周期。
       if (outcome === undefined || outcome === "not_started") this.coordinatedCompactionResolved = true;
-      this.awaitingCoordinatedContinuationStart = outcome === "succeeded"
+      this.awaitingCoordinatedContinuationTransactionId = outcome === "succeeded"
         && continuationExpected
-        && !this.coordinatedContinuationStarted;
+        && !this.coordinatedContinuationStarted
+        ? transactionId
+        : undefined;
     }
+    this.reconcileCoordinatedSettlementWork();
+    return true;
+  }
+
+  /** succeeded 后 continuation 明确 not_started，只允许同事务撤销等待。 */
+  compensateCoordinationContinuation(transactionId: string): boolean {
+    if (
+      !validCoordinationTransactionId(transactionId)
+      || this.awaitingCoordinatedContinuationTransactionId !== transactionId
+    ) return false;
+    this.awaitingCoordinatedContinuationTransactionId = undefined;
+    this.coordinatedCompactionResolved = true;
     this.reconcileCoordinatedSettlementWork();
     return true;
   }
@@ -449,7 +484,7 @@ export class AgentTaskMailbox {
    * 把该空档继续视为等待会形成自我依赖的压缩死锁。
    */
   coordinationBarrierReadiness(): CoordinationBarrierReadiness {
-    if (this.deliveryUncertain || this.maintenanceFailed) return "unsafe";
+    if (this.deliveryUncertain) return "unsafe";
     return this.inFlight === undefined
       && this.hostPendingCount === 0
       ? "quiescent"
@@ -471,7 +506,7 @@ export class AgentTaskMailbox {
     this.awaitingNativeCompactionOutcome = false;
     this.awaitingRetryStart = false;
     this.awaitingPromptStart = false;
-    if (this.deliveryUncertain || this.maintenanceFailed) {
+    if (this.deliveryUncertain) {
       this.applySuspendedBarrier();
     } else {
       this.state = "working";
@@ -487,20 +522,18 @@ export class AgentTaskMailbox {
     coordinated = false,
   ): void {
     this.compactionActive = false;
+    this.awaitingCompactionPromptRetry = false;
     if (coordinated) {
       this.coordinatedPhysicalLifecycleObserved = true;
       if (this.coordinatedSettlementWorkPending) this.coordinatedCompactionResolved = true;
     }
     this.awaitingRetryStart = !failed && willRetry;
-    if (failed || willRetry) {
+    // compaction_end 的失败是已知业务结果：Pi 已退出压缩，原上下文仍可结算。
+    // 只有 willRetry 会作废旧轮候选；失败本身不得升级为永久维护隔离。
+    if (willRetry) {
       this.settlementObserved = false;
       this.clearPreparedFinal();
       this.replyOutboxPendingCount = 0;
-    }
-    if (failed) {
-      this.maintenanceFailed = true;
-      this.applySuspendedBarrier();
-      return;
     }
     if (coordinated && this.coordinatedContinuationStarted) {
       if (!this.interruptBarrier) this.state = "working";
@@ -515,7 +548,7 @@ export class AgentTaskMailbox {
     }
     if (reason === "manual" && !willRetry) {
       this.awaitingNativeCompactionOutcome = false;
-      if (this.deliveryUncertain || this.maintenanceFailed) {
+      if (this.deliveryUncertain) {
         this.applySuspendedBarrier();
         return;
       }
@@ -527,7 +560,7 @@ export class AgentTaskMailbox {
       return;
     }
     this.awaitingNativeCompactionOutcome = true;
-    if (this.deliveryUncertain || this.maintenanceFailed) {
+    if (this.deliveryUncertain) {
       this.applySuspendedBarrier();
       return;
     }
@@ -636,11 +669,11 @@ export class AgentTaskMailbox {
     this.awaitingNativeCompactionOutcome = false;
     this.awaitingRetryStart = false;
     this.awaitingPromptStart = false;
+    this.awaitingCompactionPromptRetry = false;
     this.clearCoordinatedSettlementWork();
     this.deliveryUncertain = false;
     this.deliveryUncertainTaskId = undefined;
     this.uncertainDelivery = undefined;
-    this.maintenanceFailed = false;
     this.hostPendingCount = 0;
     this.replyOutboxPendingCount = 0;
     this.toolCounts.clear();
@@ -664,15 +697,16 @@ export class AgentTaskMailbox {
    * 由调用方在 compaction_end 后重新发起请求。
    */
   isCompactionActive(): boolean {
-    return this.compactionActive;
+    return this.compactionActive || this.awaitingCompactionPromptRetry;
   }
 
   hasUncertainDelivery(): boolean {
     return this.deliveryUncertain;
   }
 
+  /** 普通 compaction_end 不再产生永久维护隔离；保留查询接口兼容旧调用方。 */
   hasMaintenanceFailure(): boolean {
-    return this.maintenanceFailed;
+    return false;
   }
 
   requestInterrupt(): { readonly changed: boolean; readonly should_abort: boolean } {
@@ -787,13 +821,16 @@ export class AgentTaskMailbox {
     }
     if (
       !this.interruptBarrier
-      && (this.coordinationBarriers.size > 0 || this.awaitingCoordinatedContinuationStart)
+      && (
+        this.coordinationBarriers.size > 0
+        || this.awaitingCoordinatedContinuationTransactionId !== undefined
+      )
     ) {
       // 协调压缩中的 raw settlement 不是逻辑任务终点；保持已返回 task_id
       // 稳定，并等待压缩结束或真实 continuation start 后再投递。
       this.coordinatedSettlementWorkPending = true;
       if (
-        this.awaitingCoordinatedContinuationStart
+        this.awaitingCoordinatedContinuationTransactionId !== undefined
         && this.coordinatedPhysicalLifecycleObserved
         && !this.compactionActive
       ) this.coordinatedCompactionResolved = true;
@@ -810,16 +847,15 @@ export class AgentTaskMailbox {
       || this.compactionActive
       || this.coordinationBarriers.size > 0
       || (this.coordinatedSettlementWorkPending && !this.coordinatedCompactionResolved)
-      || this.awaitingCoordinatedContinuationStart
+      || this.awaitingCoordinatedContinuationTransactionId !== undefined
       || this.awaitingNativeCompactionOutcome
       || this.awaitingPromptStart
+      || this.awaitingCompactionPromptRetry
       || this.deliveryUncertain
-      || this.maintenanceFailed
       || this.state !== "working"
     ) return false;
     return this.phase !== "finalizing"
       && this.phase !== "waiting_parent_ack"
-      && this.phase !== "maintenance_failed"
       && this.phase !== "delivery_uncertain";
   }
 
@@ -827,11 +863,10 @@ export class AgentTaskMailbox {
     return this.compactionActive
       || this.coordinationBarriers.size > 0
       || this.coordinatedSettlementWorkPending
-      || this.awaitingCoordinatedContinuationStart
+      || this.awaitingCoordinatedContinuationTransactionId !== undefined
       || this.awaitingNativeCompactionOutcome
+      || this.awaitingCompactionPromptRetry
       || this.deliveryUncertain
-      || this.maintenanceFailed
-      || this.phase === "maintenance_failed"
       || this.phase === "delivery_uncertain";
   }
 
@@ -865,10 +900,6 @@ export class AgentTaskMailbox {
     }
     const task = this.currentTask;
     if (task?.taskId === delivery.task_id) task.hostStarted = true;
-    if (this.maintenanceFailed) {
-      this.applySuspendedBarrier();
-      return;
-    }
     if (!this.interruptBarrier) this.state = "working";
     this.phase = this.compactionActive
       ? "compacting"
@@ -885,10 +916,10 @@ export class AgentTaskMailbox {
       || this.coordinationBarriers.size > 0
       || !this.coordinatedCompactionResolved
       || this.compactionActive
-      || this.awaitingCoordinatedContinuationStart
+      || this.awaitingCoordinatedContinuationTransactionId !== undefined
       || this.awaitingNativeCompactionOutcome
+      || this.awaitingCompactionPromptRetry
       || this.deliveryUncertain
-      || this.maintenanceFailed
     ) return;
     this.coordinatedSettlementWorkPending = false;
     this.coordinatedCompactionResolved = false;
@@ -908,7 +939,7 @@ export class AgentTaskMailbox {
     this.coordinatedCompactionResolved = false;
     this.coordinatedPhysicalLifecycleObserved = false;
     this.coordinatedContinuationStarted = false;
-    this.awaitingCoordinatedContinuationStart = false;
+    this.awaitingCoordinatedContinuationTransactionId = undefined;
   }
 
   private hasCurrentTaskMailboxWork(): boolean {
@@ -929,7 +960,7 @@ export class AgentTaskMailbox {
 
   private applySuspendedBarrier(): void {
     this.state = "suspended";
-    this.phase = this.deliveryUncertain ? "delivery_uncertain" : "maintenance_failed";
+    this.phase = "delivery_uncertain";
   }
 
   private rememberStaleFinalTurn(turnId: string): void {

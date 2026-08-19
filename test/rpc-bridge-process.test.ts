@@ -547,12 +547,19 @@ test("bridge 拒绝把 Pi success:false 响应当作 prompt 或 steer 成功", a
 
   await bridge.start();
   await assert.rejects(
+    bridge.prompt("压缩期间 prompt"),
+    (error: unknown) => error instanceof ManagedRpcCommandRejectedError
+      && error.reason === "compaction_active",
+  );
+  await assert.rejects(
     bridge.prompt("明确拒绝 prompt"),
-    (error: unknown) => error instanceof ManagedRpcCommandRejectedError,
+    (error: unknown) => error instanceof ManagedRpcCommandRejectedError
+      && error.reason === undefined,
   );
   await assert.rejects(
     bridge.steer("明确拒绝 steer"),
-    (error: unknown) => error instanceof ManagedRpcCommandRejectedError,
+    (error: unknown) => error instanceof ManagedRpcCommandRejectedError
+      && error.reason === undefined,
   );
 
   const closeObservation = once(child, "close") as Promise<[number | null, NodeJS.Signals | null]>;

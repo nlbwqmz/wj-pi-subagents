@@ -1138,6 +1138,90 @@ test("threshold 压缩保留先到的 final，并在真实 settled 后完成双�
   }
 });
 
+test("aborted compaction 即使携带 willRetry 也不等待不存在的续跑", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "压缩取消结算" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+  const current = await supervisor.prompt("取消压缩仍需结算");
+  assert.equal(current.ok, true);
+  if (!current.ok) return;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  rpcClient.emitEvent({ type: "agent_start" });
+  channel.emitTaskStarted({ task_id: current.task_id, turn_id: TURN_ID });
+  rpcClient.emitEvent({ type: "compaction_start", reason: "overflow" });
+  rpcClient.emitEvent({
+    type: "compaction_end",
+    reason: "overflow",
+    aborted: true,
+    willRetry: true,
+    failed: false,
+  });
+  rpcClient.emitEvent({ type: "agent_settled" });
+
+  assert.equal(supervisor.acceptChildReply(finalEnvelope(current.task_id), () => true), true);
+  const status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "idle");
+    assert.equal(status.data.last_task?.commit_id, COMMIT_ID);
+  }
+});
+
+test("provider compaction failure 释放任务结算，不把 final 卡在 maintenance_failed", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "压缩失败结算" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+  const current = await supervisor.prompt("压缩失败仍需交付结果");
+  assert.equal(current.ok, true);
+  if (!current.ok) return;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  rpcClient.emitEvent({ type: "agent_start" });
+  channel.emitTaskStarted({ task_id: current.task_id, turn_id: TURN_ID });
+  rpcClient.emitEvent({ type: "compaction_start", reason: "threshold" });
+  rpcClient.emitEvent({
+    type: "compaction_end",
+    reason: "threshold",
+    aborted: false,
+    willRetry: false,
+    failed: true,
+  });
+  rpcClient.emitEvent({ type: "agent_settled" });
+
+  let deliveries = 0;
+  assert.equal(supervisor.acceptChildReply(finalEnvelope(current.task_id), () => {
+    deliveries += 1;
+    return true;
+  }), true);
+  assert.equal(deliveries, 1);
+  const status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "idle");
+    assert.equal(status.data.activity, undefined);
+    assert.equal(status.data.last_task?.commit_id, COMMIT_ID);
+  }
+});
+
 test("overflow willRetry 隔离旧 turn final，必须等下一真实 start 才能提交新 turn", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
@@ -1729,6 +1813,206 @@ test("明确拒绝的 steer 只重用一次正文并降级为 prompt", async () 
   await supervisor.terminate();
 });
 
+test("压缩期明确拒绝的 prompt 等待物理压缩和 settled 后以相同身份重试一次", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "压缩拒绝延迟重试" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+  const getStateBeforeRejection = rpcClient.operations()
+    .filter((operation) => operation === "get_state").length;
+
+  const rejectedPrompt = rpcClient.deferNext("prompt");
+  const submission = await supervisor.prompt("压缩竞争正文");
+  assert.equal(submission.ok, true);
+  if (!submission.ok) return;
+  await rejectedPrompt.started;
+  rpcClient.setState({ isStreaming: false, isCompacting: true, pendingMessageCount: 0 });
+  rpcClient.emitEvent({ type: "compaction_start", reason: "threshold" });
+  rejectedPrompt.reject(new ManagedRpcCommandRejectedError("compaction_active"));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(rpcClient.operations().filter((operation) => operation === "prompt").length, 1);
+  assert.equal(
+    rpcClient.operations().filter((operation) => operation === "get_state").length,
+    getStateBeforeRejection + 1,
+  );
+  let status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "working");
+    assert.equal(status.data.activity?.phase, "compacting");
+    assert.equal(status.data.mailbox_pending_count, 1);
+  }
+
+  const retriedPrompt = rpcClient.deferNext("prompt");
+  rpcClient.setState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+  rpcClient.emitEvent({
+    type: "compaction_end",
+    reason: "threshold",
+    aborted: false,
+    willRetry: false,
+    failed: false,
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(rpcClient.operations().filter((operation) => operation === "prompt").length, 1);
+
+  rpcClient.emitEvent({ type: "agent_settled" });
+  await retriedPrompt.started;
+  assert.deepEqual(channel.publishedTaskAssignments().slice(-2), [
+    { message_id: submission.message_id, task_id: submission.task_id, mode: "prompt" },
+    { message_id: submission.message_id, task_id: submission.task_id, mode: "prompt" },
+  ]);
+  retriedPrompt.resolve();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) assert.notEqual(status.data.activity?.phase, "delivery_uncertain");
+  await supervisor.terminate();
+});
+
+test("压缩状态探针连续失配时最多立即重试一次，随后等待真实生命周期", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "压缩拒绝防忙等" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+  const getStateCount = rpcClient.operations().filter((operation) => operation === "get_state").length;
+  rpcClient.setState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+
+  const first = rpcClient.deferNext("prompt");
+  const submission = await supervisor.prompt("不得形成即时拒绝循环");
+  assert.equal(submission.ok, true);
+  await first.started;
+  const second = rpcClient.deferNext("prompt");
+  first.reject(new ManagedRpcCommandRejectedError("compaction_active"));
+  await second.started;
+  second.reject(new ManagedRpcCommandRejectedError("compaction_active"));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(rpcClient.operations().filter((operation) => operation === "prompt").length, 2);
+  assert.equal(
+    rpcClient.operations().filter((operation) => operation === "get_state").length,
+    getStateCount + 1,
+  );
+  const status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "working");
+    assert.equal(status.data.activity?.phase, "compacting");
+    assert.equal(status.data.mailbox_pending_count, 1);
+  }
+  await supervisor.terminate();
+});
+
+test("未分类的明确 prompt 拒绝仍保持 delivery uncertainty 且不自动重发", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "普通 prompt 拒绝" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+  const getStateCount = rpcClient.operations().filter((operation) => operation === "get_state").length;
+
+  const rejected = rpcClient.deferNext("prompt");
+  const submission = await supervisor.prompt("普通拒绝不得盲目重试");
+  assert.equal(submission.ok, true);
+  await rejected.started;
+  rejected.reject(new ManagedRpcCommandRejectedError());
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(rpcClient.operations().filter((operation) => operation === "prompt").length, 1);
+  assert.equal(
+    rpcClient.operations().filter((operation) => operation === "get_state").length,
+    getStateCount,
+  );
+  const status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "suspended");
+    assert.equal(status.data.activity?.phase, "delivery_uncertain");
+  }
+  await supervisor.terminate();
+});
+
+test("native continuation 先于压缩拒绝响应启动时，被拒正文只以 steer 投入续跑轮", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "迟到压缩拒绝" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+
+  const rejectedPrompt = rpcClient.deferNext("prompt");
+  const submission = await supervisor.prompt("续跑后仍需送达");
+  assert.equal(submission.ok, true);
+  if (!submission.ok) return;
+  await rejectedPrompt.started;
+  rpcClient.emitEvent({ type: "compaction_start", reason: "overflow" });
+  rpcClient.emitEvent({
+    type: "compaction_end",
+    reason: "overflow",
+    aborted: false,
+    willRetry: true,
+    failed: false,
+  });
+  rpcClient.emitEvent({ type: "agent_start" });
+  channel.emitTaskStarted({ task_id: submission.task_id, turn_id: TURN_ID });
+  rpcClient.setState({ isStreaming: true, isCompacting: false, pendingMessageCount: 0 });
+
+  const steered = rpcClient.deferNext("steer");
+  rejectedPrompt.reject(new ManagedRpcCommandRejectedError("compaction_active"));
+  await steered.started;
+  assert.deepEqual(channel.publishedTaskAssignments().slice(-2), [
+    { message_id: submission.message_id, task_id: submission.task_id, mode: "prompt" },
+    { message_id: submission.message_id, task_id: submission.task_id, mode: "steer" },
+  ]);
+  assert.equal(rpcClient.operations().filter((operation) => operation === "prompt").length, 1);
+  assert.equal(rpcClient.operations().filter((operation) => operation === "steer").length, 1);
+  steered.resolve();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "working");
+    assert.equal(status.data.mailbox_pending_count, 0);
+  }
+  await supervisor.terminate();
+});
+
 test("压缩期间中断返回可重试提示，压缩结束后仍可正常中断", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
@@ -2068,14 +2352,14 @@ test("final 注入回调中的 continuation 在当前 final commit 后重放", a
   }
 });
 
-test("final 注入回调中的维护失败在 commit 后重放且不丢 final", async () => {
+test("final 注入回调中的压缩取消在 commit 后重放且不丢 final", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
   const channel = new RecordingSupervisorChannel([]);
   const supervisor = new RpcSupervisor({
     controller: tree,
     actor: ROOT_TREE_ACTOR,
-    reservation: { templateId: "researcher", name: "final 重入维护失败" },
+    reservation: { templateId: "researcher", name: "final 重入压缩取消" },
     managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
     channel,
     startupTimeoutMs: 100,
@@ -2094,7 +2378,7 @@ test("final 注入回调中的维护失败在 commit 后重放且不丢 final", 
       reason: "manual",
       aborted: true,
       willRetry: false,
-      failed: true,
+      failed: false,
     });
     return true;
   }), true);
@@ -2102,8 +2386,8 @@ test("final 注入回调中的维护失败在 commit 后重放且不丢 final", 
   const status = tree.getStatus(FIRST_AGENT_ID);
   assert.equal(status.ok, true);
   if (status.ok) {
-    assert.equal(status.data.state, "suspended");
-    assert.equal(status.data.activity?.phase, "maintenance_failed");
+    assert.equal(status.data.state, "idle");
+    assert.equal(status.data.activity, undefined);
     assert.equal(status.data.last_task?.commit_id, COMMIT_ID);
   }
 });
@@ -3184,6 +3468,134 @@ test("业务 complete 与补偿先于 manual start/end 到达时仍保留生命�
   assert.equal(status.ok, true);
   if (status.ok) assert.notEqual(status.data.state, "failed");
   assert.equal((await supervisor.prompt("manual 后仍可用")).ok, true);
+});
+
+test("成功 complete 后的 not_started 补偿撤销父端 continuation 等待并回退 prompt", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const edgeOperations: string[] = [];
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "continuation 补偿" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+    onCompactionPrepare: (transactionId) => {
+      edgeOperations.push(`begin:${transactionId}`);
+      return true;
+    },
+    onCompactionComplete: (transactionId, outcome) => {
+      edgeOperations.push(`complete:${transactionId}:${outcome}`);
+      return true;
+    },
+  });
+  assert.equal((await supervisor.start()).ok, true);
+  const current = await supervisor.prompt("进入自动压缩的任务");
+  assert.equal(current.ok, true);
+  if (!current.ok) return;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  rpcClient.emitEvent({ type: "agent_start" });
+  channel.emitTaskStarted({ task_id: current.task_id, turn_id: TURN_ID });
+
+  channel.emitCompactionPrepare("compact-continuation-compensation");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const queued = await supervisor.steer("续跑未启动也必须处理");
+  assert.equal(queued.ok, true);
+  if (!queued.ok) return;
+  rpcClient.emitEvent({ type: "agent_settled" });
+  rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
+  rpcClient.emitEvent({
+    type: "compaction_end",
+    reason: "manual",
+    aborted: false,
+    willRetry: false,
+    failed: false,
+  });
+  channel.emitCompactionComplete(
+    "compact-continuation-compensation",
+    "succeeded",
+    true,
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(rpcClient.operations().filter((operation) => operation === "steer").length, 0);
+  assert.equal(rpcClient.operations().filter((operation) => operation === "prompt").length, 1);
+
+  const fallback = rpcClient.deferNext("prompt");
+  channel.emitCompactionComplete("compact-continuation-compensation", "not_started");
+  await fallback.started;
+  assert.deepEqual(channel.publishedTaskAssignments().at(-1), {
+    message_id: queued.message_id,
+    task_id: current.task_id,
+    mode: "prompt",
+  });
+  assert.deepEqual(edgeOperations, [
+    "begin:compact-continuation-compensation",
+    "complete:compact-continuation-compensation:succeeded",
+  ]);
+  assert.deepEqual(
+    channel.publishedCompactionResponses()
+      .filter((response) => response.transaction_id === "compact-continuation-compensation")
+      .map((response) => response.accepted),
+    [true, true, true],
+  );
+  fallback.resolve();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await supervisor.terminate();
+});
+
+test("自动 continuation 已真实启动后拒绝迟到的 not_started 补偿", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "迟到 continuation 补偿" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+    onCompactionPrepare: () => true,
+    onCompactionComplete: () => true,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+  const current = await supervisor.prompt("进入协调压缩");
+  assert.equal(current.ok, true);
+  if (!current.ok) return;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  rpcClient.emitEvent({ type: "agent_start" });
+  channel.emitTaskStarted({ task_id: current.task_id, turn_id: TURN_ID });
+
+  channel.emitCompactionPrepare("compact-late-compensation");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  rpcClient.emitEvent({ type: "agent_settled" });
+  rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
+  rpcClient.emitEvent({
+    type: "compaction_end",
+    reason: "manual",
+    aborted: false,
+    willRetry: false,
+    failed: false,
+  });
+  channel.emitCompactionComplete("compact-late-compensation", "succeeded", true);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  rpcClient.emitEvent({ type: "agent_start" });
+
+  channel.emitCompactionComplete("compact-late-compensation", "not_started");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(
+    channel.publishedCompactionResponses()
+      .filter((response) => response.transaction_id === "compact-late-compensation")
+      .map((response) => response.accepted),
+    [true, true, false],
+  );
+  await supervisor.terminate();
 });
 
 test("单个 pending manual 授权可通过公开事件正常 start/end", async () => {
