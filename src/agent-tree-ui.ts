@@ -934,7 +934,7 @@ function formatAgentStateIcon(node: AgentSnapshot, workingFrame: string): string
     case "interrupting":
       return "↻";
     case "suspended":
-      return "Ⅱ";
+      return "■";
     case "failed":
       return "×";
     case "terminating":

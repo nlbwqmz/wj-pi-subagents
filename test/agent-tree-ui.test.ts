@@ -133,7 +133,7 @@ test("常驻 Agents widget 显示 Pi Working spinner 帧和生命周期图标", 
   assert.match(initial[2]!, /^├─ ○ /);
   assert.match(initial[3]!, /^├─ ⠋ /);
   assert.match(initial[4]!, /^├─ ↻ /);
-  assert.match(initial[5]!, /^├─ Ⅱ /);
+  assert.match(initial[5]!, /^├─ ■ /);
   assert.match(initial[6]!, /^├─ × /);
   assert.match(initial[7]!, /^└─ … /);
   assert.match(renderAgentsWidget(snapshot, 240, "⠹")[3]!, /^├─ ⠹ /);
