@@ -26,8 +26,6 @@
 | 模型 | 根会话需要已选择并配置可用模型 |
 | Windows | 需要 Bash，推荐 Git for Windows；还需可从 `PATH` 调用 `powershell.exe` |
 
-插件支持 Windows、macOS 和 Linux，目前主要在 Windows 原生环境中完成验证。
-
 ## 安装
 
 ### 用户级安装
