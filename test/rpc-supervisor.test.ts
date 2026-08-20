@@ -958,6 +958,156 @@ test("Pi 自动重试沿用父端任务身份且不把继续执行投影为 inte
   }
 });
 
+test("协调 continuation 已启动时，尾随旧 settled 不得降级活动轮次", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "尾随旧结算" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+    onCompactionPrepare: () => true,
+    onCompactionComplete: () => true,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+
+  const current = await supervisor.prompt("进入协调压缩任务");
+  assert.equal(current.ok, true);
+  if (!current.ok) return;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  rpcClient.emitEvent({ type: "agent_start" });
+  channel.emitTaskStarted({ task_id: current.task_id, turn_id: TURN_ID });
+
+  channel.emitCompactionPrepare("compact-trailing-settled");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(channel.publishedCompactionResponses(), [{
+    transaction_id: "compact-trailing-settled",
+    accepted: true,
+  }]);
+
+  rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
+  rpcClient.emitEvent({
+    type: "compaction_end",
+    reason: "manual",
+    aborted: false,
+    willRetry: false,
+    failed: false,
+  });
+  channel.emitCompactionComplete("compact-trailing-settled", "succeeded", true);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  // 协调扩展可在旧 agent_settled handler 返回前启动 continuation。
+  rpcClient.emitEvent({ type: "agent_start" });
+  channel.emitTaskStarted({ task_id: current.task_id, turn_id: NEXT_TURN_ID });
+  rpcClient.emitEvent({
+    type: "tool_execution_start",
+    toolCallId: "continuation-tool",
+    toolName: "spawn_agent",
+  });
+  rpcClient.emitEvent({ type: "agent_settled" });
+
+  let status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "working");
+    assert.equal(status.data.activity?.phase, "executing_tools");
+    assert.equal(status.data.activity?.category, "delegating");
+    assert.equal(status.data.activity?.active_count, 1);
+    assert.equal(status.data.reply_outbox_pending_count, 0);
+  }
+
+  const unexpectedPrompt = rpcClient.deferNext("prompt");
+  const queued = await supervisor.steer("续跑中的补充指令");
+  assert.equal(queued.ok, true);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const assignment = channel.publishedTaskAssignments().at(-1);
+  if (assignment?.mode === "prompt") {
+    unexpectedPrompt.reject(new ManagedRpcCommandRejectedError());
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  assert.equal(assignment?.mode, "steer");
+  assert.equal(rpcClient.operations().filter((operation) => operation === "prompt").length, 1);
+  assert.equal(rpcClient.operations().filter((operation) => operation === "steer").length, 1);
+
+  status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "working");
+    assert.equal(status.data.mailbox_pending_count, 0);
+    assert.equal(status.data.activity?.phase, "executing_tools");
+    assert.equal(status.data.activity?.task_id, current.task_id);
+  }
+  await supervisor.terminate();
+});
+
+test("协调 continuation 的旧 settled 正常先到时仍建立 provisional candidate", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "正常结算顺序" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+    onCompactionPrepare: () => true,
+    onCompactionComplete: () => true,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+
+  const current = await supervisor.prompt("进入协调压缩任务");
+  assert.equal(current.ok, true);
+  if (!current.ok) return;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  rpcClient.emitEvent({ type: "agent_start" });
+  channel.emitTaskStarted({ task_id: current.task_id, turn_id: TURN_ID });
+
+  channel.emitCompactionPrepare("compact-settled-first");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  rpcClient.emitEvent({ type: "compaction_start", reason: "manual" });
+  rpcClient.emitEvent({
+    type: "compaction_end",
+    reason: "manual",
+    aborted: false,
+    willRetry: false,
+    failed: false,
+  });
+  channel.emitCompactionComplete("compact-settled-first", "succeeded", true);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  // 没有新 start 时，这就是当前旧 run 的正常 settled，不能被标记误吞。
+  rpcClient.emitEvent({ type: "agent_settled" });
+  let status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "working");
+    assert.equal(status.data.reply_outbox_pending_count, 1);
+  }
+
+  rpcClient.emitEvent({ type: "agent_start" });
+  channel.emitTaskStarted({ task_id: current.task_id, turn_id: NEXT_TURN_ID });
+  status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "working");
+    assert.equal(status.data.activity?.phase, "processing");
+    assert.equal(status.data.reply_outbox_pending_count, 0);
+  }
+  await supervisor.terminate();
+});
+
 test("Pi 原生自动压缩续跑后，压缩期消息按 FIFO 通过公开 steer 进入同一任务", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
@@ -3545,6 +3695,13 @@ test("成功 complete 后的 not_started 补偿撤销父端 continuation 等待�
   );
   fallback.resolve();
   await new Promise<void>((resolve) => setImmediate(resolve));
+
+  rpcClient.emitEvent({ type: "agent_start" });
+  channel.emitTaskStarted({ task_id: current.task_id, turn_id: NEXT_TURN_ID });
+  rpcClient.emitEvent({ type: "agent_settled" });
+  const status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) assert.equal(status.data.reply_outbox_pending_count, 1);
   await supervisor.terminate();
 });
 

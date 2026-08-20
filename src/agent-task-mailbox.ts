@@ -91,6 +91,10 @@ export class AgentTaskMailbox {
   private coordinatedPhysicalLifecycleObserved = false;
   private coordinatedContinuationStarted = false;
   private awaitingCoordinatedContinuationTransactionId: string | undefined;
+  private coordinatedTrailingSettlement: {
+    readonly transactionId: string;
+    readonly startEpoch: number;
+  } | undefined;
   private awaitingNativeCompactionOutcome = false;
   private awaitingRetryStart = false;
   private awaitingPromptStart = false;
@@ -366,6 +370,16 @@ export class AgentTaskMailbox {
     this.reconcileCoordinatedSettlementWork();
   }
 
+  /** 协调 continuation 已启动时，只消费一次旧 run 尾随转发的 settled。 */
+  classifyAgentSettled(): "current" | "superseded_coordinated_continuation" {
+    const trailing = this.coordinatedTrailingSettlement;
+    if (trailing === undefined) return "current";
+    this.coordinatedTrailingSettlement = undefined;
+    return this.startEpoch > trailing.startEpoch
+      ? "superseded_coordinated_continuation"
+      : "current";
+  }
+
   /** raw settled 只形成 candidate；没有 final commit 时绝不进入 idle。 */
   observeAgentSettled(): "candidate" | "superseded" {
     this.awaitingCompactionPromptRetry = false;
@@ -456,11 +470,19 @@ export class AgentTaskMailbox {
     if (this.coordinationBarriers.size === 0) {
       // not_started 或无物理结果的通用屏障都不会再出现本事务的压缩生命周期。
       if (outcome === undefined || outcome === "not_started") this.coordinatedCompactionResolved = true;
-      this.awaitingCoordinatedContinuationTransactionId = outcome === "succeeded"
-        && continuationExpected
+      const expectsContinuation = outcome === "succeeded" && continuationExpected;
+      this.awaitingCoordinatedContinuationTransactionId = expectsContinuation
         && !this.coordinatedContinuationStarted
         ? transactionId
         : undefined;
+      if (expectsContinuation && this.coordinatedTrailingSettlement === undefined) {
+        // continuation 可在旧 agent_settled handler 返回前启动；保存旧 run 的
+        // start epoch，让随后转发的 settled 无法覆盖新 run。
+        this.coordinatedTrailingSettlement = Object.freeze({
+          transactionId,
+          startEpoch: this.startEpoch,
+        });
+      }
     }
     this.reconcileCoordinatedSettlementWork();
     return true;
@@ -473,6 +495,9 @@ export class AgentTaskMailbox {
       || this.awaitingCoordinatedContinuationTransactionId !== transactionId
     ) return false;
     this.awaitingCoordinatedContinuationTransactionId = undefined;
+    if (this.coordinatedTrailingSettlement?.transactionId === transactionId) {
+      this.coordinatedTrailingSettlement = undefined;
+    }
     this.coordinatedCompactionResolved = true;
     this.reconcileCoordinatedSettlementWork();
     return true;
@@ -940,6 +965,7 @@ export class AgentTaskMailbox {
     this.coordinatedPhysicalLifecycleObserved = false;
     this.coordinatedContinuationStarted = false;
     this.awaitingCoordinatedContinuationTransactionId = undefined;
+    this.coordinatedTrailingSettlement = undefined;
   }
 
   private hasCurrentTaskMailboxWork(): boolean {

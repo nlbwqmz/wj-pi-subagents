@@ -1988,10 +1988,18 @@ export class RpcSupervisor {
   }
 
   private observeProvisionalSettlement(): void {
+    if (this.mailbox.classifyAgentSettled() === "superseded_coordinated_continuation") {
+      // 协调扩展可先启动 continuation，再让旧 run 的 settled 离开 handler。
+      // 该旧事实不得清除新 run 的工具活动或改变 prompt/steer 路由。
+      this.commitTaskProjection();
+      this.drainCommandQueue();
+      return;
+    }
     this.resetToolActivity();
     this.mailbox.observeAgentSettled();
     this.commitTaskProjection();
-    // Pi 保证 agent_settled 已位于其自动重试、自动压缩和队列续轮之后。
+    // Pi 自身的自动重试、自动压缩和队列续轮位于 settled 前；扩展内
+    // 协调 continuation 的尾随旧 settled 已在上方单独消费。
     // final 若先到，通道仍会将它隔离至这个 candidate 建立后再投递。
     this.schedulePendingReplyRetry();
     this.drainCommandQueue();
