@@ -1,0 +1,47 @@
+name: Cross-platform tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.21.1"
+          cache: npm
+
+      - name: Install project dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Run type checks and tests
+        run: npm run check
+
+      - name: Run package smoke test
+        run: npm run pack:smoke
+
+      - name: Install Pi
+        run: npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.84.2
+
+      - name: Run Pi compatibility smoke test
+        run: npm run compat:pi
