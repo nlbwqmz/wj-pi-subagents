@@ -1708,6 +1708,8 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
     `- ${PARENT_COORDINATION_GUIDELINES.slowProgress}`,
     `- ${PARENT_COORDINATION_GUIDELINES.taskRecovery}`,
     `- ${PARENT_COORDINATION_GUIDELINES.retryPolicy}`,
+    `- ${PARENT_COORDINATION_GUIDELINES.agentCleanup}`,
+    `- ${PARENT_COORDINATION_GUIDELINES.capacityCleanup}`,
     `- ${PARENT_COORDINATION_GUIDELINES.replyTooLarge}`,
   ].join("\n");
   const childFinalReplyGuidance = [

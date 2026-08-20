@@ -92,6 +92,14 @@ test("管理工具系统提示约束任务所有权并覆盖慢任务和异常�
   assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /最多扩展到 5 次/);
   assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /不要自动切换模型或创建替代代理/);
   assert.equal(
+    PARENT_COORDINATION_GUIDELINES.agentCleanup,
+    "子代理回收：interrupt_agent 仅中断当前任务，不释放节点名额；回收必须调用 terminate_agent 并确认资源已释放。子代理已提交可用最终答复、当前任务已完成且当前阶段暂不使用时，可以回收；按“异常恢复/重试”流程达到停止条件仍不可用时，必须回收。",
+  );
+  assert.equal(
+    PARENT_COORDINATION_GUIDELINES.capacityCleanup,
+    "容量回收：spawn_agent 返回 max_children_reached 或 max_tree_agents_reached 时，检查现有子代理，优先使用 terminate_agent 回收已完成且暂不使用或已不可恢复的节点；确认名额释放后再重试创建。",
+  );
+  assert.equal(
     PARENT_COORDINATION_GUIDELINES.replyTooLarge,
     "若收到子代理 final 的 reply_too_large，说明最终消息过长而未成功交付，但不代表代理故障。不要终止、替换或盲目重跑原任务；先查询原 agent 状态，再向同一 agent 发送消息，说明其最终消息过长，要求其基于已有工作精炼后补交最终结果。",
   );

@@ -189,6 +189,8 @@ export const PARENT_COORDINATION_GUIDELINES = Object.freeze({
   slowProgress: "慢任务：working/processing 或 timeout 不代表失败。不要仅因耗时而要求子代理提前总结、调用 interrupt_agent 或 terminate_agent；可以用 send_message 询问进度，然后继续 wait_agent。",
   taskRecovery: "异常恢复：task_failed、task_interrupted，或最终答复缺失、不可用时，先用 get_agent_status 核对，再向同一 agent_id 发送恢复指令。复用已有上下文，从未完成步骤继续，避免重复已完成的副作用，并要求其提交完整最终答复。",
   retryPolicy: "重试：除 spawn_failed 和 internal_error 外，其他异常均可重试，包括 message_delivery_failed 和 suspended。重试前先核对并修正原因；默认重试 3 次，若每次仍有进展、状态变化或错误变化，最多扩展到 5 次，每次尝试后都使用 wait_agent。节点终止、用户取消或达到上限时停止，并报告原因；不要自动切换模型或创建替代代理。",
+  agentCleanup: "子代理回收：interrupt_agent 仅中断当前任务，不释放节点名额；回收必须调用 terminate_agent 并确认资源已释放。子代理已提交可用最终答复、当前任务已完成且当前阶段暂不使用时，可以回收；按“异常恢复/重试”流程达到停止条件仍不可用时，必须回收。",
+  capacityCleanup: "容量回收：spawn_agent 返回 max_children_reached 或 max_tree_agents_reached 时，检查现有子代理，优先使用 terminate_agent 回收已完成且暂不使用或已不可恢复的节点；确认名额释放后再重试创建。",
   replyTooLarge: "若收到子代理 final 的 reply_too_large，说明最终消息过长而未成功交付，但不代表代理故障。不要终止、替换或盲目重跑原任务；先查询原 agent 状态，再向同一 agent 发送消息，说明其最终消息过长，要求其基于已有工作精炼后补交最终结果。",
   interruptAgent: TAKEOVER_GUIDELINE,
 });
