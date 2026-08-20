@@ -547,7 +547,9 @@ function parseVisibleEnvelope(text: string, kind: VisibleKind): VisibleEnvelope 
     status: `${envelope.run_state} / ${envelope.output_state}${
       envelope.reason_code === undefined ? "" : ` / ${envelope.reason_code}`
     }`,
-    payload: envelope.text ?? "No task output is available.",
+    payload: envelope.text ?? (envelope.reason_code === "reply_too_large"
+      ? "The final reply was too large and was not delivered. The subagent completed normally."
+      : "No task output is available."),
   });
 }
 

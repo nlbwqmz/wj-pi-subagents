@@ -40,6 +40,21 @@ function interruptedFinal(agentId: string, taskId: string): ChildFinalEnvelope {
   };
 }
 
+function replyTooLargeFinal(agentId: string, taskId: string): ChildFinalEnvelope {
+  return {
+    schema: CHILD_REPLY_SCHEMA,
+    version: CHILD_REPLY_VERSION,
+    kind: "final",
+    agent_id: agentId,
+    task_id: taskId,
+    turn_id: TEST_TURN_ID,
+    commit_id: TEST_COMMIT_ID,
+    run_state: "settled",
+    output_state: "absent",
+    reason_code: "reply_too_large",
+  };
+}
+
 class ReadyChannel implements RpcSupervisorChannel {
   private ready = true;
   private readonly eventListeners = new Set<(event: SupervisorEvent) => void>();
@@ -219,6 +234,64 @@ test("直接父子旅程闭合 spawn、prompt、steering、wait 和协作式 int
     assert.equal(one.data.state, "idle");
     assert.equal("observed_at" in one.data, false);
   }
+});
+
+test("reply_too_large final 正常完成任务且不把代理标记为故障", async () => {
+  const id = "41414141-4141-4414-8414-414141414141";
+  const tree = makeTree(id);
+  let node: FakeManagedRpcNode | undefined;
+  let channel: ReadyChannel | undefined;
+  let supervisor: RpcSupervisor | undefined;
+  const controller = new AgentController({
+    tree,
+    allowUnvalidatedTemplates: true,
+    createSupervisor: ({ actor, reservation }) => {
+      node = new FakeManagedRpcNode();
+      channel = new ReadyChannel();
+      supervisor = new RpcSupervisor({
+        controller: tree,
+        actor,
+        reservation,
+        managedNode: node,
+        channel,
+        startupTimeoutMs: 100,
+        gracefulShutdownMs: 10,
+      });
+      return supervisor;
+    },
+  });
+
+  const spawned = await controller.spawnAgent({ template_id: "researcher", name: "超限结果代理" });
+  assert.equal(spawned.ok, true);
+  if (!spawned.ok || node === undefined || channel === undefined || supervisor === undefined) return;
+  const submitted = await controller.sendMessage({ agent_id: id, message: "生成详细报告" });
+  assert.equal(submitted.ok, true);
+  if (!submitted.ok) return;
+  node.emitEvent({ type: "agent_start" });
+  channel.emitTaskStarted({ task_id: submitted.data.task_id, turn_id: TEST_TURN_ID });
+  const waiting = controller.waitAgents({ agent_ids: [id] });
+  node.emitEvent({ type: "agent_settled" });
+  assert.equal(supervisor.acceptChildReply(
+    replyTooLargeFinal(id, submitted.data.task_id),
+    () => true,
+  ), true);
+
+  const result = await waiting;
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.data.outcome, "task_completed");
+    assert.equal(result.data.state, "idle");
+    assert.equal(result.data.last_task?.outcome, "completed");
+    assert.equal(result.data.last_task?.output_state, "absent");
+    assert.equal(result.data.error, undefined);
+  }
+  const status = controller.getAgentStatus(id);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "idle");
+    assert.equal(status.data.error, undefined);
+  }
+  await controller.shutdown();
 });
 
 test("自主 agent_start 后控制器保持 working，并按 steering、wait 和 interrupt 路由", async () => {

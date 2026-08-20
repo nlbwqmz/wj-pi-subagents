@@ -67,15 +67,15 @@ function receiveAndAck(
   return result;
 }
 
-test("v12 reply wire payload contains only reply_seq and envelope", () => {
+test("v13 reply wire payload contains only reply_seq and envelope", () => {
   const pair = readyPair();
   const value = envelope();
   const frame = pair.child.publishReply(value);
-  assert.equal(frame.protocol, "wj-pi-subagents/12");
+  assert.equal(frame.protocol, "wj-pi-subagents/13");
   assert.deepEqual(frame.payload, { reply_seq: 1, envelope: value });
 });
 
-test("v12 rejects v8/v9 frames and reply envelopes with a forged agent identity", () => {
+test("v13 rejects legacy frames and reply envelopes with a forged agent identity", () => {
   const legacyPair = readyPair();
   const valid = legacyPair.child.publishReply(envelope());
   const v8 = { ...valid, protocol: "wj-pi-subagents/8" } as unknown as SupervisorFrame;
@@ -89,6 +89,27 @@ test("v12 rejects v8/v9 frames and reply envelopes with a forged agent identity"
   assert.deepEqual(v9Pair.parent.receive(v9), {
     kind: "protocol_fault",
     error: "protocol_mismatch",
+  });
+
+  const v12Pair = readyPair();
+  const v12 = { ...v12Pair.child.publishReply(envelope()), protocol: "wj-pi-subagents/12" } as unknown as SupervisorFrame;
+  assert.deepEqual(v12Pair.parent.receive(v12), {
+    kind: "protocol_fault",
+    error: "protocol_mismatch",
+  });
+
+  const v4EnvelopePair = readyPair();
+  const v4EnvelopeFrame = v4EnvelopePair.child.publishReply(envelope());
+  const forgedV4Envelope = {
+    ...v4EnvelopeFrame,
+    payload: {
+      ...v4EnvelopeFrame.payload,
+      envelope: { ...envelope(), version: 4 },
+    },
+  } as unknown as SupervisorFrame;
+  assert.deepEqual(v4EnvelopePair.parent.receive(forgedV4Envelope), {
+    kind: "protocol_fault",
+    error: "reply_invalid",
   });
 
   const identityPair = readyPair();

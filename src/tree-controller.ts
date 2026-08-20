@@ -39,6 +39,7 @@ export {
 /** 公开控制面允许返回的稳定错误码闭集。 */
 export const PUBLIC_ERROR_CODES = Object.freeze([
   "invalid_argument",
+  "reply_too_large",
   "agent_not_found",
   "not_direct_child",
   "template_not_found",
@@ -84,6 +85,7 @@ const ERROR_METADATA: Readonly<Record<PublicErrorCode, Readonly<{
   retryable: boolean;
 }>>> = Object.freeze({
   invalid_argument: Object.freeze({ message: "Invalid argument", retryable: false }),
+  reply_too_large: Object.freeze({ message: "Reply exceeds the maximum size", retryable: false }),
   agent_not_found: Object.freeze({ message: "Subagent ID is not registered", retryable: false }),
   not_direct_child: Object.freeze({ message: "Target is not a direct child", retryable: false }),
   template_not_found: Object.freeze({ message: "Agent template not found", retryable: false }),

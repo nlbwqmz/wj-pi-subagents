@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import {
-  CHILD_REPLY_ENVELOPE_LIMITS,
   CHILD_REPLY_SCHEMA,
   CHILD_REPLY_VERSION,
   parseChildReplyEnvelope,
@@ -8,6 +7,7 @@ import {
   type ChildFinalReasonCode,
   type ChildReplyEnvelope,
 } from "./child-reply-envelope.ts";
+import { REPLY_MAX_TEXT_BYTES } from "./child-reply-limits.ts";
 import { normalizeAssistantMessageEnd } from "./rpc-bridge-event.ts";
 import type {
   SupervisorCompactionOutcome,
@@ -83,7 +83,8 @@ export class ChildReplyCoordinator {
   private publicationTail: Promise<void> = Promise.resolve();
   private candidate: FinalCandidate | undefined;
   private finalState: RunFinalState = "normal";
-  private failureReason: Exclude<ChildFinalReasonCode, "no_output"> | undefined;
+  private failureReason: Exclude<ChildFinalReasonCode, "no_output" | "reply_too_large"> | undefined;
+  private absentReason: Extract<ChildFinalReasonCode, "reply_too_large"> | undefined;
   private currentTaskId: string | undefined;
   private currentTurnId: string | undefined;
   private pendingSettledTurnId: string | undefined;
@@ -173,6 +174,7 @@ export class ChildReplyCoordinator {
       this.awaitingRetryStart = false;
       this.finalSubmitted = false;
       this.candidate = undefined;
+      this.absentReason = undefined;
     }
     this.pendingPromptTaskId = assignment.task_id;
     this.settlementEpoch += 1;
@@ -204,6 +206,7 @@ export class ChildReplyCoordinator {
     this.candidate = undefined;
     this.finalState = "normal";
     this.failureReason = undefined;
+    this.absentReason = undefined;
     this.settlementEpoch += 1;
     const publishTaskStarted = this.port.publishTaskStarted;
     if (publishTaskStarted !== undefined) {
@@ -223,21 +226,24 @@ export class ChildReplyCoordinator {
     if (!this.runActive || this.finalSubmitted || this.currentTurnId === undefined) return;
     const parsed = normalizeAssistantMessageEnd(event);
     if (parsed.kind === "ignored") return;
-    if (parsed.kind !== "event" || parsed.event.type !== "message_end") {
-      this.finalState = "failed";
-      this.failureReason = "runtime_fault";
-      return;
-    }
     const raw = isRecord(event) && isRecord(event.message) ? event.message : undefined;
     const stopReason = raw?.stopReason;
+    if (parsed.kind === "invalid") {
+      this.finalState = "failed";
+      this.failureReason = "runtime_fault";
+      this.absentReason = undefined;
+      return;
+    }
     if (stopReason === "error") {
       this.finalState = "failed";
       this.failureReason = "provider_error";
+      this.absentReason = undefined;
       return;
     }
     if (stopReason === "aborted") {
       this.finalState = "interrupted";
       this.failureReason = undefined;
+      this.absentReason = undefined;
       return;
     }
     this.finalState = "normal";
@@ -245,12 +251,29 @@ export class ChildReplyCoordinator {
     if (stopReason !== "stop" && stopReason !== "length") return;
     if (Array.isArray(raw?.content) && raw.content.some((item) => isRecord(item) && item.type === "toolCall")) return;
 
+    if (parsed.kind === "rejected") {
+      this.candidate = undefined;
+      this.absentReason = parsed.reason;
+      return;
+    }
+    if (parsed.event.type !== "message_end") {
+      this.finalState = "failed";
+      this.failureReason = "runtime_fault";
+      this.absentReason = undefined;
+      return;
+    }
     const text = parsed.event.message.content
       .filter((item): item is { readonly type: "text"; readonly text: string } => item.type === "text")
       .map((item) => item.text)
       .join("\n");
-    if (text.trim().length === 0 || utf8Length(text) > CHILD_REPLY_ENVELOPE_LIMITS.maxStringBytes) return;
+    if (text.trim().length === 0) return;
+    if (utf8Length(text) > REPLY_MAX_TEXT_BYTES) {
+      this.candidate = undefined;
+      this.absentReason = "reply_too_large";
+      return;
+    }
     this.candidate = Object.freeze({ text, stopReason });
+    this.absentReason = undefined;
   }
 
   async replyToParent(
@@ -258,6 +281,9 @@ export class ChildReplyCoordinator {
     signal?: AbortSignal,
   ): Promise<ControlResult<ReplyToParentData>> {
     if (!isReplyToParentInput(input)) return controlFailure("invalid_argument");
+    if (utf8Length(input.message) > REPLY_MAX_TEXT_BYTES) {
+      return controlFailure("reply_too_large");
+    }
     const taskId = this.currentTaskId;
     const turnId = this.currentTurnId;
     if (!this.runActive || taskId === undefined || turnId === undefined) {
@@ -291,7 +317,10 @@ export class ChildReplyCoordinator {
     if (this.terminalFailure || this.compactionActive) return;
     this.compactionActive = true;
     this.awaitingRetryStart = willRetry;
-    if (willRetry) this.candidate = undefined;
+    if (willRetry) {
+      this.candidate = undefined;
+      this.absentReason = undefined;
+    }
     this.settlementEpoch += 1;
   }
 
@@ -371,6 +400,7 @@ export class ChildReplyCoordinator {
           this.currentTaskId = undefined;
           this.currentTurnId = undefined;
           this.candidate = undefined;
+          this.absentReason = undefined;
           this.notifyFinalAccepted();
         },
         () => this.failFinal(),
@@ -390,7 +420,7 @@ export class ChildReplyCoordinator {
       ? "settled"
       : this.finalState;
     const reasonCode: ChildFinalReasonCode | undefined = runState === "settled" && outputState === "absent"
-      ? "no_output"
+      ? this.absentReason ?? "no_output"
       : runState === "failed"
         ? this.failureReason ?? "runtime_fault"
         : undefined;
@@ -427,6 +457,7 @@ export class ChildReplyCoordinator {
     this.currentTaskId = undefined;
     this.currentTurnId = undefined;
     this.candidate = undefined;
+    this.absentReason = undefined;
     this.notifyFinalFailure();
   }
 
@@ -475,7 +506,6 @@ function isReplyToParentInput(value: unknown): value is ReplyToParentInput {
   const candidate = value as Record<string, unknown>;
   return typeof candidate.message === "string"
     && candidate.message.trim().length > 0
-    && utf8Length(candidate.message) <= CHILD_REPLY_ENVELOPE_LIMITS.maxStringBytes
     && Object.keys(candidate).every((key) => key === "message");
 }
 

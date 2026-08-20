@@ -6,6 +6,7 @@ import {
   type ChildFinalEnvelope,
   type ChildMessageEnvelope,
 } from "../src/child-reply-envelope.ts";
+import { REPLY_MAX_TEXT_BYTES } from "../src/child-reply-limits.ts";
 import {
   SUPERVISOR_CAPABILITY_LIMITS,
   SUPERVISOR_CHANNEL_LIMITS,
@@ -163,7 +164,7 @@ test("task assignment 与 task_started 在同一累计 ACK 顺序域传递 UUIDv
   }), "invalid_frame");
 });
 
-test("v12 压缩帧只允许 child 请求和 parent 响应并携带 continuation 所有权", () => {
+test("v13 压缩帧只允许 child 请求和 parent 响应并携带 continuation 所有权", () => {
   const pair = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,
     childAgentId: CHILD_ID,
@@ -238,7 +239,7 @@ test("v12 压缩帧只允许 child 请求和 parent 响应并携带 continuation
   }), "invalid_frame");
 });
 
-test("v12 拒绝已移除的 compaction_resume 帧", () => {
+test("v13 拒绝已移除的 compaction_resume 帧", () => {
   const pair = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,
     childAgentId: CHILD_ID,
@@ -725,7 +726,44 @@ test("工作中 message 为 final 预留窗口槽位，二者按同一 reply_seq
   assert.equal(pair.child.getPublicState().pending_reply_count, 0);
 });
 
-test("v12 reply 必须携带合法 envelope，且 message/final 都拒绝图片字段", () => {
+test("v13 reply 使用独立 32 KiB 正文预算且不扩大其他监督字符串限制", () => {
+  assert.equal(SUPERVISOR_CHANNEL_LIMITS.maxStringBytes, 16 * 1024);
+  assert.equal(REPLY_MAX_TEXT_BYTES, 32 * 1024);
+  const pair = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+  });
+  handshake(pair);
+  const roundTrip = (frame: SupervisorFrame, expectedReplySeq: number): void => {
+    const encoded = encodeSupervisorFrame(frame);
+    assert.ok(encoded.byteLength <= SUPERVISOR_CHANNEL_LIMITS.maxFrameBytes + 4);
+    const result = pair.parent.receive(encoded);
+    assert.equal(result.kind, "accepted");
+    if (result.kind !== "accepted") return;
+    let replyAck: number | undefined;
+    for (const outbound of result.outbound) {
+      const childResult = pair.child.receive(encodeSupervisorFrame(outbound));
+      if (childResult.kind === "accepted" && childResult.reply_ack !== undefined) {
+        replyAck = childResult.reply_ack;
+      }
+    }
+    assert.equal(replyAck, expectedReplySeq);
+    assert.equal(pair.child.getPublicState().pending_reply_count, 0);
+  };
+
+  roundTrip(pair.child.publishReply(workingReply(
+    "x".repeat(REPLY_MAX_TEXT_BYTES),
+  )), 1);
+  roundTrip(pair.child.publishReply(workingReply(
+    "\u0000".repeat(REPLY_MAX_TEXT_BYTES),
+  )), 2);
+  roundTrip(pair.child.publishReply(finalReply(
+    "😀".repeat(8_192),
+  )), 3);
+});
+
+test("v13 reply 必须携带合法 envelope，且 message/final 都拒绝图片字段", () => {
   const missingEnvelope = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,
     childAgentId: CHILD_ID,
@@ -765,6 +803,25 @@ test("v12 reply 必须携带合法 envelope，且 message/final 都拒绝图片�
     error: "reply_invalid",
   });
 
+  const forgedOversized = createFakeSupervisorChannelPair({
+    rootId: ROOT_ID,
+    childAgentId: CHILD_ID,
+    credential: CREDENTIAL,
+  });
+  handshake(forgedOversized);
+  const validSizedFrame = forgedOversized.child.publishReply(workingReply("合法正文"));
+  const forgedOversizedFrame = {
+    ...validSizedFrame,
+    payload: {
+      ...validSizedFrame.payload,
+      envelope: workingReply("x".repeat(REPLY_MAX_TEXT_BYTES + 1)),
+    },
+  } as SupervisorFrame;
+  assert.deepEqual(forgedOversized.parent.receive(forgedOversizedFrame), {
+    kind: "protocol_fault",
+    error: "reply_invalid",
+  });
+
   const emptyMessage = createFakeSupervisorChannelPair({
     rootId: ROOT_ID,
     childAgentId: CHILD_ID,
@@ -773,6 +830,12 @@ test("v12 reply 必须携带合法 envelope，且 message/final 都拒绝图片�
   handshake(emptyMessage);
   assert.throws(
     () => emptyMessage.child.publishReply(workingReply("   ")),
+    (error: unknown) => error instanceof SupervisorProtocolError && error.code === "reply_invalid",
+  );
+  assert.throws(
+    () => emptyMessage.child.publishReply(workingReply(
+      "x".repeat(REPLY_MAX_TEXT_BYTES + 1),
+    )),
     (error: unknown) => error instanceof SupervisorProtocolError && error.code === "reply_invalid",
   );
   assert.throws(
@@ -925,7 +988,7 @@ test("根权威控制响应可传递超过普通回复文本边界的模板正�
     credential: CREDENTIAL,
   });
   handshake(pair);
-  const body = "x".repeat(SUPERVISOR_CHANNEL_LIMITS.maxStringBytes + 1);
+  const body = "x".repeat(REPLY_MAX_TEXT_BYTES + 1);
   const response = pair.parent.publishControlResponse({
     operation_id: "resolve_large_template",
     ok: true,

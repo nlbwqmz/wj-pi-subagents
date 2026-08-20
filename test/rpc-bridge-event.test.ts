@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { REPLY_MAX_TEXT_BYTES } from "../src/child-reply-limits.ts";
 import {
   normalizeAssistantMessageEnd,
   normalizeRpcBridgeEvent,
@@ -143,6 +144,53 @@ test("任务桥接忽略全部 message_end，真正 child 回复端点仍拒绝�
   assert.deepEqual(normalizeAssistantMessageEnd({
     type: "message_end",
     message: { role: "assistant", content: [{ type: "text", text: 42 }] },
+  }), {
+    kind: "invalid",
+  });
+});
+
+test("真正 child 最终文本按拼接后的 32 KiB UTF-8 总长度区分回复超限", () => {
+  const exactFirst = "x".repeat(REPLY_MAX_TEXT_BYTES - 4);
+  const exact = normalizeAssistantMessageEnd({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: exactFirst }, { type: "text", text: "完" }],
+    },
+  });
+  assert.equal(exact.kind, "event");
+
+  assert.deepEqual(normalizeAssistantMessageEnd({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: exactFirst }, { type: "text", text: "abcd" }],
+    },
+  }), {
+    kind: "rejected",
+    reason: "reply_too_large",
+  });
+
+  assert.deepEqual(normalizeAssistantMessageEnd({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "测".repeat(10_923) }],
+    },
+  }), {
+    kind: "rejected",
+    reason: "reply_too_large",
+  });
+
+  assert.deepEqual(normalizeAssistantMessageEnd({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [
+        { type: "text", text: "x".repeat(REPLY_MAX_TEXT_BYTES + 1) },
+        { type: "future_secret_block", secret: "仍须按非法事件拒绝" },
+      ],
+    },
   }), {
     kind: "invalid",
   });

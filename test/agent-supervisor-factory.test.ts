@@ -121,7 +121,7 @@ function factoryHarness(deliverReply?: (agentId: string, reply: ManagedRpcReply)
     rootArguments: { maxDepth: 2 },
     controllerMetadata: {
       rootId: "root-factory",
-      protocolVersion: "wj-pi-subagents/12",
+      protocolVersion: "wj-pi-subagents/13",
     },
   });
   const options = {
@@ -244,7 +244,7 @@ test("身份预留后才建立监督上下文并追加最终子代理环境", as
   assert.equal(context.environment?.WJ_PI_SUBAGENTS_AGENT_ID, AGENT_ID);
   assert.equal(context.environment?.WJ_PI_SUBAGENTS_DEPTH, "1");
   assert.equal(context.environment?.WJ_PI_SUBAGENTS_MAX_DEPTH, "2");
-  assert.equal(context.environment?.WJ_PI_SUBAGENTS_PROTOCOL_VERSION, "wj-pi-subagents/12");
+  assert.equal(context.environment?.WJ_PI_SUBAGENTS_PROTOCOL_VERSION, "wj-pi-subagents/13");
   await supervisor.terminate();
 });
 

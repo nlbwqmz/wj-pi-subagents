@@ -328,6 +328,49 @@ test("final 提交后迟到的 message_end 不能重新打开同一轮工作中�
   assert.deepEqual(replies, [finalEnvelope("已完成")]);
 });
 
+test("reply_to_parent 超限只拒绝本次消息，精炼后可继续回复同一任务", async () => {
+  const replies: ChildReplyEnvelope[] = [];
+  const value = coordinator({
+    async publishReply(reply) {
+      replies.push(reply);
+    },
+    async publishReplyAndWaitForAck(): Promise<void> {},
+  });
+  value.observeAgentStart();
+  const taskId = value.getCurrentTaskId();
+
+  const oversized = await value.replyToParent({ message: "x".repeat(32 * 1024 + 1) });
+  assert.equal(oversized.ok, false);
+  if (!oversized.ok) assert.equal(oversized.error.code, "reply_too_large");
+  const oversizedEmoji = await value.replyToParent({ message: "😀".repeat(8_193) });
+  assert.equal(oversizedEmoji.ok, false);
+  if (!oversizedEmoji.ok) assert.equal(oversizedEmoji.error.code, "reply_too_large");
+  assert.equal(replies.length, 0);
+  assert.equal(value.getCurrentTaskId(), taskId);
+
+  const exactEmojiText = "😀".repeat(8_192);
+  const exactEmoji = await value.replyToParent({ message: exactEmojiText });
+  assert.deepEqual(exactEmoji, { ok: true, data: { accepted: true } });
+  assert.equal(replies[0]?.text, exactEmojiText);
+
+  const exactChineseText = `${"测".repeat(10_922)}ab`;
+  const exactChinese = await value.replyToParent({ message: exactChineseText });
+  assert.deepEqual(exactChinese, { ok: true, data: { accepted: true } });
+  assert.equal(replies[1]?.text, exactChineseText);
+
+  const exact = await value.replyToParent({ message: "x".repeat(32 * 1024) });
+  assert.deepEqual(exact, { ok: true, data: { accepted: true } });
+  assert.equal(replies.length, 3);
+  assert.equal(replies[2]?.text?.length, 32 * 1024);
+
+  const refined = await value.replyToParent({ message: "精炼后的进度" });
+  assert.deepEqual(refined, { ok: true, data: { accepted: true } });
+  assert.equal(replies.length, 4);
+  assert.equal(replies[3]?.kind, "message");
+  assert.equal(replies[3]?.text, "精炼后的进度");
+  assert.equal(value.getCurrentTaskId(), taskId);
+});
+
 test("工作中回复拒绝 images 扩展字段", async () => {
   const port = new RecordingPort();
   const value = coordinator(port);
@@ -448,6 +491,53 @@ test("最终候选连接文本块并忽略图片内容", async () => {
   assert.deepEqual(port.replies, [finalEnvelope("第一部分\n第二部分")]);
   port.acknowledgeAll();
   await settled;
+});
+
+test("最终回复超限只报告未交付并正常完成，不回退旧候选或标记代理故障", async () => {
+  const port = new RecordingPort();
+  let finalAccepted = 0;
+  let finalFailures = 0;
+  const value = new ChildReplyCoordinator({
+    agentId: AGENT_ID,
+    port,
+    turnIdFactory: () => TURN_1,
+    taskIdFactory: () => TASK_1,
+    commitIdFactory: () => COMMIT_1,
+    onFinalAccepted: () => { finalAccepted += 1; },
+    onFinalFailure: () => { finalFailures += 1; },
+  });
+  value.observeAgentStart();
+  value.observeAssistantMessageEnd({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: "不得回退提交的旧候选" }],
+    },
+  });
+  value.observeAssistantMessageEnd({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: "x".repeat(32 * 1024 + 1) }],
+    },
+  });
+
+  value.settle();
+  await nextTask();
+  assert.deepEqual(port.replies, [finalEnvelope(undefined, {
+    run_state: "settled",
+    reason_code: "reply_too_large",
+  })]);
+  assert.equal(finalFailures, 0);
+  port.acknowledgeAll();
+  await nextTask();
+  await nextTask();
+  assert.equal(finalAccepted, 1);
+  assert.equal(finalFailures, 0);
+  assert.equal(value.getCurrentTaskId(), undefined);
+  assert.equal(value.getCurrentTurnId(), undefined);
 });
 
 test("图片-only assistant 输出形成无正文 final", async () => {
@@ -967,6 +1057,19 @@ test("父回复 renderer 隐藏原始 JSON 与协议字段并展示发送者、�
   ).render(120).join("\n");
   assert.match(finalRendered, /settled \/ absent \/ no_output/);
   assert.match(finalRendered, /No task output is available/);
+
+  const tooLargeEnvelope = finalEnvelope(undefined, {
+    run_state: "settled",
+    reason_code: "reply_too_large",
+  });
+  const tooLargeRendered = renderers.get("wj-pi-subagents-final")!({
+    customType: "wj-pi-subagents-final",
+    content: [{ type: "text", text: createVisibleEnvelope(tooLargeEnvelope) }],
+    details: { agent_id: AGENT_ID, kind: "final" },
+  }, { expanded: true, outputPad: 0 }, RENDER_THEME).render(120).join("\n");
+  assert.match(tooLargeRendered, /settled \/ absent \/ reply_too_large/);
+  assert.match(tooLargeRendered, /was not delivered/);
+  assert.match(tooLargeRendered, /completed normally/);
 });
 
 test("工作中回复与最终答复正文按 Markdown 渲染", () => {

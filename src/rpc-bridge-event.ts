@@ -1,3 +1,5 @@
+import { REPLY_MAX_TEXT_BYTES } from "./child-reply-limits.ts";
+
 /** 桥接进程允许跨进程公开的 Pi 事件闭集。 */
 export type SafeRpcBridgeEvent =
   | { readonly type: "agent_start" | "agent_settled" }
@@ -33,12 +35,18 @@ export type RpcBridgeEventNormalization =
   | { readonly kind: "ignored" }
   | { readonly kind: "invalid" };
 
-const MAX_MESSAGE_BYTES = 16 * 1024;
+export type AssistantMessageEndNormalization = RpcBridgeEventNormalization
+  | { readonly kind: "rejected"; readonly reason: "reply_too_large" };
+
 const MAX_CONTENT_BLOCKS = 64;
 const MAX_TOOL_ID_BYTES = 256;
 
 const IGNORED_EVENT: RpcBridgeEventNormalization = Object.freeze({ kind: "ignored" });
 const INVALID_EVENT: RpcBridgeEventNormalization = Object.freeze({ kind: "invalid" });
+const REPLY_TOO_LARGE_EVENT: AssistantMessageEndNormalization = Object.freeze({
+  kind: "rejected",
+  reason: "reply_too_large",
+});
 
 /**
  * 把 Pi 公共 RpcClient 事件缩减为安全事件。未知顶层事件属于无关观察，直接忽略；
@@ -97,7 +105,7 @@ export function normalizeRpcBridgeEvent(event: unknown): RpcBridgeEventNormaliza
 }
 
 /** child 扩展把最终 assistant 消息收窄为可进入监督 reply 的安全内容。 */
-export function normalizeAssistantMessageEnd(event: unknown): RpcBridgeEventNormalization {
+export function normalizeAssistantMessageEnd(event: unknown): AssistantMessageEndNormalization {
   if (!isRecord(event) || event.type !== "message_end") return INVALID_EVENT;
   if (!isRecord(event.message)) return INVALID_EVENT;
   // Pi 会为 user、toolResult 等角色发布同名事件，它们不属于直接回复。
@@ -106,6 +114,8 @@ export function normalizeAssistantMessageEnd(event: unknown): RpcBridgeEventNorm
     return INVALID_EVENT;
   }
   const content: Array<{ readonly type: "text"; readonly text: string }> = [];
+  let textBytes = 0;
+  let replyTooLarge = false;
   for (const item of event.message.content) {
     if (!isRecord(item) || typeof item.type !== "string") return INVALID_EVENT;
     if (item.type === "thinking" || item.type === "toolCall" || item.type === "image") {
@@ -113,14 +123,17 @@ export function normalizeAssistantMessageEnd(event: unknown): RpcBridgeEventNorm
       continue;
     }
     if (item.type === "text") {
-      if (typeof item.text !== "string" || utf8Length(item.text) > MAX_MESSAGE_BYTES) {
-        return INVALID_EVENT;
-      }
+      if (typeof item.text !== "string") return INVALID_EVENT;
+      // coordinator 使用换行连接文本块；边界必须覆盖连接后的完整正文。
+      const nextBytes = textBytes + (content.length === 0 ? 0 : 1) + utf8Length(item.text);
+      if (nextBytes > REPLY_MAX_TEXT_BYTES) replyTooLarge = true;
+      textBytes = nextBytes;
       content.push(Object.freeze({ type: "text", text: item.text }));
       continue;
     }
     return INVALID_EVENT;
   }
+  if (replyTooLarge) return REPLY_TOO_LARGE_EVENT;
   return safeEvent(Object.freeze({
     type: "message_end",
     message: Object.freeze({

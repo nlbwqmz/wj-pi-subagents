@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   AGENT_TOOL_NAMES,
+  CHILD_REPLY_TOO_LARGE_GUIDELINE,
   CHILD_REPLY_TOOL_NAME,
   PARENT_COORDINATION_GUIDELINES,
   registerAgentTools,
@@ -90,6 +91,14 @@ test("管理工具系统提示约束任务所有权并覆盖慢任务和异常�
   assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /默认重试 3 次/);
   assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /最多扩展到 5 次/);
   assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /不要自动切换模型或创建替代代理/);
+  assert.equal(
+    PARENT_COORDINATION_GUIDELINES.replyTooLarge,
+    "若收到子代理 final 的 reply_too_large，说明最终消息过长而未成功交付，但不代表代理故障。不要终止、替换或盲目重跑原任务；先查询原 agent 状态，再向同一 agent 发送消息，说明其最终消息过长，要求其基于已有工作精炼后补交最终结果。",
+  );
+  assert.equal(
+    CHILD_REPLY_TOO_LARGE_GUIDELINE,
+    "若 reply_to_parent 返回 reply_too_large，说明本次任务中消息过长而未成功交付，不影响当前任务。不要原样重试；请将消息精炼后重新调用 reply_to_parent，再继续当前任务。任务完成时仍须提交正常 final。",
+  );
   const readDescription = (name: string): string =>
     String(registrations.find((tool) => tool.name === name)?.description ?? "");
   assert.match(readDescription("get_agent_templates"), /JSON array/);
@@ -1052,12 +1061,37 @@ test("reply_to_parent 只展示文本且 schema 不暴露图片字段", () => {
   } | undefined;
   assert.deepEqual(parameters?.required, ["message"]);
   assert.deepEqual(Object.keys(parameters?.properties ?? {}), ["message"]);
+  assert.equal(
+    (parameters?.properties?.message as { readonly maxLength?: unknown } | undefined)?.maxLength,
+    undefined,
+    "UTF-8 字节上限应由工具执行层返回 reply_too_large，不能被字符数 schema 提前拦截",
+  );
   assert.equal(registration?.promptGuidelines, undefined);
   assert.equal(
     registration?.description,
     "Call reply_to_parent only when your direct parent explicitly asks for a progress report or when blocked on an issue that the parent must handle or decide.",
   );
   assert.doesNotMatch(JSON.stringify(registration?.parameters), /requires_response/);
+});
+
+test("reply_to_parent 将回复超限公开为稳定的 reply_too_large 工具错误", async () => {
+  const registrations: Array<Record<string, unknown>> = [];
+  registerReplyToParentTool(
+    { registerTool: (tool) => registrations.push(tool as Record<string, unknown>) },
+    async () => ({
+      replyToParent: async () => controlFailure("reply_too_large"),
+    } as never),
+  );
+  const tool = registrations.find((candidate) => candidate.name === CHILD_REPLY_TOOL_NAME);
+  assert.ok(tool);
+  const execute = tool.execute as (...args: unknown[]) => Promise<unknown>;
+
+  await assert.rejects(
+    execute("reply-too-large", { message: "过长进度" }, undefined, undefined, {}),
+    (error: unknown) => error instanceof SubagentToolError
+      && error.code === "reply_too_large"
+      && /Reply exceeds the maximum size/.test(error.message),
+  );
 });
 
 test("get_agent_templates 直接返回安全模板数组并保留空数组", async () => {

@@ -1,12 +1,13 @@
+import { REPLY_MAX_TEXT_BYTES } from "./child-reply-limits.ts";
 import { isCanonicalUuid, isCanonicalUuidV4 } from "./tree-controller.ts";
 
 export const CHILD_REPLY_SCHEMA = "wj-pi-subagents.reply" as const;
 export const CHILD_TERMINAL_SCHEMA = "wj-pi-subagents.terminal" as const;
-/** v7 监督协议沿用第四版 reply 信封；旧监督主版本不可热接管。 */
-export const CHILD_REPLY_VERSION = 4 as const;
+/** v13 监督协议使用第五版 reply 信封，增加可恢复的回复超限结果。 */
+export const CHILD_REPLY_VERSION = 5 as const;
 
 export const CHILD_REPLY_ENVELOPE_LIMITS = Object.freeze({
-  maxStringBytes: 16 * 1024,
+  maxStringBytes: REPLY_MAX_TEXT_BYTES,
 });
 
 interface ChildReplyCommon {
@@ -26,7 +27,7 @@ export interface ChildMessageEnvelope extends ChildReplyCommon {
 
 export type ChildRunState = "settled" | "failed" | "interrupted";
 export type ChildOutputState = "present" | "absent";
-export type ChildFinalReasonCode = "no_output" | "provider_error" | "runtime_fault";
+export type ChildFinalReasonCode = "no_output" | "reply_too_large" | "provider_error" | "runtime_fault";
 
 export interface ChildFinalEnvelope extends ChildReplyCommon {
   readonly kind: "final";
@@ -55,7 +56,7 @@ export interface ChildReplyEnvelopeLimits {
   readonly maxStringBytes: number;
 }
 
-/** 校验并按字段闭集重建 v7 child reply。 */
+/** 校验并按字段闭集重建 v13 child reply。 */
 export function parseChildReplyEnvelope(
   value: unknown,
   limits: ChildReplyEnvelopeLimits = CHILD_REPLY_ENVELOPE_LIMITS,
@@ -69,8 +70,9 @@ export function parseChildReplyEnvelope(
     || !isCanonicalUuidV4(value.turn_id)
   ) return undefined;
 
-  if (value.kind === "message") return parseMessageEnvelope(value, limits);
-  if (value.kind === "final") return parseFinalEnvelope(value, limits);
+  const maxTextBytes = Math.min(limits.maxStringBytes, REPLY_MAX_TEXT_BYTES);
+  if (value.kind === "message") return parseMessageEnvelope(value, maxTextBytes);
+  if (value.kind === "final") return parseFinalEnvelope(value, maxTextBytes);
   return undefined;
 }
 
@@ -124,7 +126,7 @@ export function encodeTerminalNotice(value: TerminalNotice): string {
 
 function parseMessageEnvelope(
   value: Record<string, unknown>,
-  limits: ChildReplyEnvelopeLimits,
+  maxTextBytes: number,
 ): ChildMessageEnvelope | undefined {
   const allowed = new Set([
     "schema",
@@ -137,7 +139,7 @@ function parseMessageEnvelope(
   ]);
   if (
     Object.keys(value).some((key) => !allowed.has(key))
-    || !validNonBlankText(value.text, limits.maxStringBytes)
+    || !validNonBlankText(value.text, maxTextBytes)
   ) return undefined;
   return Object.freeze({
     schema: CHILD_REPLY_SCHEMA,
@@ -152,7 +154,7 @@ function parseMessageEnvelope(
 
 function parseFinalEnvelope(
   value: Record<string, unknown>,
-  limits: ChildReplyEnvelopeLimits,
+  maxTextBytes: number,
 ): ChildFinalEnvelope | undefined {
   const allowed = new Set([
     "schema",
@@ -173,7 +175,7 @@ function parseFinalEnvelope(
     || !isRunState(value.run_state)
     || !isOutputState(value.output_state)
   ) return undefined;
-  if (value.text !== undefined && !validNonBlankText(value.text, limits.maxStringBytes)) {
+  if (value.text !== undefined && !validNonBlankText(value.text, maxTextBytes)) {
     return undefined;
   }
   const hasOutput = value.text !== undefined;
@@ -201,7 +203,9 @@ function validFinalState(
   reasonCode: unknown,
 ): reasonCode is ChildFinalReasonCode | undefined {
   if (runState === "settled") {
-    return outputState === "present" ? reasonCode === undefined : reasonCode === "no_output";
+    return outputState === "present"
+      ? reasonCode === undefined
+      : reasonCode === "no_output" || reasonCode === "reply_too_large";
   }
   if (runState === "failed") {
     return reasonCode === "provider_error" || reasonCode === "runtime_fault";

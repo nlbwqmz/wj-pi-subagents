@@ -73,26 +73,46 @@ test("reply envelope validates required fields and rejects unknown fields", () =
   assert.equal(parseChildReplyEnvelope({ ...message(), agent_id: "agent" }), undefined);
 });
 
-test("reply envelope enforces identifiers, version, enums, and text bytes", () => {
+test("reply envelope enforces identifiers, version, enums, and 32 KiB UTF-8 text bytes", () => {
   assert.equal(parseChildReplyEnvelope({ ...message(), turn_id: "turn-1" }), undefined);
   assert.equal(parseChildReplyEnvelope({ ...message(), turn_id: UUID_V1 }), undefined);
   assert.equal(parseChildReplyEnvelope({ ...message(), version: 1 }), undefined);
+  assert.equal(parseChildReplyEnvelope({ ...message(), version: CHILD_REPLY_VERSION - 1 }), undefined);
   assert.equal(parseChildReplyEnvelope({ ...message(), version: CHILD_REPLY_VERSION + 1 }), undefined);
   assert.equal(parseChildReplyEnvelope({ ...message(), kind: "progress" }), undefined);
   assert.equal(parseChildReplyEnvelope({ ...message(), text: { arbitrary: "json" } }), undefined);
 
+  assert.equal(CHILD_REPLY_ENVELOPE_LIMITS.maxStringBytes, 32 * 1024);
   const exact = "x".repeat(CHILD_REPLY_ENVELOPE_LIMITS.maxStringBytes);
   assert.equal(parseChildReplyEnvelope(message({ text: exact }))?.text, exact);
-  assert.equal(
-    parseChildReplyEnvelope(message({ text: `${exact}x` })),
-    undefined,
-  );
+  assert.equal(parseChildReplyEnvelope(final({ text: exact }))?.text, exact);
+  assert.equal(parseChildReplyEnvelope(message({ text: `${exact}x` })), undefined);
+  assert.equal(parseChildReplyEnvelope(final({ text: `${exact}x` })), undefined);
+  assert.equal(parseChildReplyEnvelope(
+    message({ text: `${exact}x` }),
+    { maxStringBytes: 64 * 1024 },
+  ), undefined);
+  assert.equal(parseChildReplyEnvelope(
+    message({ text: exact }),
+    { maxStringBytes: 16 * 1024 },
+  ), undefined);
+
+  const exactUtf8 = `${"测".repeat(10_922)}ab`;
+  assert.equal(new TextEncoder().encode(exactUtf8).byteLength, 32 * 1024);
+  assert.equal(parseChildReplyEnvelope(message({ text: exactUtf8 }))?.text, exactUtf8);
+  assert.equal(parseChildReplyEnvelope(message({ text: `${exactUtf8}测` })), undefined);
+
+  const exactEmoji = "😀".repeat(8_192);
+  assert.equal(new TextEncoder().encode(exactEmoji).byteLength, 32 * 1024);
+  assert.equal(parseChildReplyEnvelope(final({ text: exactEmoji }))?.text, exactEmoji);
+  assert.equal(parseChildReplyEnvelope(final({ text: `${exactEmoji}😀` })), undefined);
 });
 
 test("final envelope validates the complete lifecycle/output state matrix", () => {
   const valid = [
     final(),
     final({ run_state: "settled", output_state: "absent", text: undefined, reason_code: "no_output" }),
+    final({ run_state: "settled", output_state: "absent", text: undefined, reason_code: "reply_too_large" }),
     final({ run_state: "failed", output_state: "present", reason_code: "provider_error" }),
     final({ run_state: "failed", output_state: "absent", text: undefined, reason_code: "provider_error" }),
     final({ run_state: "failed", output_state: "present", reason_code: "runtime_fault" }),
@@ -106,6 +126,7 @@ test("final envelope validates the complete lifecycle/output state matrix", () =
   assert.equal(parseChildReplyEnvelope(final({ output_state: "present", text: undefined })), undefined);
   assert.equal(parseChildReplyEnvelope(final({ run_state: "settled", reason_code: "provider_error" })), undefined);
   assert.equal(parseChildReplyEnvelope(final({ run_state: "failed", reason_code: "no_output" })), undefined);
+  assert.equal(parseChildReplyEnvelope(final({ run_state: "failed", reason_code: "reply_too_large" })), undefined);
   assert.equal(parseChildReplyEnvelope(final({ run_state: "interrupted", reason_code: "runtime_fault" })), undefined);
   assert.equal(parseChildReplyEnvelope({ ...final(), requires_response: false }), undefined);
 });

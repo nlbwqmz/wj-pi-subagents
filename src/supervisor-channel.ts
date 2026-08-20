@@ -1,10 +1,10 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { parseAgentSnapshot as parseSafeAgentSnapshot } from "./agent-snapshot-codec.ts";
 import {
-  CHILD_REPLY_ENVELOPE_LIMITS,
   parseChildReplyEnvelope,
   type ChildReplyEnvelope,
 } from "./child-reply-envelope.ts";
+import { REPLY_MAX_TEXT_BYTES } from "./child-reply-limits.ts";
 import {
   AGENT_LIFECYCLE_EVENT_TYPES,
   AGENT_LIFECYCLE_STATES,
@@ -20,7 +20,7 @@ import {
 } from "./tree-controller.ts";
 
 /** 父子监督通道与 Pi 任务 RPC 完全隔离的固定协议版本。 */
-export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/12";
+export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/13";
 
 export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "hello",
@@ -62,7 +62,8 @@ const SUPERVISOR_FRAME_KEYS = new Set([
 export const SUPERVISOR_CHANNEL_LIMITS = Object.freeze({
   /** 覆盖最大控制正文、完整快照及 JSON 转义后的监督帧。 */
   maxFrameBytes: 512 * 1024,
-  maxStringBytes: CHILD_REPLY_ENVELOPE_LIMITS.maxStringBytes,
+  /** 身份、快照等普通监督字段沿用原有字符串预算。 */
+  maxStringBytes: 16 * 1024,
   /** 根权威向递归子控制器交付模板正文时使用的独立有界字符串预算。 */
   maxControlStringBytes: 64 * 1024,
   maxJsonDepth: 16,
@@ -130,7 +131,7 @@ export interface SupervisorSnapshot {
 
 export type SupervisorReplyKind = ChildReplyEnvelope["kind"];
 
-/** v12 wire reply：传输序号与模型可见信封保持明确分层。 */
+/** v13 wire reply：传输序号与模型可见信封保持明确分层。 */
 export interface SupervisorReply {
   readonly reply_seq: number;
   readonly envelope: ChildReplyEnvelope;
@@ -442,7 +443,11 @@ function utf8Length(value: string): number {
 }
 
 function maxFrameStringBytes(limits: SupervisorChannelLimits): number {
-  return Math.max(limits.maxStringBytes, limits.maxControlStringBytes);
+  return Math.max(
+    limits.maxStringBytes,
+    REPLY_MAX_TEXT_BYTES,
+    limits.maxControlStringBytes,
+  );
 }
 
 function replySemanticDigest(envelope: ChildReplyEnvelope): string {
@@ -1043,7 +1048,7 @@ function parseReply(payload: Record<string, unknown>, limits: SupervisorChannelL
     frameError("reply_invalid");
   }
   const envelope = parseChildReplyEnvelope(payload.envelope, {
-    maxStringBytes: limits.maxStringBytes,
+    maxStringBytes: REPLY_MAX_TEXT_BYTES,
   });
   if (envelope === undefined) frameError("reply_invalid");
   return Object.freeze({
@@ -1381,7 +1386,7 @@ export class SupervisorChannel {
       throw new SupervisorProtocolError("closed");
     }
     const directEnvelope = parseChildReplyEnvelope(reply, {
-      maxStringBytes: this.limits.maxStringBytes,
+      maxStringBytes: REPLY_MAX_TEXT_BYTES,
     });
     const wireRecord = isRecord(reply) ? reply : undefined;
     const wireCandidate = directEnvelope === undefined
