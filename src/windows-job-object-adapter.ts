@@ -11,7 +11,9 @@ import type {
   ResourceObservation,
 } from "./process-tree-capability.ts";
 
-const DEFAULT_READY_TIMEOUT_MS = 5_000;
+// helper 内部的 named pipe 连接最多等待 10 秒；启动门限必须更长，避免
+// GitHub Windows runner 在首次启动 PowerShell/C# helper 时被过早判定为失败。
+const DEFAULT_READY_TIMEOUT_MS = 15_000;
 const DEFAULT_COMMAND_TIMEOUT_MS = 5_000;
 function defaultWindowsJobHelperPath(): string {
   const colocated = fileURLToPath(new URL("./windows-job-object-helper.ps1", import.meta.url));
@@ -79,6 +81,9 @@ interface TreeState {
   resources: ResourceObservation["state"];
   handleReleased: boolean;
   helperEnded: boolean;
+  helperError: string | undefined;
+  helperExitCode: number | null | undefined;
+  helperExitSignal: NodeJS.Signals | null | undefined;
   readyReceived: boolean;
 }
 
@@ -286,6 +291,9 @@ export class WindowsJobObjectAdapter implements ProcessTreeAdapter {
       resources: "unknown",
       handleReleased: false,
       helperEnded: false,
+      helperError: undefined,
+      helperExitCode: undefined,
+      helperExitSignal: undefined,
       readyReceived: false,
     };
     connectState = state;
@@ -294,9 +302,14 @@ export class WindowsJobObjectAdapter implements ProcessTreeAdapter {
 
     try {
       await waitFor(state.ready.promise, this.readyTimeoutMs, "Windows Job Object helper 启动超时");
-    } catch {
+    } catch (error: unknown) {
       await this.cleanupFailedLaunch(state);
-      throw safeError("Windows Job Object helper 未就绪");
+      const detail = state.helperError
+        ?? (error instanceof Error ? error.message : "未知启动错误");
+      const exitDetail = state.helperExitCode === undefined
+        ? ""
+        : `，helper exit=${state.helperExitCode ?? "null"}${state.helperExitSignal === null ? "" : ` signal=${state.helperExitSignal}`}`;
+      throw safeError(`Windows Job Object helper 未就绪：${detail}${exitDetail}`);
     }
 
     return Object.freeze({
@@ -428,15 +441,20 @@ export class WindowsJobObjectAdapter implements ProcessTreeAdapter {
       return;
     }
     if (parts[0] === "error") {
+      state.helperError = parts.slice(1).join(" ").trim() || "helper 协议错误";
+      if (!state.ready.settled()) state.ready.reject(safeError(state.helperError));
       this.markEventUnavailable(state);
+      return;
     }
   }
 
   private bindHelperLifecycle(state: TreeState): void {
     const unavailable = () => this.markHelperUnavailable(state);
     state.helper.once("error", unavailable);
-    state.helper.once("exit", () => {
+    state.helper.once("exit", (code, signal) => {
       state.helperEnded = true;
+      state.helperExitCode = code;
+      state.helperExitSignal = signal;
       if (!state.ready.settled()) state.ready.reject(safeError("Windows Job Object helper 已退出"));
       closeServer(state.controlServer);
       if (state.eventSocket === undefined) this.markEventUnavailable(state);

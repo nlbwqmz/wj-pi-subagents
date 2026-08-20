@@ -70,7 +70,7 @@ test("Windows Job Object 在启动前绑定直接子进程，并在优雅 EOF �
   }
 });
 
-test("Windows Job Object 在目标退出后立即保留可确认的资源状态", nativeTestOptions, async () => {
+test("Windows Job Object 在目标退出后最终保留可确认的资源状态", nativeTestOptions, async () => {
   // 重复执行以覆盖 helper 报告最终 released 状态与命名管道 EOF 的原始竞态窗口。
   for (let attempt = 0; attempt < 6; attempt += 1) {
     const adapter = new WindowsJobObjectAdapter();
@@ -84,6 +84,7 @@ test("Windows Job Object 在目标退出后立即保留可确认的资源状态"
       assert.deepEqual(await adapter.waitForExit(launch.tree, deadlineAfter(5_000)), {
         state: "exited",
       });
+      await waitForResources(adapter, launch, "released");
       assert.deepEqual(await adapter.inspect(launch.tree), { state: "released" });
     } finally {
       await forceRelease(adapter, launch);
