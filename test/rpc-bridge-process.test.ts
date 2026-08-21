@@ -505,11 +505,16 @@ test("bridge 通过首个分片 start 配置长模板，并在 Pi 启动后清�
 
   await bridge.steer("运行中追加");
   const steerState = await bridge.getState() as {
-    lastCommand?: { type?: string; message?: string };
+    lastCommand?: {
+      type?: string;
+      message?: string;
+      streamingBehavior?: string;
+    };
   };
   assert.deepEqual(steerState.lastCommand, {
-    type: "steer",
+    type: "prompt",
     message: "运行中追加",
+    streamingBehavior: "steer",
   });
 
   const closeObservation = once(child, "close") as Promise<[number | null, NodeJS.Signals | null]>;
@@ -552,9 +557,19 @@ test("bridge 拒绝把 Pi success:false 响应当作 prompt 或 steer 成功", a
       && error.reason === "compaction_active",
   );
   await assert.rejects(
+    bridge.prompt("宿主忙碌 prompt"),
+    (error: unknown) => error instanceof ManagedRpcCommandRejectedError
+      && error.reason === "host_busy",
+  );
+  await assert.rejects(
     bridge.prompt("明确拒绝 prompt"),
     (error: unknown) => error instanceof ManagedRpcCommandRejectedError
       && error.reason === undefined,
+  );
+  await assert.rejects(
+    bridge.steer("压缩期间 prompt"),
+    (error: unknown) => error instanceof ManagedRpcCommandRejectedError
+      && error.reason === "compaction_active",
   );
   await assert.rejects(
     bridge.steer("明确拒绝 steer"),

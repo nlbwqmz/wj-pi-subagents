@@ -35,10 +35,23 @@ export class RpcClient {
   async stop() {}
 
   async send(command) {
-    if (!["prompt", "steer"].includes(command?.type) || typeof command.message !== "string") {
+    if (
+      !["prompt", "steer"].includes(command?.type)
+      || typeof command.message !== "string"
+      || (command.streamingBehavior !== undefined && command.streamingBehavior !== "steer")
+    ) {
       throw new Error("无效的原子消息命令");
     }
-    await this[command.type](command.message);
+    this.#state = {
+      ...this.#state,
+      lastCommand: {
+        type: command.type,
+        message: command.message,
+        ...(command.streamingBehavior === undefined
+          ? {}
+          : { streamingBehavior: command.streamingBehavior }),
+      },
+    };
     return { type: "response", command: command.type, success: true };
   }
 

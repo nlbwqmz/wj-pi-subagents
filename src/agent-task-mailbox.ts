@@ -24,7 +24,10 @@ export interface AgentHostDelivery {
   readonly message_id: string;
   readonly task_id: string;
   readonly message: string;
+  /** child task/turn 协调模式；不用于猜测 Pi 的瞬时 active 状态。 */
   readonly mode: "prompt" | "steer";
+  /** 物理宿主提交方式；同一已启动任务始终由 Pi 原子判断 active/idle。 */
+  readonly host_submission: "strict_prompt" | "adaptive_steer";
   readonly start_epoch: number;
   readonly task_start_epoch: number;
   readonly host_queue_epoch: number;
@@ -53,6 +56,8 @@ interface CurrentTask {
   taskId: string;
   turnId?: string;
   hostStarted: boolean;
+  /** 单调任务事实；同一 task final commit 前绝不恢复为 false。 */
+  hasStarted: boolean;
   readonly origin: "assigned" | "automatic";
 }
 
@@ -99,10 +104,13 @@ export class AgentTaskMailbox {
   private awaitingRetryStart = false;
   private awaitingPromptStart = false;
   private awaitingCompactionPromptRetry = false;
+  private awaitingHostIdlePromptRetry = false;
   private deliveryUncertain = false;
   private deliveryUncertainTaskId: string | undefined;
   private uncertainDelivery: AgentHostDelivery | undefined;
+  private acceptedAdaptiveDelivery: AgentHostDelivery | undefined;
   private readonly staleFinalTurns = new Set<string>();
+  private readonly unsettledStartEpochs: number[] = [];
   private startEpoch = 0;
   private taskStartEpoch = 0;
   private confirmedTaskStartKey: string | undefined;
@@ -151,6 +159,9 @@ export class AgentTaskMailbox {
       task_id: entry.taskId,
       message: entry.message,
       mode: task.hostStarted ? "steer" as const : "prompt" as const,
+      host_submission: task.hostStarted || task.hasStarted
+        ? "adaptive_steer" as const
+        : "strict_prompt" as const,
       start_epoch: this.startEpoch,
       task_start_epoch: this.taskStartEpoch,
       host_queue_epoch: this.hostQueueEpoch,
@@ -173,9 +184,15 @@ export class AgentTaskMailbox {
       this.markDeliveryUncertain(delivery.task_id, delivery);
       return true;
     }
-    if (delivery.mode === "steer") {
-      // steer 成功响应是 Pi 已完成同步入队的接纳事实。期间出现的新 run 或旧
-      // settled 不能反向否定该事实；它们只说明队列由 continuation 消费。
+    if (
+      delivery.mode === "steer"
+      || (
+        delivery.host_submission === "adaptive_steer"
+        && this.hostQueueObservedSince(delivery)
+      )
+    ) {
+      // adaptive steer 的 queue_update 可能先于 RPC 尾部到达；即使 child
+      // assignment 为 prompt，这仍是正文已进入当前 host run 的强事实。
       this.reconcileAcceptedSteer(delivery);
       return true;
     }
@@ -211,46 +228,51 @@ export class AgentTaskMailbox {
     return true;
   }
 
-  /** 明确拒绝证明正文未入 Pi；steer 可保留原正文并安全降级为新 prompt。 */
+  /** 未分类明确拒绝证明正文未入 Pi，但不提供安全自动重试条件。 */
   hostRejected(deliveryId: number): boolean {
     const delivery = this.claimDelivery(deliveryId);
     if (delivery === undefined) return false;
-    const task = this.currentTask;
-    if (task?.taskId !== delivery.task_id) {
-      this.markDeliveryUncertain(delivery.task_id, delivery);
-      return true;
-    }
-    if (delivery.mode === "prompt") {
-      // prompt 已经是最后一种安全投递模式；保留正文并等待新的宿主事实。
-      this.markDeliveryUncertain(delivery.task_id, delivery);
-      return true;
-    }
-    task.hostStarted = false;
-    this.settlementObserved = false;
-    this.clearPreparedFinal();
-    this.replyOutboxPendingCount = 0;
-    this.awaitingPromptStart = false;
-    if (!this.interruptBarrier) this.state = "working";
-    this.phase = "reconciling";
-    return true;
+    this.markDeliveryUncertain(delivery.task_id);
+    // 返回值只表示是否应把原命令重新排队；未知拒绝必须等待外部裁决。
+    return false;
   }
 
   /**
-   * 压缩期明确拒绝证明 prompt 正文未进入 Pi。保留同一 mailbox 条目，
-   * 物理压缩结束前冻结重试；若 continuation 已启动，正常 reducer 会改用 steer。
+   * 压缩期明确拒绝证明正文未进入 Pi。保留同一 mailbox 条目，物理压缩
+   * 结束前冻结重试；重试时仍由 host_submission 保持任务身份边界。
    */
   hostRejectedForCompaction(deliveryId: number, hostCompacting: boolean): boolean {
     const delivery = this.claimDelivery(deliveryId);
     if (delivery === undefined) return false;
     const task = this.currentTask;
-    if (delivery.mode !== "prompt" || task?.taskId !== delivery.task_id) {
-      this.markDeliveryUncertain(delivery.task_id, delivery);
-      return true;
+    if (task?.taskId !== delivery.task_id) {
+      this.markDeliveryUncertain(delivery.task_id);
+      return false;
     }
     this.awaitingPromptStart = false;
     this.awaitingCompactionPromptRetry = hostCompacting || this.compactionActive;
     if (!this.interruptBarrier) this.state = "working";
     this.phase = this.awaitingCompactionPromptRetry ? "compacting" : "reconciling";
+    return true;
+  }
+
+  /** strict prompt 的 busy 拒绝等待真实 idle；adaptive steer 不允许走此恢复路径。 */
+  hostRejectedForBusy(deliveryId: number, hostStreaming: boolean): boolean {
+    const delivery = this.claimDelivery(deliveryId);
+    if (delivery === undefined) return false;
+    const task = this.currentTask;
+    if (
+      delivery.host_submission !== "strict_prompt"
+      || task?.taskId !== delivery.task_id
+    ) {
+      this.markDeliveryUncertain(delivery.task_id);
+      return false;
+    }
+    this.awaitingPromptStart = false;
+    // settled 可能先于拒绝响应到达；该事实同样允许立即重试。
+    this.awaitingHostIdlePromptRetry = hostStreaming && !this.settlementObserved;
+    if (!this.interruptBarrier) this.state = "working";
+    this.phase = "reconciling";
     return true;
   }
 
@@ -263,7 +285,10 @@ export class AgentTaskMailbox {
       this.reconcileObservedPromptExecution();
       return true;
     }
-    if (delivery.mode === "steer" && this.hostQueueObservedSince(delivery)) {
+    if (
+      delivery.host_submission === "adaptive_steer"
+      && this.hostQueueObservedSince(delivery)
+    ) {
       this.reconcileAcceptedSteer(delivery);
       return true;
     }
@@ -291,6 +316,7 @@ export class AgentTaskMailbox {
         taskId,
         turnId,
         hostStarted: true,
+        hasStarted: true,
         origin: "automatic",
       };
     } else if (current.taskId !== taskId) {
@@ -302,6 +328,7 @@ export class AgentTaskMailbox {
       current.taskId = taskId;
       current.turnId = turnId;
       current.hostStarted = true;
+      current.hasStarted = true;
     } else {
       if (current.turnId !== undefined && current.turnId !== turnId) {
         this.rememberStaleFinalTurn(current.turnId);
@@ -310,6 +337,7 @@ export class AgentTaskMailbox {
       }
       current.turnId = turnId;
       current.hostStarted = true;
+      current.hasStarted = true;
     }
     if (
       !this.settlementObserved
@@ -320,6 +348,7 @@ export class AgentTaskMailbox {
       this.phase = this.toolCounts.size > 0 ? "executing_tools" : "processing";
     }
     this.awaitingCompactionPromptRetry = false;
+    this.awaitingHostIdlePromptRetry = false;
     if (this.confirmedTaskStartKey !== taskStartKey) {
       this.confirmedTaskStartKey = taskStartKey;
       this.taskStartEpoch += 1;
@@ -329,14 +358,21 @@ export class AgentTaskMailbox {
 
   observeAgentStart(): void {
     this.startEpoch += 1;
+    this.unsettledStartEpochs.push(this.startEpoch);
+    if (
+      this.acceptedAdaptiveDelivery !== undefined
+      && this.startEpoch > this.acceptedAdaptiveDelivery.start_epoch
+    ) this.acceptedAdaptiveDelivery = undefined;
     if (this.currentTask === undefined) {
       this.currentTask = {
         taskId: this.allocateTaskId(),
         hostStarted: true,
+        hasStarted: true,
         origin: "automatic",
       };
     } else {
       this.currentTask.hostStarted = true;
+      this.currentTask.hasStarted = true;
     }
     const coordinatedContinuation = this.awaitingCoordinatedContinuationTransactionId !== undefined
       || (
@@ -370,8 +406,20 @@ export class AgentTaskMailbox {
     this.reconcileCoordinatedSettlementWork();
   }
 
-  /** 协调 continuation 已启动时，只消费一次旧 run 尾随转发的 settled。 */
-  classifyAgentSettled(): "current" | "superseded_coordinated_continuation" {
+  /** 新 run 先于旧 settled 出现时，只消费最旧 run 的尾随事实。 */
+  classifyAgentSettled():
+    | "current"
+    | "superseded_coordinated_continuation"
+    | "superseded_active_run" {
+    if (this.unsettledStartEpochs.length > 1) {
+      this.unsettledStartEpochs.shift();
+      const coordinated = this.coordinatedTrailingSettlement;
+      if (coordinated !== undefined && this.startEpoch > coordinated.startEpoch) {
+        this.coordinatedTrailingSettlement = undefined;
+        return "superseded_coordinated_continuation";
+      }
+      return "superseded_active_run";
+    }
     const trailing = this.coordinatedTrailingSettlement;
     if (trailing === undefined) return "current";
     this.coordinatedTrailingSettlement = undefined;
@@ -382,7 +430,9 @@ export class AgentTaskMailbox {
 
   /** raw settled 只形成 candidate；没有 final commit 时绝不进入 idle。 */
   observeAgentSettled(): "candidate" | "superseded" {
+    if (this.unsettledStartEpochs.length > 0) this.unsettledStartEpochs.shift();
     this.awaitingCompactionPromptRetry = false;
+    this.awaitingHostIdlePromptRetry = false;
     if (this.awaitingRetryStart) {
       this.settlementObserved = false;
       this.clearPreparedFinal();
@@ -411,15 +461,49 @@ export class AgentTaskMailbox {
       this.currentTask = {
         taskId: this.allocateTaskId(),
         hostStarted: false,
+        hasStarted: true,
         origin: "automatic",
       };
     }
     this.currentTask.hostStarted = false;
+    const acceptedAdaptive = this.acceptedAdaptiveDelivery;
+    if (
+      acceptedAdaptive?.task_id === this.currentTask.taskId
+      && this.hostPendingCount > 0
+      && this.hostQueueObservedSince(acceptedAdaptive)
+    ) {
+      // adaptive preflight 已确认正文入队，但命令可能落在 Pi 最后一次 queue poll
+      // 与 settled 之间。保留宿主 pending 事实，不能降级为未知交付。
+      this.settlementObserved = false;
+      this.clearPreparedFinal();
+      this.replyOutboxPendingCount = 0;
+      if (!this.interruptBarrier) this.state = "working";
+      this.phase = "reconciling";
+      return "superseded";
+    }
+    if (
+      acceptedAdaptive?.task_id === this.currentTask.taskId
+      && !this.hostQueueObservedSince(acceptedAdaptive)
+      && this.startEpoch <= acceptedAdaptive.start_epoch
+    ) {
+      // Pi 已在 idle 分支接纳新 prompt，但旧 run 的 settled 先于新 start
+      // 离开扩展 handler；等待对应 start，不能提交旧 final。
+      this.settlementObserved = false;
+      this.clearPreparedFinal();
+      this.replyOutboxPendingCount = 0;
+      if (!this.interruptBarrier) this.state = "working";
+      this.phase = "reconciling";
+      return "superseded";
+    }
+    this.acceptedAdaptiveDelivery = undefined;
     if (this.hostPendingCount > 0) {
       this.settlementObserved = false;
       this.clearPreparedFinal();
       this.replyOutboxPendingCount = 0;
-      if (this.inFlight?.mode === "steer" && this.hostQueueObservedSince(this.inFlight)) {
+      if (
+        this.inFlight?.host_submission === "adaptive_steer"
+        && this.hostQueueObservedSince(this.inFlight)
+      ) {
         this.currentTask.hostStarted = true;
         if (!this.interruptBarrier) this.state = "working";
         this.phase = this.toolCounts.size > 0 ? "executing_tools" : "processing";
@@ -601,7 +685,7 @@ export class AgentTaskMailbox {
     const uncertain = this.uncertainDelivery;
     if (
       this.deliveryUncertain
-      && uncertain?.mode === "steer"
+      && uncertain?.host_submission === "adaptive_steer"
       && this.hostQueueObservedSince(uncertain)
     ) {
       this.reconcileAcceptedSteer(uncertain);
@@ -619,6 +703,7 @@ export class AgentTaskMailbox {
         taskId: final.task_id,
         turnId: final.turn_id,
         hostStarted: false,
+        hasStarted: true,
         origin: "automatic",
       };
     } else if (current.taskId !== final.task_id) {
@@ -627,10 +712,12 @@ export class AgentTaskMailbox {
       }
       current.taskId = final.task_id;
       current.turnId = final.turn_id;
+      current.hasStarted = true;
     } else if (current.turnId !== undefined && current.turnId !== final.turn_id) {
       return false;
     } else {
       current.turnId = final.turn_id;
+      current.hasStarted = true;
     }
     this.preparedFinal = final;
     this.preparedFinalDeliveryState = "prepared";
@@ -695,10 +782,13 @@ export class AgentTaskMailbox {
     this.awaitingRetryStart = false;
     this.awaitingPromptStart = false;
     this.awaitingCompactionPromptRetry = false;
+    this.awaitingHostIdlePromptRetry = false;
     this.clearCoordinatedSettlementWork();
     this.deliveryUncertain = false;
     this.deliveryUncertainTaskId = undefined;
     this.uncertainDelivery = undefined;
+    this.acceptedAdaptiveDelivery = undefined;
+    this.unsettledStartEpochs.length = 0;
     this.hostPendingCount = 0;
     this.replyOutboxPendingCount = 0;
     this.toolCounts.clear();
@@ -820,7 +910,12 @@ export class AgentTaskMailbox {
     const current = this.currentTask;
     if (current === undefined) {
       const taskId = this.allocateTaskId();
-      this.currentTask = { taskId, hostStarted: false, origin: "assigned" };
+      this.currentTask = {
+        taskId,
+        hostStarted: false,
+        hasStarted: false,
+        origin: "assigned",
+      };
       return taskId;
     }
     if (this.successorTaskId !== undefined) return this.successorTaskId;
@@ -876,6 +971,7 @@ export class AgentTaskMailbox {
       || this.awaitingNativeCompactionOutcome
       || this.awaitingPromptStart
       || this.awaitingCompactionPromptRetry
+      || this.awaitingHostIdlePromptRetry
       || this.deliveryUncertain
       || this.state !== "working"
     ) return false;
@@ -891,6 +987,7 @@ export class AgentTaskMailbox {
       || this.awaitingCoordinatedContinuationTransactionId !== undefined
       || this.awaitingNativeCompactionOutcome
       || this.awaitingCompactionPromptRetry
+      || this.awaitingHostIdlePromptRetry
       || this.deliveryUncertain
       || this.phase === "delivery_uncertain";
   }
@@ -915,6 +1012,9 @@ export class AgentTaskMailbox {
 
   private reconcileAcceptedSteer(delivery: AgentHostDelivery): void {
     this.awaitingPromptStart = false;
+    this.acceptedAdaptiveDelivery = this.startEpoch <= delivery.start_epoch
+      ? delivery
+      : undefined;
     this.settlementObserved = false;
     this.clearPreparedFinal();
     this.replyOutboxPendingCount = 0;
@@ -980,7 +1080,9 @@ export class AgentTaskMailbox {
     this.awaitingPromptStart = false;
     this.deliveryUncertain = true;
     this.deliveryUncertainTaskId = taskId ?? this.currentTask?.taskId;
-    this.uncertainDelivery = delivery?.mode === "steer" ? delivery : undefined;
+    this.uncertainDelivery = delivery?.host_submission === "adaptive_steer"
+      ? delivery
+      : undefined;
     this.applySuspendedBarrier();
   }
 
@@ -1003,7 +1105,12 @@ export class AgentTaskMailbox {
     const taskId = this.successorTaskId ?? this.mailbox[0]?.taskId;
     if (taskId === undefined) return;
     this.successorTaskId = undefined;
-    this.currentTask = { taskId, hostStarted: false, origin: "assigned" };
+    this.currentTask = {
+      taskId,
+      hostStarted: false,
+      hasStarted: false,
+      origin: "assigned",
+    };
   }
 
   private claimDelivery(deliveryId: number): AgentHostDelivery | undefined {

@@ -35,6 +35,8 @@ const CREDENTIAL_ENV = MANAGED_RPC_BRIDGE_CREDENTIAL_ENV;
 const MAX_MESSAGE_BYTES = 16 * 1024;
 const COMPACTION_ACTIVE_PROMPT_ERROR =
   "Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.";
+const HOST_BUSY_PROMPT_ERROR =
+  "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.";
 
 interface BridgeClient {
   start(): Promise<void>;
@@ -43,6 +45,7 @@ interface BridgeClient {
   send(command: {
     readonly type: "prompt" | "steer";
     readonly message: string;
+    readonly streamingBehavior?: "steer";
   }): Promise<unknown>;
   prompt(message: string): Promise<void>;
   steer(message: string): Promise<void>;
@@ -142,9 +145,13 @@ function piCommandDisposition(
   }
   if (value.success === true) return Object.freeze({ kind: "accepted" });
   if (value.success !== false) return Object.freeze({ kind: "unknown" });
-  const reason = command === "prompt" && value.error === COMPACTION_ACTIVE_PROMPT_ERROR
-    ? "compaction_active" as const
-    : undefined;
+  const reason = command !== "prompt"
+    ? undefined
+    : value.error === COMPACTION_ACTIVE_PROMPT_ERROR
+      ? "compaction_active" as const
+      : value.error === HOST_BUSY_PROMPT_ERROR
+        ? "host_busy" as const
+        : undefined;
   return Object.freeze({
     kind: "rejected",
     ...(reason === undefined ? {} : { reason }),
@@ -700,11 +707,20 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
         return;
       }
       const commandName = command.command;
-      const result = await current.send({
-        type: commandName,
-        message: command.payload.message,
-      });
-      const disposition = piCommandDisposition(result, commandName);
+      // 逻辑 steer 始终交给 Pi 的 prompt preflight 原子判断：运行中入
+      // steering queue，空闲时直接启动新轮，避免本地 active 快照竞态。
+      const piCommand = commandName === "steer"
+        ? {
+          type: "prompt" as const,
+          message: command.payload.message,
+          streamingBehavior: "steer" as const,
+        }
+        : {
+          type: "prompt" as const,
+          message: command.payload.message,
+        };
+      const result = await current.send(piCommand);
+      const disposition = piCommandDisposition(result, piCommand.type);
       if (disposition.kind === "accepted") response(command.id, true);
       else if (disposition.kind === "rejected") rejectedResponse(command.id, disposition.reason);
       else response(command.id, false);

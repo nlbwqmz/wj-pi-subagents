@@ -59,10 +59,12 @@ test("并发 submit 在一个任务内分配不同 message_id，并严格选择 
 
   const prompt = value.takeNextDelivery();
   assert.equal(prompt?.mode, "prompt");
+  assert.equal(prompt?.host_submission, "strict_prompt");
   assert.equal(value.hostAccepted(prompt!.delivery_id), true);
   value.observeAgentStart();
   const steer = value.takeNextDelivery();
   assert.equal(steer?.mode, "steer");
+  assert.equal(steer?.host_submission, "adaptive_steer");
   assert.equal(value.hostAccepted(steer!.delivery_id), true);
   assert.deepEqual(value.projection(), {
     state: "working",
@@ -93,6 +95,7 @@ test("interrupt 栅栏后的消息获得后继 task_id，当前 final commit 后
   const next = value.takeNextDelivery();
   assert.equal(next?.task_id, TASK_2);
   assert.equal(next?.mode, "prompt");
+  assert.equal(next?.host_submission, "strict_prompt");
   assert.equal(value.projection().last_task?.outcome, "interrupted");
 });
 
@@ -345,6 +348,48 @@ test("协调 continuation 中已入队并消费的 steer 不被旧 settled 降�
   assert.equal(value.projection().activity?.phase, "processing");
 });
 
+test("adaptive steer 已接纳后迟到 settled 不把宿主队列改判为 uncertain", () => {
+  const value = mailbox();
+  const current = value.submit("当前任务");
+  const initial = value.takeNextDelivery();
+  assert.equal(value.hostAccepted(initial!.delivery_id), true);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
+
+  value.submit("已进入宿主队列的补充正文");
+  const delivery = value.takeNextDelivery();
+  assert.equal(delivery?.host_submission, "adaptive_steer");
+  assert.equal(value.reconcileHostPending(1), true);
+  assert.equal(value.hostAccepted(delivery!.delivery_id), true);
+
+  assert.equal(value.observeAgentSettled(), "superseded");
+  assert.equal(value.projection().state, "working");
+  assert.equal(value.projection().activity?.phase, "reconciling");
+  assert.equal(value.projection().mailbox_pending_count, 0);
+  assert.equal(value.projection().host_pending_count, 1);
+});
+
+test("普通新 run 先启动时按 start epoch 忽略旧 run 的尾随 settled", () => {
+  const value = mailbox();
+  const current = value.submit("当前任务");
+  const initial = value.takeNextDelivery();
+  assert.equal(value.hostAccepted(initial!.delivery_id), true);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
+
+  value.submit("settled 窗口启动下一轮");
+  const delivery = value.takeNextDelivery();
+  assert.equal(value.hostAccepted(delivery!.delivery_id), true);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_2), true);
+  value.observeToolActivity("running", 1);
+
+  assert.equal(value.classifyAgentSettled(), "superseded_active_run");
+  assert.equal(value.projection().activity?.phase, "executing_tools");
+  assert.equal(value.classifyAgentSettled(), "current");
+  assert.equal(value.observeAgentSettled(), "candidate");
+});
+
 test("迟到的 steer 入队事实解除 delivery uncertainty 且不重投正文", () => {
   const value = mailbox();
   const current = value.submit("当前任务");
@@ -391,7 +436,29 @@ test("先到且已归零的队列事实仍能裁决迟到的 steer uncertainty",
   assert.equal(value.takeNextDelivery(), undefined);
 });
 
-test("明确拒绝的 steer 保留正文并安全降级为 prompt", () => {
+test("同任务 settled 后的 prompt assignment 用队列事实裁决 adaptive steer", () => {
+  const value = mailbox();
+  const current = value.submit("当前任务");
+  const initial = value.takeNextDelivery();
+  assert.equal(value.hostAccepted(initial!.delivery_id), true);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
+  assert.equal(value.observeAgentSettled(), "candidate");
+
+  const queued = value.submit("旧 settled 窗口后的同任务正文");
+  const delivery = value.takeNextDelivery();
+  assert.equal(delivery?.message_id, queued.message_id);
+  assert.equal(delivery?.mode, "prompt");
+  assert.equal(delivery?.host_submission, "adaptive_steer");
+
+  assert.equal(value.reconcileHostPending(1), true);
+  assert.equal(value.hostAccepted(delivery!.delivery_id), true);
+  assert.equal(value.reconcileHostPending(0), true);
+  assert.equal(value.observeAgentSettled(), "candidate");
+  assert.notEqual(value.projection().activity?.phase, "delivery_uncertain");
+});
+
+test("明确拒绝的 adaptive steer 保留正文且不跨模式重投", () => {
   const value = mailbox();
   const current = value.submit("当前任务");
   const initial = value.takeNextDelivery();
@@ -402,14 +469,16 @@ test("明确拒绝的 steer 保留正文并安全降级为 prompt", () => {
   const queued = value.submit("steer 被明确拒绝");
   const rejected = value.takeNextDelivery();
   assert.equal(rejected?.mode, "steer");
-  assert.equal(value.hostRejected(rejected!.delivery_id), true);
-  assert.equal(value.projection().state, "working");
+  assert.equal(rejected?.host_submission, "adaptive_steer");
+  assert.equal(value.hostRejected(rejected!.delivery_id), false);
+  assert.equal(value.projection().state, "suspended");
+  assert.equal(value.projection().activity?.phase, "delivery_uncertain");
   assert.equal(value.projection().mailbox_pending_count, 1);
-
-  const fallback = value.takeNextDelivery();
-  assert.equal(fallback?.message_id, queued.message_id);
-  assert.equal(fallback?.task_id, current.task_id);
-  assert.equal(fallback?.mode, "prompt");
+  assert.equal(value.takeNextDelivery(), undefined);
+  assert.equal(value.reconcileHostPending(1), true);
+  assert.equal(value.projection().state, "suspended");
+  assert.equal(value.projection().activity?.phase, "delivery_uncertain");
+  assert.equal(queued.task_id, current.task_id);
 });
 
 test("压缩期明确拒绝的 prompt 保留正文，等待物理压缩和真实 settled 后只重试一次", () => {
@@ -575,6 +644,7 @@ test("native 压缩后若 Pi 已 settled，mailbox 使用 prompt 启动后续任
 
   const next = value.takeNextDelivery();
   assert.equal(next?.mode, "prompt");
+  assert.equal(next?.host_submission, "adaptive_steer");
   assert.equal(next?.task_id, current.task_id);
 });
 

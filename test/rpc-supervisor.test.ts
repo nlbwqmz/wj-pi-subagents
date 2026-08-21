@@ -1442,7 +1442,7 @@ test("overflow willRetry 隔离旧 turn final，必须等下一真实 start 才�
   }
 });
 
-test("Pi 原生自动压缩后若真实 settled，mailbox 用 prompt 延续同一逻辑任务", async () => {
+test("同任务 settled 后保留 prompt assignment，但物理提交使用 adaptive steer", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
   const channel = new RecordingSupervisorChannel([]);
@@ -1484,8 +1484,8 @@ test("Pi 原生自动压缩后若真实 settled，mailbox 用 prompt 延续同�
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
 
-  assert.equal(rpcClient.operations().filter((operation) => operation === "prompt").length, 2);
-  assert.equal(rpcClient.operations().filter((operation) => operation === "steer").length, 0);
+  assert.equal(rpcClient.operations().filter((operation) => operation === "prompt").length, 1);
+  assert.equal(rpcClient.operations().filter((operation) => operation === "steer").length, 1);
   const assignment = channel.publishedTaskAssignments().at(-1);
   assert.deepEqual(assignment === undefined ? undefined : {
     task_id: assignment.task_id,
@@ -1918,7 +1918,50 @@ test("steer 成功响应不被期间到达的旧 settled 降级", async () => {
   await supervisor.terminate();
 });
 
-test("明确拒绝的 steer 只重用一次正文并降级为 prompt", async () => {
+test("adaptive 入队响应先于旧 settled 时保留已接纳的宿主 pending", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "入队响应后旧 settled" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+  const current = await supervisor.prompt("先进入工作态");
+  assert.equal(current.ok, true);
+  if (!current.ok) return;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  rpcClient.emitEvent({ type: "agent_start" });
+  channel.emitTaskStarted({ task_id: current.task_id, turn_id: TURN_ID });
+
+  const steerGate = rpcClient.deferNext("steer");
+  const queued = await supervisor.steer("先入队后收到旧 settled");
+  assert.equal(queued.ok, true);
+  if (!queued.ok) return;
+  await steerGate.started;
+  rpcClient.emitEvent({ type: "queue_update", pendingMessageCount: 1 });
+  steerGate.resolve();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  rpcClient.emitEvent({ type: "agent_settled" });
+
+  const status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "working");
+    assert.equal(status.data.activity?.phase, "reconciling");
+    assert.equal(status.data.mailbox_pending_count, 0);
+    assert.equal(status.data.host_pending_count, 1);
+  }
+  await supervisor.terminate();
+});
+
+test("明确拒绝的 adaptive steer 不跨模式重投正文", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
   const channel = new RecordingSupervisorChannel([]);
@@ -1949,16 +1992,151 @@ test("明确拒绝的 steer 只重用一次正文并降级为 prompt", async () 
   await new Promise<void>((resolve) => setImmediate(resolve));
 
   assert.equal(rpcClient.operations().filter((operation) => operation === "steer").length, 1);
-  assert.equal(rpcClient.operations().filter((operation) => operation === "prompt").length, 2);
-  assert.deepEqual(channel.publishedTaskAssignments().slice(-2), [
+  assert.equal(rpcClient.operations().filter((operation) => operation === "prompt").length, 1);
+  assert.deepEqual(channel.publishedTaskAssignments().slice(-1), [
     { message_id: queued.message_id, task_id: current.task_id, mode: "steer" },
-    { message_id: queued.message_id, task_id: current.task_id, mode: "prompt" },
   ]);
   const status = tree.getStatus(FIRST_AGENT_ID);
   assert.equal(status.ok, true);
   if (status.ok) {
+    assert.equal(status.data.state, "suspended");
+    assert.equal(status.data.activity?.phase, "delivery_uncertain");
+    assert.equal(status.data.mailbox_pending_count, 1);
+  }
+  await supervisor.terminate();
+});
+
+test("strict prompt 遇到 host_busy 后等待真实 settled 并以同一身份重试", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "宿主忙碌重试" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+  const getStateBeforeRejection = rpcClient.operations()
+    .filter((operation) => operation === "get_state").length;
+
+  const rejectedPrompt = rpcClient.deferNext("prompt");
+  const submission = await supervisor.prompt("只在宿主空闲后启动的新任务");
+  assert.equal(submission.ok, true);
+  if (!submission.ok) return;
+  await rejectedPrompt.started;
+  rpcClient.setState({ isStreaming: true, isCompacting: false, pendingMessageCount: 0 });
+  rejectedPrompt.reject(new ManagedRpcCommandRejectedError("host_busy"));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(rpcClient.operations().filter((operation) => operation === "prompt").length, 1);
+  assert.equal(
+    rpcClient.operations().filter((operation) => operation === "get_state").length,
+    getStateBeforeRejection + 1,
+  );
+  let status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
     assert.equal(status.data.state, "working");
+    assert.equal(status.data.activity?.phase, "reconciling");
+    assert.equal(status.data.mailbox_pending_count, 1);
+  }
+
+  const retriedPrompt = rpcClient.deferNext("prompt");
+  rpcClient.setState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+  rpcClient.emitEvent({ type: "agent_settled" });
+  await retriedPrompt.started;
+  assert.deepEqual(channel.publishedTaskAssignments().slice(-2), [
+    { message_id: submission.message_id, task_id: submission.task_id, mode: "prompt" },
+    { message_id: submission.message_id, task_id: submission.task_id, mode: "prompt" },
+  ]);
+  retriedPrompt.resolve();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  rpcClient.emitEvent({ type: "agent_start" });
+  channel.emitTaskStarted({ task_id: submission.task_id, turn_id: TURN_ID });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "working");
+    assert.notEqual(status.data.activity?.phase, "delivery_uncertain");
     assert.equal(status.data.mailbox_pending_count, 0);
+  }
+  await supervisor.terminate();
+});
+
+test("adaptive steer 遇到 compaction_active 后等待 settled 并保持同一身份重试", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "adaptive 压缩拒绝" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+  const current = await supervisor.prompt("先进入工作态");
+  assert.equal(current.ok, true);
+  if (!current.ok) return;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  rpcClient.emitEvent({ type: "agent_start" });
+  channel.emitTaskStarted({ task_id: current.task_id, turn_id: TURN_ID });
+
+  const rejectedAdaptive = rpcClient.deferNext("steer");
+  const queued = await supervisor.steer("压缩竞争中的同任务正文");
+  assert.equal(queued.ok, true);
+  if (!queued.ok) return;
+  await rejectedAdaptive.started;
+  rpcClient.setState({ isStreaming: false, isCompacting: true, pendingMessageCount: 0 });
+  rpcClient.emitEvent({ type: "compaction_start", reason: "threshold" });
+  rejectedAdaptive.reject(new ManagedRpcCommandRejectedError("compaction_active"));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  let status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "working");
+    assert.equal(status.data.activity?.phase, "compacting");
+    assert.equal(status.data.mailbox_pending_count, 1);
+  }
+  assert.equal(rpcClient.operations().filter((operation) => operation === "steer").length, 1);
+  assert.equal(rpcClient.operations().filter((operation) => operation === "prompt").length, 1);
+
+  const retriedAdaptive = rpcClient.deferNext("steer");
+  rpcClient.setState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+  rpcClient.emitEvent({
+    type: "compaction_end",
+    reason: "threshold",
+    aborted: false,
+    willRetry: false,
+    failed: false,
+  });
+  rpcClient.emitEvent({ type: "agent_settled" });
+  await retriedAdaptive.started;
+  assert.deepEqual(channel.publishedTaskAssignments().slice(-2), [
+    { message_id: queued.message_id, task_id: current.task_id, mode: "steer" },
+    { message_id: queued.message_id, task_id: current.task_id, mode: "prompt" },
+  ]);
+  retriedAdaptive.resolve();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  rpcClient.emitEvent({ type: "agent_start" });
+  channel.emitTaskStarted({ task_id: current.task_id, turn_id: NEXT_TURN_ID });
+
+  status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.mailbox_pending_count, 0);
+    assert.notEqual(status.data.activity?.phase, "delivery_uncertain");
   }
   await supervisor.terminate();
 });
@@ -2691,7 +2869,7 @@ test("final 注入回调中的 interrupt 在 commit 后重新裁决", async () =
   }
 });
 
-test("父端未接纳 final 后的消息恢复当前任务并作废旧 turn final", async () => {
+test("父端未接纳 final 后以 adaptive steer 恢复当前任务并作废旧 turn final", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
   const channel = new RecordingSupervisorChannel([]);
@@ -2717,12 +2895,13 @@ test("父端未接纳 final 后的消息恢复当前任务并作废旧 turn fina
   }), false);
   assert.equal(finalDeliveryAttempts, 1);
 
-  const promptGate = rpcClient.deferNext("prompt");
+  const adaptiveGate = rpcClient.deferNext("steer");
   const resumed = await supervisor.steer("final 未接纳时继续当前任务");
   assert.equal(resumed.ok, true);
   if (!resumed.ok) return;
   assert.equal(resumed.task_id, AUTONOMOUS_TASK_ID);
-  await promptGate.started;
+  await adaptiveGate.started;
+  assert.equal(channel.publishedTaskAssignments().at(-1)?.mode, "prompt");
 
   let status = tree.getStatus(FIRST_AGENT_ID);
   assert.equal(status.ok, true);
@@ -2733,7 +2912,7 @@ test("父端未接纳 final 后的消息恢复当前任务并作废旧 turn fina
 
   rpcClient.emitEvent({ type: "agent_start" });
   channel.emitTaskStarted({ task_id: AUTONOMOUS_TASK_ID, turn_id: NEXT_TURN_ID });
-  promptGate.resolve();
+  adaptiveGate.resolve();
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -2849,7 +3028,7 @@ test("raw settled sibling 与 working sibling 的进度消息都独立进入当�
   firstRpc.emitEvent({ type: "agent_settled" });
   await new Promise<void>((resolve) => setImmediate(resolve));
 
-  const firstPrompt = firstRpc.deferNext("prompt");
+  const firstAdaptive = firstRpc.deferNext("steer");
   const secondSteer = secondRpc.deferNext("steer");
   const firstProgress = await first.steer("first progress");
   const secondProgress = await second.steer("second progress");
@@ -2859,11 +3038,11 @@ test("raw settled sibling 与 working sibling 的进度消息都独立进入当�
   assert.equal(firstProgress.task_id, AUTONOMOUS_TASK_ID);
   assert.equal(secondProgress.task_id, secondTaskId);
 
-  await Promise.all([firstPrompt.started, secondSteer.started]);
-  firstPrompt.resolve();
+  await Promise.all([firstAdaptive.started, secondSteer.started]);
+  firstAdaptive.resolve();
   secondSteer.resolve();
   await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(firstRpc.operations().at(-1), "prompt");
+  assert.equal(firstRpc.operations().at(-1), "steer");
   assert.equal(secondRpc.operations().at(-1), "steer");
   assert.deepEqual(firstChannel.publishedTaskAssignments().at(-1), {
     message_id: firstProgress.message_id,
@@ -3620,7 +3799,7 @@ test("业务 complete 与补偿先于 manual start/end 到达时仍保留生命�
   assert.equal((await supervisor.prompt("manual 后仍可用")).ok, true);
 });
 
-test("成功 complete 后的 not_started 补偿撤销父端 continuation 等待并回退 prompt", async () => {
+test("成功 complete 后的 not_started 补偿撤销 continuation 等待并恢复 prompt assignment", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();
   const channel = new RecordingSupervisorChannel([]);
@@ -3675,9 +3854,9 @@ test("成功 complete 后的 not_started 补偿撤销父端 continuation 等待�
   assert.equal(rpcClient.operations().filter((operation) => operation === "steer").length, 0);
   assert.equal(rpcClient.operations().filter((operation) => operation === "prompt").length, 1);
 
-  const fallback = rpcClient.deferNext("prompt");
+  const adaptiveFallback = rpcClient.deferNext("steer");
   channel.emitCompactionComplete("compact-continuation-compensation", "not_started");
-  await fallback.started;
+  await adaptiveFallback.started;
   assert.deepEqual(channel.publishedTaskAssignments().at(-1), {
     message_id: queued.message_id,
     task_id: current.task_id,
@@ -3693,7 +3872,7 @@ test("成功 complete 后的 not_started 补偿撤销父端 continuation 等待�
       .map((response) => response.accepted),
     [true, true, true],
   );
-  fallback.resolve();
+  adaptiveFallback.resolve();
   await new Promise<void>((resolve) => setImmediate(resolve));
 
   rpcClient.emitEvent({ type: "agent_start" });

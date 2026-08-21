@@ -20,7 +20,7 @@ export type ManagedRpcReply = ChildReplyEnvelope;
 
 export type ManagedRpcTransportFault = "eof" | "protocol_fault" | "process_exit";
 
-export const MANAGED_RPC_BRIDGE_PROTOCOL = "wj-pi-subagents/managed-rpc/5" as const;
+export const MANAGED_RPC_BRIDGE_PROTOCOL = "wj-pi-subagents/managed-rpc/6" as const;
 /** 只用于节点启动事务的一次性本地认证，不进入公开控制面。 */
 export const MANAGED_RPC_BRIDGE_CREDENTIAL_ENV = "WJ_PI_SUBAGENTS_MANAGED_RPC_CREDENTIAL" as const;
 /** 外层桥接 JSON 正文的硬边界。 */
@@ -61,6 +61,7 @@ export interface ManagedRpcNodeStartContext {
 export interface ManagedRpcBridge {
   start(signal?: AbortSignal, context?: ManagedRpcNodeStartContext): Promise<void>;
   prompt(message: string): Promise<void>;
+  /** 同一逻辑任务的自适应提交：Pi active 时 steer，idle 时启动 prompt。 */
   steer(message: string): Promise<void>;
   abort(): Promise<void>;
   getState(): Promise<unknown>;
@@ -162,6 +163,7 @@ export interface ManagedRpcNodeLike {
   readonly process_binding: "managed";
   start(signal?: AbortSignal, context?: ManagedRpcNodeStartContext): Promise<void>;
   prompt(message: string): Promise<void>;
+  /** 与 bridge 一致，steer 必须由宿主在 active/idle 间原子裁决。 */
   steer(message: string): Promise<void>;
   abort(): Promise<void>;
   getState(): Promise<unknown>;
@@ -524,7 +526,7 @@ function abortError(): Error {
   return error;
 }
 
-export type ManagedRpcCommandRejectionReason = "compaction_active";
+export type ManagedRpcCommandRejectionReason = "compaction_active" | "host_busy";
 
 /** Pi 已明确拒绝命令；与可能已经入队的传输不确定结果严格区分。 */
 export class ManagedRpcCommandRejectedError extends Error {
@@ -792,7 +794,11 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
         || typeof value.ok !== "boolean"
         || (value.ok === false && Object.hasOwn(value, "data"))
         || (Object.hasOwn(value, "rejected") && value.rejected !== true)
-        || (Object.hasOwn(value, "rejection_reason") && value.rejection_reason !== "compaction_active")
+        || (
+          Object.hasOwn(value, "rejection_reason")
+          && value.rejection_reason !== "compaction_active"
+          && value.rejection_reason !== "host_busy"
+        )
         || (Object.hasOwn(value, "rejection_reason") && value.rejected !== true)
         || (value.ok === true && (Object.hasOwn(value, "rejected") || Object.hasOwn(value, "rejection_reason")))
       ) {

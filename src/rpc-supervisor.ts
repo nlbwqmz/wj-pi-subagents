@@ -577,6 +577,12 @@ function readIsCompacting(value: unknown): boolean | undefined {
     : undefined;
 }
 
+function readIsStreaming(value: unknown): boolean | undefined {
+  return isRecord(value) && typeof value.isStreaming === "boolean"
+    ? value.isStreaming
+    : undefined;
+}
+
 type MessageCommandKind = "submit";
 
 type CoordinatedCompactionPhase = "preparing" | "prepared" | "release_failed" | "closed";
@@ -608,6 +614,7 @@ interface QueuedMessageCommand {
   readonly message_id: string;
   readonly delivery?: AgentHostDelivery;
   readonly compaction_rejection_count?: number;
+  readonly host_busy_rejection_count?: number;
   resolve(result: RpcSupervisorCommandResult): void;
 }
 
@@ -1907,14 +1914,18 @@ export class RpcSupervisor {
       || !this.mailbox.isDeliveryActive(delivery.delivery_id)
     ) return;
     try {
-      if (delivery.mode === "prompt") await this.commandClient().prompt(delivery.message);
-      else await this.commandClient().steer(delivery.message);
+      if (delivery.host_submission === "strict_prompt") {
+        await this.commandClient().prompt(delivery.message);
+      } else {
+        await this.commandClient().steer(delivery.message);
+      }
       this.mailbox.hostAccepted(delivery.delivery_id);
     } catch (error) {
       if (error instanceof ManagedRpcCommandRejectedError) {
         let requeue = false;
         let nextCompactionRejectionCount = command.compaction_rejection_count;
-        if (delivery.mode === "prompt" && error.reason === "compaction_active") {
+        let nextHostBusyRejectionCount = command.host_busy_rejection_count;
+        if (error.reason === "compaction_active") {
           const priorRejections = command.compaction_rejection_count ?? 0;
           // compaction_end 与命令响应分属不同通道；首次只读宿主状态用于收敛乱序。
           // 若立即重试仍得到同一拒绝，不再信任失配探针，等待真实生命周期以禁止忙等。
@@ -1928,11 +1939,29 @@ export class RpcSupervisor {
             );
             nextCompactionRejectionCount = priorRejections + 1;
           }
+        } else if (
+          error.reason === "host_busy"
+          && delivery.host_submission === "strict_prompt"
+        ) {
+          const priorRejections = command.host_busy_rejection_count ?? 0;
+          // 首次拒绝用只读状态收敛 response/settled 乱序；连续拒绝必须等待
+          // 新的 settled 事实，禁止 get_state 瞬时失配形成忙循环。
+          const hostStreaming = priorRejections > 0
+            ? true
+            : await this.probeHostStreamingAfterRejection();
+          if (this.phase === "ready" && this.mailbox.isDeliveryActive(delivery.delivery_id)) {
+            requeue = this.mailbox.hostRejectedForBusy(
+              delivery.delivery_id,
+              hostStreaming,
+            );
+            nextHostBusyRejectionCount = priorRejections + 1;
+          }
         } else {
           requeue = this.mailbox.hostRejected(delivery.delivery_id);
         }
         if (requeue) {
-          // 明确拒绝证明正文未入 Pi；保留原投递身份，由 mailbox 仲裁 prompt/steer 与续跑顺序。
+          // 已分类拒绝证明正文未入 Pi；只有 reducer 明确给出等待条件时，
+          // 才保留同一身份进行事件驱动重试，绝不跨宿主提交模式降级。
           this.commandQueue.unshift({
             kind: command.kind,
             message: command.message,
@@ -1940,6 +1969,9 @@ export class RpcSupervisor {
             ...(nextCompactionRejectionCount === undefined
               ? {}
               : { compaction_rejection_count: nextCompactionRejectionCount }),
+            ...(nextHostBusyRejectionCount === undefined
+              ? {}
+              : { host_busy_rejection_count: nextHostBusyRejectionCount }),
             resolve: command.resolve,
           });
         }
@@ -1967,6 +1999,15 @@ export class RpcSupervisor {
     }
   }
 
+  private async probeHostStreamingAfterRejection(): Promise<boolean> {
+    try {
+      return readIsStreaming(await this.commandClient().getState()) !== false;
+    } catch {
+      // 探针失败不能证明宿主已空闲；等待真实 settled，禁止猜测式重投。
+      return true;
+    }
+  }
+
   private async executeInterruptCommand(command: QueuedInterruptCommand): Promise<void> {
     // 兼容旧的内部排队调用；公开 interrupt 已在 reducer 接纳点直接发送 abort。
     command.resolve(Object.freeze({ ok: true, accepted: false, changed: false }));
@@ -1988,9 +2029,10 @@ export class RpcSupervisor {
   }
 
   private observeProvisionalSettlement(): void {
-    if (this.mailbox.classifyAgentSettled() === "superseded_coordinated_continuation") {
-      // 协调扩展可先启动 continuation，再让旧 run 的 settled 离开 handler。
-      // 该旧事实不得清除新 run 的工具活动或改变 prompt/steer 路由。
+    const classification = this.mailbox.classifyAgentSettled();
+    if (classification !== "current") {
+      // 新 run 可在旧 run 的 settled 离开扩展 handler 前启动。旧事实不得
+      // 清除新 run 的工具活动，也不得改变当前宿主提交方式。
       this.commitTaskProjection();
       this.drainCommandQueue();
       return;

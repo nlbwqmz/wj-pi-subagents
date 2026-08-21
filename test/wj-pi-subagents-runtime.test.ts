@@ -2147,6 +2147,8 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
   }, rootContext) as { details?: Record<string, unknown> };
   assert.equal(steered.details?.accepted, true);
   await steerObserved;
+  parentNode.emitEvent({ type: "queue_update", pendingMessageCount: 1 });
+  parentNode.emitEvent({ type: "queue_update", pendingMessageCount: 0 });
   const interruptedNewTurn = await execute(rootApi, "interrupt_agent", {
     agent_id: parentId,
   }, rootContext) as { details?: Record<string, unknown> };
