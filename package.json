@@ -1,6 +1,6 @@
 {
   "name": "wj-pi-subagents",
-  "version": "0.0.18",
+  "version": "0.0.19",
   "author": "WJ",
   "description": "Create and manage recursive subagents in Pi",
   "homepage": "https://github.com/nlbwqmz/wj-pi-subagents#readme",
