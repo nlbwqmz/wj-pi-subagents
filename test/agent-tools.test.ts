@@ -83,7 +83,9 @@ test("管理工具系统提示约束任务所有权并覆盖慢任务和异常�
   assert.match(PARENT_COORDINATION_GUIDELINES.sendMessageReply, /首次下发任务.*不添加 reply_to_parent 提示/);
   assert.match(PARENT_COORDINATION_GUIDELINES.sendMessageReply, /不是目标子代理是否处于 working\/processing 状态/);
   assert.match(PARENT_COORDINATION_GUIDELINES.slowProgress, /不代表失败/);
-  assert.match(PARENT_COORDINATION_GUIDELINES.slowProgress, /interrupt_agent 或 terminate_agent/);
+  assert.match(PARENT_COORDINATION_GUIDELINES.slowProgress, /停止探索.*提前提交最终报告/);
+  assert.match(PARENT_COORDINATION_GUIDELINES.slowProgress, /调查不充分.*降低结果质量/);
+  assert.match(PARENT_COORDINATION_GUIDELINES.slowProgress, /interrupt_agent、terminate_agent/);
   assert.match(PARENT_COORDINATION_GUIDELINES.taskRecovery, /复用已有上下文/);
   assert.match(PARENT_COORDINATION_GUIDELINES.taskRecovery, /避免重复已完成的副作用/);
   assert.match(PARENT_COORDINATION_GUIDELINES.retryPolicy, /spawn_failed 和 internal_error/);

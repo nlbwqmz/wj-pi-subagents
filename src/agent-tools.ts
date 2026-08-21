@@ -186,7 +186,7 @@ export const PARENT_COORDINATION_GUIDELINES = Object.freeze({
   sendMessage: DELIVERY_AND_WAITING_GUIDELINE,
   sendMessageReply: "中途回复（特别注意）：仅当本次 send_message 明确要求子代理在当前任务完成前返回一次信息，并在回复后继续当前任务时，才在消息正文中要求其使用 reply_to_parent 进行回复。典型场景包括询问当前进度、索取阶段性结果，或要求先回答执行中的问题再继续。首次下发任务、任务完成后下发新任务、只追加或修正任务要求且无需中途回应、异常恢复指令，以及任何只需等待最终答复的消息，均按普通任务消息发送，不添加 reply_to_parent 提示。判断依据是“是否需要任务完成前的中途回复”，不是目标子代理是否处于 working/processing 状态。",
   waitAgent: DELIVERY_AND_WAITING_GUIDELINE,
-  slowProgress: "慢任务：working/processing 或 timeout 不代表失败。不要仅因耗时而要求子代理提前总结、调用 interrupt_agent 或 terminate_agent；可以用 send_message 询问进度，然后继续 wait_agent。",
+  slowProgress: "慢任务：working/processing 或 timeout 不代表失败。不要仅因耗时就要求子代理停止探索、基于尚未完成的当前工作提前提交最终报告，或调用 interrupt_agent、terminate_agent；仓促收尾可能因调查不充分而降低结果质量。如需了解情况，可以用 send_message 询问进度，并明确要求其继续原任务，然后继续 wait_agent。",
   taskRecovery: "异常恢复：task_failed、task_interrupted，或最终答复缺失、不可用时，先用 get_agent_status 核对，再向同一 agent_id 发送恢复指令。复用已有上下文，从未完成步骤继续，避免重复已完成的副作用，并要求其提交完整最终答复。",
   retryPolicy: "重试：除 spawn_failed 和 internal_error 外，其他异常均可重试，包括 message_delivery_failed 和 suspended。重试前先核对并修正原因；默认重试 3 次，若每次仍有进展、状态变化或错误变化，最多扩展到 5 次，每次尝试后都使用 wait_agent。节点终止、用户取消或达到上限时停止，并报告原因；不要自动切换模型或创建替代代理。",
   agentCleanup: "子代理回收：interrupt_agent 仅中断当前任务，不释放节点名额；回收必须调用 terminate_agent 并确认资源已释放。子代理已提交可用最终答复、当前任务已完成且当前阶段暂不使用时，可以回收；按“异常恢复/重试”流程达到停止条件仍不可用时，必须回收。",
