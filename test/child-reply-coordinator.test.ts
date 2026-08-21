@@ -27,6 +27,7 @@ const TURN_1 = "550e8400-e29b-41d4-a716-446655440001";
 const TURN_2 = "550e8400-e29b-41d4-a716-446655440002";
 const TASK_1 = "450e8400-e29b-41d4-a716-446655440001";
 const COMMIT_1 = "750e8400-e29b-41d4-a716-446655440001";
+const COMMIT_2 = "750e8400-e29b-41d4-a716-446655440002";
 const UUID_V1 = "550e8400-e29b-11d4-a716-446655440001";
 
 class RecordingPort implements ChildReplyPort {
@@ -61,6 +62,34 @@ class TaskStartedBarrierPort implements ChildReplyPort {
 
   acknowledgeStarted(): void {
     this.releaseStarted();
+  }
+}
+
+class NonBlockingFinalPort implements ChildReplyPort {
+  readonly events: Array<{ readonly kind: "started" | "reply"; readonly task_id: string; readonly turn_id: string }> = [];
+  private readonly pendingAcknowledgements = new Map<string, () => void>();
+
+  async publishTaskStarted(started: { readonly task_id: string; readonly turn_id: string }): Promise<void> {
+    this.events.push({ kind: "started", ...started });
+  }
+
+  async publishReplyWithAck(reply: ChildReplyEnvelope): Promise<{ readonly acknowledged: Promise<void> }> {
+    this.events.push({ kind: "reply", task_id: reply.task_id, turn_id: reply.turn_id });
+    let resolveAcknowledgement!: () => void;
+    const acknowledged = new Promise<void>((resolve) => { resolveAcknowledgement = resolve; });
+    this.pendingAcknowledgements.set(reply.turn_id, resolveAcknowledgement);
+    return Object.freeze({ acknowledged });
+  }
+
+  async publishReplyAndWaitForAck(): Promise<void> {
+    throw new Error("测试端口不应使用同步 final 发布");
+  }
+
+  acknowledge(turnId: string): void {
+    const resolve = this.pendingAcknowledgements.get(turnId);
+    if (resolve === undefined) return;
+    this.pendingAcknowledgements.delete(turnId);
+    resolve();
   }
 }
 
@@ -410,6 +439,55 @@ test("每次 agent_start 生成新轮次且不会覆盖上一轮 final", async (
   assert.equal(port.replies[1]?.turn_id, TURN_2);
   port.acknowledgeAll();
   await second;
+});
+
+test("ACK 未到时后续 turn 的 task_started 和 final 仍写入监督 outbox", async () => {
+  const port = new NonBlockingFinalPort();
+  let accepted = 0;
+  let turnIndex = 0;
+  let commitIndex = 0;
+  const value = new ChildReplyCoordinator({
+    agentId: AGENT_ID,
+    port,
+    turnIdFactory: () => [TURN_1, TURN_2][turnIndex++]!,
+    taskIdFactory: () => TASK_1,
+    commitIdFactory: () => [COMMIT_1, COMMIT_2][commitIndex++]!,
+    onFinalAccepted: () => { accepted += 1; },
+  });
+
+  value.observeAgentStart();
+  await nextTask();
+  value.observeAssistantMessageEnd({
+    type: "message_end",
+    message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "第一轮" }] },
+  });
+  value.settle();
+  await nextTask();
+
+  value.observeAgentStart();
+  await nextTask();
+  value.observeAssistantMessageEnd({
+    type: "message_end",
+    message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "第二轮" }] },
+  });
+  value.settle();
+  await nextTask();
+
+  assert.deepEqual(port.events, [
+    { kind: "started", task_id: TASK_1, turn_id: TURN_1 },
+    { kind: "reply", task_id: TASK_1, turn_id: TURN_1 },
+    { kind: "started", task_id: TASK_1, turn_id: TURN_2 },
+    { kind: "reply", task_id: TASK_1, turn_id: TURN_2 },
+  ]);
+  assert.equal(accepted, 0);
+
+  port.acknowledge(TURN_1);
+  await nextTask();
+  assert.equal(accepted, 0);
+  port.acknowledge(TURN_2);
+  await nextTask();
+  await nextTask();
+  assert.equal(accepted, 1);
 });
 
 test("轮次分配拒绝 UUID v1，重试重复值，并在耗尽后废止旧轮次", async () => {

@@ -20,6 +20,7 @@ import type {
   SupervisorEvent,
   SupervisorReply,
   SupervisorReplyInput,
+  SupervisorReplyPublication,
   SupervisorSnapshot,
   SupervisorTaskAssignment,
   SupervisorTaskStarted,
@@ -318,7 +319,11 @@ export interface RpcSupervisorChannel {
   waitForReady(signal: AbortSignal): Promise<void>;
   isReady(): boolean;
   publishReply(reply: SupervisorReplyInput | SupervisorReply): Promise<void>;
-  /** child final ACK 使用；父端实现可拒绝该方向。 */
+  /** child final 使用；Promise 只等待本地帧写入，ACK 通过返回句柄异步完成。 */
+  publishReplyWithAck?(
+    reply: SupervisorReplyInput | SupervisorReply,
+  ): Promise<SupervisorReplyPublication>;
+  /** 显式等待父端累计 ACK；不得作为 child 生命周期帧的串行发布操作。 */
   publishReplyAndWaitForAck?(
     reply: SupervisorReplyInput | SupervisorReply,
     signal?: AbortSignal,

@@ -139,6 +139,11 @@ export interface SupervisorReply {
 
 export type SupervisorReplyInput = ChildReplyEnvelope;
 
+/** 子端回复已写入本地监督传输，但父端累计 ACK 仍异步等待。 */
+export interface SupervisorReplyPublication {
+  readonly acknowledged: Promise<void>;
+}
+
 /** 父端在投递正文前先下发的逻辑任务租约；正文不进入监督协议。 */
 export interface SupervisorTaskAssignment {
   readonly message_id: string;

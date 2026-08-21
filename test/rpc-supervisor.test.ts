@@ -2869,6 +2869,72 @@ test("final 注入回调中的 interrupt 在 commit 后重新裁决", async () =
   }
 });
 
+test("continuation in-flight 时迟到 final 不阻塞新 turn 与 stale ACK", async () => {
+  const tree = createController();
+  const rpcClient = new FakeRpcClient();
+  const channel = new RecordingSupervisorChannel([]);
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "迟到 final continuation" },
+    managedNode: new TestManagedRpcNode(rpcClient, new FakeProcessTreeAdapter()),
+    channel,
+    startupTimeoutMs: 100,
+    gracefulShutdownMs: 5,
+  });
+  assert.equal((await supervisor.start()).ok, true);
+  rpcClient.emitEvent({ type: "agent_start" });
+  channel.emitTaskStarted({ task_id: AUTONOMOUS_TASK_ID, turn_id: TURN_ID });
+  rpcClient.emitEvent({ type: "agent_settled" });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const continuationGate = rpcClient.deferNext("steer");
+  const resumed = await supervisor.steer("旧 final 到达前继续当前任务");
+  assert.equal(resumed.ok, true);
+  if (!resumed.ok) return;
+  await continuationGate.started;
+
+  const oldFinal = finalEnvelope(AUTONOMOUS_TASK_ID);
+  let oldFinalDeliveries = 0;
+  assert.equal(supervisor.acceptChildReply(oldFinal, () => {
+    oldFinalDeliveries += 1;
+    return true;
+  }), false);
+  assert.equal(oldFinalDeliveries, 0);
+
+  let status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "working");
+    assert.equal(status.data.activity?.phase, "reconciling");
+    assert.equal(status.data.mailbox_pending_count, 1);
+    assert.equal(status.data.reply_outbox_pending_count, 0);
+  }
+
+  const retriesBeforeStart = channel.pendingReplyRetries();
+  rpcClient.emitEvent({ type: "agent_start" });
+  channel.emitTaskStarted({ task_id: AUTONOMOUS_TASK_ID, turn_id: NEXT_TURN_ID });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(channel.pendingReplyRetries(), retriesBeforeStart + 1);
+  assert.equal(supervisor.acceptChildReply(oldFinal, () => {
+    oldFinalDeliveries += 1;
+    return true;
+  }), true);
+  assert.equal(oldFinalDeliveries, 0);
+
+  continuationGate.resolve();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  rpcClient.emitEvent({ type: "agent_settled" });
+  const nextCommitId = "77777777-7777-4777-8777-777777777777";
+  assert.equal(supervisor.acceptChildReply(
+    finalEnvelope(AUTONOMOUS_TASK_ID, NEXT_TURN_ID, nextCommitId),
+    () => true,
+  ), true);
+  status = tree.getStatus(FIRST_AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) assert.equal(status.data.state, "idle");
+});
+
 test("父端未接纳 final 后以 adaptive steer 恢复当前任务并作废旧 turn final", async () => {
   const tree = createController();
   const rpcClient = new FakeRpcClient();

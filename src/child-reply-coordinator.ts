@@ -11,6 +11,7 @@ import { REPLY_MAX_TEXT_BYTES } from "./child-reply-limits.ts";
 import { normalizeAssistantMessageEnd } from "./rpc-bridge-event.ts";
 import type {
   SupervisorCompactionOutcome,
+  SupervisorReplyPublication,
   SupervisorTaskAssignment,
   SupervisorTaskStarted,
 } from "./supervisor-channel.ts";
@@ -36,7 +37,11 @@ export interface ChildReplyPort {
   publishReply?(
     reply: ChildReplyEnvelope,
   ): Promise<void>;
-  /** 兼容旧适配器及 final 提交所需的父端接纳等待。 */
+  /** 写入 final 帧后立即返回；父端 ACK 通过 publication 异步通知。 */
+  publishReplyWithAck?(
+    reply: ChildReplyEnvelope,
+  ): Promise<SupervisorReplyPublication>;
+  /** 显式等待父端接纳；仅兼容旧适配器，不用于 wirePublicationTail。 */
   publishReplyAndWaitForAck(
     reply: ChildReplyEnvelope,
     signal?: AbortSignal,
@@ -56,7 +61,7 @@ export interface ChildReplyCoordinatorOptions {
   readonly onFinalFailure?: () => void;
 }
 
-type Publication = () => Promise<void>;
+type Publication<T> = () => Promise<T>;
 type RunFinalState = "normal" | "failed" | "interrupted";
 
 const MAX_ID_GENERATION_ATTEMPTS = 32;
@@ -80,7 +85,7 @@ export class ChildReplyCoordinator {
   private readonly onFinalAccepted: (() => void) | undefined;
   private readonly onFinalFailure: (() => void) | undefined;
   private readonly coordinationBarriers = new Set<string>();
-  private publicationTail: Promise<void> = Promise.resolve();
+  private wirePublicationTail: Promise<void> = Promise.resolve();
   private candidate: FinalCandidate | undefined;
   private finalState: RunFinalState = "normal";
   private failureReason: Exclude<ChildFinalReasonCode, "no_output" | "reply_too_large"> | undefined;
@@ -394,18 +399,34 @@ export class ChildReplyCoordinator {
         return;
       }
       this.finalSubmitted = true;
-      void this.enqueue(() => this.port.publishReplyAndWaitForAck(final)).then(
-        () => {
-          if (this.currentTaskId !== final.task_id || this.currentTurnId !== final.turn_id) return;
-          this.currentTaskId = undefined;
-          this.currentTurnId = undefined;
-          this.candidate = undefined;
-          this.absentReason = undefined;
-          this.notifyFinalAccepted();
+      const publishReplyWithAck = this.port.publishReplyWithAck;
+      if (publishReplyWithAck === undefined) {
+        // 旧适配器仍保留同步语义；生产监督通道走下方非阻塞句柄路径。
+        void this.enqueue(() => this.port.publishReplyAndWaitForAck(final)).then(
+          () => this.handleFinalAcknowledged(final),
+          () => this.failFinal(),
+        );
+        return;
+      }
+      void this.enqueue(() => publishReplyWithAck.call(this.port, final)).then(
+        (publication) => {
+          void publication.acknowledged.then(
+            () => this.handleFinalAcknowledged(final),
+            () => this.failFinal(),
+          );
         },
         () => this.failFinal(),
       );
     });
+  }
+
+  private handleFinalAcknowledged(final: ChildFinalEnvelope): void {
+    if (this.currentTaskId !== final.task_id || this.currentTurnId !== final.turn_id) return;
+    this.currentTaskId = undefined;
+    this.currentTurnId = undefined;
+    this.candidate = undefined;
+    this.absentReason = undefined;
+    this.notifyFinalAccepted();
   }
 
   private createFinal(): ChildFinalEnvelope | undefined {
@@ -490,9 +511,12 @@ export class ChildReplyCoordinator {
     return undefined;
   }
 
-  private enqueue(operation: Publication): Promise<void> {
-    const next = this.publicationTail.catch(() => {}).then(operation);
-    this.publicationTail = next.catch(() => {});
+  private enqueue<T>(operation: Publication<T>): Promise<T> {
+    const next = this.wirePublicationTail.catch(() => {}).then(operation);
+    this.wirePublicationTail = next.then(
+      () => undefined,
+      () => undefined,
+    );
     return next;
   }
 }

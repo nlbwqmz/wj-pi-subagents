@@ -17,13 +17,16 @@ import {
   SupervisorRequestIdRegistry,
   type SupervisorCapabilityManifest,
   type SupervisorReply,
+  type SupervisorTaskStarted,
 } from "../src/supervisor-channel.ts";
 import type { AgentSnapshot } from "../src/tree-controller.ts";
 
 const CHILD_ID = "550e8400-e29b-41d4-a716-446655440000";
 const TURN_ID = "550e8400-e29b-41d4-a716-446655440001";
+const TURN_ID_2 = "550e8400-e29b-41d4-a716-446655440002";
 const TASK_ID = "450e8400-e29b-41d4-a716-446655440001";
 const COMMIT_ID = "750e8400-e29b-41d4-a716-446655440001";
+const COMMIT_ID_2 = "750e8400-e29b-41d4-a716-446655440002";
 const ROOT_ID = "root-test";
 const CREDENTIAL = "stream-test-credential";
 
@@ -39,15 +42,19 @@ function workingReply(text: string): ChildMessageEnvelope {
   };
 }
 
-function finalReply(text: string): ChildFinalEnvelope {
+function finalReply(
+  text: string,
+  turnId = TURN_ID,
+  commitId = COMMIT_ID,
+): ChildFinalEnvelope {
   return {
     schema: CHILD_REPLY_SCHEMA,
     version: CHILD_REPLY_VERSION,
     kind: "final",
     agent_id: CHILD_ID,
     task_id: TASK_ID,
-    turn_id: TURN_ID,
-    commit_id: COMMIT_ID,
+    turn_id: turnId,
+    commit_id: commitId,
     run_state: "settled",
     output_state: "present",
     text,
@@ -482,6 +489,44 @@ test("child reply 发布等待父端累计 ACK，message 与非空 final 共用�
     { kind: "message", text: "进度" },
     { kind: "final", text: "完成" },
   ]);
+  await pair.parent.release();
+  await pair.child.release();
+});
+
+test("final ACK 未到时仍可发送后续 task_started，并可通过重试完成 ACK", async () => {
+  let accept = false;
+  const started: SupervisorTaskStarted[] = [];
+  const pair = channelPair(() => accept);
+  pair.parent.onTaskStarted((value) => started.push(value));
+  await pair.child.bind(new AbortController().signal);
+  await pair.parent.waitForReady(new AbortController().signal);
+  await pair.child.waitForReady(new AbortController().signal);
+
+  const publication = await pair.child.publishReplyWithAck(finalReply("等待父端确认"));
+  await settleIo();
+  assert.equal(pair.child.getPublicState().pending_reply_count, 1);
+  let acknowledged = false;
+  void publication.acknowledged.then(() => { acknowledged = true; });
+
+  await pair.child.publishTaskStarted({ task_id: TASK_ID, turn_id: TURN_ID_2 });
+  await settleIo();
+  assert.deepEqual(started, [{ task_id: TASK_ID, turn_id: TURN_ID_2 }]);
+  assert.equal(acknowledged, false);
+
+  const secondPublication = await pair.child.publishReplyWithAck(
+    finalReply("第二轮仍可写入", TURN_ID_2, COMMIT_ID_2),
+  );
+  await settleIo();
+  assert.equal(pair.child.getPublicState().pending_reply_count, 2);
+  assert.equal(acknowledged, false);
+
+  accept = true;
+  await pair.parent.retryPendingReplies();
+  await settleIo();
+  await publication.acknowledged;
+  await secondPublication.acknowledged;
+  assert.equal(acknowledged, true);
+
   await pair.parent.release();
   await pair.child.release();
 });

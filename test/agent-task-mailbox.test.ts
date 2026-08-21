@@ -797,6 +797,61 @@ test("prompt 命令尾部晚于 task_started 与 final 时，成功或拒绝都�
   }
 });
 
+test("continuation 已排队或 in-flight 时迟到 final 不重装逻辑 outbox", () => {
+  for (const stage of ["queued", "in_flight"] as const) {
+    const value = mailbox();
+    const current = value.submit("当前任务");
+    const prompt = value.takeNextDelivery();
+    assert.ok(prompt);
+    assert.equal(value.hostAccepted(prompt.delivery_id), true);
+    value.observeAgentStart();
+    assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
+    assert.equal(value.observeAgentSettled(), "candidate");
+
+    const continuation = value.submit(`迟到 final 前的 ${stage} continuation`);
+    const delivery = stage === "in_flight" ? value.takeNextDelivery() : undefined;
+    if (stage === "in_flight") assert.equal(delivery?.message_id, continuation.message_id);
+
+    const lateFinal = final(current.task_id, TURN_1, COMMIT_1);
+    assert.equal(value.prepareFinal(lateFinal), false);
+    assert.equal(value.preparedFinalCommitId(), undefined);
+    assert.deepEqual(value.projection(), {
+      state: "working",
+      mailbox_pending_count: 1,
+      host_pending_count: 0,
+      reply_outbox_pending_count: 0,
+      activity: { phase: "reconciling", task_id: current.task_id },
+    });
+
+    if (stage === "queued") {
+      assert.equal(value.takeNextDelivery()?.message_id, continuation.message_id);
+    } else {
+      assert.equal(value.takeNextDelivery(), undefined);
+    }
+  }
+});
+
+test("final 先于 raw settled 到达时 continuation 撤销 provisional prepare", () => {
+  const value = mailbox();
+  const current = value.submit("当前任务");
+  const prompt = value.takeNextDelivery();
+  assert.ok(prompt);
+  assert.equal(value.hostAccepted(prompt.delivery_id), true);
+  value.observeAgentStart();
+  assert.equal(value.observeTaskStarted(current.task_id, TURN_1), true);
+
+  const earlyFinal = final(current.task_id, TURN_1, COMMIT_1);
+  assert.equal(value.prepareFinal(earlyFinal), false);
+  assert.equal(value.projection().activity?.phase, "finalizing");
+  assert.equal(value.projection().reply_outbox_pending_count, 1);
+
+  const continuation = value.submit("raw settled 之前继续当前任务");
+  assert.equal(value.preparedFinalCommitId(), undefined);
+  assert.equal(value.projection().activity?.phase, "reconciling");
+  assert.equal(value.projection().reply_outbox_pending_count, 0);
+  assert.equal(value.takeNextDelivery()?.message_id, continuation.message_id);
+});
+
 test("未获父端接纳的 prepared final 仍可由 continuation 消息撤销", () => {
   const value = mailbox();
   const current = value.submit("当前任务");

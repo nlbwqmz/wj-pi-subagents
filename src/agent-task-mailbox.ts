@@ -695,6 +695,7 @@ export class AgentTaskMailbox {
 
   /** final 先 prepare，父会话注入成功后再用 commitPreparedFinal 单调提交。 */
   prepareFinal(final: ChildFinalEnvelope): boolean {
+    if (this.finalConflictsWithPendingContinuation(final.task_id)) return false;
     if (this.preparedFinal?.commit_id === final.commit_id) return this.canCommitPreparedFinal();
     if (this.preparedFinal !== undefined) return false;
     const current = this.currentTask;
@@ -920,6 +921,13 @@ export class AgentTaskMailbox {
     }
     if (this.successorTaskId !== undefined) return this.successorTaskId;
     if (!this.interruptBarrier && !this.settlementObserved) {
+      if (this.preparedFinalDeliveryState === "prepared") {
+        // final 与 raw settled 可跨监督/RPC 流重排；父端 continuation 优先，
+        // 未接纳 final 留在协议缓冲区等待新 turn 后按 stale ACK 收敛。
+        this.clearPreparedFinal();
+        this.replyOutboxPendingCount = 0;
+        this.phase = "reconciling";
+      }
       if (this.coordinationBarriers.size > 0) {
         this.coordinatedSettlementWorkPending = true;
         this.phase = this.compactionActive ? "compacting" : "reconciling";
@@ -935,6 +943,7 @@ export class AgentTaskMailbox {
     ) {
       // raw settled 和未获父端接纳的 final 都仍可由当前逻辑任务撤销；
       // 提前分配 successor 会让后续 continuation 无法取得该 mailbox 项。
+      this.clearPreparedFinal();
       this.replyOutboxPendingCount = 0;
       this.phase = "reconciling";
       return current.taskId;
@@ -1066,6 +1075,20 @@ export class AgentTaskMailbox {
     this.coordinatedContinuationStarted = false;
     this.awaitingCoordinatedContinuationTransactionId = undefined;
     this.coordinatedTrailingSettlement = undefined;
+  }
+
+  private finalConflictsWithPendingContinuation(taskId: string): boolean {
+    const pending = this.mailbox.filter((entry) => entry.taskId === taskId);
+    if (pending.length === 0) return false;
+    const delivery = this.inFlight;
+    // 首轮 prompt 的命令响应可以晚于 task_started、settled 和 final；
+    // 已启动任务的 adaptive steer 则一定是 continuation，final 必须让路。
+    return !(
+      pending.length === 1
+      && delivery?.task_id === taskId
+      && delivery.message_id === pending[0]?.messageId
+      && delivery.host_submission === "strict_prompt"
+    );
   }
 
   private hasCurrentTaskMailboxWork(): boolean {

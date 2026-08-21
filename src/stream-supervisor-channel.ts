@@ -15,6 +15,7 @@ import {
   type SupervisorReceiveResult,
   type SupervisorReply,
   type SupervisorReplyInput,
+  type SupervisorReplyPublication,
   type SupervisorSnapshot,
   type SupervisorChannelPublicState,
   type SupervisorTaskAssignment,
@@ -155,6 +156,26 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
 
   async publishReply(reply: SupervisorReplyInput | SupervisorReply): Promise<void> {
     await this.send(this.protocol.publishReply(reply));
+  }
+
+  /** 发布 reply 帧后只等待本地写入；累计父端 ACK 通过句柄异步完成。 */
+  async publishReplyWithAck(
+    reply: SupervisorReplyInput | SupervisorReply,
+  ): Promise<SupervisorReplyPublication> {
+    const frame = this.protocol.publishReply(reply);
+    const replySeq = readReplySeq(frame);
+    const waiter = createDeferred<void>();
+    void waiter.promise.catch(() => {});
+    this.replyAcknowledgements.set(replySeq, waiter);
+    try {
+      await this.send(frame);
+      return Object.freeze({ acknowledged: waiter.promise });
+    } catch (error) {
+      if (this.replyAcknowledgements.get(replySeq) === waiter) this.replyAcknowledgements.delete(replySeq);
+      if (error instanceof Error && error.name === "AbortError") throw error;
+      this.fail("protocol_fault");
+      throw new Error("监督回复未获确认");
+    }
   }
 
   /** child 在普通 ready 后发布一次内部 capability manifest。 */
