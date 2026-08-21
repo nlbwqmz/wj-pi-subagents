@@ -1658,6 +1658,36 @@ test("根会话 max 场景允许模板请求父活动工具之外的已注册业
   await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
 });
 
+test("拥有管理能力但没有可用模板时不注入模板目录", async () => {
+  const cwd = "C:\\workspace\\empty-template-prompt";
+  const api = new FakeExtensionApi();
+  const context = extensionContext(cwd);
+  const activate = createWjPiSubagentsRuntimeActivator({
+    rootIdFactory: () => "root-empty-template-prompt",
+    templateFileSystem: templateFileSystem(cwd, undefined, []),
+  });
+  await activate(api as never, {
+    ok: true,
+    nodeVersion: process.versions.node,
+    piVersion: "0.84.1",
+    platform: "win32",
+    processTreeAdapter: {} as never,
+  });
+  await api.emit("session_start", { type: "session_start", reason: "startup" }, context);
+
+  const promptHandler = api.handlers.get("before_agent_start")?.[0];
+  assert.ok(promptHandler);
+  const prompt = await promptHandler({ systemPrompt: "空模板根提示" }, context) as {
+    readonly systemPrompt?: unknown;
+  };
+  assert.match(String(prompt.systemPrompt), /^空模板根提示\n\n父子任务协作要求（必须遵守）：/);
+  assert.doesNotMatch(String(prompt.systemPrompt), /可用子代理模板/);
+
+  const templates = await execute(api, "get_agent_templates", {}, context) as { details?: unknown[] };
+  assert.deepEqual(templates.details, []);
+  await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context);
+});
+
 test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管理能力", async () => {
   const cwd = "C:\\workspace\\recursive-runtime";
   const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
@@ -1712,6 +1742,11 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
     `- ${PARENT_COORDINATION_GUIDELINES.capacityCleanup}`,
     `- ${PARENT_COORDINATION_GUIDELINES.replyTooLarge}`,
   ].join("\n");
+  const availableTemplateGuidance = [
+    "可用子代理模板：",
+    "模板 ID 区分大小写，创建子代理时必须原样使用。",
+    "- researcher：运行时测试模板",
+  ].join("\n");
   const childFinalReplyGuidance = [
     "子代理任务与最终答复要求：",
     `- ${CHILD_REPLY_GUIDELINE}`,
@@ -1726,6 +1761,8 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
     "根会话提示",
     "",
     parentCoordinationGuidance,
+    "",
+    availableTemplateGuidance,
   ].join("\n"));
   const rootCustomPromptResult = await rootPromptHandler({
     systemPrompt: "自定义根会话提示",
@@ -1735,6 +1772,8 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
     "自定义根会话提示",
     "",
     parentCoordinationGuidance,
+    "",
+    availableTemplateGuidance,
   ].join("\n"));
   assert.match(String(rootCustomPromptResult.systemPrompt), /无数据依赖、无共享写资源/);
   assert.match(String(rootCustomPromptResult.systemPrompt), /不要盲目重发/);
@@ -1794,6 +1833,8 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
     "",
     parentCoordinationGuidance,
     "",
+    availableTemplateGuidance,
+    "",
     childFinalReplyGuidance,
   ].join("\n"));
   const childCustomPromptResult = await childPromptHandler({
@@ -1804,6 +1845,8 @@ test("递归 child runtime 继承冻结树权威、作用域 actor 和逐级管�
     "自定义模板与项目提示",
     "",
     parentCoordinationGuidance,
+    "",
+    availableTemplateGuidance,
     "",
     childFinalReplyGuidance,
   ].join("\n"));
@@ -2509,6 +2552,15 @@ test("根与 child 跨实例 reload 保留同一监督连接，并让既有 chil
     { template_id: "researcher", description: "运行时测试模板", tools: [] },
     { template_id: "reviewer", description: "运行时测试模板", tools: [] },
   ]);
+  const reloadedChildPromptHandler = newChildApi.handlers.get("before_agent_start")?.[0];
+  assert.ok(reloadedChildPromptHandler);
+  const reloadedChildPrompt = await reloadedChildPromptHandler({
+    systemPrompt: "reload 后子代理提示",
+  }, context) as { readonly systemPrompt?: unknown };
+  const reloadedPromptText = String(reloadedChildPrompt.systemPrompt);
+  assert.match(reloadedPromptText, /- researcher：运行时测试模板/);
+  assert.match(reloadedPromptText, /- reviewer：运行时测试模板/);
+  assert.doesNotMatch(reloadedPromptText, /tools:/);
 
   await newChildApi.emit("agent_start", { type: "agent_start" }, context);
   await newChildApi.emit("message_end", {

@@ -72,6 +72,7 @@ import {
 } from "./tree-authority.ts";
 import {
   TemplateSnapshotController,
+  type AgentTemplateListItem,
   type TemplateDefinition,
   type TemplateDiscoveryFileSystem,
 } from "./template-discovery-snapshot.ts";
@@ -256,6 +257,14 @@ const PARENT_COORDINATION_GUIDANCE = [
   `- ${PARENT_COORDINATION_GUIDELINES.capacityCleanup}`,
   `- ${PARENT_COORDINATION_GUIDELINES.replyTooLarge}`,
 ].join("\n");
+
+function formatAgentTemplateCatalog(templates: readonly AgentTemplateListItem[]): string {
+  return [
+    "可用子代理模板：",
+    "模板 ID 区分大小写，创建子代理时必须原样使用。",
+    ...templates.map(({ template_id, description }) => `- ${template_id}：${description}`),
+  ].join("\n");
+}
 
 const CHILD_FINAL_REPLY_GUIDANCE = [
   "子代理任务与最终答复要求：",
@@ -802,13 +811,23 @@ export function createWjPiSubagentsRuntimeActivator(
       },
     });
 
-    api.on("before_agent_start", (event) => {
+    api.on("before_agent_start", async (event) => {
       const current = active;
       if (current === undefined || current.handoffPending === true) return;
       if (!isRecord(event) || typeof event.systemPrompt !== "string") return;
       const guidance: string[] = [];
       if (current.managementEnabled) {
         guidance.push(PARENT_COORDINATION_GUIDANCE);
+        let templates: ControlResult<readonly AgentTemplateListItem[]> | undefined;
+        try {
+          templates = await current.controller.getAgentTemplates();
+        } catch {
+          // 模板目录查询失败不能阻断本轮；模型仍可通过公开工具重试。
+        }
+        if (active !== current || Boolean(current.handoffPending)) return;
+        if (templates?.ok === true && templates.data.length > 0) {
+          guidance.push(formatAgentTemplateCatalog(templates.data));
+        }
       }
       if (current.isChild) guidance.push(CHILD_FINAL_REPLY_GUIDANCE);
       if (guidance.length === 0) return;
