@@ -563,6 +563,9 @@ function collapsedStatusLines(snapshot: AgentSnapshot): readonly SafeRenderLine[
   if (snapshot.working_elapsed_ms !== undefined) {
     lines.push({ text: `working_elapsed_ms: ${snapshot.working_elapsed_ms}`, color: "dim" });
   }
+  if (snapshot.activity !== undefined) {
+    lines.push({ text: `activity.phase: ${snapshot.activity.phase}`, color: "dim" });
+  }
   if (snapshot.error !== undefined) lines.push({ text: `error.code: ${snapshot.error.code}`, color: "warning" });
   if (snapshot.termination_result !== undefined) {
     lines.push({ text: `termination_result: ${snapshot.termination_result}`, color: "dim" });
@@ -589,6 +592,9 @@ function expandedStatusLines(snapshot: AgentSnapshot): readonly SafeRenderLine[]
   }
   if (snapshot.working_elapsed_ms !== undefined) {
     lines.push({ text: `working_elapsed_ms: ${snapshot.working_elapsed_ms}`, color: "dim" });
+  }
+  if (snapshot.activity !== undefined) {
+    lines.push({ text: `activity.phase: ${snapshot.activity.phase}`, color: "dim" });
   }
   if (snapshot.error !== undefined) {
     lines.push({ text: `error.code: ${snapshot.error.code}`, color: "warning" });
@@ -699,7 +705,8 @@ function formatTreeNode(node: AgentSnapshot): string {
   const context = node.context_window_tokens === undefined
     ? ""
     : ` · ${node.context_usage_percent === undefined ? "?" : `${node.context_usage_percent.toFixed(1)}%`}/${formatTokens(node.context_window_tokens)}`;
-  return `${node.template_id} · ${node.name} · ${node.state} · ${node.agent_id}${context}`;
+  const activity = node.activity === undefined ? "" : ` · ${node.activity.phase}`;
+  return `${node.template_id} · ${node.name} · ${node.state}${activity} · ${node.agent_id}${context}`;
 }
 
 function formatTokens(count: number): string {

@@ -929,7 +929,10 @@ export class AgentController {
     ) {
       this.notifySessionEvent(agentId, "final_report");
     }
-    // activity 只属于监督器本地诊断，不进入树快照、修订或 wait_agent 事件。
+    if (event.kind === "activity" && agentId !== undefined) {
+      this.tree.updateActivity(agentId, event.activity);
+    }
+    // activity 阶段属于安全树快照；工具正文、名称和参数仍只留在监督器本地。
     const lifecycleApplied = agentId !== undefined
       && event.kind === "lifecycle"
       && this.wasLifecycleEventApplied(agentId, event.event);

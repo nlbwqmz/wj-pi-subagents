@@ -2,10 +2,14 @@ import { randomUUID } from "node:crypto";
 import type { RuntimeConfig } from "./root-runtime-context.ts";
 import { canTransition } from "./conversation-lifecycle.ts";
 import {
+  AGENT_ACTIVITY_PHASES,
   AGENT_FAULT_CODES,
   AGENT_FAULT_METADATA,
   isCanonicalAgentUuid,
+  parseAgentActivitySummary,
   parseAgentSnapshot,
+  type AgentActivitySummary,
+  type AgentActivityPhase,
   type AgentFault,
   type AgentFaultCode,
   type AgentLifecycleState,
@@ -16,9 +20,12 @@ import {
 type InternalAgentLifecycleState = AgentLifecycleState;
 
 export {
+  AGENT_ACTIVITY_PHASES,
   AGENT_FAULT_CODES,
   AGENT_LIFECYCLE_STATES,
   AGENT_TERMINATION_RESULTS,
+  type AgentActivityPhase,
+  type AgentActivitySummary,
   type AgentFault,
   type AgentFaultCode,
   type AgentLifecycleState,
@@ -306,6 +313,7 @@ interface AgentRecord {
   accumulatedWorkingElapsedMs: number;
   contextWindowTokens: number | undefined;
   contextUsagePercent: number | undefined;
+  activity: AgentActivitySummary | undefined;
   error: AgentFault | undefined;
   terminationResult: AgentTerminationResult | undefined;
   terminationHadFailure: boolean;
@@ -331,6 +339,8 @@ interface PublicMutation {
   readonly state?: InternalAgentLifecycleState;
   readonly errorCode?: AgentFaultCode;
   readonly clearError?: boolean;
+  /** undefined 表示保持，null 表示清除。 */
+  readonly activity?: AgentActivitySummary | null;
   /** undefined 表示保持，null 表示清除。 */
   readonly contextWindowTokens?: number | null;
   /** undefined 表示保持，null 表示清除。 */
@@ -483,6 +493,7 @@ function sameSnapshot(
     && record.createdAt === node.created_at
     && workingMatches
     && contextMatches
+    && JSON.stringify(record.activity) === JSON.stringify(node.activity)
     && JSON.stringify(currentFault) === JSON.stringify(nextFault)
     && record.terminationResult === node.termination_result
   );
@@ -581,6 +592,7 @@ export class TreeController {
         accumulatedWorkingElapsedMs: 0,
         contextWindowTokens: undefined,
         contextUsagePercent: undefined,
+        activity: undefined,
         error: undefined,
         terminationResult: undefined,
         terminationHadFailure: false,
@@ -749,6 +761,7 @@ export class TreeController {
       accumulatedWorkingElapsedMs: 0,
       contextWindowTokens: undefined,
       contextUsagePercent: undefined,
+      activity: undefined,
       error: undefined,
       terminationResult: undefined,
       terminationHadFailure: false,
@@ -813,6 +826,7 @@ export class TreeController {
       accumulatedWorkingElapsedMs: 0,
       contextWindowTokens: undefined,
       contextUsagePercent: undefined,
+      activity: undefined,
       error: undefined,
       terminationResult: undefined,
       terminationHadFailure: false,
@@ -923,6 +937,23 @@ export class TreeController {
       contextWindowTokens: usage?.context_window_tokens ?? null,
       contextUsagePercent: usage?.context_usage_percent ?? null,
     });
+    return controlSuccess(this.outcome(record, applied));
+  }
+
+  /** 更新当前子代理 working 期间的安全活动阶段。 */
+  updateActivity(
+    agentId: unknown,
+    activity: AgentActivitySummary | unknown,
+  ): ControlResult<LifecycleEventOutcome> {
+    const resolved = this.findAgent(agentId);
+    if (!resolved.ok) return resolved;
+    const parsed = parseAgentActivitySummary(activity);
+    if (parsed === undefined) return controlFailure("invalid_argument");
+    const record = resolved.data;
+    if (record.state !== "working" && record.state !== "interrupting") {
+      return controlSuccess(this.outcome(record, false));
+    }
+    const applied = this.mutate(record, { activity: parsed });
     return controlSuccess(this.outcome(record, applied));
   }
 
@@ -1102,6 +1133,8 @@ export class TreeController {
     const additions: AgentRecord[] = [];
     const additionById = new Map<string, AgentRecord>();
     let scopeContextUsage: AgentContextUsageInput | undefined;
+    let scopeActivity: AgentActivitySummary | undefined;
+    let scopeActivityObserved = false;
     for (const node of parsed.data) {
       const current = this.agents.get(node.agent_id);
       if (current === undefined) {
@@ -1130,6 +1163,7 @@ export class TreeController {
           accumulatedWorkingElapsedMs: node.working_elapsed_ms ?? 0,
           contextWindowTokens: node.context_window_tokens,
           contextUsagePercent: node.context_usage_percent,
+          activity: node.activity,
           error: node.error,
           terminationResult: node.termination_result,
           terminationHadFailure: snapshotHadTerminationFailure(node),
@@ -1151,6 +1185,8 @@ export class TreeController {
               : { context_usage_percent: node.context_usage_percent }),
           });
         }
+        scopeActivityObserved = true;
+        scopeActivity = node.activity;
         continue;
       }
       if (current.state === "terminated" && node.revision !== current.revision) {
@@ -1186,13 +1222,19 @@ export class TreeController {
           contextWindowTokens: scopeContextUsage.context_window_tokens,
           contextUsagePercent: scopeContextUsage.context_usage_percent ?? null,
         }, safeWallClockNow(this.now), monotonicAt);
+    const scopeActivityChanged = !scopeActivityObserved
+      || (scope.state !== "working" && scope.state !== "interrupting")
+      ? false
+      : this.applyMutation(scope, {
+          activity: scopeActivity ?? null,
+        }, safeWallClockNow(this.now), monotonicAt);
     this.subtreeRevisions.set(scope.agentId, input.subtree_revision);
-    if (additions.length > 0 || changes.length > 0 || scopeContextChanged) {
+    if (additions.length > 0 || changes.length > 0 || scopeContextChanged || scopeActivityChanged) {
       this.treeRevision += 1;
       this.notifyChange();
     }
     return controlSuccess(Object.freeze({
-      applied: additions.length > 0 || changes.length > 0 || scopeContextChanged,
+      applied: additions.length > 0 || changes.length > 0 || scopeContextChanged || scopeActivityChanged,
       scope_agent_id: scope.agentId,
       subtree_revision: input.subtree_revision,
       tree_revision: this.treeRevision,
@@ -1243,6 +1285,7 @@ export class TreeController {
     record.state = node.state;
     record.revision = node.revision;
     record.createdAt = node.created_at;
+    record.activity = node.activity;
     record.error = cloneAgentFault(node.error);
     record.terminationHadFailure ||= snapshotHadTerminationFailure(node);
     record.terminationHadIncompleteCleanup ||= snapshotHadIncompleteCleanup(node);
@@ -1528,13 +1571,19 @@ export class TreeController {
     const nextErrorCode = mutation.errorCode === undefined
       ? (mutation.clearError === true ? undefined : record.error?.code)
       : mutation.errorCode;
+    const nextActivity = mutation.activity === undefined
+      ? record.activity
+      : mutation.activity === null
+        ? undefined
+        : mutation.activity;
     const stateChanged = nextState !== record.state;
     const wasWorking = isWorkingTimeState(record.state);
     const willBeWorking = isWorkingTimeState(nextState);
     const contextChanged = nextContextWindowTokens !== record.contextWindowTokens
       || nextContextUsagePercent !== record.contextUsagePercent;
     const errorChanged = nextErrorCode !== record.error?.code;
-    if (!stateChanged && !contextChanged && !errorChanged) return false;
+    const activityChanged = JSON.stringify(nextActivity) !== JSON.stringify(record.activity);
+    if (!stateChanged && !contextChanged && !errorChanged && !activityChanged) return false;
 
     const workingElapsedAtMutation = this.workingElapsedValue(record, monotonicAt);
     const nextError = mutation.errorCode === undefined
@@ -1543,6 +1592,7 @@ export class TreeController {
     record.state = nextState;
     record.contextWindowTokens = nextContextWindowTokens;
     record.contextUsagePercent = nextContextUsagePercent;
+    record.activity = willBeWorking ? nextActivity : undefined;
     record.error = nextError;
     if (wasWorking && !willBeWorking) {
       record.accumulatedWorkingElapsedMs = workingElapsedAtMutation;
@@ -1653,9 +1703,12 @@ export class TreeController {
             ? {}
             : { context_usage_percent: record.contextUsagePercent }),
         };
-    const withTerminationResult = record.terminationResult === undefined
+    const withActivity = record.activity === undefined
       ? withContextUsage
-      : { ...withContextUsage, termination_result: record.terminationResult };
+      : { ...withContextUsage, activity: Object.freeze({ ...record.activity }) };
+    const withTerminationResult = record.terminationResult === undefined
+      ? withActivity
+      : { ...withActivity, termination_result: record.terminationResult };
     if (record.error === undefined) return Object.freeze(withTerminationResult);
     return Object.freeze({ ...withTerminationResult, error: record.error });
   }

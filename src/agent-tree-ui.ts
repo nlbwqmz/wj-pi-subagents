@@ -449,9 +449,7 @@ export function renderAgentsWidget(
   const rows = nodes.map((node, index) => {
     const branch = index === nodes.length - 1 ? "└─" : "├─";
     const icon = formatAgentStateIcon(node, workingFrame);
-    return truncateToDisplayWidth(`${branch} ${icon} ${formatAgentFacts(node, {
-      includeActivityCategoryCount: false,
-    })}`, width);
+    return truncateToDisplayWidth(`${branch} ${icon} ${formatAgentFacts(node)}`, width);
   });
   if (rows.length === 0) return Object.freeze([]);
   return Object.freeze([truncateToDisplayWidth(AGENTS_WIDGET_TITLE, width), ...rows]);
@@ -938,13 +936,9 @@ function formatAgentStateIcon(node: AgentSnapshot, workingFrame: string): string
   return "·";
 }
 
-interface FormatAgentFactsOptions {
-  readonly includeActivityCategoryCount?: boolean;
-}
-
-function formatAgentFacts(node: AgentSnapshot, options: FormatAgentFactsOptions = {}): string {
+function formatAgentFacts(node: AgentSnapshot): string {
   const facts = [safeUiFact(node.template_id), safeUiFact(node.name), node.state];
-  void options;
+  if (node.activity !== undefined) facts.push(node.activity.phase);
   if (node.context_window_tokens !== undefined) {
     const percent = node.context_usage_percent === undefined
       ? "?"
@@ -1049,6 +1043,7 @@ function sameAgentFactsExceptElapsed(left: AgentSnapshot, right: AgentSnapshot):
     && left.created_at === right.created_at
     && left.context_window_tokens === right.context_window_tokens
     && left.context_usage_percent === right.context_usage_percent
+    && JSON.stringify(left.activity) === JSON.stringify(right.activity)
     && JSON.stringify(left.error) === JSON.stringify(right.error)
     && left.termination_result === right.termination_result;
 }

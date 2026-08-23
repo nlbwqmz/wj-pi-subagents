@@ -8,6 +8,18 @@ export const AGENT_LIFECYCLE_STATES = LIFECYCLE_STATES;
 /** 公开生命周期状态闭集。 */
 export type AgentLifecycleState = LifecycleState;
 
+/** working 期间可安全展示的当前活动阶段。 */
+export const AGENT_ACTIVITY_PHASES = Object.freeze([
+  "processing",
+  "executing_tools",
+  "compacting",
+] as const);
+export type AgentActivityPhase = (typeof AGENT_ACTIVITY_PHASES)[number];
+
+export interface AgentActivitySummary {
+  readonly phase: AgentActivityPhase;
+}
+
 export const AGENT_FAULT_CODES = Object.freeze([
   "spawn_failed",
   "spawn_timeout",
@@ -29,8 +41,8 @@ export const AGENT_TERMINATION_RESULTS = Object.freeze(["completed", "failed", "
 export type AgentTerminationResult = (typeof AGENT_TERMINATION_RESULTS)[number];
 
 /**
- * 公开树快照。不要向该结构添加任务、邮箱、ACK 或消息身份字段。
- * working/interrupting 期间的活动详情只属于本地诊断，不进入该投影。
+ * 公开树快照保留生命周期和受限的活动阶段；任务、邮箱、ACK、消息身份以及工具
+ * 名称、参数和结果都不进入该投影。
  */
 export interface AgentSnapshot {
   readonly agent_id: string;
@@ -44,6 +56,7 @@ export interface AgentSnapshot {
   readonly working_elapsed_ms?: number;
   readonly context_window_tokens?: number;
   readonly context_usage_percent?: number;
+  readonly activity?: AgentActivitySummary;
   readonly error?: AgentFault;
   readonly termination_result?: AgentTerminationResult;
 }
@@ -69,8 +82,9 @@ export interface AgentSnapshotCodecOptions {
 const SNAPSHOT_KEYS = new Set([
   "agent_id", "parent_agent_id", "template_id", "name", "depth", "state", "revision",
   "created_at", "working_elapsed_ms", "context_window_tokens", "context_usage_percent",
-  "error", "termination_result",
+  "activity", "error", "termination_result",
 ]);
+const ACTIVITY_KEYS = new Set(["phase"]);
 const FAULT_KEYS = new Set(["code", "message", "retryable"]);
 const UTF8_ENCODER = new TextEncoder();
 const RFC3339_MILLIS_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -105,6 +119,10 @@ export function parseAgentSnapshot(
       || (record.context_window_tokens !== undefined && !positiveSafeInteger(record.context_window_tokens))
       || (record.context_usage_percent !== undefined && !validContextUsagePercent(record.context_usage_percent))
     ) return undefined;
+    const activity = record.activity === undefined
+      ? undefined
+      : parseAgentActivitySummary(record.activity);
+    if (record.activity !== undefined && activity === undefined) return undefined;
     const fault = record.error === undefined ? undefined : parseAgentFault(record.error, options.maxStringBytes);
     if (record.error !== undefined && fault === undefined) return undefined;
     const termination = record.termination_result;
@@ -114,6 +132,7 @@ export function parseAgentSnapshot(
     if (state !== "failed" && fault !== undefined) return undefined;
     if (state === "terminated" && termination === undefined) return undefined;
     if (state !== "terminated" && termination !== undefined) return undefined;
+    if (activity !== undefined && state !== "working" && state !== "interrupting") return undefined;
     if (state === "starting" && (record.created_at !== undefined || record.working_elapsed_ms !== undefined)) return undefined;
     if (record.context_usage_percent !== undefined && record.context_window_tokens === undefined) return undefined;
     return Object.freeze({
@@ -128,12 +147,23 @@ export function parseAgentSnapshot(
       ...(record.working_elapsed_ms === undefined ? {} : { working_elapsed_ms: record.working_elapsed_ms as number }),
       ...(record.context_window_tokens === undefined ? {} : { context_window_tokens: record.context_window_tokens as number }),
       ...(record.context_usage_percent === undefined ? {} : { context_usage_percent: record.context_usage_percent as number }),
+      ...(activity === undefined ? {} : { activity }),
       ...(fault === undefined ? {} : { error: fault }),
       ...(termination === undefined ? {} : { termination_result: termination as AgentTerminationResult }),
     });
   } catch {
     return undefined;
   }
+}
+
+export function parseAgentActivitySummary(value: unknown): AgentActivitySummary | undefined {
+  const record = plainDataRecord(value, ACTIVITY_KEYS);
+  if (
+    record === undefined
+    || !(AGENT_ACTIVITY_PHASES as readonly unknown[]).includes(record.phase)
+    || Object.keys(record).some((key) => key !== "phase")
+  ) return undefined;
+  return Object.freeze({ phase: record.phase as AgentActivityPhase });
 }
 
 export function parseAgentFault(value: unknown, maxStringBytes?: number): AgentFault | undefined {

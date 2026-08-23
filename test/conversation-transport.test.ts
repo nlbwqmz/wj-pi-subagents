@@ -249,6 +249,16 @@ test("真实 Pi 手动压缩事件与监督 ACK 并发时保留协调授权", as
       code: "compaction_active",
     });
     emitPiEvent(rpc, { type: "agent_start" });
+    emitPiEvent(rpc, { type: "tool_execution_start", toolCallId: "call-1", toolName: "apply_patch" });
+    assert.deepEqual(supervisorEvents.at(-1), {
+      kind: "activity",
+      activity: { phase: "executing_tools" },
+    });
+    emitPiEvent(rpc, { type: "tool_execution_end", toolCallId: "call-1", toolName: "apply_patch" });
+    assert.deepEqual(supervisorEvents.at(-1), {
+      kind: "activity",
+      activity: { phase: "processing" },
+    });
     emitPiEvent(rpc, { type: "queue_update", steering: [], followUp: [] });
     emitPiEvent(rpc, { type: "compaction_start", reason: "manual" });
     assert.deepEqual(await supervisor.sendMessage("压缩进行中发送"), {

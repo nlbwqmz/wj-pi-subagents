@@ -82,6 +82,12 @@ class FakeSupervisor implements AgentSupervisor {
     for (const listener of this.listeners) listener({ kind: "lifecycle", event });
   }
 
+  emitActivity(phase: "processing" | "executing_tools" | "compacting"): void {
+    for (const listener of this.listeners) {
+      listener({ kind: "activity", activity: { phase } });
+    }
+  }
+
   emitReply(kind: ChildReplyEnvelope["kind"], text = "父端消息"): void {
     const reply = {
       schema: CHILD_REPLY_SCHEMA,
@@ -129,6 +135,38 @@ function generation(tree: TreeController): number {
 async function waitForEvent(controller: AgentController): Promise<Awaited<ReturnType<AgentController["waitAgents"]>>> {
   return controller.waitAgents({ agent_ids: [AGENT_ID], timeout_ms: 10_000 });
 }
+
+test("监督器活动阶段进入公开快照，并在生命周期离开 working 时清除", async () => {
+  const fake = new FakeSupervisor();
+  const { controller, tree } = makeController(fake);
+  const spawned = await controller.spawnAgent({ template_id: "demo", name: "活动测试" });
+  assert.equal(spawned.ok, true, JSON.stringify(spawned));
+
+  fake.emitLifecycle({ type: "agent_start", expected_generation: generation(tree) });
+  fake.emitActivity("processing");
+  let status = tree.getStatus(AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) assert.deepEqual(status.data.activity, { phase: "processing" });
+
+  fake.emitActivity("executing_tools");
+  status = tree.getStatus(AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) assert.deepEqual(status.data.activity, { phase: "executing_tools" });
+
+  fake.emitActivity("compacting");
+  status = tree.getStatus(AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) assert.deepEqual(status.data.activity, { phase: "compacting" });
+
+  fake.emitLifecycle({ type: "agent_settled", expected_generation: generation(tree) });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  status = tree.getStatus(AGENT_ID);
+  assert.equal(status.ok, true);
+  if (status.ok) {
+    assert.equal(status.data.state, "idle");
+    assert.equal(status.data.activity, undefined);
+  }
+});
 
 test("send_message 失败只结算本次调用，wait_agent 返回独立消息事件和生命周期快照", async () => {
   const fake = new FakeSupervisor();

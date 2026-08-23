@@ -25,6 +25,7 @@ import type {
 import type {
   AgentLifecycleEvent,
   AgentLifecycleState,
+  AgentActivityPhase,
   AgentSnapshot,
   ControlResult,
   LifecycleEventOutcome,
@@ -268,18 +269,8 @@ export class FakeRpcClient implements RpcSupervisorClient {
 export type RpcSupervisorChannelCloseState = "released" | "present" | "unknown";
 export type RpcSupervisorChannelFault = "eof" | "protocol_fault";
 
-export type RpcSupervisorActivityCategory =
-  | "editing"
-  | "reading"
-  | "running"
-  | "researching"
-  | "delegating"
-  | "other";
-
 export interface RpcSupervisorActivity {
-  readonly category: RpcSupervisorActivityCategory;
-  readonly phase: "started" | "finished";
-  readonly active_count: number;
+  readonly phase: AgentActivityPhase;
 }
 
 export interface RpcSupervisorRuntimeState {
@@ -520,16 +511,6 @@ const IGNORED_RPC_EVENT_TYPES = new Set([
   "bash_execution_update",
 ]);
 
-function activityCategory(toolName: string): RpcSupervisorActivityCategory {
-  const normalized = toolName.toLowerCase();
-  if (/apply[_-]?patch|edit|write|create|delete|move|rename/.test(normalized)) return "editing";
-  if (/read|view|list|find|grep|search|glob|stat/.test(normalized)) return "reading";
-  if (/bash|shell|exec|command|terminal/.test(normalized)) return "running";
-  if (/web|browser|browse|fetch|http|research/.test(normalized)) return "researching";
-  if (/agent|delegate|subtask/.test(normalized)) return "delegating";
-  return "other";
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -582,8 +563,7 @@ export class RpcSupervisor {
   private unsubscribeCompactionPrepare: (() => void) | undefined;
   private unsubscribeCompactionComplete: (() => void) | undefined;
   private readonly eventListeners = new Set<(event: RpcSupervisorEvent) => void>();
-  private readonly activeTools = new Map<string, RpcSupervisorActivityCategory>();
-  private readonly activeToolCounts = new Map<RpcSupervisorActivityCategory, number>();
+  private readonly activeTools = new Set<string>();
   private readonly retiredToolCallIds = new Set<string>();
   private readonly coordinatedCompactions = new Map<string, CoordinatedCompactionState>();
   private readonly closedCoordinatedCompactions = new Map<string, ClosedCoordinatedCompaction>();
@@ -1190,10 +1170,12 @@ export class RpcSupervisor {
         this.markLifecycleObservation("agent_start");
         this.resetToolActivity();
         if (this.lifecycleState === "idle") this.applyLifecycle({ type: "agent_start" });
+        this.emitActivity(this.runtimeCompactionActive ? "compacting" : "processing");
         return;
       case "agent_end":
         // agent_end 只离开当前模型循环，不直接写入 idle。
         this.resetToolActivity();
+        this.emitActivity(this.runtimeCompactionActive ? "compacting" : "processing");
         return;
       case "agent_settled": {
         const settlementVersion = this.markLifecycleObservation();
@@ -1221,6 +1203,7 @@ export class RpcSupervisor {
         this.runtimeCompactionActive = true;
         this.compactionObservationVersion += 1;
         this.markLifecycleObservation();
+        this.emitActivity("compacting");
         return;
       }
       case "compaction_end":
@@ -1244,6 +1227,7 @@ export class RpcSupervisor {
         this.runtimeCompactionActive = false;
         this.compactionObservationVersion += 1;
         this.markLifecycleObservation();
+        this.emitActivity(this.activeTools.size > 0 ? "executing_tools" : "processing");
         void coordinatedManual;
         return;
       case "queue_update": {
@@ -1376,14 +1360,8 @@ export class RpcSupervisor {
       return;
     }
     this.retiredToolCallIds.delete(event.toolCallId);
-    const category = activityCategory(event.toolName);
-    this.activeTools.set(event.toolCallId, category);
-    const activeCount = (this.activeToolCounts.get(category) ?? 0) + 1;
-    this.activeToolCounts.set(category, activeCount);
-    this.emitEvent(Object.freeze({
-      kind: "activity",
-      activity: Object.freeze({ category, phase: "started", active_count: activeCount }),
-    }));
+    this.activeTools.add(event.toolCallId);
+    this.emitActivity(this.runtimeCompactionActive ? "compacting" : "executing_tools");
   }
 
   private receiveToolEnd(event: Record<string, unknown>): void {
@@ -1391,24 +1369,27 @@ export class RpcSupervisor {
       this.failRuntime("invalid_rpc_event");
       return;
     }
-    const category = this.activeTools.get(event.toolCallId);
-    if (category === undefined) {
+    if (!this.activeTools.has(event.toolCallId)) {
       if (this.retiredToolCallIds.has(event.toolCallId)) return;
       this.failRuntime("invalid_rpc_event");
       return;
     }
     this.activeTools.delete(event.toolCallId);
-    const activeCount = Math.max(0, (this.activeToolCounts.get(category) ?? 1) - 1);
-    if (activeCount === 0) this.activeToolCounts.delete(category);
-    else this.activeToolCounts.set(category, activeCount);
+    this.emitActivity(this.runtimeCompactionActive
+      ? "compacting"
+      : this.activeTools.size > 0 ? "executing_tools" : "processing");
+  }
+
+  private emitActivity(phase: AgentActivityPhase): void {
+    if (this.lifecycleState !== "working" && this.lifecycleState !== "interrupting") return;
     this.emitEvent(Object.freeze({
       kind: "activity",
-      activity: Object.freeze({ category, phase: "finished", active_count: activeCount }),
+      activity: Object.freeze({ phase }),
     }));
   }
 
   private resetToolActivity(): void {
-    if (this.activeTools.size === 0 && this.activeToolCounts.size === 0) return;
+    if (this.activeTools.size === 0) return;
     for (const toolCallId of this.activeTools.keys()) {
       this.retiredToolCallIds.add(toolCallId);
     }
@@ -1418,7 +1399,6 @@ export class RpcSupervisor {
       this.retiredToolCallIds.delete(oldest);
     }
     this.activeTools.clear();
-    this.activeToolCounts.clear();
   }
 
   private quarantineRuntime(code: RpcSupervisorFaultCode, terminate = false): void {
@@ -1437,7 +1417,6 @@ export class RpcSupervisor {
     this.phase = "failed";
     this.releaseCoordinatedCompactions();
     this.activeTools.clear();
-    this.activeToolCounts.clear();
     this.retiredToolCallIds.clear();
   }
 
@@ -1563,6 +1542,9 @@ export class RpcSupervisor {
           return false;
         }
       }
+      this.emitActivity(isCompacting
+        ? "compacting"
+        : this.activeTools.size > 0 ? "executing_tools" : "processing");
       return true;
     }
 
@@ -1574,6 +1556,7 @@ export class RpcSupervisor {
       || this.latestAgentStartVersion > latestAgentStartAtProbe
     ) return true;
     if (isCompacting || this.compactionBarrierActive() || pendingMessageCount !== 0) {
+      this.emitActivity("compacting");
       return true;
     }
     if (this.lifecycleState === "working" || this.lifecycleState === "interrupting") {
