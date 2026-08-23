@@ -1,3 +1,9 @@
+import {
+  normalizeReplyAcceptance,
+  ReplyDeliveryRejectedError,
+  type ReplyAcceptance,
+  type ReplyDeliveryDecision,
+} from "./reply-acceptance.ts";
 import type { ChildReplyEnvelope } from "./child-reply-envelope.ts";
 import {
   ManagedRpcCommandRejectedError,
@@ -630,25 +636,38 @@ export class RpcSupervisor {
   }
 
   /**
-   * 在父端 Pi 接纳边界登记一条独立会话消息。消息和报告不携带任务/回合
-   * 身份，也不做去重、排序或提交；每次调用都单独交给父端。
+   * 在父端 Pi 接纳边界登记一条独立会话消息。保留该布尔入口供旧调用者使用；
+   * 生产回复链路使用 acceptChildReplyResult 传播压缩拒绝原因。
    */
-  acceptChildReply(envelope: ChildReplyEnvelope, deliver: () => boolean): boolean {
+  acceptChildReply(
+    envelope: ChildReplyEnvelope,
+    deliver: () => ReplyDeliveryDecision,
+  ): boolean {
+    return this.acceptChildReplyResult(envelope, deliver).accepted;
+  }
+
+  acceptChildReplyResult(
+    envelope: ChildReplyEnvelope,
+    deliver: () => ReplyDeliveryDecision,
+  ): ReplyAcceptance {
     if (
       this.phase !== "ready"
       || this.lifecycleState === "interrupting"
       || this.lifecycleState === "terminating"
       || this.lifecycleState === "terminated"
       || this.lifecycleState === "failed"
-    ) return false;
-    let accepted = false;
+    ) return Object.freeze({ accepted: false });
+    let acceptance: ReplyAcceptance;
     try {
-      accepted = deliver();
-    } catch {
-      accepted = false;
+      acceptance = normalizeReplyAcceptance(deliver());
+    } catch (error) {
+      acceptance = error instanceof ReplyDeliveryRejectedError
+        && error.blockedReason === "compaction_active"
+        ? Object.freeze({ accepted: false, blocked_reason: "compaction_active" })
+        : Object.freeze({ accepted: false });
     }
-    if (accepted) this.emitEvent(Object.freeze({ kind: "reply", reply: envelope }));
-    return accepted;
+    if (acceptance.accepted) this.emitEvent(Object.freeze({ kind: "reply", reply: envelope }));
+    return acceptance;
   }
 
   sendMessage(message: string): Promise<RpcSupervisorCommandResult> {

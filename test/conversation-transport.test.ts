@@ -28,6 +28,10 @@ import {
   type SupervisorByteTransport,
 } from "../src/stream-supervisor-channel.ts";
 import {
+  ReplyDeliveryRejectedError,
+  type ReplyDeliveryDecision,
+} from "../src/reply-acceptance.ts";
+import {
   SUPERVISOR_PROTOCOL_VERSION,
   SupervisorChannel,
   SupervisorRequestIdRegistry,
@@ -135,7 +139,7 @@ function snapshot(state: "starting" | "idle" = "idle"): Record<string, unknown> 
 }
 
 function pair(
-  onReply: (reply: SupervisorReply) => boolean,
+  onReply: (reply: SupervisorReply) => ReplyDeliveryDecision,
   replyAcceptanceTimeoutMs = 200,
   initialState: "starting" | "idle" = "idle",
 ): {
@@ -383,6 +387,22 @@ test("流式监督通道等待父端 reply_acceptance，拒绝不进入普通 co
   await channels.child.release();
 });
 
+test("流式监督通道向子端传播父端 compaction_active 拒绝原因", async () => {
+  const channels = pair(() => ({
+    accepted: false,
+    blocked_reason: "compaction_active" as const,
+  }));
+  await readyChannels(channels);
+
+  await assert.rejects(
+    channels.child.publishReply(message("父端压缩期间消息")),
+    (error: unknown) => error instanceof ReplyDeliveryRejectedError
+      && error.blockedReason === "compaction_active",
+  );
+
+  await channels.parent.release();
+  await channels.child.release();
+});
 test("回复等待器有界超时并在失败后清理，后续独立消息仍可发送", async () => {
   let accepted = false;
   const channels = pair(() => accepted, 30);

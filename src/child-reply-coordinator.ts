@@ -10,6 +10,11 @@ import {
   type ChildReplyEnvelope,
 } from "./child-reply-envelope.ts";
 import { REPLY_MAX_TEXT_BYTES } from "./child-reply-limits.ts";
+import {
+  normalizeReplyAcceptance,
+  ReplyDeliveryRejectedError,
+  type ReplyAcceptance,
+} from "./reply-acceptance.ts";
 
 export interface ReplyToParentInput {
   readonly message: string;
@@ -32,7 +37,7 @@ export type ChildCompactionReason = "manual" | "threshold" | "overflow";
  * ACK、应用序号和消息重放不属于该接口。
  */
 export interface ChildReplyPort {
-  publishReply(reply: ChildReplyEnvelope, signal?: AbortSignal): Promise<void>;
+  publishReply(reply: ChildReplyEnvelope, signal?: AbortSignal): Promise<void | ReplyAcceptance>;
 }
 
 export interface ChildReplyCoordinatorOptions {
@@ -137,11 +142,12 @@ export class ChildReplyCoordinator {
     if (utf8Length(input.message) > REPLY_MAX_TEXT_BYTES) return controlFailure("reply_too_large");
     if (
       !this.runActive
-      || this.compactionActive
-      || this.coordinationBarriers.size > 0
       || this.terminalFailure
       || signal?.aborted === true
     ) return controlFailure("message_delivery_failed");
+    if (this.compactionActive || this.coordinationBarriers.size > 0) {
+      return controlFailure("compaction_active");
+    }
 
     const envelope = parseChildReplyEnvelope({
       schema: CHILD_REPLY_SCHEMA,
@@ -153,8 +159,17 @@ export class ChildReplyCoordinator {
     if (envelope === undefined) return controlFailure("invalid_argument");
     try {
       const result: unknown = await this.port.publishReply(envelope, signal);
-      if (!isSynchronousAcceptance(result)) throw new Error("message_delivery_failed");
-    } catch {
+      if (!isSynchronousAcceptance(result)) {
+        const acceptance = normalizeReplyAcceptance(result);
+        if (!acceptance.accepted && acceptance.blocked_reason === "compaction_active") {
+          return controlFailure("compaction_active");
+        }
+        throw new Error("message_delivery_failed");
+      }
+    } catch (error) {
+      if (error instanceof ReplyDeliveryRejectedError && error.blockedReason === "compaction_active") {
+        return controlFailure("compaction_active");
+      }
       return controlFailure("message_delivery_failed");
     }
     return Object.freeze({ ok: true, data: Object.freeze({ accepted: true as const }) });

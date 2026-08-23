@@ -4,6 +4,11 @@ import {
   parseChildReplyEnvelope,
   type ChildReplyEnvelope,
 } from "./child-reply-envelope.ts";
+import {
+  normalizeReplyAcceptance,
+  type ReplyAcceptance,
+  type ReplyDeliveryDecision,
+} from "./reply-acceptance.ts";
 import { REPLY_MAX_TEXT_BYTES } from "./child-reply-limits.ts";
 import {
   AGENT_FAULT_CODES,
@@ -20,7 +25,7 @@ import {
 } from "./tree-controller.ts";
 
 /** 父子监督通道与 Pi 任务 RPC 完全隔离的固定协议版本。 */
-export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/14";
+export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/15";
 
 export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "hello",
@@ -340,8 +345,8 @@ export interface SupervisorChannelOptions {
   readonly streamIdFactory?: () => string;
   /** 同一活动根会话的全部监督通道必须共享这一分配器。 */
   readonly requestIdRegistry: SupervisorRequestIdRegistry;
-  /** 父端在普通回复可安全注入会话后调用；返回 false 时不确认该回复。 */
-  readonly onReply?: (reply: SupervisorReply) => boolean;
+  /** 父端在普通回复可安全注入会话后返回同步接纳裁决，可携带压缩拒绝原因。 */
+  readonly onReply?: (reply: SupervisorReply) => ReplyDeliveryDecision;
   /** EOF/断序后允许对端完成完整快照重同步的内部期限。 */
   readonly resyncTimeoutMs?: number;
   /** 重同步期限耗尽时的本地通知；不携带帧或底层错误。 */
@@ -1204,7 +1209,7 @@ export class SupervisorChannel {
   private readonly credential: Uint8Array;
   private readonly streamIdFactory: () => string;
   private readonly requestIdRegistry: SupervisorRequestIdRegistry;
-  private readonly onReply: ((reply: SupervisorReply) => boolean) | undefined;
+  private readonly onReply: ((reply: SupervisorReply) => ReplyDeliveryDecision) | undefined;
   private readonly resyncTimeoutMs: number;
   private readonly onProtocolFault: (() => void) | undefined;
   private resyncTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1658,9 +1663,11 @@ export class SupervisorChannel {
         break;
       case "reply": {
         const replyResult = this.applyReplyFrame(frame);
-        replies = replyResult.accepted ? Object.freeze([replyResult.reply]) : EMPTY_REPLIES;
+        replies = replyResult.acceptance.accepted
+          ? Object.freeze([replyResult.reply])
+          : EMPTY_REPLIES;
         if (frame.request_id !== undefined) {
-          outbound.push(this.createReplyAcceptanceResponse(frame.request_id, replyResult.accepted));
+          outbound.push(this.createReplyAcceptanceResponse(frame.request_id, replyResult.acceptance));
         }
         break;
       }
@@ -1799,33 +1806,41 @@ export class SupervisorChannel {
 
   private applyReplyFrame(frame: InternalFrame): {
     readonly reply: SupervisorReply;
-    readonly accepted: boolean;
+    readonly acceptance: ReplyAcceptance;
   } {
     if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
     const reply = parseReply(frame.payload);
     if (reply.agent_id !== this.peerAgentId) frameError("identity_mismatch");
-    let accepted = true;
+    let acceptance: ReplyAcceptance = Object.freeze({ accepted: true });
     // 父端接纳回调是唯一的 Pi 同步裁决点。回调缺失时，协议端点只能把
     // 该帧视为已通过传输边界，生产装配会始终提供 ParentReplyInbox 回调。
     try {
-      accepted = this.onReply === undefined ? true : this.onReply(reply) === true;
+      acceptance = this.onReply === undefined
+        ? Object.freeze({ accepted: true })
+        : normalizeReplyAcceptance(this.onReply(reply));
     } catch {
-      accepted = false;
+      acceptance = Object.freeze({ accepted: false });
     }
-    return Object.freeze({ reply, accepted });
+    return Object.freeze({ reply, acceptance });
   }
 
   /**
    * 用控制响应返回一次同步 Pi 接纳裁决。它不携带正文、消息身份、序号、
    * ACK 或重放状态；operation_id 只是本次控制调用的传输相关性值。
    */
-  private createReplyAcceptanceResponse(operationId: string, accepted: boolean): SupervisorFrame {
+  private createReplyAcceptanceResponse(
+    operationId: string,
+    acceptance: ReplyAcceptance,
+  ): SupervisorFrame {
     return this.createFrame("control_response", {
       operation_id: operationId,
       ok: true,
       data: {
         kind: "reply_acceptance",
-        accepted,
+        accepted: acceptance.accepted,
+        ...(acceptance.accepted || acceptance.blocked_reason === undefined
+          ? {}
+          : { blocked_reason: acceptance.blocked_reason }),
       },
     });
   }
@@ -2111,7 +2126,7 @@ export interface FakeSupervisorChannelPairOptions {
   readonly credential?: string | Uint8Array;
   readonly limits?: Partial<SupervisorChannelLimits>;
   readonly requestIdRegistry?: SupervisorRequestIdRegistry;
-  readonly onReply?: (reply: SupervisorReply) => boolean;
+  readonly onReply?: (reply: SupervisorReply) => ReplyDeliveryDecision;
   readonly autoDeliver?: boolean;
 }
 

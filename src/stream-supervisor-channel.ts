@@ -23,6 +23,10 @@ import type {
   RpcSupervisorChannelFault,
 } from "./rpc-supervisor.ts";
 import {
+  ReplyDeliveryRejectedError,
+  type ReplyAcceptance,
+} from "./reply-acceptance.ts";
+import {
   createDeferred,
   notifySupervisorListeners,
   raceSupervisorAbort,
@@ -66,7 +70,7 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
   private readonly replyAcceptanceTimeoutMs: number;
   private readonly ready = createDeferred<void>();
   private readonly closed = createDeferred<void>();
-  private readonly replyAcceptances = new Map<string, Deferred<boolean>>();
+  private readonly replyAcceptances = new Map<string, Deferred<ReplyAcceptance>>();
   private readonly compactionPrepared = new Map<string, Deferred<boolean>>();
   private readonly compactionCompleted = new Map<string, Deferred<boolean>>();
   private readonly compactionPrepareListeners = new Set<(request: SupervisorCompactionPrepare) => void>();
@@ -163,13 +167,13 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     const frame = this.protocol.publishReply(reply);
     const requestId = frame.request_id;
     if (requestId === undefined) throw new Error("message_delivery_failed");
-    const waiter = createDeferred<boolean>();
+    const waiter = createDeferred<ReplyAcceptance>();
     void waiter.promise.catch(() => {});
     this.replyAcceptances.set(requestId, waiter);
     try {
       await this.send(frame);
       const accepted = await this.waitForReplyAcceptance(waiter, signal);
-      if (!accepted) throw new Error("message_delivery_failed");
+      if (!accepted.accepted) throw new ReplyDeliveryRejectedError(accepted.blocked_reason);
     } finally {
       if (this.replyAcceptances.get(requestId) === waiter) this.replyAcceptances.delete(requestId);
     }
@@ -377,7 +381,7 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
       if (acceptance === undefined) {
         notifySupervisorListeners(this.controlResponseListeners, result.control_response);
       } else {
-        this.resolveReplyAcceptance(acceptance.operationId, acceptance.accepted);
+        this.resolveReplyAcceptance(acceptance.operationId, acceptance.acceptance);
       }
     }
     if (result.kind === "accepted" && result.compaction_prepare !== undefined) {
@@ -478,19 +482,19 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     for (const item of pending) item.completion.reject(new Error("监督通道不可用"));
   }
 
-  private resolveReplyAcceptance(operationId: string, accepted: boolean): void {
+  private resolveReplyAcceptance(operationId: string, acceptance: ReplyAcceptance): void {
     const waiter = this.replyAcceptances.get(operationId);
     if (waiter === undefined) return;
     this.replyAcceptances.delete(operationId);
-    waiter.resolve(accepted);
+    waiter.resolve(acceptance);
   }
 
   private async waitForReplyAcceptance(
-    waiter: Deferred<boolean>,
+    waiter: Deferred<ReplyAcceptance>,
     signal?: AbortSignal,
-  ): Promise<boolean> {
+  ): Promise<ReplyAcceptance> {
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<boolean>((_, reject) => {
+    const timeout = new Promise<ReplyAcceptance>((_, reject) => {
       timer = setTimeout(() => reject(new Error("message_delivery_failed")), this.replyAcceptanceTimeoutMs);
       timer.unref?.();
     });
@@ -590,13 +594,25 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
 
 function readReplyAcceptance(
   response: SupervisorControlResponse,
-): { readonly operationId: string; readonly accepted: boolean } | undefined {
+): { readonly operationId: string; readonly acceptance: ReplyAcceptance } | undefined {
   if (!response.ok || typeof response.data !== "object" || response.data === null || Array.isArray(response.data)) {
     return undefined;
   }
   const data = response.data as Record<string, unknown>;
   if (data.kind !== "reply_acceptance" || typeof data.accepted !== "boolean") return undefined;
-  return Object.freeze({ operationId: response.operation_id, accepted: data.accepted });
+  const blockedReason = data.blocked_reason;
+  if (
+    (blockedReason !== undefined && blockedReason !== "compaction_active")
+    || (data.accepted === true && blockedReason !== undefined)
+  ) return undefined;
+  return Object.freeze({
+    operationId: response.operation_id,
+    acceptance: data.accepted === true
+      ? Object.freeze({ accepted: true })
+      : blockedReason === "compaction_active"
+        ? Object.freeze({ accepted: false, blocked_reason: "compaction_active" as const })
+        : Object.freeze({ accepted: false }),
+  });
 }
 
 function validPositiveDuration(value: number | undefined): value is number {

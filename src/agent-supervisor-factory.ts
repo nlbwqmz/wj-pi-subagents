@@ -14,6 +14,9 @@ import {
 } from "./managed-rpc-node.ts";
 import { ManagedRpcSupervisorChannel } from "./managed-rpc-supervisor-channel.ts";
 import type { ProcessTreeAdapter } from "./process-tree-capability.ts";
+import type {
+  ReplyDeliveryDecision,
+} from "./reply-acceptance.ts";
 import {
   RpcSupervisor,
   type RpcSupervisorChannelBinding,
@@ -51,8 +54,8 @@ export interface AgentSupervisorFactoryOptions {
   readonly currentThinking?: string | (() => string | undefined);
   readonly managementToolNames?: readonly string[];
   readonly childReplyToolNames?: readonly string[];
-  /** 只有宿主消息已同步进入父会话上下文时才返回 true，随后监督通道才会返回接纳裁决。 */
-  readonly deliverReply?: (agentId: string, reply: ManagedRpcReply) => boolean;
+  /** 只有宿主消息已同步进入父会话上下文时才返回接纳裁决；可携带压缩拒绝原因。 */
+  readonly deliverReply?: (agentId: string, reply: ManagedRpcReply) => ReplyDeliveryDecision;
   /** 为当前父会话内的直接子同步建立/释放协调压缩 reply 屏障。 */
   readonly onCompactionPrepare?: (agentId: string, transactionId: string) => boolean;
   readonly onCompactionComplete?: (
@@ -153,9 +156,9 @@ export function createAgentSupervisorFactory(
           requestIdRegistry,
           onReply: (reply) => {
             if (rpcSupervisor === undefined || options.deliverReply === undefined) return false;
-            return rpcSupervisor.acceptChildReply(reply, () => {
+            return rpcSupervisor.acceptChildReplyResult(reply, () => {
               try {
-                return options.deliverReply!(context.agent_id, reply) === true;
+                return options.deliverReply!(context.agent_id, reply);
               } catch {
                 return false;
               }

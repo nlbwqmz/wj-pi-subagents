@@ -22,6 +22,7 @@ import {
   type SafeRenderLine,
 } from "./agent-tool-rendering.ts";
 import type { ManagedRpcReply } from "./managed-rpc-node.ts";
+import type { ReplyAcceptance } from "./reply-acceptance.ts";
 import { isCanonicalUuid } from "./tree-controller.ts";
 
 export const WJ_PI_SUBAGENTS_MESSAGE_TYPE = "wj-pi-subagents-message" as const;
@@ -93,6 +94,7 @@ export class ParentReplyInbox {
   private readSenderName: ((agentId: string) => string | undefined) | undefined;
   private turnTriggerState: "open" | "blocked" | "failed" = "open";
   private turnTriggerBlockToken = Symbol("turn-trigger-block");
+  private localCompactionActive = false;
   private readonly sessionCompactionBarriers = new Set<string>();
   private readonly childCompactionBarriers = new Map<string, Set<string>>();
 
@@ -162,14 +164,33 @@ export class ParentReplyInbox {
     return true;
   }
 
+  /** 当前 Pi 会话本身压缩时，拒绝所有新进入父端的 child 消息。 */
+  observeCompactionStart(): void {
+    this.localCompactionActive = true;
+  }
+
+  observeCompactionEnd(): void {
+    this.localCompactionActive = false;
+  }
+
   accept(agentId: string, reply: ManagedRpcReply): boolean {
+    return this.acceptResult(agentId, reply).accepted;
+  }
+
+  /** 返回父端 Pi 接纳裁决，保留压缩屏障这一可恢复原因。 */
+  acceptResult(agentId: string, reply: ManagedRpcReply): ReplyAcceptance {
     const envelope = parseChildReplyEnvelope(reply);
-    if (envelope === undefined || envelope.agent_id !== agentId) return false;
+    if (envelope === undefined || envelope.agent_id !== agentId) {
+      return Object.freeze({ accepted: false });
+    }
     const content = messageContent(envelope);
     if (
-      this.sessionCompactionBarriers.size > 0
+      this.localCompactionActive
+      || this.sessionCompactionBarriers.size > 0
       || (this.childCompactionBarriers.get(agentId)?.size ?? 0) > 0
-    ) return false;
+    ) {
+      return Object.freeze({ accepted: false, blocked_reason: "compaction_active" });
+    }
     const senderName = this.safeReadSenderName(agentId);
     try {
       const sendResult = this.readApi().sendMessage({
@@ -185,14 +206,20 @@ export class ParentReplyInbox {
         triggerTurn: true,
         deliverAs: "steer",
       });
-      if (!isSynchronousAcceptance(sendResult)) return false;
-    } catch {
-      return false;
+      if (!isSynchronousAcceptance(sendResult)) {
+        return isCompactionActiveResponse(sendResult)
+          ? Object.freeze({ accepted: false, blocked_reason: "compaction_active" })
+          : Object.freeze({ accepted: false });
+      }
+    } catch (error) {
+      return isCompactionActiveResponse(error)
+        ? Object.freeze({ accepted: false, blocked_reason: "compaction_active" })
+        : Object.freeze({ accepted: false });
     }
     try {
       this.onSessionEvent?.(agentId, envelope.kind === "message" ? "reply" : "final_report");
     } catch { /* 观察失败不撤销接纳 */ }
-    return true;
+    return Object.freeze({ accepted: true });
   }
 
   /** 节点故障通知由直接父运行时生成，不伪装成 child final。 */
@@ -523,10 +550,34 @@ function readProperty(value: unknown, key: string): unknown {
   }
 }
 
+const COMPACTION_ACTIVE_PROMPT_ERROR =
+  "Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.";
+
+function isCompactionActiveResponse(value: unknown): boolean {
+  const record = readRecord(value);
+  if (record === undefined) return false;
+  if (
+    readProperty(record, "blocked_reason") === "compaction_active"
+    || readProperty(record, "blockedReason") === "compaction_active"
+    || readProperty(record, "code") === "compaction_active"
+  ) return true;
+  if (
+    readProperty(record, "message") === COMPACTION_ACTIVE_PROMPT_ERROR
+    || readProperty(record, "error") === COMPACTION_ACTIVE_PROMPT_ERROR
+  ) return true;
+  const nestedError = readProperty(record, "error");
+  return readProperty(nestedError, "code") === "compaction_active"
+    || readProperty(nestedError, "message") === COMPACTION_ACTIVE_PROMPT_ERROR;
+}
+
 function isSynchronousAcceptance(value: unknown): boolean {
   if (value === undefined || value === true) return true;
   if (value === false || value === null || typeof value !== "object") return false;
   const record = value as Record<string, unknown>;
+  if (
+    (record.accepted === true || record.ok === true)
+    && record.blocked_reason !== undefined
+  ) return false;
   if (typeof record.then === "function") return false;
   return (record.ok === true || record.accepted === true)
     && record.ok !== false

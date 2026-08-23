@@ -107,6 +107,32 @@ test("显式 reply_to_parent 和 final_report 可在同一活动回合交错多�
   if (!afterNaturalStop.ok) assert.equal(afterNaturalStop.error.code, "message_delivery_failed");
 });
 
+test("压缩或协调压缩屏障返回 compaction_active，普通传输失败仍保持原错误", async () => {
+  const coordinator = new ChildReplyCoordinator({
+    agentId: AGENT_ID,
+    port: {
+      async publishReply(): Promise<void> {
+        throw new Error("父端不可用");
+      },
+    },
+  });
+  coordinator.observeAgentStart();
+  coordinator.observeCompactionStart("threshold");
+  const localBlocked = await coordinator.replyToParent({ message: "压缩期间消息" });
+  assert.equal(localBlocked.ok, false);
+  if (!localBlocked.ok) assert.equal(localBlocked.error.code, "compaction_active");
+  coordinator.observeCompactionEnd("threshold");
+
+  coordinator.beginCoordinationBarrier("parent-compaction");
+  const coordinatedBlocked = await coordinator.finalReport({ message: "协调屏障期间报告" });
+  assert.equal(coordinatedBlocked.ok, false);
+  if (!coordinatedBlocked.ok) assert.equal(coordinatedBlocked.error.code, "compaction_active");
+  coordinator.completeCoordinationBarrier("parent-compaction", "succeeded");
+
+  const failed = await coordinator.replyToParent({ message: "普通失败" });
+  assert.equal(failed.ok, false);
+  if (!failed.ok) assert.equal(failed.error.code, "message_delivery_failed");
+});
 test("父端 Pi 同步接纳决定消息事件，context/UI 异常不撤销已接纳事实", () => {
   const delivered: Array<{ readonly customType: string; readonly text: string }> = [];
   const events: string[] = [];
@@ -138,6 +164,27 @@ test("父端 Pi 同步接纳决定消息事件，context/UI 异常不撤销已�
     WJ_PI_SUBAGENTS_FINAL_TYPE,
   ]);
   assert.deepEqual(events, ["reply", "final_report"]);
+
+  const barrierInbox = new ParentReplyInbox({
+    readApi: () => ({
+      sendMessage: () => {
+        throw new Error("压缩期间不应调用父端 Pi");
+      },
+    }),
+  });
+  barrierInbox.beginSessionCompactionBarrier("parent-compaction");
+  assert.deepEqual(barrierInbox.acceptResult(AGENT_ID, reply), {
+    accepted: false,
+    blocked_reason: "compaction_active",
+  });
+  assert.equal(barrierInbox.accept(AGENT_ID, reply), false);
+  barrierInbox.completeSessionCompactionBarrier("parent-compaction");
+  barrierInbox.observeCompactionStart();
+  assert.deepEqual(barrierInbox.acceptResult(AGENT_ID, reply), {
+    accepted: false,
+    blocked_reason: "compaction_active",
+  });
+  barrierInbox.observeCompactionEnd();
 
   const rejectingInbox = new ParentReplyInbox({
     readApi: () => ({ sendMessage: () => ({ ok: false, accepted: false }) }),

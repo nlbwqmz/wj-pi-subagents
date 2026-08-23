@@ -272,7 +272,7 @@ const CHILD_FINAL_REPLY_GUIDANCE = [
   "- 需要父代理看到阶段性成果、明确交付物或单独记录的报告时，显式调用 final_report。final_report 可以在同一活动回合中多次调用，也可以与 reply_to_parent 交错；成功发送不结束当前 Pi 回合或会话。",
   "- 不要依赖普通 assistant 文本、message_end、agent_end、自然停止或压缩完成自动生成 reply 或 final_report。没有显式调用时，父端不会收到自动报告。",
   `- ${CHILD_REPLY_TOO_LARGE_GUIDELINE}`,
-  "- 压缩或控制屏障期间遵守工具返回的拒绝结果；屏障前已接纳的消息不会回滚，失败调用不会被暗存、自动重试或重放。",
+  "- 压缩或控制屏障期间遵守工具返回的拒绝结果；收到 compaction_active 时等待压缩结束后显式重试。屏障前已接纳的消息不会回滚，失败调用不会被暗存、自动重试或重放。",
   "- 当前工作结束时仍应输出非空且可用的正常 assistant 答复，说明完成内容、关键结果和产物路径。这个 assistant 答复只属于当前 Pi 会话，不会自动变成 final_report；如果直接父代理需要看到报告，必须显式调用 final_report。",
 ].join("\n");
 
@@ -847,7 +847,9 @@ export function createWjPiSubagentsRuntimeActivator(
 
     api.on("agent_start", (_event, rawContext) => {
       const current = active;
-      if (current === undefined || !current.isChild || current.handoffPending === true) return;
+      if (current === undefined || current.handoffPending === true) return;
+      current.replyInbox.observeCompactionEnd();
+      if (!current.isChild) return;
       coordinationParticipant?.observeAgentStart();
       try {
         current.replyCoordinator?.observeAgentStart();
@@ -899,8 +901,11 @@ export function createWjPiSubagentsRuntimeActivator(
 
     api.on("session_before_compact", (event) => {
       const current = active;
-      if (current === undefined || !current.isChild || current.handoffPending === true) return;
+      if (current === undefined || current.handoffPending === true) return;
       const reason = isRecord(event) ? event.reason : undefined;
+      if (reason !== "manual" && reason !== "threshold" && reason !== "overflow") return;
+      current.replyInbox.observeCompactionStart();
+      if (!current.isChild) return;
       const willRetry = isRecord(event) ? event.willRetry : undefined;
       if (reason === "manual") {
         const coordinated = coordinationParticipant?.beginManualCompaction() === true;
@@ -925,9 +930,12 @@ export function createWjPiSubagentsRuntimeActivator(
 
     api.on("session_compact", (event, rawContext) => {
       const current = active;
-      if (current === undefined || !current.isChild || current.handoffPending === true) return;
+      if (current === undefined || current.handoffPending === true) return;
       refreshContextUsage(current, rawContext);
       const reason = isRecord(event) ? event.reason : undefined;
+      if (reason !== "manual" && reason !== "threshold" && reason !== "overflow") return;
+      current.replyInbox.observeCompactionEnd();
+      if (!current.isChild) return;
       if (reason === "manual") {
         const coordinated = coordinationParticipant?.completeManualCompaction() === true;
         if (!coordinated) {
@@ -1283,7 +1291,7 @@ export function createWjPiSubagentsRuntimeActivator(
         rootId,
         currentModel: () => currentModelReference(state.bindings.context),
         currentThinking: () => currentThinking(state.bindings.context),
-        deliverReply: (agentId, reply) => state.replyInbox.accept(agentId, reply),
+        deliverReply: (agentId, reply) => state.replyInbox.acceptResult(agentId, reply),
         onCompactionPrepare: (agentId, transactionId) =>
           state.replyInbox.beginChildCompactionBarrier(agentId, transactionId),
         onCompactionComplete: (agentId, transactionId) => {
