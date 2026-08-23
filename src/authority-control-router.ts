@@ -461,6 +461,7 @@ function lifecycleOutcomeToJson(value: LifecycleEventOutcome): SupervisorJsonVal
     node: snapshotToJson(value.node),
     lifecycle_generation: value.lifecycle_generation,
     tree_revision: value.tree_revision,
+    ...(value.diagnostic === undefined ? {} : { diagnostic: value.diagnostic }),
   });
 }
 
@@ -621,12 +622,17 @@ function parseTerminationBarrier(value: SupervisorJsonValue): TerminationBarrier
 }
 
 function parseLifecycleOutcome(value: SupervisorJsonValue): LifecycleEventOutcome | undefined {
-  const record = exactRecord(value, ["applied", "node", "lifecycle_generation", "tree_revision"]);
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const allowed = ["applied", "node", "lifecycle_generation", "tree_revision", "diagnostic"];
   if (
-    record === undefined
+    Object.keys(record).some((key) => !allowed.includes(key))
     || typeof record.applied !== "boolean"
     || !nonNegativeSafeInteger(record.lifecycle_generation)
     || !nonNegativeSafeInteger(record.tree_revision)
+    || (record.diagnostic !== undefined
+      && record.diagnostic !== "stale_generation"
+      && record.diagnostic !== "invalid_transition")
   ) return undefined;
   const node = parseAgentSnapshot(record.node);
   return node === undefined ? undefined : Object.freeze({
@@ -634,6 +640,9 @@ function parseLifecycleOutcome(value: SupervisorJsonValue): LifecycleEventOutcom
     node,
     lifecycle_generation: record.lifecycle_generation as number,
     tree_revision: record.tree_revision as number,
+    ...(record.diagnostic === undefined ? {} : {
+      diagnostic: record.diagnostic as "stale_generation" | "invalid_transition",
+    }),
   });
 }
 

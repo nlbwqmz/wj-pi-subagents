@@ -68,6 +68,9 @@ export class RpcClient {
   async getState() {
     return {
       ...this.#state,
+      isStreaming: false,
+      isCompacting: false,
+      pendingMessageCount: 0,
       ...(typeof this.#state.promptPath === "string"
         ? { promptPathExistsAfterStart: existsSync(this.#state.promptPath) }
         : {}),

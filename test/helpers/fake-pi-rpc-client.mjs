@@ -132,6 +132,9 @@ export class RpcClient {
   async getState() {
     await this.#requireReady();
     return {
+      isStreaming: false,
+      isCompacting: false,
+      pendingMessageCount: 0,
       supervisor: this.#channel.getPublicState(),
       endpoint: this.#endpoint,
       localCredential: this.#localCredential,

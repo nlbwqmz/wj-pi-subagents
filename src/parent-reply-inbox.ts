@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import {
   Markdown,
   truncateToWidth,
@@ -26,23 +25,19 @@ import type { ManagedRpcReply } from "./managed-rpc-node.ts";
 import { isCanonicalUuid } from "./tree-controller.ts";
 
 export const WJ_PI_SUBAGENTS_MESSAGE_TYPE = "wj-pi-subagents-message" as const;
-export const WJ_PI_SUBAGENTS_FINAL_TYPE = "wj-pi-subagents-final" as const;
+export const WJ_PI_SUBAGENTS_FINAL_TYPE = "wj-pi-subagents-final-report" as const;
 export const WJ_PI_SUBAGENTS_TERMINAL_TYPE = "wj-pi-subagents-terminal" as const;
 
 export interface ParentConversationApi {
-  sendMessage(message: unknown, options?: unknown): void;
+  sendMessage(message: unknown, options?: unknown): unknown;
 }
 
 export interface ParentReplyInboxOptions {
   readonly readApi: () => ParentConversationApi;
-  readonly notifyMessage: (
+  readonly onSessionEvent?: (
     agentId: string,
-    notificationId: string,
-    taskId: string,
-    turnId: string,
+    event: "reply" | "final_report" | "terminal",
   ) => void;
-  /** 父模型上下文观察 custom message 后确认对应工作中通知。 */
-  readonly acknowledgeMessage?: (agentId: string, notificationId: string) => void;
   /** 只返回当前控制器确认的直接子代理名称。 */
   readonly readSenderName?: (agentId: string) => string | undefined;
 }
@@ -90,23 +85,16 @@ export interface ParentReplyMessageRendererOptions {
 
 /**
  * 父端结构化回复接纳点。只有 Pi 会话已同步接受 custom message 后才返回 true，
- * 监督通道据此发送累计 ACK。
+ * 监督通道据此返回一次性的 Pi 接纳裁决。
  */
 export class ParentReplyInbox {
   private readApi!: () => ParentConversationApi;
-  private notifyMessage!: (
-    agentId: string,
-    notificationId: string,
-    taskId: string,
-    turnId: string,
-  ) => void;
-  private acknowledgeMessage: ((agentId: string, notificationId: string) => void) | undefined;
+  private onSessionEvent: ParentReplyInboxOptions["onSessionEvent"];
   private readSenderName: ((agentId: string) => string | undefined) | undefined;
   private turnTriggerState: "open" | "blocked" | "failed" = "open";
   private turnTriggerBlockToken = Symbol("turn-trigger-block");
   private readonly sessionCompactionBarriers = new Set<string>();
   private readonly childCompactionBarriers = new Map<string, Set<string>>();
-  private readonly injectedFinalTurns = new Map<string, string>();
 
   constructor(options: ParentReplyInboxOptions) {
     this.rebind(options);
@@ -115,37 +103,12 @@ export class ParentReplyInbox {
   /** reload 交接后将已持有的 inbox 绑定到新扩展实例的 API 和控制器。 */
   rebind(options: ParentReplyInboxOptions): void {
     this.readApi = options.readApi;
-    this.notifyMessage = options.notifyMessage;
-    this.acknowledgeMessage = options.acknowledgeMessage;
+    this.onSessionEvent = options.onSessionEvent;
     this.readSenderName = options.readSenderName;
   }
 
-  /** 在 Pi 的 context 事件中确认已经进入父模型请求的工作中消息。 */
-  observeContext(event: unknown): void {
-    const messages = readProperty(event, "messages");
-    if (!Array.isArray(messages)) return;
-    for (const message of messages) {
-      const record = readRecord(message);
-      if (
-        record === undefined
-        || readProperty(record, "role") !== "custom"
-        || readProperty(record, "customType") !== WJ_PI_SUBAGENTS_MESSAGE_TYPE
-      ) continue;
-      const details = readRecord(readProperty(record, "details"));
-      const agentId = readProperty(details, "agent_id");
-      const notificationId = readProperty(details, "reply_notification_id");
-      if (
-        readProperty(details, "kind") !== "message"
-        || !isCanonicalUuid(agentId)
-        || !validNotificationId(notificationId)
-      ) continue;
-      try {
-        this.acknowledgeMessage?.(agentId, notificationId);
-      } catch {
-        // 上下文观察失败不影响已经接纳的会话消息；控制器可在后续事件重试。
-      }
-    }
-  }
+  /** context/UI 观察只负责展示，不能改变已接纳会话事件。 */
+  observeContext(_event: unknown): void {}
 
   /** Pi 即将结束当前 loop 时先阻止后代回复重入；重复调用返回同一屏障令牌。 */
   blockTurnTriggers(): symbol {
@@ -203,62 +166,39 @@ export class ParentReplyInbox {
     const envelope = parseChildReplyEnvelope(reply);
     if (envelope === undefined || envelope.agent_id !== agentId) return false;
     const content = messageContent(envelope);
-    const finalTurnKey = envelope.kind === "final" ? `${agentId}:${envelope.turn_id}` : undefined;
-    if (finalTurnKey !== undefined) {
-      const injected = this.injectedFinalTurns.get(finalTurnKey);
-      if (injected !== undefined) return injected === content[0]!.text;
-    }
-    const triggerTurn = true;
     if (
-      this.turnTriggerState !== "open"
-      || this.sessionCompactionBarriers.size > 0
+      this.sessionCompactionBarriers.size > 0
       || (this.childCompactionBarriers.get(agentId)?.size ?? 0) > 0
     ) return false;
     const senderName = this.safeReadSenderName(agentId);
-    const notificationId = envelope.kind === "message" ? randomUUID() : undefined;
     try {
-      this.readApi().sendMessage({
+      const sendResult = this.readApi().sendMessage({
         customType: envelope.kind === "message" ? WJ_PI_SUBAGENTS_MESSAGE_TYPE : WJ_PI_SUBAGENTS_FINAL_TYPE,
         content,
         display: true,
         details: {
           agent_id: agentId,
           kind: envelope.kind,
-          ...(notificationId === undefined ? {} : { reply_notification_id: notificationId }),
-          ...(envelope.kind === "final"
-            ? { run_state: envelope.run_state, output_state: envelope.output_state }
-            : {}),
           ...(senderName === undefined ? {} : { sender_name: senderName }),
         },
       }, {
-        triggerTurn,
+        triggerTurn: true,
         deliverAs: "steer",
       });
+      if (!isSynchronousAcceptance(sendResult)) return false;
     } catch {
       return false;
     }
-    if (envelope.kind === "message") {
-      try {
-        this.notifyMessage(agentId, notificationId!, envelope.task_id, envelope.turn_id);
-      } catch {
-        // 会话消息已经被接纳，等待观察者失败不能导致重复注入。
-      }
-    } else {
-      this.injectedFinalTurns.set(finalTurnKey!, content[0]!.text);
-      while (this.injectedFinalTurns.size > 128) {
-        const oldest = this.injectedFinalTurns.keys().next().value;
-        if (oldest === undefined) break;
-        this.injectedFinalTurns.delete(oldest);
-      }
-    }
+    try {
+      this.onSessionEvent?.(agentId, envelope.kind === "message" ? "reply" : "final_report");
+    } catch { /* 观察失败不撤销接纳 */ }
     return true;
   }
 
   /** 节点故障通知由直接父运行时生成，不伪装成 child final。 */
-  acceptTerminal(agentId: string, turnId?: string): boolean {
+  acceptTerminal(agentId: string): boolean {
     if (
       !isCanonicalUuid(agentId)
-      || this.turnTriggerState !== "open"
       || this.sessionCompactionBarriers.size > 0
       || (this.childCompactionBarriers.get(agentId)?.size ?? 0) > 0
     ) return false;
@@ -267,29 +207,31 @@ export class ParentReplyInbox {
       version: CHILD_REPLY_VERSION,
       kind: "terminal",
       agent_id: agentId,
-      ...(turnId === undefined ? {} : { turn_id: turnId }),
-      node_state: "failed",
-      reason_code: "runtime_fault",
+      state: "failed",
+      error_code: "runtime_fault",
     };
     const senderName = this.safeReadSenderName(agentId);
     try {
-      this.readApi().sendMessage({
+      const sendResult = this.readApi().sendMessage({
         customType: WJ_PI_SUBAGENTS_TERMINAL_TYPE,
         content: [{ type: "text", text: encodeTerminalNotice(notice) }],
         display: true,
         details: {
           agent_id: agentId,
           kind: "terminal",
-          node_state: "failed",
+          state: notice.state,
+          error_code: notice.error_code,
           ...(senderName === undefined ? {} : { sender_name: senderName }),
         },
       }, {
         triggerTurn: true,
         deliverAs: "steer",
       });
+      if (!isSynchronousAcceptance(sendResult)) return false;
     } catch {
       return false;
     }
+    try { this.onSessionEvent?.(agentId, "terminal"); } catch { /* 观察失败不撤销接纳 */ }
     return true;
   }
 
@@ -318,7 +260,7 @@ export function registerParentReplyMessageRenderers(
   );
   api.registerMessageRenderer(
     WJ_PI_SUBAGENTS_FINAL_TYPE,
-    createParentReplyMessageRenderer("final", options),
+    createParentReplyMessageRenderer("final_report", options),
   );
   api.registerMessageRenderer(
     WJ_PI_SUBAGENTS_TERMINAL_TYPE,
@@ -326,7 +268,7 @@ export function registerParentReplyMessageRenderers(
   );
 }
 
-type VisibleKind = "message" | "final" | "terminal";
+type VisibleKind = "message" | "final_report" | "terminal";
 const MAX_COLLAPSED_PAYLOAD_LINES = 8;
 
 function createParentReplyMessageRenderer(
@@ -336,8 +278,8 @@ function createParentReplyMessageRenderer(
   const customType = customTypeFor(kind);
   const messageType = kind === "message"
     ? "AGENT_MESSAGE"
-    : kind === "final"
-      ? "FINAL_ANSWER"
+    : kind === "final_report"
+      ? "FINAL_REPORT"
       : "TERMINAL_NOTICE";
   return (message, renderOptions, theme) => {
     const record = readRecord(message);
@@ -362,7 +304,7 @@ function createParentReplyMessageRenderer(
     const headerLines: SafeRenderLine[] = [
       {
         text: `Message Type: ${messageType}`,
-        color: kind === "message" ? "customMessageLabel" : "success",
+      color: kind === "message" ? "customMessageLabel" : "success",
         bold: true,
       },
       { text: `Sender: ${sender}`, color: "muted" },
@@ -490,7 +432,7 @@ function messageContent(envelope: ChildReplyEnvelope): Array<{ readonly type: st
 
 function customTypeFor(kind: VisibleKind): string {
   if (kind === "message") return WJ_PI_SUBAGENTS_MESSAGE_TYPE;
-  if (kind === "final") return WJ_PI_SUBAGENTS_FINAL_TYPE;
+  if (kind === "final_report") return WJ_PI_SUBAGENTS_FINAL_TYPE;
   return WJ_PI_SUBAGENTS_TERMINAL_TYPE;
 }
 
@@ -529,7 +471,7 @@ function parseVisibleEnvelope(text: string, kind: VisibleKind): VisibleEnvelope 
     if (notice === undefined) return undefined;
     return Object.freeze({
       agentId: notice.agent_id,
-      status: `${notice.node_state} / ${notice.reason_code}`,
+      status: `${notice.state} / ${notice.error_code ?? "runtime_fault"}`,
       payload: "The subagent runtime encountered a failure.",
     });
   }
@@ -544,12 +486,8 @@ function parseVisibleEnvelope(text: string, kind: VisibleKind): VisibleEnvelope 
   }
   return Object.freeze({
     agentId: envelope.agent_id,
-    status: `${envelope.run_state} / ${envelope.output_state}${
-      envelope.reason_code === undefined ? "" : ` / ${envelope.reason_code}`
-    }`,
-    payload: envelope.text ?? (envelope.reason_code === "reply_too_large"
-      ? "The final reply was too large and was not delivered. The subagent completed normally."
-      : "No task output is available."),
+    status: "explicit final report",
+    payload: envelope.text,
   });
 }
 
@@ -570,13 +508,6 @@ function validCompactionTransactionId(value: string): boolean {
   return typeof value === "string" && value.length > 0 && value.length <= 256;
 }
 
-function validNotificationId(value: unknown): value is string {
-  return typeof value === "string"
-    && value.length > 0
-    && value.length <= 128
-    && /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(value);
-}
-
 function readRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -590,6 +521,16 @@ function readProperty(value: unknown, key: string): unknown {
   } catch {
     return undefined;
   }
+}
+
+function isSynchronousAcceptance(value: unknown): boolean {
+  if (value === undefined || value === true) return true;
+  if (value === false || value === null || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  if (typeof record.then === "function") return false;
+  return (record.ok === true || record.accepted === true)
+    && record.ok !== false
+    && record.accepted !== false;
 }
 
 export function createVisibleEnvelope(envelope: ChildReplyEnvelope | TerminalNotice): string {

@@ -35,7 +35,7 @@ export class RpcClient {
   }
 
   async getState() {
-    return { isStreaming: true, pendingMessageCount: 0 };
+    return { isStreaming: true, isCompacting: false, pendingMessageCount: 0 };
   }
 
   #emit(event) {

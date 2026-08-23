@@ -14,6 +14,7 @@ import {
   AGENT_TOOL_NAMES,
   CHILD_REPLY_GUIDELINE,
   CHILD_REPLY_TOO_LARGE_GUIDELINE,
+  CHILD_FINAL_REPORT_TOOL_NAME,
   CHILD_REPLY_TOOL_NAME,
   PARENT_COORDINATION_GUIDELINES,
   registerAgentTools,
@@ -91,8 +92,6 @@ import {
   type AgentTreeUiContext,
 } from "./agent-tree-ui.ts";
 
-/** @deprecated 使用区分 message/final 的两个 customType。 */
-export const WJ_PI_SUBAGENTS_REPLY_MESSAGE_TYPE = WJ_PI_SUBAGENTS_FINAL_TYPE;
 export { WJ_PI_SUBAGENTS_FINAL_TYPE, WJ_PI_SUBAGENTS_MESSAGE_TYPE };
 
 interface RuntimeExtensionApi extends AgentToolRegistrationApi {
@@ -243,15 +242,16 @@ interface RuntimeTransfer {
 const SYSTEM_TOOL_NAMES = new Set<string>([
   ...AGENT_TOOL_NAMES,
   CHILD_REPLY_TOOL_NAME,
+  CHILD_FINAL_REPORT_TOOL_NAME,
 ]);
 
 const PARENT_COORDINATION_GUIDANCE = [
   "父子任务协作要求（必须遵守）：",
-  `- ${PARENT_COORDINATION_GUIDELINES.taskOwnership}`,
+  `- ${PARENT_COORDINATION_GUIDELINES.sessionOwnership}`,
   `- ${PARENT_COORDINATION_GUIDELINES.sendMessage}`,
   `- ${PARENT_COORDINATION_GUIDELINES.sendMessageReply}`,
   `- ${PARENT_COORDINATION_GUIDELINES.slowProgress}`,
-  `- ${PARENT_COORDINATION_GUIDELINES.taskRecovery}`,
+  `- ${PARENT_COORDINATION_GUIDELINES.sessionRecovery}`,
   `- ${PARENT_COORDINATION_GUIDELINES.retryPolicy}`,
   `- ${PARENT_COORDINATION_GUIDELINES.agentCleanup}`,
   `- ${PARENT_COORDINATION_GUIDELINES.capacityCleanup}`,
@@ -267,11 +267,13 @@ function formatAgentTemplateCatalog(templates: readonly AgentTemplateListItem[])
 }
 
 const CHILD_FINAL_REPLY_GUIDANCE = [
-  "子代理任务与最终答复要求：",
+  "子代理任务与回复/显式报告要求：",
   `- ${CHILD_REPLY_GUIDELINE}`,
+  "- 需要父代理看到阶段性成果、明确交付物或单独记录的报告时，显式调用 final_report。final_report 可以在同一活动回合中多次调用，也可以与 reply_to_parent 交错；成功发送不结束当前 Pi 回合或会话。",
+  "- 不要依赖普通 assistant 文本、message_end、agent_end、自然停止或压缩完成自动生成 reply 或 final_report。没有显式调用时，父端不会收到自动报告。",
   `- ${CHILD_REPLY_TOO_LARGE_GUIDELINE}`,
-  "- 压缩或自动续轮后继续同一逻辑任务，不重复已经完成的副作用。",
-  "- 结束前必须输出非空且可用的最终 assistant 答复，说明完成内容、关键结果和产物路径。不要以工具调用、工具结果、reply_to_parent 或空白消息结束；没有可用结果时简要说明原因。",
+  "- 压缩或控制屏障期间遵守工具返回的拒绝结果；屏障前已接纳的消息不会回滚，失败调用不会被暗存、自动重试或重放。",
+  "- 当前工作结束时仍应输出非空且可用的正常 assistant 答复，说明完成内容、关键结果和产物路径。这个 assistant 答复只属于当前 Pi 会话，不会自动变成 final_report；如果直接父代理需要看到报告，必须显式调用 final_report。",
 ].join("\n");
 
 function asRuntimeApi(api: ExtensionApiSurface): RuntimeExtensionApi {
@@ -567,7 +569,7 @@ function applyAgentToolVisibility(
   try {
     const business = activeBusinessTools(api);
     const system = [
-      ...(replyEnabled ? [CHILD_REPLY_TOOL_NAME] : []),
+      ...(replyEnabled ? [CHILD_REPLY_TOOL_NAME, CHILD_FINAL_REPORT_TOOL_NAME] : []),
       ...(managementEnabled ? AGENT_TOOL_NAMES : []),
     ];
     api.setActiveTools(system.length === 0
@@ -855,9 +857,7 @@ export function createWjPiSubagentsRuntimeActivator(
       }
       refreshContextUsage(current, rawContext);
       if (current.replyInbox.releaseTurnTriggers()) {
-        // pending reply 会在首次 transport await 前同步重新注入；ACK 写回属于后台
-        // 维护，不能让半开子通道阻塞 Pi 的 agent_start 生命周期。
-        void current.controller.retryPendingReplies().catch(() => {});
+        // 屏障释放只恢复后续控制触发；已接纳消息不由运行时重放。
       }
     });
 
@@ -1051,9 +1051,6 @@ export function createWjPiSubagentsRuntimeActivator(
             replyInbox: current.replyInbox,
             ...(current.replyCoordinator === undefined ? {} : { replyCoordinator: current.replyCoordinator }),
             ...(current.upstream === undefined ? {} : { upstream: { channel: current.upstream.channel } }),
-            retryPendingReplies: () => current.handoffPending === true
-              ? Promise.resolve()
-              : current.controller.retryPendingReplies(),
           };
         },
       });
@@ -1082,7 +1079,6 @@ export function createWjPiSubagentsRuntimeActivator(
         applyAgentToolVisibility(api, active.managementEnabled, active.isChild);
         refreshContextUsage(active, context);
         bindRuntimeUi(active, context);
-        await active.controller.retryPendingReplies();
         return;
       }
       if (sessionEvent.reason === "reload") {
@@ -1115,7 +1111,6 @@ export function createWjPiSubagentsRuntimeActivator(
           } catch {
             // 测试/宿主观察者不属于控制面。
           }
-          await current.controller.retryPendingReplies();
           return;
         } catch (error) {
           await reloadCoordinator.cleanupIncoming(incoming);
@@ -1244,13 +1239,12 @@ export function createWjPiSubagentsRuntimeActivator(
           if (current === undefined) throw new Error("父会话尚未就绪");
           return current.bindings.api;
         },
-        // 工作中 reply 在 custom message 被 Pi 会话接纳时登记；之后由 context
-        // 事件确认是否真正进入父模型请求，避免监督事件和注入层重复计数。
-        notifyMessage: (agentId, notificationId, taskId, turnId) => {
-          stateReference?.controller.notifyAgentReply(agentId, notificationId, taskId, turnId);
-        },
-        acknowledgeMessage: (agentId, notificationId) => {
-          stateReference?.controller.acknowledgeAgentReply(agentId, notificationId);
+        onSessionEvent: (agentId, event) => {
+          if (event === "reply" || event === "final_report") {
+            stateReference?.controller.recordAcceptedSessionEvent(agentId, event);
+          } else {
+            stateReference?.controller.notifySessionEvent(agentId, event);
+          }
         },
         readSenderName: (agentId) => readDirectChildDisplayName(stateReference, agentId, false),
       });
@@ -1259,21 +1253,7 @@ export function createWjPiSubagentsRuntimeActivator(
         : new ChildReplyCoordinator({
           agentId: bootstrap!.agentId,
           port: upstream.channel,
-          onFinalAccepted: () => {
-            if (!replyInbox.releaseTurnTriggers()) return;
-            const current = stateReference;
-            if (current !== undefined) void current.controller.retryPendingReplies();
-          },
-          onFinalFailure: () => {
-            upstream.channel.failProtocol();
-            void upstream.channel.release().catch(() => {});
-          },
         });
-      if (upstream !== undefined && replyCoordinator !== undefined) {
-        upstream.channel.onTaskAssignment((assignment) => {
-          replyCoordinator.observeTaskAssignment(assignment);
-        });
-      }
       const state: ActiveRuntime = {
         controller: undefined as unknown as AgentController,
         templates,
@@ -1301,7 +1281,6 @@ export function createWjPiSubagentsRuntimeActivator(
         rootRuntime,
         templateSnapshot,
         rootId,
-        activeTools: () => activeBusinessTools(state.bindings.api),
         currentModel: () => currentModelReference(state.bindings.context),
         currentThinking: () => currentThinking(state.bindings.context),
         deliverReply: (agentId, reply) => state.replyInbox.accept(agentId, reply),
@@ -1309,7 +1288,6 @@ export function createWjPiSubagentsRuntimeActivator(
           state.replyInbox.beginChildCompactionBarrier(agentId, transactionId),
         onCompactionComplete: (agentId, transactionId) => {
           const completed = state.replyInbox.completeChildCompactionBarrier(agentId, transactionId);
-          if (completed) void state.controller.retryPendingReplies();
           return completed;
         },
         requestIdRegistry,
@@ -1328,7 +1306,6 @@ export function createWjPiSubagentsRuntimeActivator(
         actor,
         createSupervisor,
         templateSnapshot,
-        activeTools: () => activeBusinessTools(state.bindings.api),
         waitTimeoutMs: rootRuntime.config.waitTimeoutMs,
         onTerminal: (agentId) => state.replyInbox.acceptTerminal(agentId),
         replyNotificationsHandledByInbox: true,

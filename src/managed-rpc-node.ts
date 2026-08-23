@@ -61,7 +61,7 @@ export interface ManagedRpcNodeStartContext {
 export interface ManagedRpcBridge {
   start(signal?: AbortSignal, context?: ManagedRpcNodeStartContext): Promise<void>;
   prompt(message: string): Promise<void>;
-  /** 同一逻辑任务的自适应提交：Pi active 时 steer，idle 时启动 prompt。 */
+  /** 同一持续会话的自适应发送：Pi active 时 steer，idle 时启动 prompt。 */
   steer(message: string): Promise<void>;
   abort(): Promise<void>;
   getState(): Promise<unknown>;

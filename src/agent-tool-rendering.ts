@@ -247,7 +247,7 @@ export function renderAgentToolCall(
       title(`${name} · ${readString(input, "agent_id")}`),
     ], theme, context);
   }
-  if (name === "reply_to_parent") {
+  if (name === "reply_to_parent" || name === "final_report") {
     return createMessageCallComponent(name, input, theme, context, expanded);
   }
 
@@ -309,10 +309,13 @@ export function renderAgentToolResult(
   if (name === "terminate_agent") return renderTerminateResult(result, theme, context, lookups);
   if (name === "get_agent_status") return renderStatusResult(result, options, theme, context);
   if (name === "get_agent_tree") return renderTreeResult(result, options, theme, context);
-  if (name === "reply_to_parent") {
+  if (name === "reply_to_parent" || name === "final_report") {
     const details = readRecord(readProperty(result, "details"));
     return readProperty(details, "accepted") === true
-      ? createSafeTextComponent([{ text: "Received by parent session", color: "success" }], theme, context)
+      ? createSafeTextComponent([{
+        text: name === "final_report" ? "Report received by parent session" : "Received by parent session",
+        color: "success",
+      }], theme, context)
       : invalidResult(theme, context);
   }
   return invalidResult(theme, context);
@@ -387,7 +390,7 @@ function renderSendResult(
   lookups: AgentToolRenderLookups,
 ): AgentToolRenderComponent {
   const details = readRecord(readProperty(result, "details"));
-  if (readProperty(details, "accepted") !== true || readOptionalString(details, "message_id") === undefined) {
+  if (readProperty(details, "accepted") !== true) {
     return invalidResult(theme, context);
   }
   const agentId = readAgentId(context.args);
@@ -425,10 +428,8 @@ function renderWaitResult(
       || releasedByOutcome === undefined
       || ![
         "reply",
-        "task_completed",
-        "task_failed",
-        "task_interrupted",
-        "suspended",
+        "final_report",
+        "idle",
         "terminal",
       ].includes(releasedByOutcome)
     ) return invalidResult(theme, context);
@@ -447,10 +448,8 @@ function renderWaitResult(
     || outcome === undefined
     || ![
       "reply",
-      "task_completed",
-      "task_failed",
-      "task_interrupted",
-      "suspended",
+      "final_report",
+      "idle",
       "terminal",
     ].includes(outcome)
     || state === undefined
@@ -459,8 +458,7 @@ function renderWaitResult(
   ) return invalidResult(theme, context);
   const errorCode = outcome === "terminal" ? readFaultCode(readProperty(details, "error")) : undefined;
   const warning = errorCode !== undefined
-    || outcome === "task_failed"
-    || outcome === "suspended";
+    || outcome === "idle";
   const name = resolveName(agentId, lookups) ?? agentId;
   return createSafeTextComponent([{
     text: `${name} · ${outcome}${errorCode === undefined ? "" : ` · ${errorCode}`}`,
@@ -555,9 +553,6 @@ function collapsedStatusLines(snapshot: AgentSnapshot): readonly SafeRenderLine[
     { text: `name: ${snapshot.name}`, color: "muted" },
     { text: `state: ${snapshot.state}`, color: "dim" },
     { text: `depth: ${snapshot.depth}`, color: "dim" },
-    { text: `mailbox_pending_count: ${snapshot.mailbox_pending_count}`, color: "dim" },
-    { text: `host_pending_count: ${snapshot.host_pending_count}`, color: "dim" },
-    { text: `reply_outbox_pending_count: ${snapshot.reply_outbox_pending_count}`, color: "dim" },
   ];
   if (snapshot.context_window_tokens !== undefined) {
     lines.push({ text: `context_window_tokens: ${snapshot.context_window_tokens}`, color: "dim" });
@@ -567,19 +562,6 @@ function collapsedStatusLines(snapshot: AgentSnapshot): readonly SafeRenderLine[
   }
   if (snapshot.working_elapsed_ms !== undefined) {
     lines.push({ text: `working_elapsed_ms: ${snapshot.working_elapsed_ms}`, color: "dim" });
-  }
-  if (snapshot.activity !== undefined) {
-    lines.push({ text: `activity.phase: ${snapshot.activity.phase}`, color: "dim" });
-    if (snapshot.activity.category !== undefined) {
-      lines.push({ text: `activity.category: ${snapshot.activity.category}`, color: "dim" });
-    }
-    if (snapshot.activity.active_count !== undefined) {
-      lines.push({ text: `activity.active_count: ${snapshot.activity.active_count}`, color: "dim" });
-    }
-  }
-  if (snapshot.last_task !== undefined) {
-    lines.push({ text: `last_task.outcome: ${snapshot.last_task.outcome}`, color: "dim" });
-    lines.push({ text: `last_task.output_state: ${snapshot.last_task.output_state}`, color: "dim" });
   }
   if (snapshot.error !== undefined) lines.push({ text: `error.code: ${snapshot.error.code}`, color: "warning" });
   if (snapshot.termination_result !== undefined) {
@@ -596,9 +578,6 @@ function expandedStatusLines(snapshot: AgentSnapshot): readonly SafeRenderLine[]
     { text: `parent_agent_id: ${snapshot.parent_agent_id}`, color: "dim" },
     { text: `depth: ${snapshot.depth}`, color: "dim" },
     { text: `state: ${snapshot.state}`, color: "dim" },
-    { text: `mailbox_pending_count: ${snapshot.mailbox_pending_count}`, color: "dim" },
-    { text: `host_pending_count: ${snapshot.host_pending_count}`, color: "dim" },
-    { text: `reply_outbox_pending_count: ${snapshot.reply_outbox_pending_count}`, color: "dim" },
     { text: `revision: ${snapshot.revision}`, color: "dim" },
   ];
   if (snapshot.created_at !== undefined) lines.push({ text: `created_at: ${snapshot.created_at}`, color: "dim" });
@@ -610,25 +589,6 @@ function expandedStatusLines(snapshot: AgentSnapshot): readonly SafeRenderLine[]
   }
   if (snapshot.working_elapsed_ms !== undefined) {
     lines.push({ text: `working_elapsed_ms: ${snapshot.working_elapsed_ms}`, color: "dim" });
-  }
-  if (snapshot.activity !== undefined) {
-    lines.push({ text: `activity.phase: ${snapshot.activity.phase}`, color: "dim" });
-    if (snapshot.activity.task_id !== undefined) {
-      lines.push({ text: `activity.task_id: ${snapshot.activity.task_id}`, color: "dim" });
-    }
-    if (snapshot.activity.category !== undefined) {
-      lines.push({ text: `activity.category: ${snapshot.activity.category}`, color: "dim" });
-    }
-    if (snapshot.activity.active_count !== undefined) {
-      lines.push({ text: `activity.active_count: ${snapshot.activity.active_count}`, color: "dim" });
-    }
-  }
-  if (snapshot.last_task !== undefined) {
-    lines.push({ text: `last_task.task_id: ${snapshot.last_task.task_id}`, color: "dim" });
-    lines.push({ text: `last_task.turn_id: ${snapshot.last_task.turn_id}`, color: "dim" });
-    lines.push({ text: `last_task.commit_id: ${snapshot.last_task.commit_id}`, color: "dim" });
-    lines.push({ text: `last_task.outcome: ${snapshot.last_task.outcome}`, color: "dim" });
-    lines.push({ text: `last_task.output_state: ${snapshot.last_task.output_state}`, color: "dim" });
   }
   if (snapshot.error !== undefined) {
     lines.push({ text: `error.code: ${snapshot.error.code}`, color: "warning" });
@@ -728,10 +688,7 @@ function treeSummary(tree: ScopedAgentTreeSnapshot): string {
   const failed = tree.nodes.filter((node) => node.state === "failed" || node.termination_result === "failed").length;
   const completed = tree.nodes.filter((node) => node.termination_result === "completed").length;
   const incomplete = tree.nodes.filter((node) => node.termination_result === "incomplete").length;
-  const mailboxPending = tree.nodes.reduce((total, node) => total + node.mailbox_pending_count, 0);
-  const hostPending = tree.nodes.reduce((total, node) => total + node.host_pending_count, 0);
-  const replyPending = tree.nodes.reduce((total, node) => total + node.reply_outbox_pending_count, 0);
-  return `scope: ${formatScope(tree)} · active ${active} · working ${working} · failed ${failed} · completed ${completed} · queues ${mailboxPending}/${hostPending}/${replyPending}${incomplete === 0 ? "" : ` · incomplete ${incomplete}`}`;
+  return `scope: ${formatScope(tree)} · active ${active} · working ${working} · failed ${failed} · completed ${completed}${incomplete === 0 ? "" : ` · incomplete ${incomplete}`}`;
 }
 
 function formatScope(tree: ScopedAgentTreeSnapshot): string {

@@ -43,7 +43,6 @@ interface BranchAggregate {
   readonly descendants: number;
   readonly working: number;
   readonly failed: number;
-  readonly pending: number;
 }
 
 interface FinishedAggregate {
@@ -659,8 +658,6 @@ export class AgentTreePanelModel {
   ): boolean {
     if (
       node.state !== "idle"
-      || pendingQueueCount(node) > 0
-      || node.activity !== undefined
       || node.error !== undefined
     ) return true;
     return (childrenByParent.get(node.agent_id) ?? [])
@@ -674,18 +671,16 @@ export class AgentTreePanelModel {
     let descendants = 0;
     let working = 0;
     let failed = 0;
-    let pending = 0;
     const visit = (parentId: string): void => {
       for (const child of childrenByParent.get(parentId) ?? []) {
         descendants += 1;
         if (child.state === "working") working += 1;
         if (child.state === "failed") failed += 1;
-        pending += pendingQueueCount(child);
         visit(child.agent_id);
       }
     };
     visit(agentId);
-    return Object.freeze({ descendants, working, failed, pending });
+    return Object.freeze({ descendants, working, failed });
   }
 
   private finishedAggregate(): FinishedAggregate {
@@ -933,8 +928,6 @@ function formatAgentStateIcon(node: AgentSnapshot, workingFrame: string): string
     }
     case "interrupting":
       return "↻";
-    case "suspended":
-      return "■";
     case "failed":
       return "×";
     case "terminating":
@@ -942,6 +935,7 @@ function formatAgentStateIcon(node: AgentSnapshot, workingFrame: string): string
     case "terminated":
       return "·";
   }
+  return "·";
 }
 
 interface FormatAgentFactsOptions {
@@ -950,16 +944,7 @@ interface FormatAgentFactsOptions {
 
 function formatAgentFacts(node: AgentSnapshot, options: FormatAgentFactsOptions = {}): string {
   const facts = [safeUiFact(node.template_id), safeUiFact(node.name), node.state];
-  if (node.activity !== undefined) {
-    facts.push(node.activity.phase);
-    if (
-      options.includeActivityCategoryCount !== false
-      && node.activity.category !== undefined
-      && node.activity.active_count !== undefined
-    ) {
-      facts.push(`${node.activity.category} ${node.activity.active_count}`);
-    }
-  }
+  void options;
   if (node.context_window_tokens !== undefined) {
     const percent = node.context_usage_percent === undefined
       ? "?"
@@ -968,10 +953,6 @@ function formatAgentFacts(node: AgentSnapshot, options: FormatAgentFactsOptions 
   }
   if (node.state !== "starting" && node.working_elapsed_ms !== undefined) {
     facts.push(formatElapsed(node.working_elapsed_ms));
-  }
-  const pending = pendingQueueCount(node);
-  if (pending > 0) {
-    facts.push(`queues ${node.mailbox_pending_count}/${node.host_pending_count}/${node.reply_outbox_pending_count}`);
   }
   if (
     node.error !== undefined
@@ -983,12 +964,8 @@ function formatAgentFacts(node: AgentSnapshot, options: FormatAgentFactsOptions 
   return facts.join(" · ");
 }
 
-function pendingQueueCount(node: AgentSnapshot): number {
-  return node.mailbox_pending_count + node.host_pending_count + node.reply_outbox_pending_count;
-}
-
 function formatBranchAggregate(aggregate: BranchAggregate): string {
-  return ` · descendants ${aggregate.descendants} · working ${aggregate.working} · failed ${aggregate.failed} · pending ${aggregate.pending}`;
+  return ` · descendants ${aggregate.descendants} · working ${aggregate.working} · failed ${aggregate.failed}`;
 }
 
 function finishedKind(node: AgentSnapshot): "completed" | "failed" | "incomplete" {
@@ -1068,15 +1045,10 @@ function sameAgentFactsExceptElapsed(left: AgentSnapshot, right: AgentSnapshot):
     && left.name === right.name
     && left.depth === right.depth
     && left.state === right.state
-    && left.mailbox_pending_count === right.mailbox_pending_count
-    && left.host_pending_count === right.host_pending_count
-    && left.reply_outbox_pending_count === right.reply_outbox_pending_count
     && left.revision === right.revision
     && left.created_at === right.created_at
     && left.context_window_tokens === right.context_window_tokens
     && left.context_usage_percent === right.context_usage_percent
-    && JSON.stringify(left.activity) === JSON.stringify(right.activity)
-    && JSON.stringify(left.last_task) === JSON.stringify(right.last_task)
     && JSON.stringify(left.error) === JSON.stringify(right.error)
     && left.termination_result === right.termination_result;
 }

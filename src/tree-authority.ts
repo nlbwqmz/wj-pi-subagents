@@ -293,11 +293,6 @@ function controlUnavailableCode(
   if (action === "interrupt_agent") {
     return node.state === "starting" ? "agent_unavailable" : undefined;
   }
-  if (
-    action === "send_message"
-    && node.state === "suspended"
-    && node.activity?.phase === "delivery_uncertain"
-  ) return undefined;
   return node.state === "idle" || node.state === "working" || node.state === "interrupting"
     ? undefined
     : "agent_unavailable";

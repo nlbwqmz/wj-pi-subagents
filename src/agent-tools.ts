@@ -43,6 +43,7 @@ export const AGENT_TOOL_NAMES = Object.freeze([
 
 /** 子代理向唯一直接父会话上行工作中回复的专用工具；不属于管理工具集合。 */
 export const CHILD_REPLY_TOOL_NAME = "reply_to_parent" as const;
+export const CHILD_FINAL_REPORT_TOOL_NAME = "final_report" as const;
 
 export type AgentToolName = (typeof AGENT_TOOL_NAMES)[number];
 
@@ -168,30 +169,30 @@ const schemas: Readonly<Record<AgentToolName, JsonSchema>> = Object.freeze({
 const descriptions: Readonly<Record<AgentToolName, string>> = Object.freeze({
   get_agent_templates: "List currently discovered and valid subagent templates as a JSON array. Each item includes template_id, optional description, and declared business tools. Do not call spawn_agent when the result is [].",
   spawn_agent: "Create a direct child subagent with a valid template_id and complete the startup handshake. Call get_agent_templates first; copy template_id exactly and preserve case. Do not guess, rewrite, or substitute description. Do not call spawn_agent when get_agent_templates returns []. After creation, use send_message to send the first task.",
-  send_message: "Send a task message or steering to a direct child subagent. accepted: true means only that the mailbox accepted the message and assigned message_id/task_id; it does not mean the model read it or the task completed. If message_delivery_failed is returned, check status and existing replies before deciding; do not blindly resend.",
-  wait_agent: "Wait for a work-in-progress reply, task submission, suspended state, or terminal state from one or more direct child subagents. Pass all targets in this batch in one agent_ids call; do not call this separately for the same batch. outcome: reply means still processing; task_completed/task_failed/task_interrupted mean the latest task was submitted; suspended requires status inspection and a decision; batch_released means another wait_agent in the same batch released this call; timeout ends only this wait.",
-  interrupt_agent: "Cooperatively interrupt the current task of a direct child subagent while preserving its node and context.",
+  send_message: "Send a message or steering to a direct child subagent. accepted: true means only that the receiving Pi accepted this message; it does not mean the model read it, started work, or completed processing. A delivery failure affects only this call and does not change lifecycle state.",
+  wait_agent: "Wait for the next independent reply, final_report, idle, or terminal event from one or more direct child subagents. The result includes independent lifecycle state and revision, never task results or report text. batch_released is only a tool-call wrapper; timeout ends only this wait.",
+  interrupt_agent: "Cooperatively interrupt the active Pi turn of a direct child subagent while preserving its node and context.",
   terminate_agent: "Permanently terminate a direct child subagent and its registered subtree, then confirm resource reclamation. Use only when you are sure the branch will not be reused.",
   get_agent_status: "Read the most recently confirmed safe status snapshot for a direct child subagent.",
   get_agent_tree: "Read the read-only agent tree visible to the current caller.",
 });
 
 const DELIVERY_AND_WAITING_GUIDELINE =
-  "交付与等待：消息被接纳不等于模型已读或任务完成；交付不确定时先核对状态和已有回复，不要盲目重发。一次 wait_agent 等待本批次全部目标。";
+  "交付与等待：消息被接纳不等于模型已读或工作完成；交付不确定时先核对状态和已有事件，不要盲目重发。wait_agent 等待目标子代理的下一条独立 reply、final_report、idle 或 terminal 事件。";
 const TAKEOVER_GUIDELINE =
   "需要接管时，先 interrupt_agent，再 wait_agent 确认子代理已结束。";
 
 export const PARENT_COORDINATION_GUIDELINES = Object.freeze({
-  taskOwnership: "任务所有权：send_message 返回 accepted: true 后，该任务由目标直接子代理负责，直到其提交最终答复或进入终态。父会话不得继续或重复调查（包括读取、搜索、扫描或分析子代理负责范围，即使是只读操作），也不得实现、测试、验证、评审或再次委派同一任务；只能等待、查询状态、向该子代理发送 steering，或处理事先明确拆分且无数据依赖、无共享写资源的独立工作。需要接管时，先 interrupt_agent，再 wait_agent 确认子代理已结束。",
-  sendMessage: DELIVERY_AND_WAITING_GUIDELINE,
-  sendMessageReply: "中途回复（特别注意）：仅当本次 send_message 明确要求子代理在当前任务完成前返回一次信息，并在回复后继续当前任务时，才在消息正文中要求其使用 reply_to_parent 进行回复。典型场景包括询问当前进度、索取阶段性结果，或要求先回答执行中的问题再继续。首次下发任务、任务完成后下发新任务、只追加或修正任务要求且无需中途回应、异常恢复指令，以及任何只需等待最终答复的消息，均按普通任务消息发送，不添加 reply_to_parent 提示。判断依据是“是否需要任务完成前的中途回复”，不是目标子代理是否处于 working/processing 状态。",
+  sessionOwnership: "工作边界：send_message 返回 accepted: true，只表示接收侧 Pi 已接纳这条消息；目标子代理继续负责当前工作范围，但这不代表模型已经读取、开始处理或完成。父会话不得重复调查或代做同一范围（包括读取、搜索、扫描、分析、实现、测试和评审），只能等待、查询状态、发送新的 steering，或处理事先明确拆分且无数据依赖、无共享写资源的独立工作。需要接管时，先 interrupt_agent，再 wait_agent 确认子代理已结束。",
+  sendMessage: "交付与等待：消息被接纳不等于模型已读或工作完成；交付不确定时先核对状态和已有事件，不要盲目重发。wait_agent 等待目标子代理的下一条独立 reply、final_report、idle 或 terminal 事件。",
+  sendMessageReply: "中途回复：只有在本次 send_message 明确要求子代理在当前工作完成前返回进度、回答问题或报告阻塞时，才在消息正文中要求其使用 reply_to_parent。需要父代理看到阶段性成果、明确交付物或需要单独记录的报告时，要求其调用 final_report。首次下发消息、追加要求、异常恢复指令，以及只需等待结果的消息，不要额外要求中途回复。",
   waitAgent: DELIVERY_AND_WAITING_GUIDELINE,
-  slowProgress: "慢任务：working/processing 或 timeout 不代表失败。不要仅因耗时就要求子代理停止探索、基于尚未完成的当前工作提前提交最终报告，或调用 interrupt_agent、terminate_agent；仓促收尾可能因调查不充分而降低结果质量。如需了解情况，可以用 send_message 询问进度，并明确要求其继续原任务，然后继续 wait_agent。",
-  taskRecovery: "异常恢复：task_failed、task_interrupted，或最终答复缺失、不可用时，先用 get_agent_status 核对，再向同一 agent_id 发送恢复指令。复用已有上下文，从未完成步骤继续，避免重复已完成的副作用，并要求其提交完整最终答复。",
-  retryPolicy: "重试：除 spawn_failed 和 internal_error 外，其他异常均可重试，包括 message_delivery_failed 和 suspended。重试前先核对并修正原因；默认重试 3 次，若每次仍有进展、状态变化或错误变化，最多扩展到 5 次，每次尝试后都使用 wait_agent。节点终止、用户取消或达到上限时停止，并报告原因；不要自动切换模型或创建替代代理。",
-  agentCleanup: "子代理回收：interrupt_agent 仅中断当前任务，不释放节点名额；回收必须调用 terminate_agent 并确认资源已释放。子代理已提交可用最终答复、当前任务已完成且当前阶段暂不使用时，可以回收；按“异常恢复/重试”流程达到停止条件仍不可用时，必须回收。",
+  slowProgress: "慢进展：working 或 timeout 不代表失败。不要仅因耗时就要求子代理停止探索、提前报告或调用 interrupt_agent、terminate_agent；需要了解情况时，可以用 send_message 询问进度，再继续 wait_agent。",
+  sessionRecovery: "异常恢复：message_delivery_failed、reply_too_large 或等待超时只影响本次操作，不自动解释为子代理故障。先使用 get_agent_status 核对 state 和已有事件，再由模型决定是否发送一条新的独立消息。",
+  retryPolicy: "重试：消息调用不会自动重试、暗存或重放正文。只有在确认失败原因、且明确知道重复发送不会造成副作用后，才由模型显式发起新的调用；不要因为结果不确定而盲目重复发送。",
+  agentCleanup: "子代理回收：interrupt_agent 只建立 interrupting 屏障，必须等真实 idle 或后续控制结果；释放节点和子树资源必须调用 terminate_agent 并等待 terminated。是否发送 final_report 不决定回收时机。",
   capacityCleanup: "容量回收：spawn_agent 返回 max_children_reached 或 max_tree_agents_reached 时，检查现有子代理，优先使用 terminate_agent 回收已完成且暂不使用或已不可恢复的节点；确认名额释放后再重试创建。",
-  replyTooLarge: "若收到子代理 final 的 reply_too_large，说明最终消息过长而未成功交付，但不代表代理故障。不要终止、替换或盲目重跑原任务；先查询原 agent 状态，再向同一 agent 发送消息，说明其最终消息过长，要求其基于已有工作精炼后补交最终结果。",
+  replyTooLarge: "若收到 reply_too_large，说明本次消息过长而未被 Pi 接纳，不代表代理故障；精炼后由模型显式重新发送，不要终止、替换或自动重跑原工作。",
   interruptAgent: TAKEOVER_GUIDELINE,
 });
 
@@ -208,14 +209,19 @@ const childReplySchema: JsonSchema = Object.freeze({
   additionalProperties: false,
 });
 
+const childFinalReportSchema: JsonSchema = childReplySchema;
+
 export const CHILD_REPLY_GUIDELINE =
-  "仅在直接父代理明确要求你回报，或遇到必须由父代理处理或裁决的阻塞时调用 reply_to_parent。不要将其用于完成通知或替代最终答复。消息被接纳后继续当前任务，任务完成时仍须提交正常的最终答复。";
+  "仅在直接父代理明确要求你回报进度、回答问题，或遇到必须由父代理处理或裁决的阻塞时调用 reply_to_parent。它表示一条独立的父端可见消息，不结束当前 Pi 回合、当前工作或生命周期。";
 
 export const CHILD_REPLY_TOO_LARGE_GUIDELINE =
-  "若 reply_to_parent 返回 reply_too_large，说明本次任务中消息过长而未成功交付，不影响当前任务。不要原样重试；请将消息精炼后重新调用 reply_to_parent，再继续当前任务。任务完成时仍须提交正常 final。";
+  "若 reply_to_parent 或 final_report 返回 reply_too_large，说明本次消息过长而未被父端 Pi 接纳，不影响当前工作；请精炼后由模型显式重新调用，不要原样重试。";
 
 const childReplyDescription =
   "Call reply_to_parent only when your direct parent explicitly asks for a progress report or when blocked on an issue that the parent must handle or decide.";
+
+const childFinalReportDescription =
+  "Send an explicit report to the direct parent. A successful call only means the parent Pi accepted this message; it does not end the current turn or session, and it may be called multiple times.";
 
 /** 返回给 Pi 的固定工具结果；details 只包含控制器安全数据。 */
 function toolResult<T>(result: ControlResult<T>, dataOnly = false): unknown {
@@ -314,7 +320,7 @@ export function registerAgentTools(
     }, false, lookups),
     executeTool("get_agent_status", provider, async (controller, params) => {
       const agentId = readAgentId(params);
-      return Promise.resolve(controller.getAgentStatus(agentId));
+      return controller.synchronizeAgentStatus(agentId);
     }, false, lookups),
     executeTool("get_agent_tree", provider, async (controller, params) => {
       if (!isEmptyObject(params)) return controlFailure("invalid_argument");
@@ -364,6 +370,35 @@ export function registerReplyToParentTool(
         throw new SubagentToolError(controlFailure("agent_unavailable").error);
       }
       return toolResult(await coordinator.replyToParent(params, signal));
+    },
+  });
+  api.registerTool({
+    name: CHILD_FINAL_REPORT_TOOL_NAME,
+    label: CHILD_FINAL_REPORT_TOOL_NAME,
+    description: childFinalReportDescription,
+    parameters: childFinalReportSchema,
+    executionMode: "sequential",
+    renderCall: (
+      params: unknown,
+      theme: AgentToolRenderTheme,
+      context: AgentToolRenderContext,
+    ) => renderAgentToolCall(CHILD_FINAL_REPORT_TOOL_NAME, params, theme, context),
+    renderResult: (
+      result: AgentToolResultView,
+      options: AgentToolResultRenderOptions,
+      theme: AgentToolRenderTheme,
+      context: AgentToolRenderContext,
+    ) => renderAgentToolResult(CHILD_FINAL_REPORT_TOOL_NAME, result, options, theme, context),
+    execute: async (
+      _toolCallId: string,
+      params: unknown,
+      signal: AbortSignal | undefined,
+      _onUpdate: unknown,
+      context: unknown,
+    ) => {
+      const coordinator = await provider(context);
+      if (coordinator === undefined) throw new SubagentToolError(controlFailure("agent_unavailable").error);
+      return toolResult(await coordinator.finalReport(params, signal));
     },
   });
 }

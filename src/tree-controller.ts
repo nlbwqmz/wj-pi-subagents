@@ -1,38 +1,28 @@
 import { randomUUID } from "node:crypto";
 import type { RuntimeConfig } from "./root-runtime-context.ts";
+import { canTransition } from "./conversation-lifecycle.ts";
 import {
   AGENT_FAULT_CODES,
   AGENT_FAULT_METADATA,
   isCanonicalAgentUuid,
-  parseAgentActivitySummary,
-  parseAgentLastTask,
   parseAgentSnapshot,
-  type AgentActivityCategory,
-  type AgentActivitySummary,
   type AgentFault,
   type AgentFaultCode,
-  type AgentLastTask,
   type AgentLifecycleState,
   type AgentSnapshot,
   type AgentTerminationResult,
 } from "./agent-snapshot-codec.ts";
 
+type InternalAgentLifecycleState = AgentLifecycleState;
+
 export {
-  AGENT_ACTIVITY_CATEGORIES,
-  AGENT_ACTIVITY_PHASES,
   AGENT_FAULT_CODES,
   AGENT_LIFECYCLE_STATES,
-  AGENT_TASK_OUTCOMES,
   AGENT_TERMINATION_RESULTS,
-  type AgentActivityCategory,
-  type AgentActivityPhase,
-  type AgentActivitySummary,
   type AgentFault,
   type AgentFaultCode,
-  type AgentLastTask,
   type AgentLifecycleState,
   type AgentSnapshot,
-  type AgentTaskOutcome,
   type AgentTerminationResult,
 } from "./agent-snapshot-codec.ts";
 
@@ -53,6 +43,7 @@ export const PUBLIC_ERROR_CODES = Object.freeze([
   "spawn_timeout",
   "agent_unavailable",
   "message_delivery_failed",
+  "protocol_mismatch",
   "termination_incomplete",
   "internal_error",
 ] as const);
@@ -99,6 +90,7 @@ const ERROR_METADATA: Readonly<Record<PublicErrorCode, Readonly<{
   spawn_timeout: AGENT_FAULT_METADATA.spawn_timeout,
   agent_unavailable: Object.freeze({ message: "Subagent currently unavailable", retryable: false }),
   message_delivery_failed: AGENT_FAULT_METADATA.message_delivery_failed,
+  protocol_mismatch: AGENT_FAULT_METADATA.protocol_mismatch,
   termination_incomplete: AGENT_FAULT_METADATA.termination_incomplete,
   internal_error: AGENT_FAULT_METADATA.internal_error,
 });
@@ -185,6 +177,8 @@ export interface LifecycleEventOutcome {
   readonly node: AgentSnapshot;
   readonly lifecycle_generation: number;
   readonly tree_revision: number;
+  /** 未应用事实的稳定归因；成功转换不携带诊断。 */
+  readonly diagnostic?: "stale_generation" | "invalid_transition";
 }
 
 /** 一次树级终止屏障的固定成员和线性化修订。 */
@@ -239,15 +233,6 @@ interface FailureEvent extends EventGeneration {
   readonly error_code?: AgentFaultCode;
 }
 
-export interface AgentTaskProjectionInput {
-  readonly state: "idle" | "working" | "interrupting" | "suspended";
-  readonly mailbox_pending_count: number;
-  readonly host_pending_count: number;
-  readonly reply_outbox_pending_count: number;
-  readonly activity?: AgentActivitySummary;
-  readonly last_task?: AgentLastTask;
-}
-
 /** 来自 Pi ExtensionContext 的安全上下文用量投影。 */
 export interface AgentContextUsageInput {
   readonly context_window_tokens: number;
@@ -258,9 +243,11 @@ export interface AgentContextUsageInput {
 export const AGENT_LIFECYCLE_EVENT_TYPES = Object.freeze([
   "startup_ready",
   "startup_failed",
+  "agent_start",
+  "agent_settled",
+  "interrupt_accepted",
+  "terminate_accepted",
   "runtime_failed",
-  "termination_requested",
-  "termination_incomplete",
   "resources_confirmed",
 ] as const);
 
@@ -306,10 +293,7 @@ interface AgentRecord {
   readonly name: string;
   readonly depth: number;
   readonly managementEnabled: boolean;
-  state: AgentLifecycleState;
-  mailboxPendingCount: number;
-  hostPendingCount: number;
-  replyOutboxPendingCount: number;
+  state: InternalAgentLifecycleState;
   revision: number;
   lifecycleGeneration: number;
   createdAt: string | undefined;
@@ -317,9 +301,6 @@ interface AgentRecord {
   accumulatedWorkingElapsedMs: number;
   contextWindowTokens: number | undefined;
   contextUsagePercent: number | undefined;
-  activity: AgentActivitySummary | undefined;
-  activityCounts: Map<AgentActivityCategory, number>;
-  lastTask: AgentLastTask | undefined;
   error: AgentFault | undefined;
   terminationResult: AgentTerminationResult | undefined;
   terminationHadFailure: boolean;
@@ -342,54 +323,13 @@ interface ResolvedActor {
 }
 
 interface PublicMutation {
-  readonly state?: AgentLifecycleState;
-  readonly mailboxPendingCount?: number;
-  readonly hostPendingCount?: number;
-  readonly replyOutboxPendingCount?: number;
+  readonly state?: InternalAgentLifecycleState;
   readonly errorCode?: AgentFaultCode;
   readonly clearError?: boolean;
-  /** undefined 表示保持，null 表示清除。 */
-  readonly activity?: AgentActivitySummary | null;
-  /** undefined 表示保持，null 表示清除。 */
-  readonly lastTask?: AgentLastTask | null;
   /** undefined 表示保持，null 表示清除。 */
   readonly contextWindowTokens?: number | null;
   /** undefined 表示保持，null 表示清除。 */
   readonly contextUsagePercent?: number | null;
-}
-
-function isAgentTaskProjection(value: unknown): value is AgentTaskProjectionInput {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const candidate = value as Record<string, unknown>;
-  if (
-    !["idle", "working", "interrupting", "suspended"].includes(String(candidate.state))
-    || !Number.isSafeInteger(candidate.mailbox_pending_count)
-    || (candidate.mailbox_pending_count as number) < 0
-    || !Number.isSafeInteger(candidate.host_pending_count)
-    || (candidate.host_pending_count as number) < 0
-    || !Number.isSafeInteger(candidate.reply_outbox_pending_count)
-    || (candidate.reply_outbox_pending_count as number) < 0
-    || Object.keys(candidate).some((key) => ![
-      "state",
-      "mailbox_pending_count",
-      "host_pending_count",
-      "reply_outbox_pending_count",
-      "activity",
-      "last_task",
-    ].includes(key))
-  ) return false;
-  const activity = candidate.activity === undefined ? undefined : parseAgentActivitySummary(candidate.activity);
-  const lastTask = candidate.last_task === undefined ? undefined : parseAgentLastTask(candidate.last_task);
-  if ((candidate.activity !== undefined && activity === undefined)
-    || (candidate.last_task !== undefined && lastTask === undefined)) return false;
-  if (candidate.state === "idle" && (
-    candidate.mailbox_pending_count !== 0
-    || candidate.host_pending_count !== 0
-    || candidate.reply_outbox_pending_count !== 0
-    || activity !== undefined
-  )) return false;
-  if (candidate.state !== "idle" && activity === undefined) return false;
-  return true;
 }
 
 function isAgentContextUsageInput(value: unknown): value is AgentContextUsageInput {
@@ -412,10 +352,6 @@ function isAgentContextUsageInput(value: unknown): value is AgentContextUsageInp
     ].includes(key));
 }
 
-function isAgentActivitySummary(value: unknown): value is AgentActivitySummary {
-  return parseAgentActivitySummary(value) !== undefined;
-}
-
 function isAgentFaultCode(value: unknown): value is AgentFaultCode {
   return typeof value === "string" && (AGENT_FAULT_CODES as readonly string[]).includes(value);
 }
@@ -428,12 +364,18 @@ function isLifecycleEvent(value: unknown): value is AgentLifecycleEvent {
   const supported = [
     "startup_ready",
     "startup_failed",
+    "agent_start",
+    "agent_settled",
+    "interrupt_accepted",
+    "terminate_accepted",
     "runtime_failed",
-    "termination_requested",
-    "termination_incomplete",
     "resources_confirmed",
   ];
   if (!supported.includes(type)) return false;
+  const allowsErrorCode = type === "startup_failed" || type === "runtime_failed";
+  if (Object.keys(candidate).some((key) =>
+    !["type", "expected_generation", ...(allowsErrorCode ? ["error_code"] : [])].includes(key)
+  )) return false;
   if (
     !("expected_generation" in candidate) ||
     !Number.isSafeInteger(candidate.expected_generation) ||
@@ -448,6 +390,7 @@ function isLifecycleEvent(value: unknown): value is AgentLifecycleEvent {
   ) {
     return false;
   }
+  if (!allowsErrorCode && candidate.error_code !== undefined) return false;
   return true;
 }
 
@@ -531,15 +474,10 @@ function sameSnapshot(
     && record.name === node.name
     && record.depth === node.depth
     && record.state === node.state
-    && record.mailboxPendingCount === node.mailbox_pending_count
-    && record.hostPendingCount === node.host_pending_count
-    && record.replyOutboxPendingCount === node.reply_outbox_pending_count
     && record.revision === node.revision
     && record.createdAt === node.created_at
     && workingMatches
     && contextMatches
-    && JSON.stringify(record.activity) === JSON.stringify(node.activity)
-    && JSON.stringify(record.lastTask) === JSON.stringify(node.last_task)
     && JSON.stringify(currentFault) === JSON.stringify(nextFault)
     && record.terminationResult === node.termination_result
   );
@@ -555,19 +493,18 @@ function safeWallClockNow(now: () => Date): string {
   return new Date(0).toISOString();
 }
 
-function isManagementState(state: AgentLifecycleState): boolean {
+function isManagementState(state: InternalAgentLifecycleState): boolean {
   return state === "idle"
     || state === "working"
-    || state === "interrupting"
-    || state === "suspended";
+    || state === "interrupting";
 }
 
 /** 工作时长覆盖任务实际处理和中断收尾，不计入静止、挂起或资源清理。 */
-function isWorkingTimeState(state: AgentLifecycleState): boolean {
+function isWorkingTimeState(state: InternalAgentLifecycleState): boolean {
   return state === "working" || state === "interrupting";
 }
 
-function isQuotaConsumingState(state: AgentLifecycleState): boolean {
+function isQuotaConsumingState(state: InternalAgentLifecycleState): boolean {
   return state !== "terminated";
 }
 
@@ -632,9 +569,6 @@ export class TreeController {
         depth: initialActor.depth,
         managementEnabled: initialActor.managementEnabled,
         state: "idle",
-        mailboxPendingCount: 0,
-        hostPendingCount: 0,
-        replyOutboxPendingCount: 0,
         revision: 1,
         lifecycleGeneration: 0,
         createdAt,
@@ -642,9 +576,6 @@ export class TreeController {
         accumulatedWorkingElapsedMs: 0,
         contextWindowTokens: undefined,
         contextUsagePercent: undefined,
-        activity: undefined,
-        activityCounts: new Map(),
-        lastTask: undefined,
         error: undefined,
         terminationResult: undefined,
         terminationHadFailure: false,
@@ -733,9 +664,6 @@ export class TreeController {
       ? {}
       : {
           state: "terminated",
-          mailboxPendingCount: 0,
-          hostPendingCount: 0,
-          replyOutboxPendingCount: 0,
           clearError: true,
         });
     return controlSuccess(this.outcome(
@@ -809,9 +737,6 @@ export class TreeController {
         && reservationAllowsSubagents(input)
         && depth < this.config.maxDepth,
       state: "starting",
-      mailboxPendingCount: 0,
-      hostPendingCount: 0,
-      replyOutboxPendingCount: 0,
       revision: 1,
       lifecycleGeneration: 0,
       createdAt: undefined,
@@ -819,9 +744,6 @@ export class TreeController {
       accumulatedWorkingElapsedMs: 0,
       contextWindowTokens: undefined,
       contextUsagePercent: undefined,
-      activity: undefined,
-      activityCounts: new Map(),
-      lastTask: undefined,
       error: undefined,
       terminationResult: undefined,
       terminationHadFailure: false,
@@ -879,9 +801,6 @@ export class TreeController {
       depth: node.depth,
       managementEnabled: input.management_enabled,
       state: "starting",
-      mailboxPendingCount: node.mailbox_pending_count,
-      hostPendingCount: node.host_pending_count,
-      replyOutboxPendingCount: node.reply_outbox_pending_count,
       revision: node.revision,
       lifecycleGeneration: input.lifecycle_generation,
       createdAt: undefined,
@@ -889,9 +808,6 @@ export class TreeController {
       accumulatedWorkingElapsedMs: 0,
       contextWindowTokens: undefined,
       contextUsagePercent: undefined,
-      activity: undefined,
-      activityCounts: new Map(),
-      lastTask: undefined,
       error: undefined,
       terminationResult: undefined,
       terminationHadFailure: false,
@@ -920,13 +836,34 @@ export class TreeController {
     const record = resolved.data;
     const expectedGeneration = eventGeneration(event);
     if (expectedGeneration !== record.lifecycleGeneration) {
-      return controlSuccess(this.outcome(record, false));
+      return controlSuccess(this.outcome(record, false, "stale_generation"));
     }
 
     let applied = false;
     switch (event.type) {
       case "startup_ready":
         if (record.state === "starting") applied = this.mutate(record, { state: "idle" });
+        break;
+      case "agent_start":
+        if (record.state === "idle") {
+          applied = this.mutate(record, { state: "working" });
+        }
+        break;
+      case "agent_settled":
+        if (record.state === "working" || record.state === "interrupting") {
+          applied = this.mutate(record, { state: "idle" });
+        }
+        break;
+      case "interrupt_accepted":
+        if (record.state === "working") applied = this.mutate(record, { state: "interrupting" });
+        break;
+      case "terminate_accepted":
+        if (record.state !== "terminated" && record.state !== "terminating") {
+          // 终止事实本身建立不可逆屏障，避免任何绕过管理控制器的
+          // 监督器入口只改目标状态而留下可继续接纳的后代。
+          const barrier = this.beginTerminationBarrierInternal(record.agentId, false);
+          applied = barrier.ok && barrier.data.changed;
+        }
         break;
       case "startup_failed":
         if (record.state === "starting") {
@@ -940,89 +877,24 @@ export class TreeController {
           record.state === "idle"
           || record.state === "working"
           || record.state === "interrupting"
-          || record.state === "suspended"
         ) {
           applied = this.failRuntimeAndOrphans(record, eventFaultCode(event, "spawn_failed"));
-        }
-        break;
-      case "termination_requested":
-        if (record.state !== "terminated" && record.state !== "terminating") {
-          applied = this.mutate(record, {
-            state: "terminating",
-            mailboxPendingCount: 0,
-            hostPendingCount: 0,
-            replyOutboxPendingCount: 0,
-            clearError: true,
-          });
-        }
-        break;
-      case "termination_incomplete":
-        if (record.state === "terminating") {
-          applied = this.mutate(record, { errorCode: "termination_incomplete" });
         }
         break;
       case "resources_confirmed":
         if (record.state === "terminating" && this.allDirectChildrenTerminated(record.agentId)) {
           applied = this.mutate(record, {
             state: "terminated",
-            mailboxPendingCount: 0,
-            hostPendingCount: 0,
-            replyOutboxPendingCount: 0,
             clearError: true,
           });
         }
         break;
     }
-    return controlSuccess(this.outcome(record, applied));
-  }
-
-  /**
-   * 单节点协调器一次性提交完整任务投影。状态、活动、三类队列和 last_task
-   * 共用一个 revision/tree_revision，状态查询、树和 TUI 因此不会看到撕裂快照。
-   */
-  applyTaskProjection(
-    agentId: unknown,
-    projection: AgentTaskProjectionInput | unknown,
-  ): ControlResult<LifecycleEventOutcome> {
-    const resolved = this.findAgent(agentId);
-    if (!resolved.ok) return resolved;
-    if (!isAgentTaskProjection(projection)) return controlFailure("invalid_argument");
-    const record = resolved.data;
-    if (record.state === "starting" || record.state === "failed" || record.state === "terminating" || record.state === "terminated") {
-      return controlSuccess(this.outcome(record, false));
-    }
-    const parsedActivity = projection.activity === undefined
-      ? undefined
-      : parseAgentActivitySummary(projection.activity);
-    const parsedLastTask = projection.last_task === undefined
-      ? undefined
-      : parseAgentLastTask(projection.last_task);
-    const applied = this.mutate(record, {
-      state: projection.state,
-      mailboxPendingCount: projection.mailbox_pending_count,
-      hostPendingCount: projection.host_pending_count,
-      replyOutboxPendingCount: projection.reply_outbox_pending_count,
-      activity: parsedActivity ?? null,
-      ...(parsedLastTask === undefined ? {} : { lastTask: parsedLastTask }),
-    });
-    return controlSuccess(this.outcome(record, applied));
-  }
-
-  /** 兼容安全工具活动观察；真正 phase 由任务协调器投影。 */
-  updateActivity(
-    agentId: unknown,
-    activity: AgentActivitySummary | unknown,
-  ): ControlResult<LifecycleEventOutcome> {
-    const resolved = this.findAgent(agentId);
-    if (!resolved.ok) return resolved;
-    const parsed = parseAgentActivitySummary(activity);
-    if (parsed === undefined) return controlFailure("invalid_argument");
-    const record = resolved.data;
-    if (record.state !== "working" && record.state !== "interrupting" && record.state !== "suspended") {
-      return controlSuccess(this.outcome(record, false));
-    }
-    const applied = this.mutate(record, { activity: parsed });
-    return controlSuccess(this.outcome(record, applied));
+    return controlSuccess(this.outcome(
+      record,
+      applied,
+      applied ? undefined : "invalid_transition",
+    ));
   }
 
   /** 更新当前子代理的 Pi 上下文窗口事实；undefined 清除当前可用度量。 */
@@ -1184,6 +1056,15 @@ export class TreeController {
       if (!isCanonicalUuidV4(node.agent_id) || this.issuedAgentIds.has(node.agent_id)) {
         return controlFailure("invalid_argument");
       }
+      if (
+        node.state !== "terminated"
+        && (
+          node.state !== "starting"
+          || scope.state === "failed"
+          || scope.state === "terminating"
+          || scope.state === "terminated"
+        )
+      ) return controlFailure("invalid_argument");
       if (node.state === "terminated") continue;
       addedActiveNodes += 1;
       if (node.parent_agent_id !== null) {
@@ -1219,6 +1100,11 @@ export class TreeController {
     for (const node of parsed.data) {
       const current = this.agents.get(node.agent_id);
       if (current === undefined) {
+        // terminated 节点可以作为历史身份保留；活动后代必须从 starting
+        // 建档，不能借完整快照直接伪造 working/failed/idle。
+        if (node.state !== "terminated" && node.state !== "starting") {
+          return controlFailure("invalid_argument");
+        }
         const parentRecord = node.agent_id === scope.agentId
           ? undefined
           : this.agents.get(node.parent_agent_id ?? "")
@@ -1232,9 +1118,6 @@ export class TreeController {
           depth: node.depth,
           managementEnabled: parentRecord?.managementEnabled ?? scope.managementEnabled,
           state: node.state,
-          mailboxPendingCount: node.mailbox_pending_count,
-          hostPendingCount: node.host_pending_count,
-          replyOutboxPendingCount: node.reply_outbox_pending_count,
           revision: node.revision,
           lifecycleGeneration: 0,
           createdAt: node.created_at,
@@ -1242,11 +1125,6 @@ export class TreeController {
           accumulatedWorkingElapsedMs: node.working_elapsed_ms ?? 0,
           contextWindowTokens: node.context_window_tokens,
           contextUsagePercent: node.context_usage_percent,
-          activity: node.activity,
-          activityCounts: node.activity?.category === undefined || node.activity.active_count === undefined
-            ? new Map()
-            : new Map([[node.activity.category, node.activity.active_count]]),
-          lastTask: node.last_task,
           error: node.error,
           terminationResult: node.termination_result,
           terminationHadFailure: snapshotHadTerminationFailure(node),
@@ -1269,6 +1147,15 @@ export class TreeController {
           });
         }
         continue;
+      }
+      if (current.state === "terminated" && node.revision !== current.revision) {
+        // terminated 是吸收态；终止后的远端修订不能重写资源事实。
+        return controlFailure("invalid_argument");
+      }
+      // 快照是生命周期事实的投影，不是第二条写入路径。已有节点的状态
+      // 改变必须仍落在七状态合法转换矩阵内，不能借 revision 越过屏障或吸收态。
+      if (current.state !== node.state && !canTransition(current.state, node.state)) {
+        return controlFailure("invalid_argument");
       }
       if (node.revision < current.revision) return controlFailure("invalid_argument");
       if (node.revision === current.revision && !sameSnapshot(
@@ -1335,15 +1222,10 @@ export class TreeController {
         }
       }
     }
-    return controlSuccess(Object.freeze(nodes.map((node) => {
-      const activity = node.activity === undefined ? {} : {
-        activity: Object.freeze({ ...node.activity }),
-      };
-      const copy: AgentSnapshot = node.error === undefined
-        ? Object.freeze({ ...node, ...activity })
-        : Object.freeze({ ...node, ...activity, error: cloneAgentFault(node.error)! });
-      return copy;
-    })));
+    return controlSuccess(Object.freeze(nodes.map((node) => Object.freeze({
+      ...node,
+      ...(node.error === undefined ? {} : { error: cloneAgentFault(node.error)! }),
+    }))));
   }
 
   private applySnapshotToRecord(
@@ -1354,16 +1236,8 @@ export class TreeController {
     const stateChanged = record.state !== node.state;
     const previousWorkingElapsed = this.workingElapsedValue(record, monotonicAt);
     record.state = node.state;
-    record.mailboxPendingCount = node.mailbox_pending_count;
-    record.hostPendingCount = node.host_pending_count;
-    record.replyOutboxPendingCount = node.reply_outbox_pending_count;
     record.revision = node.revision;
     record.createdAt = node.created_at;
-    record.activity = node.activity === undefined ? undefined : Object.freeze({ ...node.activity });
-    record.activityCounts = node.activity?.category === undefined || node.activity.active_count === undefined
-      ? new Map()
-      : new Map([[node.activity.category, node.activity.active_count]]);
-    record.lastTask = node.last_task === undefined ? undefined : Object.freeze({ ...node.last_task });
     record.error = cloneAgentFault(node.error);
     record.terminationHadFailure ||= snapshotHadTerminationFailure(node);
     record.terminationHadIncompleteCleanup ||= snapshotHadIncompleteCleanup(node);
@@ -1503,9 +1377,6 @@ export class TreeController {
         if (existingTarget?.state === "failed") {
           changed = this.mutate(existingTarget, {
             state: "terminating",
-            mailboxPendingCount: 0,
-            hostPendingCount: 0,
-            replyOutboxPendingCount: 0,
             clearError: true,
           });
         }
@@ -1521,9 +1392,6 @@ export class TreeController {
       if (preserveTargetFailure && record.agentId === targetAgentId) return {};
       return {
         state: "terminating",
-        mailboxPendingCount: 0,
-        hostPendingCount: 0,
-        replyOutboxPendingCount: 0,
         clearError: true,
       };
     });
@@ -1580,16 +1448,10 @@ export class TreeController {
     const applied = this.mutateMany(members, (candidate) => candidate.agentId === record.agentId
       ? {
           state: "failed",
-          mailboxPendingCount: 0,
-          hostPendingCount: 0,
-          replyOutboxPendingCount: 0,
           errorCode,
         }
       : {
           state: "terminating",
-          mailboxPendingCount: 0,
-          hostPendingCount: 0,
-          replyOutboxPendingCount: 0,
           clearError: true,
         });
     const barrier: TerminationBarrierRecord = Object.freeze({
@@ -1606,12 +1468,8 @@ export class TreeController {
   private failStartingNode(record: AgentRecord, errorCode: AgentFaultCode): boolean {
     const failedApplied = this.mutate(record, {
       state: "failed",
-      mailboxPendingCount: 0,
-      hostPendingCount: 0,
-      replyOutboxPendingCount: 0,
       errorCode,
     });
-    const terminatingApplied = this.mutate(record, { state: "terminating" });
     if (!this.terminationBarriers.has(record.agentId)) {
       const members = this.orderDescendantsFirst(this.collectSubtree(record.agentId));
       this.terminationBarriers.set(record.agentId, Object.freeze({
@@ -1621,7 +1479,9 @@ export class TreeController {
         createdTreeRevision: this.treeRevision,
       }));
     }
-    return failedApplied || terminatingApplied;
+    // startup_failed 只记录真实启动故障；后续资源清理由显式 terminate_accepted
+    // 建立 terminating 屏障，避免把清理意图伪装成启动事实。
+    return failedApplied;
   }
 
   private mutate(record: AgentRecord, mutation: PublicMutation): boolean {
@@ -1652,9 +1512,6 @@ export class TreeController {
     monotonicAt: number,
   ): boolean {
     const nextState = mutation.state ?? record.state;
-    const nextMailboxPending = mutation.mailboxPendingCount ?? record.mailboxPendingCount;
-    const nextHostPending = mutation.hostPendingCount ?? record.hostPendingCount;
-    const nextReplyPending = mutation.replyOutboxPendingCount ?? record.replyOutboxPendingCount;
     const nextContextWindowTokens = mutation.contextWindowTokens === undefined
       ? record.contextWindowTokens
       : mutation.contextWindowTokens === null ? undefined : mutation.contextWindowTokens;
@@ -1669,36 +1526,16 @@ export class TreeController {
     const stateChanged = nextState !== record.state;
     const wasWorking = isWorkingTimeState(record.state);
     const willBeWorking = isWorkingTimeState(nextState);
-    const queuesChanged = nextMailboxPending !== record.mailboxPendingCount
-      || nextHostPending !== record.hostPendingCount
-      || nextReplyPending !== record.replyOutboxPendingCount;
     const contextChanged = nextContextWindowTokens !== record.contextWindowTokens
       || nextContextUsagePercent !== record.contextUsagePercent;
     const errorChanged = nextErrorCode !== record.error?.code;
-    const nextActivity = mutation.activity === undefined
-      ? record.activity
-      : mutation.activity === null
-        ? undefined
-        : mutation.activity;
-    const nextLastTask = mutation.lastTask === undefined
-      ? record.lastTask
-      : mutation.lastTask === null
-        ? undefined
-        : mutation.lastTask;
-    const activityChanged = JSON.stringify(nextActivity) !== JSON.stringify(record.activity);
-    const lastTaskChanged = JSON.stringify(nextLastTask) !== JSON.stringify(record.lastTask);
-    if (!stateChanged && !queuesChanged && !contextChanged && !errorChanged && !activityChanged && !lastTaskChanged) return false;
+    if (!stateChanged && !contextChanged && !errorChanged) return false;
 
     const workingElapsedAtMutation = this.workingElapsedValue(record, monotonicAt);
     const nextError = mutation.errorCode === undefined
       ? (mutation.clearError === true ? undefined : record.error)
       : this.createFault(mutation.errorCode);
     record.state = nextState;
-    record.mailboxPendingCount = nextMailboxPending;
-    record.hostPendingCount = nextHostPending;
-    record.replyOutboxPendingCount = nextReplyPending;
-    record.activity = nextActivity;
-    record.lastTask = nextLastTask;
     record.contextWindowTokens = nextContextWindowTokens;
     record.contextUsagePercent = nextContextUsagePercent;
     record.error = nextError;
@@ -1721,10 +1558,6 @@ export class TreeController {
     if (stateChanged) record.lifecycleGeneration += 1;
     if (stateChanged && nextState === "idle" && record.createdAt === undefined) {
       record.createdAt = createdAt;
-    }
-    if (stateChanged && (nextState === "failed" || nextState === "terminating" || nextState === "terminated")) {
-      record.activity = undefined;
-      record.activityCounts.clear();
     }
     record.revision += 1;
     return true;
@@ -1797,9 +1630,6 @@ export class TreeController {
       name: record.name,
       depth: record.depth,
       state: record.state,
-      mailbox_pending_count: record.mailboxPendingCount,
-      host_pending_count: record.hostPendingCount,
-      reply_outbox_pending_count: record.replyOutboxPendingCount,
       revision: record.revision,
     } as const;
     const base = record.createdAt === undefined
@@ -1821,25 +1651,21 @@ export class TreeController {
     const withTerminationResult = record.terminationResult === undefined
       ? withContextUsage
       : { ...withContextUsage, termination_result: record.terminationResult };
-    const withLastTask = record.lastTask === undefined
-      ? withTerminationResult
-      : { ...withTerminationResult, last_task: Object.freeze({ ...record.lastTask }) };
-    const withActivity = record.activity === undefined
-      ? withLastTask
-      : { ...withLastTask, activity: Object.freeze({ ...record.activity }) };
-    if (record.error === undefined) return Object.freeze(withActivity);
-    return Object.freeze({ ...withActivity, error: record.error });
+    if (record.error === undefined) return Object.freeze(withTerminationResult);
+    return Object.freeze({ ...withTerminationResult, error: record.error });
   }
 
-  private outcome(record: AgentRecord, applied: boolean): LifecycleEventOutcome {
+  private outcome(
+    record: AgentRecord,
+    applied: boolean,
+    diagnostic?: LifecycleEventOutcome["diagnostic"],
+  ): LifecycleEventOutcome {
     return Object.freeze({
       applied,
       node: this.snapshot(record),
       lifecycle_generation: record.lifecycleGeneration,
       tree_revision: this.treeRevision,
+      ...(diagnostic === undefined ? {} : { diagnostic }),
     });
   }
 }
-
-// 兼容后续纵向旅程采用的命名，不复制控制器实现或状态。
-export { TreeController as AgentTreeController };

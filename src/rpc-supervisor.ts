@@ -1,11 +1,5 @@
 import type { ChildReplyEnvelope } from "./child-reply-envelope.ts";
 import {
-  AgentTaskMailbox,
-  type AgentCompactionReason,
-  type AgentHostDelivery,
-} from "./agent-task-mailbox.ts";
-import {
-  ManagedRpcCommandRejectedError,
   type ManagedRpcNodeLike,
   type ManagedRpcNodeStartContext,
 } from "./managed-rpc-node.ts";
@@ -19,17 +13,12 @@ import type {
   SupervisorControlResponse,
   SupervisorEvent,
   SupervisorReply,
-  SupervisorReplyInput,
-  SupervisorReplyPublication,
   SupervisorSnapshot,
-  SupervisorTaskAssignment,
-  SupervisorTaskStarted,
 } from "./supervisor-channel.ts";
 import type {
   AgentLifecycleEvent,
   AgentLifecycleState,
   AgentSnapshot,
-  AgentTaskProjectionInput,
   ControlResult,
   LifecycleEventOutcome,
   PublicErrorCode,
@@ -49,9 +38,9 @@ export interface RpcSupervisorClient {
   /** 客户端的 RPC 进程必须与监督器持有的平台树句柄属于同一启动事务。 */
   readonly process_binding: "managed";
   start(): Promise<void>;
-  prompt(message: string): Promise<void>;
-  steer(message: string): Promise<void>;
-  abort(): Promise<void>;
+  prompt(message: string): Promise<unknown>;
+  steer(message: string): Promise<unknown>;
+  abort(): Promise<unknown>;
   getState(): Promise<unknown>;
   onEvent(listener: (event: unknown) => void): () => void;
   onTransportFault(listener: (fault: RpcSupervisorTransportFault) => void): () => void;
@@ -60,9 +49,9 @@ export interface RpcSupervisorClient {
 /** Pi 公开 RpcClient 在监督器所需范围内的结构类型。 */
 export interface PiRpcClientPublic {
   start(): Promise<void>;
-  prompt(message: string): Promise<void>;
-  steer(message: string): Promise<void>;
-  abort(): Promise<void>;
+  prompt(message: string): Promise<unknown>;
+  steer(message: string): Promise<unknown>;
+  abort(): Promise<unknown>;
   getState(): Promise<unknown>;
   onEvent(listener: (event: unknown) => void): () => void;
 }
@@ -91,15 +80,15 @@ export class PiRpcClientAdapter {
     return this.client.start();
   }
 
-  prompt(message: string): Promise<void> {
+  prompt(message: string): Promise<unknown> {
     return this.client.prompt(message);
   }
 
-  steer(message: string): Promise<void> {
+  steer(message: string): Promise<unknown> {
     return this.client.steer(message);
   }
 
-  abort(): Promise<void> {
+  abort(): Promise<unknown> {
     return this.client.abort();
   }
 
@@ -286,6 +275,12 @@ export interface RpcSupervisorActivity {
   readonly active_count: number;
 }
 
+export interface RpcSupervisorRuntimeState {
+  readonly isStreaming: boolean;
+  readonly isCompacting: boolean;
+  readonly pendingMessageCount: number;
+}
+
 export type RpcSupervisorFaultCode =
   | "rpc_eof"
   | "rpc_protocol_fault"
@@ -318,42 +313,18 @@ export interface RpcSupervisorChannel {
   bind(signal: AbortSignal): Promise<void>;
   waitForReady(signal: AbortSignal): Promise<void>;
   isReady(): boolean;
-  publishReply(reply: SupervisorReplyInput | SupervisorReply): Promise<void>;
-  /** child final 使用；Promise 只等待本地帧写入，ACK 通过返回句柄异步完成。 */
-  publishReplyWithAck?(
-    reply: SupervisorReplyInput | SupervisorReply,
-  ): Promise<SupervisorReplyPublication>;
-  /** 显式等待父端累计 ACK；不得作为 child 生命周期帧的串行发布操作。 */
-  publishReplyAndWaitForAck?(
-    reply: SupervisorReplyInput | SupervisorReply,
-    signal?: AbortSignal,
-  ): Promise<void>;
-  /** parent 在正文 RPC 前发布任务租约并等待 child transport ACK。 */
-  publishTaskAssignmentAndWaitForAck?(
-    assignment: SupervisorTaskAssignment,
-    signal?: AbortSignal,
-  ): Promise<void>;
-  /** child 端观察已经在监督顺序域接纳的任务租约。 */
-  onTaskAssignment?(listener: (assignment: SupervisorTaskAssignment) => void): () => void;
-  /** parent 端观察 child 实际启动的 task/turn 身份。 */
-  onTaskStarted?(listener: (started: SupervisorTaskStarted) => void): () => void;
-  /** child 发布实际启动的 task/turn 身份；必须先于该 turn 的 reply。 */
-  publishTaskStarted?(started: SupervisorTaskStarted): Promise<void>;
+  publishReply(reply: SupervisorReply, signal?: AbortSignal): Promise<void>;
   /** parent 返回协调压缩准备结果。 */
   respondCompactionPrepared?(response: SupervisorCompactionPrepared): Promise<void>;
   onCompactionPrepare?(listener: (request: SupervisorCompactionPrepare) => void): () => void;
   /** parent 返回协调压缩完成结果。 */
   respondCompactionCompleted?(response: SupervisorCompactionCompleted): Promise<void>;
   onCompactionComplete?(listener: (request: SupervisorCompactionComplete) => void): () => void;
-  /** 父端在 reload 后重新尝试注入已接收但尚未确认的回复。 */
-  retryPendingReplies?(): Promise<void>;
   establishTerminationBarrier(): void;
   requestClose(signal: AbortSignal): Promise<void>;
   waitForClose(deadline: number | Date): Promise<RpcSupervisorChannelCloseState>;
   release(): Promise<void>;
   onFault(listener: (fault: RpcSupervisorChannelFault) => void): () => void;
-  /** 父端观察协议已完成接纳/去重的 reply，用于任务 commit 投影。 */
-  onReply?(listener: (reply: SupervisorReply) => void): () => void;
   /** 父端收到子端安全生命周期事实时调用；旧替身可省略。 */
   onEvent?(listener: (event: SupervisorEvent) => void): () => void;
   onSnapshot?(listener: (snapshot: SupervisorSnapshot) => void): () => void;
@@ -395,10 +366,8 @@ export interface RpcSupervisorController {
     agentId: unknown,
     event: AgentLifecycleEvent | unknown,
   ): ControlResult<LifecycleEventOutcome>;
-  applyTaskProjection(
-    agentId: unknown,
-    projection: AgentTaskProjectionInput | unknown,
-  ): ControlResult<LifecycleEventOutcome>;
+  /** 清理诊断不改变生命周期，仅在终止屏障上记录不可确认事实。 */
+  markTerminationBarrierIncomplete?(agentId: unknown): ControlResult<LifecycleEventOutcome>;
   applySubtreeSnapshot?(
     actor: TreeActor | unknown,
     input: SupervisorSnapshot,
@@ -420,10 +389,6 @@ export interface RpcSupervisorOptions {
   ) => RpcSupervisorChannelBinding;
   readonly startupTimeoutMs: number;
   readonly gracefulShutdownMs: number;
-  /** abort 已接受但 Pi 未形成 settled/final 的最长隔离窗口。 */
-  readonly interruptTimeoutMs?: number;
-  /** parent 等待 child 接纳任务租约的上限；省略时沿用启动期限。 */
-  readonly taskAssignmentTimeoutMs?: number;
   /** child extension bind 后的实际能力裁决；缺失 manifest 必须失败关闭。 */
   readonly validateCapability?: (capability: SupervisorCapabilityManifest) => boolean;
   readonly now?: () => number;
@@ -452,8 +417,6 @@ export type RpcSupervisorCommandResult =
   | {
       readonly ok: true;
       readonly accepted: true;
-      readonly message_id: string;
-      readonly task_id: string;
     }
   | {
       readonly ok: false;
@@ -522,8 +485,6 @@ class StartupTransportFaultError extends Error {
   }
 }
 
-const DEFAULT_INTERRUPT_SETTLEMENT_TIMEOUT_MS = 10_000;
-
 function validDuration(value: number): boolean {
   return Number.isSafeInteger(value) && value > 0;
 }
@@ -566,36 +527,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+type AgentCompactionReason = "manual" | "threshold" | "overflow";
+
 function isCompactionReason(value: unknown): value is AgentCompactionReason {
   return value === "manual" || value === "threshold" || value === "overflow";
 }
-
-function readPendingMessageCount(value: unknown): number | undefined {
-  if (!isRecord(value) || !Number.isSafeInteger(value.pendingMessageCount)) return undefined;
-  const pending = value.pendingMessageCount as number;
-  return pending >= 0 ? pending : undefined;
-}
-
-function readIsCompacting(value: unknown): boolean | undefined {
-  return isRecord(value) && typeof value.isCompacting === "boolean"
-    ? value.isCompacting
-    : undefined;
-}
-
-function readIsStreaming(value: unknown): boolean | undefined {
-  return isRecord(value) && typeof value.isStreaming === "boolean"
-    ? value.isStreaming
-    : undefined;
-}
-
-type MessageCommandKind = "submit";
 
 type CoordinatedCompactionPhase = "preparing" | "prepared" | "release_failed" | "closed";
 
 interface CoordinatedCompactionState {
   readonly transactionId: string;
   phase: CoordinatedCompactionPhase;
-  mailboxPrepared: boolean;
   replyPrepared: boolean;
   preparation?: Promise<boolean>;
   terminalAccepted?: boolean;
@@ -607,28 +549,6 @@ interface ClosedCoordinatedCompaction {
   readonly continuationExpected: boolean;
   compensationAccepted?: boolean;
 }
-
-interface CompactionStateWaiter {
-  readonly version: number;
-  readonly resolve: () => void;
-}
-
-interface QueuedMessageCommand {
-  readonly kind: MessageCommandKind;
-  readonly message: string;
-  readonly message_id: string;
-  readonly delivery?: AgentHostDelivery;
-  readonly compaction_rejection_count?: number;
-  readonly host_busy_rejection_count?: number;
-  resolve(result: RpcSupervisorCommandResult): void;
-}
-
-interface QueuedInterruptCommand {
-  readonly kind: "abort";
-  resolve(result: RpcSupervisorInterruptResult): void;
-}
-
-type QueuedCommand = QueuedMessageCommand | QueuedInterruptCommand;
 
 /**
  * 单节点 RPC 监督器。树所有权和公开生命周期仍由注入控制器裁决；本模块只
@@ -644,7 +564,6 @@ export class RpcSupervisor {
   private agentId: string | undefined;
   private lifecycleGeneration = 0;
   private lifecycleState: AgentLifecycleState | undefined;
-  private readonly mailbox = new AgentTaskMailbox();
   private startupFault: RpcSupervisorTransportFault | RpcSupervisorChannelFault | undefined;
   private readonly startupFaultListeners = new Set<() => void>();
   private startPromise: Promise<RpcSupervisorStartupResult> | undefined;
@@ -653,14 +572,9 @@ export class RpcSupervisor {
   private unsubscribeChannelFault: (() => void) | undefined;
   private unsubscribeChannelEvent: (() => void) | undefined;
   private unsubscribeChannelSnapshot: (() => void) | undefined;
-  private unsubscribeTaskStarted: (() => void) | undefined;
   private unsubscribeCompactionPrepare: (() => void) | undefined;
   private unsubscribeCompactionComplete: (() => void) | undefined;
-  private readonly commandQueue: QueuedCommand[] = [];
-  private activeCommand: QueuedCommand | undefined;
   private readonly eventListeners = new Set<(event: RpcSupervisorEvent) => void>();
-  private finalDeliveryInProgress = false;
-  private readonly deferredFinalDeliveryOperations: Array<() => void> = [];
   private readonly activeTools = new Map<string, RpcSupervisorActivityCategory>();
   private readonly activeToolCounts = new Map<RpcSupervisorActivityCategory, number>();
   private readonly retiredToolCallIds = new Set<string>();
@@ -669,8 +583,13 @@ export class RpcSupervisor {
   private readonly manualCompactionAuthorizations = new Set<string>();
   private activeManualCompactionTransactionId: string | undefined;
   private uncoordinatedManualCompactionActive = false;
-  private readonly compactionStateWaiters = new Set<CompactionStateWaiter>();
-  private compactionStateVersion = 0;
+  private runtimeCompactionActive = false;
+  private hostPendingInputCount = 0;
+  private lifecycleObservationVersion = 0;
+  private latestAgentStartVersion = 0;
+  private compactionObservationVersion = 0;
+  private queueObservationVersion = 0;
+  private stateReconciliationQueue: Promise<boolean> = Promise.resolve(false);
   private terminationPromise: Promise<RpcSupervisorTerminationResult> | undefined;
   private cleanupInFlight: Promise<"confirmed" | "incomplete"> | undefined;
   private lateStartupCleanupScheduled = false;
@@ -680,14 +599,11 @@ export class RpcSupervisor {
   private channelHandleReleased = false;
   private forcedTerminationUsed = false;
   private treeConfirmationPending = false;
-  private interruptSettlementTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(options: RpcSupervisorOptions) {
     if (
       !validDuration(options.startupTimeoutMs)
       || !validDuration(options.gracefulShutdownMs)
-      || (options.interruptTimeoutMs !== undefined && !validDuration(options.interruptTimeoutMs))
-      || (options.taskAssignmentTimeoutMs !== undefined && !validDuration(options.taskAssignmentTimeoutMs))
     ) {
       throw new TypeError("RPC 监督器期限无效");
     }
@@ -712,71 +628,18 @@ export class RpcSupervisor {
     return () => this.eventListeners.delete(listener);
   }
 
-  async retryPendingReplies(): Promise<void> {
-    if (this.phase !== "ready") return;
-    await this.channel?.retryPendingReplies?.();
-  }
-
-  private schedulePendingReplyRetry(): void {
-    void this.retryPendingReplies().catch(() => {
-      this.receiveTransportFault("protocol_fault", "supervisor");
-    });
-  }
-
   /**
-   * 在父端通道 ACK 之前线性化 child reply。final 只有在 raw settled candidate
-   * 已观察到且父会话同步接纳后才提交；过期 task 的回复确认后丢弃，防止 outbox
-   * 永久阻塞。
+   * 在父端 Pi 接纳边界登记一条独立会话消息。消息和报告不携带任务/回合
+   * 身份，也不做去重、排序或提交；每次调用都单独交给父端。
    */
   acceptChildReply(envelope: ChildReplyEnvelope, deliver: () => boolean): boolean {
-    if (this.phase !== "ready" || this.finalDeliveryInProgress) return false;
-    const currentTaskId = this.mailbox.currentTaskId();
-    if (currentTaskId !== undefined && currentTaskId !== envelope.task_id) return true;
-    const currentTurnId = this.mailbox.currentTurnId();
-    if (currentTurnId !== undefined && currentTurnId !== envelope.turn_id) return true;
-    if (envelope.kind === "final") {
-      if (this.mailbox.shouldAcknowledgeSupersededFinal(envelope)) return true;
-      if (!this.mailbox.prepareFinal(envelope)) {
-        this.commitTaskProjection();
-        return false;
-      }
-      this.commitTaskProjection();
-      const deliveryAction = this.mailbox.beginPreparedFinalDelivery(envelope.commit_id);
-      if (deliveryAction === undefined) return false;
-      if (deliveryAction === "deliver") {
-        let committed = false;
-        this.finalDeliveryInProgress = true;
-        try {
-          let accepted = false;
-          try {
-            accepted = deliver();
-          } catch {
-            accepted = false;
-          }
-          if (this.mailbox.completePreparedFinalDelivery(envelope.commit_id, accepted) && accepted) {
-            committed = this.mailbox.commitPreparedFinal(envelope.commit_id);
-            if (committed) {
-              this.commitTaskProjection();
-              this.clearInterruptSettlementWatchdog();
-              this.emitEvent(Object.freeze({ kind: "reply", reply: envelope }));
-            }
-          }
-        } finally {
-          this.finalDeliveryInProgress = false;
-          this.flushDeferredFinalDeliveryOperations();
-        }
-        if (!committed) return false;
-        this.drainCommandQueue();
-        return true;
-      }
-      if (!this.mailbox.commitPreparedFinal(envelope.commit_id)) return false;
-      this.commitTaskProjection();
-      this.clearInterruptSettlementWatchdog();
-      this.emitEvent(Object.freeze({ kind: "reply", reply: envelope }));
-      this.drainCommandQueue();
-      return true;
-    }
-    if (!this.mailbox.acceptsReplyTask(envelope.task_id, envelope.turn_id)) return true;
+    if (
+      this.phase !== "ready"
+      || this.lifecycleState === "interrupting"
+      || this.lifecycleState === "terminating"
+      || this.lifecycleState === "terminated"
+      || this.lifecycleState === "failed"
+    ) return false;
     let accepted = false;
     try {
       accepted = deliver();
@@ -787,68 +650,45 @@ export class RpcSupervisor {
     return accepted;
   }
 
-  submit(message: string): Promise<RpcSupervisorCommandResult> {
+  sendMessage(message: string): Promise<RpcSupervisorCommandResult> {
     return this.enqueueMessage(message);
   }
 
-  prompt(message: string): Promise<RpcSupervisorCommandResult> {
-    return this.enqueueMessage(message);
+  /** 读取 Pi 的真实运行状态并校准本地生命周期。 */
+  async synchronizeState(): Promise<boolean> {
+    if (this.phase !== "ready") return false;
+    return await this.enqueueStateReconciliation();
   }
 
-  steer(message: string): Promise<RpcSupervisorCommandResult> {
-    return this.enqueueMessage(message);
-  }
-
-  interrupt(): Promise<RpcSupervisorInterruptResult> {
-    if (this.finalDeliveryInProgress) {
-      return new Promise<RpcSupervisorInterruptResult>((resolve) => {
-        this.deferredFinalDeliveryOperations.push(() => {
-          void this.interrupt().then(
-            resolve,
-            () => resolve(Object.freeze({ ok: false, code: "agent_unavailable" })),
-          );
-        });
-      });
-    }
+  async interrupt(): Promise<RpcSupervisorInterruptResult> {
     if (this.phase !== "ready") {
-      return Promise.resolve(Object.freeze({ ok: false, code: "agent_unavailable" }));
+      return Object.freeze({ ok: false, code: "agent_unavailable" });
     }
-    if (this.mailbox.isCompactionActive()) {
-      return Promise.resolve(Object.freeze({
+    await this.synchronizeState();
+    if (this.phase !== "ready") {
+      return Object.freeze({ ok: false, code: "agent_unavailable" });
+    }
+    if (this.compactionBarrierActive()) {
+      return Object.freeze({
         ok: true,
         accepted: true,
         changed: false,
         blocked_reason: "compaction_active" as const,
-      }));
+      });
     }
-    const decision = this.mailbox.requestInterrupt();
-    this.commitTaskProjection();
-    if (!decision.changed || !decision.should_abort) {
-      return Promise.resolve(Object.freeze({ ok: true, accepted: false, changed: false }));
+    if (this.lifecycleState !== "working") {
+      return Object.freeze({ ok: true, accepted: false, changed: false });
     }
     try {
-      const abort = this.commandClient().abort();
-      void abort.catch(() => this.quarantineRuntime("rpc_protocol_fault", true));
-      this.armInterruptSettlementWatchdog();
-      return Promise.resolve(Object.freeze({ ok: true, accepted: true, changed: true }));
+      await this.commandClient().abort();
+      this.applyLifecycle({ type: "interrupt_accepted" });
+      return Object.freeze({ ok: true, accepted: true, changed: true });
     } catch {
-      this.quarantineRuntime("rpc_protocol_fault", true);
-      return Promise.resolve(Object.freeze({ ok: false, code: "agent_unavailable" }));
+      return Object.freeze({ ok: false, code: "agent_unavailable" });
     }
   }
 
   terminate(): Promise<RpcSupervisorTerminationResult> {
-    if (this.finalDeliveryInProgress) {
-      return new Promise<RpcSupervisorTerminationResult>((resolve) => {
-        this.deferredFinalDeliveryOperations.push(() => {
-          void this.terminate().then(
-            resolve,
-            () => resolve(Object.freeze({ ok: false, code: "agent_unavailable" })),
-          );
-        });
-      });
-    }
-    this.clearInterruptSettlementWatchdog();
     if (this.terminationPromise !== undefined) return this.terminationPromise;
     if (this.phase === "terminated" && this.agentId !== undefined) {
       return Promise.resolve(Object.freeze({
@@ -865,14 +705,11 @@ export class RpcSupervisor {
       return Promise.resolve(Object.freeze({ ok: false, code: "agent_unavailable" }));
     }
 
-    const abortActiveRpc = this.activeCommand !== undefined ||
-      this.lifecycleState === "working" ||
+    const abortActiveRpc = this.lifecycleState === "working" ||
       this.lifecycleState === "interrupting";
-    this.applyLifecycle({ type: "termination_requested" });
+    this.applyLifecycle({ type: "terminate_accepted" });
     this.phase = "terminating";
     this.channel?.establishTerminationBarrier();
-    this.cancelQueuedCommands();
-    this.resolveActiveMessageAsUnavailable();
 
     if (abortActiveRpc) {
       try {
@@ -1116,12 +953,6 @@ export class RpcSupervisor {
         this.receiveSupervisorSnapshot(snapshot);
       });
     }
-    const onTaskStarted = channel.onTaskStarted;
-    if (typeof onTaskStarted === "function") {
-      this.unsubscribeTaskStarted = onTaskStarted.call(channel, (started) => {
-        this.receiveTaskStarted(started);
-      });
-    }
     const onCompactionPrepare = channel.onCompactionPrepare;
     if (typeof onCompactionPrepare === "function") {
       this.unsubscribeCompactionPrepare = onCompactionPrepare.call(channel, (request) => {
@@ -1137,45 +968,44 @@ export class RpcSupervisor {
   }
 
   private async receiveCompactionPrepare(request: SupervisorCompactionPrepare): Promise<void> {
-    if (this.deferDuringFinalDelivery(() => {
-      void this.receiveCompactionPrepare(request);
-    })) return;
     const channel = this.channel;
     const respond = channel?.respondCompactionPrepared;
     if (this.phase !== "ready" || typeof respond !== "function") return;
     const transactionId = request.transaction_id;
-    let preparation: Promise<boolean>;
     const existing = this.coordinatedCompactions.get(transactionId);
+    let accepted: boolean;
     if (existing !== undefined) {
-      preparation = existing.phase === "prepared"
-        ? Promise.resolve(true)
-        : existing.preparation ?? Promise.resolve(false);
+      accepted = existing.phase === "prepared" || existing.preparation === undefined
+        ? existing.phase === "prepared"
+        : await existing.preparation;
     } else if (this.closedCoordinatedCompactions.has(transactionId)) {
-      preparation = Promise.resolve(false);
+      accepted = false;
     } else {
       const state: CoordinatedCompactionState = {
         transactionId,
         phase: "preparing",
-        mailboxPrepared: false,
         replyPrepared: false,
       };
       this.coordinatedCompactions.set(transactionId, state);
-      state.mailboxPrepared = this.mailbox.beginCoordinationBarrier(transactionId);
       try {
         state.replyPrepared = this.options.onCompactionPrepare?.(transactionId) === true;
       } catch {
         state.replyPrepared = false;
       }
-      if (!state.mailboxPrepared || !state.replyPrepared) {
-        this.releaseCoordinatedCompaction(state, "not_started");
-        preparation = Promise.resolve(false);
+      if (!state.replyPrepared) {
+        state.phase = "closed";
+        this.coordinatedCompactions.delete(transactionId);
+        this.rememberClosedCoordinatedCompaction(transactionId, "not_started", false, false);
+        accepted = false;
       } else {
-        preparation = this.awaitCoordinatedCompactionPreparation(state);
-        state.preparation = preparation;
+        state.phase = "prepared";
+        state.preparation = Promise.resolve(true);
+        // child 收到 prepared ACK 后才会发出 manual compaction_start；先登记授权，
+        // 避免 ACK 与 Pi 事件跨通道交错时把合法压缩误判为协议故障。
+        this.manualCompactionAuthorizations.add(transactionId);
+        accepted = true;
       }
     }
-
-    const accepted = await preparation;
     try {
       await respond.call(channel, { transaction_id: transactionId, accepted });
     } catch {
@@ -1186,9 +1016,6 @@ export class RpcSupervisor {
   }
 
   private async receiveCompactionComplete(request: SupervisorCompactionComplete): Promise<void> {
-    if (this.deferDuringFinalDelivery(() => {
-      void this.receiveCompactionComplete(request);
-    })) return;
     const channel = this.channel;
     const respond = channel?.respondCompactionCompleted;
     if (this.phase !== "ready" || typeof respond !== "function") return;
@@ -1204,24 +1031,6 @@ export class RpcSupervisor {
           false,
           request.continuation_expected,
         );
-      } else if (
-        request.outcome === "not_started"
-        && remembered.accepted
-        && remembered.outcome !== "not_started"
-      ) {
-        if (remembered.compensationAccepted === undefined) {
-          const changed = remembered.continuationExpected
-            ? this.mailbox.compensateCoordinationContinuation(request.transaction_id)
-            : false;
-          remembered.compensationAccepted = !remembered.continuationExpected || changed;
-          if (changed) {
-            this.commitTaskProjection();
-            this.signalCompactionStateChange();
-            this.drainCommandQueue();
-            this.schedulePendingReplyRetry();
-          }
-        }
-        accepted = remembered.compensationAccepted;
       } else {
         accepted = remembered.accepted;
       }
@@ -1247,65 +1056,12 @@ export class RpcSupervisor {
     }
   }
 
-  private async awaitCoordinatedCompactionPreparation(
-    state: CoordinatedCompactionState,
-  ): Promise<boolean> {
-    while (this.phase === "ready" && state.phase === "preparing") {
-      const readiness = this.mailbox.coordinationBarrierReadiness();
-      if (readiness === "unsafe") {
-        this.releaseCoordinatedCompaction(state, "not_started");
-        return false;
-      }
-      if (readiness === "waiting") {
-        await this.waitForCompactionStateChange(this.compactionStateVersion);
-        continue;
-      }
-
-      const version = this.compactionStateVersion;
-      const probe = Promise.resolve()
-        .then(() => this.commandClient().getState())
-        .then(
-          (value) => ({ kind: "state" as const, pending: readPendingMessageCount(value) }),
-          () => ({ kind: "state" as const, pending: undefined }),
-        );
-      const observed = await Promise.race([
-        probe,
-        this.waitForCompactionStateChange(version).then(() => ({ kind: "changed" as const })),
-      ]);
-      if (observed.kind === "changed") continue;
-      if (this.phase !== "ready" || state.phase !== "preparing") return false;
-      if (observed.pending === undefined) {
-        this.releaseCoordinatedCompaction(state, "not_started");
-        return false;
-      }
-      this.mailbox.reconcileHostPending(observed.pending);
-      this.commitTaskProjection();
-      if (observed.pending !== 0 || this.mailbox.coordinationBarrierReadiness() !== "quiescent") {
-        continue;
-      }
-      state.phase = "prepared";
-      this.manualCompactionAuthorizations.add(state.transactionId);
-      this.signalCompactionStateChange();
-      return true;
-    }
-    return state.phase === "prepared";
-  }
-
   private releaseCoordinatedCompaction(
     state: CoordinatedCompactionState,
     outcome: SupervisorCompactionComplete["outcome"],
     continuationExpected = false,
   ): boolean {
     if (state.phase === "closed") return true;
-    let mailboxReleased = !state.mailboxPrepared;
-    if (state.mailboxPrepared) {
-      mailboxReleased = this.mailbox.completeCoordinationBarrier(
-        state.transactionId,
-        outcome,
-        continuationExpected,
-      );
-      if (mailboxReleased) state.mailboxPrepared = false;
-    }
     let replyReleased = !state.replyPrepared;
     if (state.replyPrepared) {
       try {
@@ -1315,7 +1071,7 @@ export class RpcSupervisor {
       }
       if (replyReleased) state.replyPrepared = false;
     }
-    const released = mailboxReleased && replyReleased;
+    const released = replyReleased;
     if (
       outcome === "not_started"
       && this.activeManualCompactionTransactionId !== state.transactionId
@@ -1332,9 +1088,6 @@ export class RpcSupervisor {
         continuationExpected,
       );
     }
-    this.signalCompactionStateChange();
-    this.drainCommandQueue();
-    this.schedulePendingReplyRetry();
     return released;
   }
 
@@ -1358,26 +1111,6 @@ export class RpcSupervisor {
       if (this.activeManualCompactionTransactionId !== oldest) {
         this.manualCompactionAuthorizations.delete(oldest);
       }
-    }
-  }
-
-  private waitForCompactionStateChange(version: number): Promise<void> {
-    if (version !== this.compactionStateVersion) return Promise.resolve();
-    return new Promise<void>((resolve) => {
-      const waiter = { version, resolve };
-      this.compactionStateWaiters.add(waiter);
-      if (version !== this.compactionStateVersion) {
-        this.compactionStateWaiters.delete(waiter);
-        resolve();
-      }
-    });
-  }
-
-  private signalCompactionStateChange(): void {
-    this.compactionStateVersion += 1;
-    for (const waiter of [...this.compactionStateWaiters]) {
-      this.compactionStateWaiters.delete(waiter);
-      waiter.resolve();
     }
   }
 
@@ -1424,21 +1157,8 @@ export class RpcSupervisor {
     this.manualCompactionAuthorizations.clear();
   }
 
-  private receiveTaskStarted(started: SupervisorTaskStarted): void {
-    if (this.deferDuringFinalDelivery(() => this.receiveTaskStarted(started))) return;
-    if (this.phase !== "ready") return;
-    if (!this.mailbox.observeTaskStarted(started.task_id, started.turn_id)) {
-      this.failRuntime("supervisor_protocol_fault");
-      return;
-    }
-    this.commitTaskProjection();
-    this.schedulePendingReplyRetry();
-    // task_started 可能是解除交付不确定屏障后的唯一唤醒事实；对账后立即拉取后续 mailbox。
-    this.drainCommandQueue();
-  }
 
   private receiveRpcEvent(event: unknown): void {
-    if (this.deferDuringFinalDelivery(() => this.receiveRpcEvent(event))) return;
     if (this.phase !== "ready") return;
     if (!isRecord(event) || typeof event.type !== "string") {
       this.failRuntime("invalid_rpc_event");
@@ -1446,21 +1166,22 @@ export class RpcSupervisor {
     }
     switch (event.type) {
       case "agent_start":
+        this.hostPendingInputCount = 0;
+        this.markLifecycleObservation("agent_start");
         this.resetToolActivity();
-        this.mailbox.observeAgentStart();
-        this.commitTaskProjection();
-        // 压缩期间接纳的消息必须等后续真实 run 先建立，再作为 steering 进入该 run。
-        this.drainCommandQueue();
+        if (this.lifecycleState === "idle") this.applyLifecycle({ type: "agent_start" });
         return;
       case "agent_end":
-        // agent_end/agent_settled 都是工具调用已经离开活动集合的轮次边界。
-        // 若 Pi 缺失了单个 tool_execution_end，不能让 delegating 等摘要永久残留。
+        // agent_end 只离开当前模型循环，不直接写入 idle。
         this.resetToolActivity();
-        this.commitTaskProjection();
         return;
-      case "agent_settled":
-        this.observeProvisionalSettlement();
+      case "agent_settled": {
+        const settlementVersion = this.markLifecycleObservation();
+        void this.enqueueStateReconciliation(settlementVersion).catch(() => {
+          // 状态探针失败不能伪造 idle；后续状态查询或消息发送仍可重试校准。
+        });
         return;
+      }
       case "compaction_start": {
         if (!isCompactionReason(event.reason)) {
           this.failRuntime("invalid_rpc_event");
@@ -1477,8 +1198,9 @@ export class RpcSupervisor {
           return;
         }
         if (event.reason !== "manual") this.revokePendingManualCompactionAuthorizations();
-        this.mailbox.observeCompactionStart(event.reason, coordinatedManual);
-        this.commitTaskProjection();
+        this.runtimeCompactionActive = true;
+        this.compactionObservationVersion += 1;
+        this.markLifecycleObservation();
         return;
       }
       case "compaction_end":
@@ -1499,29 +1221,20 @@ export class RpcSupervisor {
           this.failRuntime("invalid_rpc_event");
           return;
         }
-        this.mailbox.observeCompactionEnd(
-          event.reason,
-          event.failed,
-          // Pi 会在取消帧中保留原始 willRetry 意图，但取消后不会启动续跑。
-          event.willRetry && !event.aborted,
-          coordinatedManual,
-        );
-        this.commitTaskProjection();
-        this.drainCommandQueue();
-        this.schedulePendingReplyRetry();
+        this.runtimeCompactionActive = false;
+        this.compactionObservationVersion += 1;
+        this.markLifecycleObservation();
+        void coordinatedManual;
         return;
       case "queue_update": {
         if (!Number.isSafeInteger(event.pendingMessageCount) || (event.pendingMessageCount as number) < 0) {
           this.failRuntime("invalid_rpc_event");
           return;
         }
-        const hadUncertainDelivery = this.mailbox.hasUncertainDelivery();
-        this.mailbox.reconcileHostPending(event.pendingMessageCount as number);
-        this.commitTaskProjection();
-        if (hadUncertainDelivery && !this.mailbox.hasUncertainDelivery()) {
-          this.schedulePendingReplyRetry();
-          this.drainCommandQueue();
-        }
+        // 只记录宿主是否还有待处理输入；它不属于公开快照或消息模型。
+        this.hostPendingInputCount = event.pendingMessageCount as number;
+        this.queueObservationVersion += 1;
+        this.markLifecycleObservation();
         return;
       }
       case "tool_execution_start":
@@ -1546,7 +1259,6 @@ export class RpcSupervisor {
     fault: RpcSupervisorTransportFault | RpcSupervisorChannelFault,
     source: "rpc" | "supervisor",
   ): void {
-    if (this.deferDuringFinalDelivery(() => this.receiveTransportFault(fault, source))) return;
     if (this.phase === "starting") {
       this.recordStartupFault(fault);
       return;
@@ -1564,7 +1276,6 @@ export class RpcSupervisor {
 
   /** 父端只接受监督协议已脱敏的生命周期事实，并按当前代际提交。 */
   private receiveSupervisorEvent(event: SupervisorEvent): void {
-    if (this.deferDuringFinalDelivery(() => this.receiveSupervisorEvent(event))) return;
     if (this.phase !== "ready" && this.phase !== "starting") return;
     const expectedGeneration = event.expected_generation;
     if (typeof expectedGeneration !== "number" || !Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) {
@@ -1577,14 +1288,25 @@ export class RpcSupervisor {
         expected_generation: expectedGeneration,
         ...(event.error_code === undefined ? {} : { error_code: event.error_code }),
       }) as AgentLifecycleEvent;
+      if (event.agent_id === this.agentId && lifecycleEvent.type === "agent_settled") {
+        const settlementVersion = this.markLifecycleObservation();
+        void this.enqueueStateReconciliation(settlementVersion).catch(() => {
+          // 状态探针失败不能伪造 idle；后续状态查询或消息发送仍可重试校准。
+        });
+        return;
+      }
       const outcome = this.options.controller.applyLifecycleEvent(event.agent_id, lifecycleEvent);
       if (!outcome.ok) {
         this.receiveTransportFault("protocol_fault", "supervisor");
         return;
       }
+      // 迟到代际或非法状态边只返回当前快照，不向上层伪造生命周期事实。
+      if (!outcome.data.applied) return;
       if (event.agent_id === this.agentId) {
         this.lifecycleGeneration = outcome.data.lifecycle_generation;
         this.lifecycleState = outcome.data.node.state;
+        if (lifecycleEvent.type === "agent_start") this.markLifecycleObservation("agent_start");
+        else if (lifecycleEvent.type === "agent_settled") this.markLifecycleObservation();
         if (lifecycleEvent.type === "runtime_failed" && outcome.data.node.state === "failed") {
           if (this.phase === "starting") {
             this.recordStartupFault("protocol_fault");
@@ -1602,7 +1324,6 @@ export class RpcSupervisor {
 
   /** 完整快照先由通道校验，再由树控制器在一个修订中合并。 */
   private receiveSupervisorSnapshot(snapshot: SupervisorSnapshot): void {
-    if (this.deferDuringFinalDelivery(() => this.receiveSupervisorSnapshot(snapshot))) return;
     if (this.phase !== "ready" && this.phase !== "starting") return;
     const applySnapshot = this.options.controller.applySubtreeSnapshot;
     if (typeof applySnapshot !== "function") return;
@@ -1612,16 +1333,6 @@ export class RpcSupervisor {
     } catch {
       this.receiveTransportFault("protocol_fault", "supervisor");
     }
-  }
-
-  private commitTaskProjection(): void {
-    this.signalCompactionStateChange();
-    if (this.agentId === undefined || this.phase === "starting" || this.phase === "new") return;
-    const projection = this.mailbox.projection();
-    const outcome = this.options.controller.applyTaskProjection(this.agentId, projection);
-    if (!outcome.ok) throw new Error(`控制器拒绝任务投影：${outcome.error.code}`);
-    this.lifecycleGeneration = outcome.data.lifecycle_generation;
-    this.lifecycleState = outcome.data.node.state;
   }
 
   private onStartupFault(listener: () => void): () => void {
@@ -1649,8 +1360,6 @@ export class RpcSupervisor {
     this.activeTools.set(event.toolCallId, category);
     const activeCount = (this.activeToolCounts.get(category) ?? 0) + 1;
     this.activeToolCounts.set(category, activeCount);
-    this.mailbox.observeToolActivity(category, activeCount);
-    this.commitTaskProjection();
     this.emitEvent(Object.freeze({
       kind: "activity",
       activity: Object.freeze({ category, phase: "started", active_count: activeCount }),
@@ -1672,8 +1381,6 @@ export class RpcSupervisor {
     const activeCount = Math.max(0, (this.activeToolCounts.get(category) ?? 1) - 1);
     if (activeCount === 0) this.activeToolCounts.delete(category);
     else this.activeToolCounts.set(category, activeCount);
-    this.mailbox.observeToolActivity(category, activeCount);
-    this.commitTaskProjection();
     this.emitEvent(Object.freeze({
       kind: "activity",
       activity: Object.freeze({ category, phase: "finished", active_count: activeCount }),
@@ -1690,9 +1397,6 @@ export class RpcSupervisor {
       if (oldest === undefined) break;
       this.retiredToolCallIds.delete(oldest);
     }
-    for (const category of this.activeToolCounts.keys()) {
-      this.mailbox.observeToolActivity(category, 0);
-    }
     this.activeTools.clear();
     this.activeToolCounts.clear();
   }
@@ -1704,44 +1408,17 @@ export class RpcSupervisor {
     if (terminate) void this.terminate().catch(() => {});
   }
 
-  private armInterruptSettlementWatchdog(): void {
-    this.clearInterruptSettlementWatchdog();
-    const timer = setTimeout(() => {
-      if (this.interruptSettlementTimer !== timer) return;
-      this.interruptSettlementTimer = undefined;
-      // abort 响应不是 settled/final 事实。超出隔离窗口仍没有提交，就不能让
-      // interrupt barrier 永久占住 mailbox；正文执行状态未知，因此只回收节点。
-      if (this.phase === "ready" && this.mailbox.hasInterruptBarrier()) {
-        this.quarantineRuntime("message_delivery_failed", true);
-      }
-    }, this.options.interruptTimeoutMs ?? DEFAULT_INTERRUPT_SETTLEMENT_TIMEOUT_MS);
-    timer.unref?.();
-    this.interruptSettlementTimer = timer;
-  }
-
-  private clearInterruptSettlementWatchdog(): void {
-    const timer = this.interruptSettlementTimer;
-    if (timer === undefined) return;
-    clearTimeout(timer);
-    this.interruptSettlementTimer = undefined;
-  }
-
   private recordStartupFault(fault: RpcSupervisorTransportFault | RpcSupervisorChannelFault): void {
     this.startupFault ??= fault;
     for (const listener of [...this.startupFaultListeners]) listener();
   }
 
   private enterFailedPhase(): void {
-    this.clearInterruptSettlementWatchdog();
     this.phase = "failed";
     this.releaseCoordinatedCompactions();
     this.activeTools.clear();
     this.activeToolCounts.clear();
     this.retiredToolCallIds.clear();
-    while (this.commandQueue.length > 0) {
-      this.resolveUnavailableCommand(this.commandQueue.shift()!);
-    }
-    this.resolveActiveMessageAsUnavailable();
   }
 
   private failRuntime(code: RpcSupervisorFaultCode): void {
@@ -1749,10 +1426,14 @@ export class RpcSupervisor {
     // applyLifecycle 会同步通知 AgentController；先固定内部失败态，确保其
     // 立即启动的 orphan cleanup 不会在 reapOrphanedDescendants 中看到 ready。
     this.enterFailedPhase();
-    this.applyLifecycle({
-      type: "runtime_failed",
-      error_code: code === "message_delivery_failed" ? "message_delivery_failed" : "internal_error",
-    });
+    const lifecycleCode = code === "message_delivery_failed"
+      ? "message_delivery_failed"
+      : code === "invalid_rpc_event"
+        || code === "rpc_protocol_fault"
+        || code === "supervisor_protocol_fault"
+        ? "protocol_mismatch"
+        : "internal_error";
+    this.applyLifecycle({ type: "runtime_failed", error_code: lifecycleCode });
     this.emitEvent(Object.freeze({ kind: "fault", code }));
   }
 
@@ -1764,298 +1445,148 @@ export class RpcSupervisor {
     this.manualCompactionAuthorizations.clear();
     this.activeManualCompactionTransactionId = undefined;
     this.uncoordinatedManualCompactionActive = false;
-    this.signalCompactionStateChange();
+    this.runtimeCompactionActive = false;
   }
 
-  private deferDuringFinalDelivery(operation: () => void): boolean {
-    if (!this.finalDeliveryInProgress) return false;
-    this.deferredFinalDeliveryOperations.push(operation);
+  private compactionBarrierActive(): boolean {
+    return this.runtimeCompactionActive
+      || this.coordinatedCompactions.size > 0
+      || this.activeManualCompactionTransactionId !== undefined
+      || this.uncoordinatedManualCompactionActive;
+  }
+
+  private async enqueueMessage(
+    message: string,
+    mode?: "prompt" | "steer",
+  ): Promise<RpcSupervisorCommandResult> {
+    if (this.phase !== "ready" || typeof message !== "string" || message.length === 0) {
+      return Object.freeze({ ok: false, code: "agent_unavailable" });
+    }
+    // 本地 lifecycle 可能落后于 Pi 的续跑事件；先读取真实状态，再决定
+    // 使用 steer 还是启动新的 prompt。
+    await this.synchronizeState();
+    if (this.phase !== "ready") {
+      return Object.freeze({ ok: false, code: "agent_unavailable" });
+    }
+    if (
+      this.lifecycleState === "interrupting"
+      || this.lifecycleState === "terminating"
+      || this.lifecycleState === "terminated"
+      || this.lifecycleState === "failed"
+    ) return Object.freeze({ ok: false, code: "message_delivery_failed" });
+    if (this.compactionBarrierActive()) {
+      return Object.freeze({ ok: false, code: "message_delivery_failed" });
+    }
+    const submissionMode = mode ?? (this.lifecycleState === "working" ? "steer" : "prompt");
+    try {
+      const operation = submissionMode === "steer"
+        ? this.commandClient().steer(message)
+        : this.commandClient().prompt(message);
+      const response = await this.withMessageTimeout(operation);
+      if (!isSynchronousAcceptance(response)) throw new Error("message_delivery_failed");
+      return Object.freeze({ ok: true, accepted: true }) as unknown as RpcSupervisorCommandResult;
+    } catch {
+      // Pi 拒绝、调用异常或响应未知只结算本次消息，不升级生命周期。
+      return Object.freeze({ ok: false, code: "message_delivery_failed" });
+    }
+  }
+
+  private markLifecycleObservation(type?: "agent_start"): number {
+    this.lifecycleObservationVersion += 1;
+    if (type === "agent_start") this.latestAgentStartVersion = this.lifecycleObservationVersion;
+    return this.lifecycleObservationVersion;
+  }
+
+  private enqueueStateReconciliation(expectedSettlementVersion?: number): Promise<boolean> {
+    const operation = this.stateReconciliationQueue.then(
+      () => this.reconcileRuntimeState(expectedSettlementVersion),
+      () => this.reconcileRuntimeState(expectedSettlementVersion),
+    );
+    this.stateReconciliationQueue = operation.catch(() => false);
+    return operation;
+  }
+
+  private async reconcileRuntimeState(expectedSettlementVersion?: number): Promise<boolean> {
+    if (this.phase !== "ready") return false;
+    const compactionVersion = this.compactionObservationVersion;
+    const queueVersion = this.queueObservationVersion;
+    const latestAgentStartAtProbe = this.latestAgentStartVersion;
+    let observed: RpcSupervisorRuntimeState | undefined;
+    try {
+      observed = parseRpcSupervisorRuntimeState(await this.commandClient().getState());
+    } catch {
+      return false;
+    }
+    if (observed === undefined || this.phase !== "ready") return false;
+
+    if (this.queueObservationVersion === queueVersion) {
+      this.hostPendingInputCount = observed.pendingMessageCount;
+    }
+    if (this.compactionObservationVersion === compactionVersion && observed.isCompacting) {
+      this.runtimeCompactionActive = true;
+    }
+    const pendingMessageCount = this.queueObservationVersion === queueVersion
+      ? observed.pendingMessageCount
+      : this.hostPendingInputCount;
+    const isCompacting = this.compactionObservationVersion === compactionVersion
+      ? observed.isCompacting
+      : this.runtimeCompactionActive;
+    const activeRun = observed.isStreaming || pendingMessageCount > 0;
+    if (activeRun) {
+      if (this.lifecycleState === "idle") {
+        try {
+          this.applyLifecycle({ type: "agent_start" });
+        } catch {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    // 续跑的 agent_start 可能已经先于旧 settled 事件抵达；旧 settled
+    // 不能覆盖这个更新的真实运行事实。
+    if (
+      (expectedSettlementVersion !== undefined
+        && this.latestAgentStartVersion > expectedSettlementVersion)
+      || this.latestAgentStartVersion > latestAgentStartAtProbe
+    ) return true;
+    if (isCompacting || this.compactionBarrierActive() || pendingMessageCount !== 0) {
+      return true;
+    }
+    if (this.lifecycleState === "working" || this.lifecycleState === "interrupting") {
+      try {
+        this.applyLifecycle({ type: "agent_settled" });
+      } catch {
+        return false;
+      }
+    }
     return true;
   }
 
-  private flushDeferredFinalDeliveryOperations(): void {
-    const operations = this.deferredFinalDeliveryOperations.splice(0);
-    for (const operation of operations) {
-      try {
-        operation();
-      } catch {
-        this.failRuntime("supervisor_protocol_fault");
-      }
-    }
-  }
-
-  private enqueueMessage(message: string): Promise<RpcSupervisorCommandResult> {
-    if (this.phase !== "ready" || typeof message !== "string" || message.length === 0) {
-      return Promise.resolve(Object.freeze({ ok: false, code: "agent_unavailable" }));
-    }
-    if (this.finalDeliveryInProgress) {
-      return new Promise<RpcSupervisorCommandResult>((resolve) => {
-        this.deferredFinalDeliveryOperations.push(() => {
-          void this.enqueueMessage(message).then(
-            resolve,
-            () => resolve(Object.freeze({ ok: false, code: "agent_unavailable" })),
-          );
-        });
-      });
-    }
-    let submission: ReturnType<AgentTaskMailbox["submit"]>;
-    try {
-      submission = this.mailbox.submit(message);
-      this.commitTaskProjection();
-    } catch {
-      return Promise.resolve(Object.freeze({ ok: false, code: "agent_unavailable" }));
-    }
-    return new Promise<RpcSupervisorCommandResult>((resolve) => {
-      this.commandQueue.push({
-        kind: "submit",
-        message,
-        message_id: submission.message_id,
-        resolve,
-      });
-      this.drainCommandQueue();
-      // 接纳点是插件 mailbox，而不是 Pi 命令响应。
-      resolve(Object.freeze({ ok: true, ...submission }));
+  private async withMessageTimeout(operation: Promise<unknown>): Promise<unknown> {
+    const timeoutMs = this.options.startupTimeoutMs;
+    return new Promise<unknown>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new Error("message_delivery_unknown"));
+      }, timeoutMs);
+      void Promise.resolve(operation).then(
+        (value: unknown) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error: unknown) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
     });
-  }
-
-  private drainCommandQueue(): void {
-    if (this.activeCommand !== undefined || this.phase !== "ready") return;
-    while (this.commandQueue[0]?.kind === "submit"
-      && !this.mailbox.hasPendingMessage(this.commandQueue[0].message_id)) {
-      this.commandQueue.shift();
-    }
-    const queued = this.commandQueue[0];
-    if (queued === undefined) return;
-    if (queued.kind === "abort") {
-      this.commandQueue.shift();
-      this.activeCommand = queued;
-      void this.executeInterruptCommand(queued).finally(() => this.finishCommand(queued));
-      return;
-    }
-    const delivery = this.mailbox.takeNextDelivery();
-    if (delivery === undefined) return;
-    const command: QueuedMessageCommand = { ...queued, delivery };
-    this.commandQueue.shift();
-    this.activeCommand = command;
-    void this.executeMessageCommand(command).finally(() => this.finishCommand(command));
-  }
-
-  private executeMessageCommand(command: QueuedMessageCommand): Promise<void> {
-    const delivery = command.delivery;
-    if (delivery === undefined) return Promise.resolve();
-    const channel = this.channelOrThrow();
-    const publishAssignment = channel.publishTaskAssignmentAndWaitForAck;
-    const assignmentController = new AbortController();
-    let assignmentTimedOut = false;
-    let commandFinished = false;
-    let resolveCommand!: () => void;
-    const completion = new Promise<void>((resolve) => {
-      resolveCommand = resolve;
-    });
-    const finish = (): void => {
-      if (commandFinished) return;
-      commandFinished = true;
-      clearTimeout(assignmentTimeout);
-      resolveCommand();
-    };
-    const assignmentTimeout = setTimeout(
-      () => {
-        if (commandFinished) return;
-        // 超时只隔离当前任务的交付；不能把没有运行时故障证据的节点升级为 failed。
-        assignmentTimedOut = true;
-        try {
-          if (this.phase === "ready") {
-            this.mailbox.hostDeliveryUncertain(delivery.delivery_id);
-            this.commitTaskProjection();
-          }
-        } finally {
-          assignmentController.abort();
-          finish();
-        }
-      },
-      this.options.taskAssignmentTimeoutMs ?? this.options.startupTimeoutMs,
-    );
-    const handleAssignmentFailure = (): void => {
-      if (commandFinished || assignmentTimedOut) return;
-      this.mailbox.hostDeliveryUncertain(delivery.delivery_id);
-      if (this.phase !== "ready") {
-        finish();
-        return;
-      }
-      this.commitTaskProjection();
-      this.schedulePendingReplyRetry();
-      finish();
-    };
-    const handleAssignmentAcknowledged = (): void => {
-      if (commandFinished || assignmentTimedOut) return;
-      clearTimeout(assignmentTimeout);
-      if (this.phase !== "ready" || !this.mailbox.isDeliveryActive(delivery.delivery_id)) {
-        finish();
-        return;
-      }
-      void this.executeAssignedDelivery(command).then(finish, finish);
-    };
-    try {
-      if (typeof publishAssignment !== "function") throw new Error("任务租约通道不可用");
-      // 通道实现可能忽略 AbortSignal；本地超时会直接完成当前命令，
-      // 不让悬挂的底层写入继续占住整个命令队列。
-      const assignment = Promise.resolve(publishAssignment.call(channel, {
-        message_id: delivery.message_id,
-        task_id: delivery.task_id,
-        mode: delivery.mode,
-      }, assignmentController.signal));
-      void assignment.then(handleAssignmentAcknowledged, handleAssignmentFailure);
-    } catch {
-      handleAssignmentFailure();
-    }
-    return completion;
-  }
-
-  private async executeAssignedDelivery(command: QueuedMessageCommand): Promise<void> {
-    const delivery = command.delivery;
-    if (
-      delivery === undefined
-      || this.phase !== "ready"
-      || !this.mailbox.isDeliveryActive(delivery.delivery_id)
-    ) return;
-    try {
-      if (delivery.host_submission === "strict_prompt") {
-        await this.commandClient().prompt(delivery.message);
-      } else {
-        await this.commandClient().steer(delivery.message);
-      }
-      this.mailbox.hostAccepted(delivery.delivery_id);
-    } catch (error) {
-      if (error instanceof ManagedRpcCommandRejectedError) {
-        let requeue = false;
-        let nextCompactionRejectionCount = command.compaction_rejection_count;
-        let nextHostBusyRejectionCount = command.host_busy_rejection_count;
-        if (error.reason === "compaction_active") {
-          const priorRejections = command.compaction_rejection_count ?? 0;
-          // compaction_end 与命令响应分属不同通道；首次只读宿主状态用于收敛乱序。
-          // 若立即重试仍得到同一拒绝，不再信任失配探针，等待真实生命周期以禁止忙等。
-          const hostCompacting = priorRejections > 0
-            ? true
-            : await this.probeHostCompactionAfterRejection();
-          if (this.phase === "ready" && this.mailbox.isDeliveryActive(delivery.delivery_id)) {
-            requeue = this.mailbox.hostRejectedForCompaction(
-              delivery.delivery_id,
-              hostCompacting,
-            );
-            nextCompactionRejectionCount = priorRejections + 1;
-          }
-        } else if (
-          error.reason === "host_busy"
-          && delivery.host_submission === "strict_prompt"
-        ) {
-          const priorRejections = command.host_busy_rejection_count ?? 0;
-          // 首次拒绝用只读状态收敛 response/settled 乱序；连续拒绝必须等待
-          // 新的 settled 事实，禁止 get_state 瞬时失配形成忙循环。
-          const hostStreaming = priorRejections > 0
-            ? true
-            : await this.probeHostStreamingAfterRejection();
-          if (this.phase === "ready" && this.mailbox.isDeliveryActive(delivery.delivery_id)) {
-            requeue = this.mailbox.hostRejectedForBusy(
-              delivery.delivery_id,
-              hostStreaming,
-            );
-            nextHostBusyRejectionCount = priorRejections + 1;
-          }
-        } else {
-          requeue = this.mailbox.hostRejected(delivery.delivery_id);
-        }
-        if (requeue) {
-          // 已分类拒绝证明正文未入 Pi；只有 reducer 明确给出等待条件时，
-          // 才保留同一身份进行事件驱动重试，绝不跨宿主提交模式降级。
-          this.commandQueue.unshift({
-            kind: command.kind,
-            message: command.message,
-            message_id: command.message_id,
-            ...(nextCompactionRejectionCount === undefined
-              ? {}
-              : { compaction_rejection_count: nextCompactionRejectionCount }),
-            ...(nextHostBusyRejectionCount === undefined
-              ? {}
-              : { host_busy_rejection_count: nextHostBusyRejectionCount }),
-            resolve: command.resolve,
-          });
-        }
-      } else {
-        // 传输异常不能证明正文未执行；只保留当前任务的交付不确定状态。
-        this.mailbox.hostDeliveryUncertain(delivery.delivery_id);
-      }
-    }
-    if (this.phase !== "ready") return;
-    this.commitTaskProjection();
-    if (this.mailbox.hasUncertainDelivery()) {
-      this.schedulePendingReplyRetry();
-      return;
-    }
-    // final 可能在独立监督流上先于命令响应到达；命令尾部正是其最后一个门闩。
-    this.schedulePendingReplyRetry();
-  }
-
-  private async probeHostCompactionAfterRejection(): Promise<boolean> {
-    try {
-      return readIsCompacting(await this.commandClient().getState()) !== false;
-    } catch {
-      // 探针失败不能证明压缩已经结束；保守等待生命周期事实，禁止忙等重投。
-      return true;
-    }
-  }
-
-  private async probeHostStreamingAfterRejection(): Promise<boolean> {
-    try {
-      return readIsStreaming(await this.commandClient().getState()) !== false;
-    } catch {
-      // 探针失败不能证明宿主已空闲；等待真实 settled，禁止猜测式重投。
-      return true;
-    }
-  }
-
-  private async executeInterruptCommand(command: QueuedInterruptCommand): Promise<void> {
-    // 兼容旧的内部排队调用；公开 interrupt 已在 reducer 接纳点直接发送 abort。
-    command.resolve(Object.freeze({ ok: true, accepted: false, changed: false }));
-  }
-
-  private finishCommand(command: QueuedCommand): void {
-    if (this.activeCommand === command) this.activeCommand = undefined;
-    this.drainCommandQueue();
-  }
-
-  private resolveActiveMessageAsUnavailable(): void {
-    // submit 已在 mailbox 接纳点返回；后续未知交付由 suspended 投影表达。
-  }
-
-  private resolveUnavailableCommand(command: QueuedCommand): void {
-    if (command.kind === "abort") {
-      command.resolve(Object.freeze({ ok: false, code: "agent_unavailable" }));
-    }
-  }
-
-  private observeProvisionalSettlement(): void {
-    const classification = this.mailbox.classifyAgentSettled();
-    if (classification !== "current") {
-      // 新 run 可在旧 run 的 settled 离开扩展 handler 前启动。旧事实不得
-      // 清除新 run 的工具活动，也不得改变当前宿主提交方式。
-      this.commitTaskProjection();
-      this.drainCommandQueue();
-      return;
-    }
-    this.resetToolActivity();
-    this.mailbox.observeAgentSettled();
-    this.commitTaskProjection();
-    // Pi 自身的自动重试、自动压缩和队列续轮位于 settled 前；扩展内
-    // 协调 continuation 的尾随旧 settled 已在上方单独消费。
-    // final 若先到，通道仍会将它隔离至这个 candidate 建立后再投递。
-    this.schedulePendingReplyRetry();
-    this.drainCommandQueue();
-  }
-
-  private cancelQueuedCommands(): void {
-    while (this.commandQueue.length > 0) {
-      this.resolveUnavailableCommand(this.commandQueue.shift()!);
-    }
   }
 
   private async rollbackStartup(
@@ -2186,7 +1717,7 @@ export class RpcSupervisor {
     }
 
     if (!this.processResourcesConfirmed || !this.channelResourcesConfirmed) {
-      if (confirmNode && this.agentId !== undefined) this.applyLifecycle({ type: "termination_incomplete" });
+      if (confirmNode && this.agentId !== undefined) this.markTerminationCleanupIncomplete();
       return "incomplete";
     }
 
@@ -2208,7 +1739,7 @@ export class RpcSupervisor {
     const releaseDeadline = this.now() + this.options.gracefulShutdownMs;
     await this.waitForDeadline(Promise.allSettled(releaseOperations), releaseDeadline);
     if (!this.nodeHandleReleased || !this.channelHandleReleased) {
-      if (confirmNode && this.agentId !== undefined) this.applyLifecycle({ type: "termination_incomplete" });
+      if (confirmNode && this.agentId !== undefined) this.markTerminationCleanupIncomplete();
       return "incomplete";
     }
 
@@ -2225,6 +1756,14 @@ export class RpcSupervisor {
     this.phase = "terminated";
     this.unsubscribeDependencies();
     return "confirmed";
+  }
+
+  private markTerminationCleanupIncomplete(): void {
+    try {
+      this.options.controller.markTerminationBarrierIncomplete?.(this.agentId);
+    } catch {
+      // 清理诊断失败不能伪造资源确认，也不能再次改变生命周期。
+    }
   }
 
   private async observeChannelClose(deadline: number | Date): Promise<boolean> {
@@ -2316,7 +1855,10 @@ export class RpcSupervisor {
     if (!outcome.ok) throw new Error("控制器拒绝监督器生命周期事实");
     this.lifecycleGeneration = outcome.data.lifecycle_generation;
     this.lifecycleState = outcome.data.node.state;
-    this.emitEvent(Object.freeze({ kind: "lifecycle", event: normalized }));
+    if (outcome.data.applied) {
+      this.markLifecycleObservation(event.type === "agent_start" ? "agent_start" : undefined);
+      this.emitEvent(Object.freeze({ kind: "lifecycle", event: normalized }));
+    }
     return outcome.data;
   }
 
@@ -2336,7 +1878,6 @@ export class RpcSupervisor {
     this.unsubscribeChannelFault?.();
     this.unsubscribeChannelEvent?.();
     this.unsubscribeChannelSnapshot?.();
-    this.unsubscribeTaskStarted?.();
     this.unsubscribeCompactionPrepare?.();
     this.unsubscribeCompactionComplete?.();
     this.channelBindingCleanup?.();
@@ -2345,10 +1886,34 @@ export class RpcSupervisor {
     this.unsubscribeChannelFault = undefined;
     this.unsubscribeChannelEvent = undefined;
     this.unsubscribeChannelSnapshot = undefined;
-    this.unsubscribeTaskStarted = undefined;
     this.unsubscribeCompactionPrepare = undefined;
     this.unsubscribeCompactionComplete = undefined;
     this.releaseCoordinatedCompactions();
     this.channelBindingCleanup = undefined;
   }
+}
+
+function parseRpcSupervisorRuntimeState(value: unknown): RpcSupervisorRuntimeState | undefined {
+  if (!isRecord(value)
+    || typeof value.isStreaming !== "boolean"
+    || typeof value.isCompacting !== "boolean"
+    || !Number.isSafeInteger(value.pendingMessageCount)
+    || (value.pendingMessageCount as number) < 0
+  ) return undefined;
+  return Object.freeze({
+    isStreaming: value.isStreaming,
+    isCompacting: value.isCompacting,
+    pendingMessageCount: value.pendingMessageCount as number,
+  });
+}
+
+function isSynchronousAcceptance(value: unknown): boolean {
+  if (value === undefined || value === true) return true;
+  if (value === false || value === null || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  if (typeof record.then === "function") return false;
+  if (record.ok === true || record.accepted === true) {
+    return record.ok !== false && record.accepted !== false;
+  }
+  return false;
 }

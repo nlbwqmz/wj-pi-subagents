@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AGENT_TOOL_NAMES, CHILD_REPLY_TOOL_NAME } from "./agent-tools.ts";
+import { AGENT_TOOL_NAMES, CHILD_FINAL_REPORT_TOOL_NAME, CHILD_REPLY_TOOL_NAME } from "./agent-tools.ts";
 import type {
   AgentSupervisorFactory,
   AgentSupervisorFactoryInput,
@@ -46,15 +46,12 @@ export interface AgentSupervisorFactoryOptions {
   readonly childExtensionPath?: string;
   readonly startupTimeoutMs?: number;
   readonly gracefulShutdownMs?: number;
-  /** abort 后缺少 settled/final 时的故障隔离期限。 */
-  readonly interruptTimeoutMs?: number;
   readonly nodeFactory?: (template: TemplateDefinition) => ManagedRpcNodeLike;
-  readonly activeTools?: () => readonly string[];
   readonly currentModel?: string | (() => string | undefined);
   readonly currentThinking?: string | (() => string | undefined);
   readonly managementToolNames?: readonly string[];
   readonly childReplyToolNames?: readonly string[];
-  /** 只有宿主消息已同步进入父会话上下文时才返回 true，随后协议才会 ACK。 */
+  /** 只有宿主消息已同步进入父会话上下文时才返回 true，随后监督通道才会返回接纳裁决。 */
   readonly deliverReply?: (agentId: string, reply: ManagedRpcReply) => boolean;
   /** 为当前父会话内的直接子同步建立/释放协调压缩 reply 屏障。 */
   readonly onCompactionPrepare?: (agentId: string, transactionId: string) => boolean;
@@ -96,7 +93,7 @@ export function createAgentSupervisorFactory(
     const template = input.template ?? resolveTemplate(templateSnapshot, input.reservation.templateId);
     if (template === undefined) throw new Error("模板快照未提供有效模板");
     const extensionPath = options.childExtensionPath ?? defaultChildExtensionPath();
-    const childReplyTools = options.childReplyToolNames ?? [CHILD_REPLY_TOOL_NAME];
+    const childReplyTools = options.childReplyToolNames ?? [CHILD_REPLY_TOOL_NAME, CHILD_FINAL_REPORT_TOOL_NAME];
     const managementTools = childManagementEnabled(options, input, template)
       ? (options.managementToolNames ?? AGENT_TOOL_NAMES)
       : [];
@@ -156,9 +153,9 @@ export function createAgentSupervisorFactory(
           requestIdRegistry,
           onReply: (reply) => {
             if (rpcSupervisor === undefined || options.deliverReply === undefined) return false;
-            return rpcSupervisor.acceptChildReply(reply.envelope, () => {
+            return rpcSupervisor.acceptChildReply(reply, () => {
               try {
-                return options.deliverReply!(context.agent_id, reply.envelope) === true;
+                return options.deliverReply!(context.agent_id, reply) === true;
               } catch {
                 return false;
               }
@@ -205,7 +202,6 @@ export function createAgentSupervisorFactory(
       },
       startupTimeoutMs,
       gracefulShutdownMs,
-      ...(options.interruptTimeoutMs === undefined ? {} : { interruptTimeoutMs: options.interruptTimeoutMs }),
       onCompactionPrepare: (transactionId) => directAgentId === undefined
         ? false
         : options.onCompactionPrepare?.(directAgentId, transactionId) ?? false,

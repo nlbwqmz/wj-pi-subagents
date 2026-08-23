@@ -21,10 +21,7 @@ import {
   type SupervisorEvent,
   type SupervisorFrame,
   type SupervisorReply,
-  type SupervisorReplyInput,
   type SupervisorSnapshot,
-  type SupervisorTaskAssignment,
-  type SupervisorTaskStarted,
 } from "./supervisor-channel.ts";
 import {
   createDeferred,
@@ -63,9 +60,6 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
   private readonly compactionComplete = new Set<(request: SupervisorCompactionComplete) => void>();
   private readonly compactionPrepared = new Map<string, ReturnType<typeof createDeferred<boolean>>>();
   private readonly compactionCompleted = new Map<string, ReturnType<typeof createDeferred<boolean>>>();
-  private readonly replies = new Set<(reply: SupervisorReply) => void>();
-  private readonly taskStarted = new Set<(started: SupervisorTaskStarted) => void>();
-  private readonly transportAcknowledgements = new Map<number, ReturnType<typeof createDeferred<void>>>();
   private readonly unsubscribeFrame: () => void;
   private readonly unsubscribeTransport: () => void;
   private writeQueue: Promise<void> = Promise.resolve();
@@ -143,51 +137,8 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
     return this.protocol.getPublicState().state === "ready";
   }
 
-  async publishReply(_reply: SupervisorReplyInput | SupervisorReply): Promise<void> {
+  async publishReply(_reply: SupervisorReply, _signal?: AbortSignal): Promise<void> {
     throw new Error("父端监督通道不能发布代理回复");
-  }
-
-  async publishReplyAndWaitForAck(
-    _reply: SupervisorReplyInput | SupervisorReply,
-    _signal?: AbortSignal,
-  ): Promise<void> {
-    throw new Error("父端监督通道不能发布代理回复");
-  }
-
-  async retryPendingReplies(): Promise<void> {
-    const replyAck = this.protocol.retryPendingReplies();
-    if (replyAck === undefined) return;
-    try {
-      await this.send(replyAck);
-    } catch {
-      this.fail("protocol_fault");
-      throw new Error("监督回复确认发送失败");
-    }
-  }
-
-  async publishTaskAssignmentAndWaitForAck(
-    assignment: SupervisorTaskAssignment,
-    signal?: AbortSignal,
-  ): Promise<void> {
-    const frame = this.protocol.publishTaskAssignment(assignment);
-    const waiter = createDeferred<void>();
-    void waiter.promise.catch(() => {});
-    this.transportAcknowledgements.set(frame.seq, waiter);
-    try {
-      await this.send(frame);
-      if (signal === undefined) await waiter.promise;
-      else await raceSupervisorAbort(waiter.promise, signal);
-    } catch (error) {
-      // 调用方的期限取消只表示租约交付未知，不能伪造为通道协议故障。
-      if (!(signal?.aborted === true && error instanceof Error && error.name === "AbortError")) {
-        this.fail("protocol_fault");
-      }
-      throw error;
-    } finally {
-      if (this.transportAcknowledgements.get(frame.seq) === waiter) {
-        this.transportAcknowledgements.delete(frame.seq);
-      }
-    }
   }
 
   establishTerminationBarrier(): void {
@@ -219,8 +170,6 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
     this.endpointClosed = true;
     this.unsubscribeFrame();
     this.unsubscribeTransport();
-    for (const waiter of this.transportAcknowledgements.values()) waiter.reject(new Error("监督通道已关闭"));
-    this.transportAcknowledgements.clear();
     this.rejectCompactionWaiters("监督通道已关闭");
     this.closed.resolve();
   }
@@ -316,16 +265,6 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
     return () => this.compactionComplete.delete(listener);
   }
 
-  onReply(listener: (reply: SupervisorReply) => void): () => void {
-    this.replies.add(listener);
-    return () => this.replies.delete(listener);
-  }
-
-  onTaskStarted(listener: (started: SupervisorTaskStarted) => void): () => void {
-    this.taskStarted.add(listener);
-    return () => this.taskStarted.delete(listener);
-  }
-
   /** 路由相关性或 operation_id 复用违约时固定为监督协议故障。 */
   failProtocol(): void {
     this.protocol.markProtocolFault();
@@ -400,19 +339,6 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
     }
     if (result.kind === "accepted" && result.compaction_completed !== undefined) {
       this.resolveCompactionAcknowledgement(this.compactionCompleted, result.compaction_completed);
-    }
-    if (result.kind === "accepted") {
-      for (const reply of result.replies) notifySupervisorListeners(this.replies, reply);
-    }
-    if (result.kind === "accepted" && result.task_started !== undefined) {
-      notifySupervisorListeners(this.taskStarted, result.task_started);
-    }
-    if (result.kind === "accepted" && result.transport_ack !== undefined) {
-      for (const [sequence, waiter] of this.transportAcknowledgements) {
-        if (sequence > result.transport_ack) continue;
-        this.transportAcknowledgements.delete(sequence);
-        waiter.resolve();
-      }
     }
     const protocolSends = result.kind === "accepted" || result.kind === "duplicate" || result.kind === "gap"
       ? this.flushDeferredFrameSends(result.outbound, framesBeforeProtocolResponses)
@@ -517,8 +443,6 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
     if (this.released || this.faultNotified) return;
     this.faultNotified = true;
     if (!this.ready.settled()) this.ready.reject(new Error("监督通道不可用"));
-    for (const waiter of this.transportAcknowledgements.values()) waiter.reject(new Error("监督通道不可用"));
-    this.transportAcknowledgements.clear();
     this.rejectCompactionWaiters("监督通道不可用");
     for (const listener of this.faults) {
       try {

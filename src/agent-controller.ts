@@ -59,17 +59,15 @@ export interface AgentSupervisorFactoryInput {
 /** 控制器只依赖单节点监督器的公开命令面，不接触其进程树或传输实现。 */
 export interface AgentSupervisor {
   start(): Promise<RpcSupervisorStartupResult>;
-  /** 消息先进入监督器 mailbox；prompt/steer 由 reducer 与宿主适配器决定。 */
-  submit(message: string): Promise<RpcSupervisorCommandResult>;
-  prompt(message: string): Promise<RpcSupervisorCommandResult>;
-  steer(message: string): Promise<RpcSupervisorCommandResult>;
+  /** 消息直接调用接收侧 Pi；成功只表示 Pi 已同步接纳。 */
+  sendMessage(message: string): Promise<RpcSupervisorCommandResult>;
+  /** 读取接收侧 Pi 的真实状态并校准生命周期；旧替身可省略。 */
+  synchronizeState?(): Promise<boolean>;
   interrupt(): Promise<RpcSupervisorInterruptResult>;
   terminate(): Promise<RpcSupervisorTerminationResult>;
   /** 故障节点的平台进程树边界回收；节点记录本身继续保持 failed。 */
   reapOrphanedDescendants?(): Promise<{ readonly confirmed: boolean; readonly forced: boolean }>;
   onEvent(listener: (event: RpcSupervisorEvent) => void): () => void;
-  /** reload 后让直接子监督器重试尚未进入父会话的回复。 */
-  retryPendingReplies?(): Promise<void>;
   wasForcedTerminationUsed(): boolean;
 }
 
@@ -87,8 +85,6 @@ export interface AgentControllerOptions {
   readonly templateSnapshot?: TemplateDiscoverySnapshot;
   /** 仅旧 fake 测试可显式开启；生产装配必须传入发现快照。 */
   readonly allowUnvalidatedTemplates?: boolean;
-  /** 已保留以兼容旧装配；模板业务工具不再与父会话活动工具做子集校验。 */
-  readonly activeTools?: () => readonly string[];
   readonly validateTemplate?: (
     template: TemplateDefinition,
     actor: TreeActor,
@@ -122,20 +118,16 @@ interface PendingWaiter {
 }
 
 interface PendingReplyNotification {
-  readonly taskId?: string;
-  readonly turnId?: string;
+  readonly event: "reply" | "final_report" | "idle" | "terminal";
   deliveredToWaiter: boolean;
 }
 
-const MAX_PENDING_REPLY_NOTIFICATIONS = 32;
-
 export type WaitAgentEventOutcome =
   | "reply"
-  | "task_completed"
-  | "task_failed"
-  | "task_interrupted"
-  | "suspended"
-  | "terminal";
+  | "final_report"
+  | "idle"
+  | "terminal"
+  ;
 
 export type WaitAgentOutcome = WaitAgentEventOutcome | "timeout";
 
@@ -145,7 +137,6 @@ export interface WaitAgentData {
   readonly state: AgentSnapshot["state"];
   readonly revision: number;
   readonly error?: AgentSnapshot["error"];
-  readonly last_task?: AgentSnapshot["last_task"];
 }
 
 export interface WaitAgentTimeoutData {
@@ -173,8 +164,6 @@ export interface TerminateAgentData {
 }
 
 export interface AgentMessageData {
-  readonly message_id: string;
-  readonly task_id: string;
   readonly accepted: true;
 }
 
@@ -210,9 +199,10 @@ export class AgentController {
   private readonly pendingWaiters = new Set<PendingWaiter>();
   /** 已注入但尚未被父模型上下文观察的工作中 reply。 */
   private readonly pendingReplyNotifications = new Map<string, Map<string, PendingReplyNotification>>();
-  private legacyReplyNotificationSequence = 0;
+  private replyNotificationSequence = 0;
+  /** 终止事实只允许产生一次 terminal 事件，即使资源确认和故障观察重复抵达。 */
+  private readonly observedTerminalEvents = new Set<string>();
   private readonly terminalNotifications = new Set<string>();
-  private readonly pendingTerminalNotifications = new Set<string>();
   private unsubscribeTreeChange: (() => void) | undefined;
   private readonly confirmedWithoutOwnership = new Set<string>();
   private readonly terminationFlows = new Map<string, Promise<ControlResult<TerminateAgentData>>>();
@@ -357,24 +347,33 @@ export class AgentController {
     if (!target.ok) return target;
     const entry = this.agents.get(input.agent_id);
     if (entry === undefined) return controlFailure("agent_unavailable");
-    if (target.data.state === "failed" || target.data.state === "terminating" || target.data.state === "terminated") {
+
+    // 权威快照可能在续跑期间先收到旧 settled 事实；发送前让接收侧
+    // 用 Pi 的 get_state 校准一次，再依据最新本地状态决定是否接单。
+    try {
+      await entry.supervisor.synchronizeState?.();
+    } catch {
+      // 无法确认时保留现有生命周期裁决；监督器内部不会伪造 idle。
+    }
+    const refreshed = this.tree.getStatus(input.agent_id);
+    if (!refreshed.ok) return refreshed;
+    if (refreshed.data.state === "starting") return controlFailure("agent_unavailable");
+    if (refreshed.data.state === "interrupting") return controlFailure("message_delivery_failed");
+    if (refreshed.data.state === "failed" || refreshed.data.state === "terminating" || refreshed.data.state === "terminated") {
       return controlFailure("agent_unavailable");
     }
     let result: RpcSupervisorCommandResult;
     try {
-      result = await entry.supervisor.submit(input.message);
+      result = await entry.supervisor.sendMessage(input.message);
     } catch {
       return controlFailure("message_delivery_failed");
     }
-    if (!result.ok) return controlFailure(result.code);
-    this.discardReplyNotificationsForOtherTasks(input.agent_id, result.task_id);
+    if (!result.ok || result.accepted !== true) return controlFailure("message_delivery_failed");
     return Object.freeze({
       ok: true,
       data: Object.freeze({
-        message_id: result.message_id,
-        task_id: result.task_id,
         accepted: true,
-      }),
+      }) as unknown as AgentMessageData,
     });
   }
 
@@ -384,6 +383,12 @@ export class AgentController {
     for (const agentId of parsed.agent_ids) {
       const target = await this.admittedDirectChild(agentId, "wait_agent");
       if (!target.ok) return target;
+      const entry = this.agents.get(agentId);
+      try {
+        await entry?.supervisor.synchronizeState?.();
+      } catch {
+        // 状态探针失败时等待器保留最近一次安全快照，不伪造 terminal 或 idle。
+      }
     }
     if (signal?.aborted === true) return controlFailure("agent_unavailable");
 
@@ -430,19 +435,61 @@ export class AgentController {
     return this.waitTimeoutMs;
   }
 
-  /** 父端 reply inbox 在工作中消息被 Pi 会话接纳后调用。 */
-  notifyAgentReply(
+  /** Pi 已同步接纳一条显式会话消息后的唯一事件登记点。 */
+  notifySessionEvent(
     agentId: unknown,
-    notificationId?: unknown,
-    taskId?: unknown,
-    turnId?: unknown,
+    event: "reply" | "final_report" | "idle" | "terminal",
   ): boolean {
-    if (!isCanonicalUuid(agentId) || !this.agents.has(agentId)) return false;
+    if (!isCanonicalUuid(agentId)) return false;
+    if (event !== "reply" && event !== "final_report" && event !== "idle" && event !== "terminal") {
+      return false;
+    }
     const status = this.tree.getStatus(agentId);
-    if (!status.ok || !canReceiveReplyNotifications(status.data.state)) return false;
-    const id = validReplyNotificationId(notificationId)
-      ? notificationId
-      : this.createLegacyReplyNotificationId();
+    if (!status.ok) return false;
+    if (
+      (event === "reply" || event === "final_report")
+      && status.data.state !== "working"
+      && status.data.state !== "interrupting"
+    ) return false;
+    if (event === "idle" && status.data.state !== "idle") return false;
+    if (event === "terminal" && status.data.state !== "failed" && status.data.state !== "terminated") {
+      return false;
+    }
+    return this.recordSessionNotification(agentId, event, status.data);
+  }
+
+  /**
+   * 父端 Pi 已同步接纳 child 消息后的内部事实入口。接纳裁决与生命周期事件
+   * 由不同传输帧承载，故 settled 可能先到；此入口保留已接纳消息，不把 idle
+   * 快照误当成消息失败。它只接受普通回复和显式报告，且拒绝终止屏障后的帧。
+   */
+  recordAcceptedSessionEvent(
+    agentId: unknown,
+    event: "reply" | "final_report",
+  ): boolean {
+    if (!isCanonicalUuid(agentId)) return false;
+    const status = this.tree.getStatus(agentId);
+    if (!status.ok) return false;
+    if (
+      status.data.state !== "idle"
+      && status.data.state !== "working"
+      && status.data.state !== "interrupting"
+    ) return false;
+    return this.recordSessionNotification(agentId, event, status.data);
+  }
+
+  private recordSessionNotification(
+    agentId: string,
+    event: "reply" | "final_report" | "idle" | "terminal",
+    status: AgentSnapshot,
+  ): boolean {
+    if (event === "terminal") {
+      // 同一生命周期只能有一个终止事实；故障通知和资源确认可能从不同
+      // 观察路径抵达，但不能把一个终止拆成多个 waiter 事件。
+      if (this.observedTerminalEvents.has(agentId)) return true;
+      this.observedTerminalEvents.add(agentId);
+    }
+    const id = this.createReplyNotificationId();
     let notifications = this.pendingReplyNotifications.get(agentId);
     if (notifications === undefined) {
       notifications = new Map<string, PendingReplyNotification>();
@@ -450,21 +497,8 @@ export class AgentController {
     }
     let notification = notifications.get(id);
     if (notification === undefined) {
-      if (notifications.size >= MAX_PENDING_REPLY_NOTIFICATIONS) {
-        const evictable = [...notifications.entries()].find(([, candidate]) => candidate.deliveredToWaiter);
-        if (evictable === undefined) {
-          const set = this.waiters.get(agentId);
-          if (set !== undefined && set.size > 0) {
-            const result = Object.freeze({ ok: true as const, data: makeWaitData(status.data, "reply") });
-            for (const waiter of [...set]) this.finishWaiter(waiter, result);
-          }
-          return true;
-        }
-        notifications.delete(evictable[0]);
-      }
       notification = {
-        ...(typeof taskId === "string" ? { taskId } : {}),
-        ...(typeof turnId === "string" ? { turnId } : {}),
+        event,
         deliveredToWaiter: false,
       };
       notifications.set(id, notification);
@@ -473,18 +507,11 @@ export class AgentController {
     const set = this.waiters.get(agentId);
     if (set !== undefined && set.size > 0) {
       notification.deliveredToWaiter = true;
-      const result = Object.freeze({ ok: true as const, data: makeWaitData(status.data, "reply") });
+      const result = Object.freeze({ ok: true as const, data: makeWaitData(status, notification.event) });
       for (const waiter of [...set]) this.finishWaiter(waiter, result);
+      notifications.delete(id);
+      if (notifications.size === 0) this.pendingReplyNotifications.delete(agentId);
     }
-    return true;
-  }
-
-  /** 父模型上下文已经包含该 custom message 后确认对应通知。 */
-  acknowledgeAgentReply(agentId: unknown, notificationId: unknown): boolean {
-    if (!isCanonicalUuid(agentId) || !validReplyNotificationId(notificationId)) return false;
-    const notifications = this.pendingReplyNotifications.get(agentId);
-    if (notifications === undefined || !notifications.delete(notificationId)) return false;
-    if (notifications.size === 0) this.pendingReplyNotifications.delete(agentId);
     return true;
   }
 
@@ -493,9 +520,16 @@ export class AgentController {
     if (!target.ok) return target;
     const entry = this.agents.get(target.data.agent_id);
     if (entry === undefined) return controlFailure("agent_unavailable");
-    if (target.data.state === "starting") return controlFailure("agent_unavailable");
-    if (target.data.state === "idle" || target.data.state === "interrupting" || target.data.state === "failed" || target.data.state === "terminating" || target.data.state === "terminated") {
-      return Object.freeze({ ok: true, data: interruptData(target.data, false) });
+    try {
+      await entry.supervisor.synchronizeState?.();
+    } catch {
+      // 状态探针失败时不猜测当前回合是否仍在运行。
+    }
+    const current = this.tree.getStatus(target.data.agent_id);
+    if (!current.ok) return current;
+    if (current.data.state === "starting") return controlFailure("agent_unavailable");
+    if (current.data.state === "idle" || current.data.state === "interrupting" || current.data.state === "failed" || current.data.state === "terminating" || current.data.state === "terminated") {
+      return Object.freeze({ ok: true, data: interruptData(current.data, false) });
     }
     let result: RpcSupervisorInterruptResult;
     try {
@@ -504,6 +538,14 @@ export class AgentController {
       return controlFailure("agent_unavailable");
     }
     if (!result.ok) return controlFailure(result.code);
+    // 控制接纳先建立 interrupting 屏障；回到 idle 只能由后续真实 agent_settled 事实触发。
+    const generation = this.tree.getLifecycleGeneration(target.data.agent_id);
+    if (generation.ok && current.data.state === "working") {
+      this.tree.applyLifecycleEvent(target.data.agent_id, {
+        type: "interrupt_accepted",
+        expected_generation: generation.data,
+      });
+    }
     const latest = this.tree.getStatus(target.data.agent_id);
     if (!latest.ok) return controlFailure("agent_not_found");
     return Object.freeze({ ok: true, data: interruptData(latest.data, result.changed, result.blocked_reason) });
@@ -592,6 +634,9 @@ export class AgentController {
       this.markTerminationIncomplete(agentId);
       return controlFailure("termination_incomplete");
     }
+    // 资源确认可能由父权威一次性提交整棵屏障，而不是由 child supervisor
+    // 单独产生 resources_confirmed 事件；此处补登记 target 的 terminal 事实。
+    this.notifySessionEvent(agentId, "terminal");
     this.releaseOwnedSupervisor(agentId, entry);
     const terminatedAfter = barrier.agent_ids.filter((memberId) => {
       const member = this.tree.getStatus(memberId);
@@ -625,12 +670,9 @@ export class AgentController {
   }
 
   private markTerminationIncomplete(agentId: string): void {
-    const generation = this.tree.getLifecycleGeneration(agentId);
-    if (!generation.ok) return;
-    this.tree.applyLifecycleEvent(agentId, {
-      type: "termination_incomplete",
-      expected_generation: generation.data,
-    });
+    // 清理未完成是资源观察诊断，不是新的生命周期事实；节点继续保持
+    // terminating/failed，后续重试仍由同一终止屏障裁决。
+    this.tree.markTerminationBarrierIncomplete(agentId);
   }
 
   private confirmSupervisorCleanup(agentId: string): void {
@@ -638,10 +680,13 @@ export class AgentController {
     if (!barrier.ok) return;
     const generation = this.tree.getLifecycleGeneration(agentId);
     if (generation.ok) {
-      this.tree.applyLifecycleEvent(agentId, {
+      const result = this.tree.applyLifecycleEvent(agentId, {
         type: "resources_confirmed",
         expected_generation: generation.data,
       });
+      if (result.ok && result.data.applied && result.data.node.state === "terminated") {
+        this.notifySessionEvent(agentId, "terminal");
+      }
     }
   }
 
@@ -650,13 +695,24 @@ export class AgentController {
     if (current !== expected) return;
     current.unsubscribe();
     this.agents.delete(agentId);
-    this.pendingReplyNotifications.delete(agentId);
     this.terminalNotifications.delete(agentId);
   }
 
   getAgentStatus(agentId: unknown): ControlResult<AgentSnapshot> {
     const target = this.directChild(agentId);
     return target;
+  }
+
+  async synchronizeAgentStatus(agentId: unknown): Promise<ControlResult<AgentSnapshot>> {
+    const target = await this.admittedDirectChild(agentId, "get_agent_status");
+    if (!target.ok) return target;
+    const entry = this.agents.get(target.data.agent_id);
+    try {
+      await entry?.supervisor.synchronizeState?.();
+    } catch {
+      // 返回最近一次本地安全快照，不把一次探针故障升级为节点故障。
+    }
+    return this.directChild(target.data.agent_id);
   }
 
   getAgentTree(): ControlResult<ScopedAgentTreeSnapshot> {
@@ -677,19 +733,6 @@ export class AgentController {
   updateTemplateSnapshot(snapshot: TemplateDiscoverySnapshot): void {
     this.templateSnapshot = snapshot;
     this.createSupervisor.updateTemplateSnapshot?.(snapshot);
-  }
-
-  /** 新 Pi API 已绑定后，逐个重试未确认的 child reply 与节点故障通知。 */
-  async retryPendingReplies(): Promise<void> {
-    await Promise.allSettled([...this.agents.values()].map(async ({ supervisor }) => {
-      await supervisor.retryPendingReplies?.();
-    }));
-    for (const agentId of [...this.pendingTerminalNotifications]) {
-      if (!this.deliverTerminalNotification(agentId)) continue;
-      this.pendingTerminalNotifications.delete(agentId);
-      this.terminalNotifications.add(agentId);
-      this.resolveWaiters(agentId);
-    }
   }
 
   /**
@@ -770,8 +813,8 @@ export class AgentController {
     this.waiters.clear();
     this.pendingWaiters.clear();
     this.pendingReplyNotifications.clear();
+    this.observedTerminalEvents.clear();
     this.terminalNotifications.clear();
-    this.pendingTerminalNotifications.clear();
     for (const entry of this.agents.values()) entry.unsubscribe();
     this.agents.clear();
     for (const unsubscribe of this.unassignedSupervisors.values()) unsubscribe();
@@ -873,20 +916,25 @@ export class AgentController {
       && agentId !== undefined
       && this.replyNotificationsHandledByInbox === false
     ) {
-      this.notifyAgentReply(agentId, undefined, event.reply.task_id, event.reply.turn_id);
+      this.notifySessionEvent(agentId, "reply");
+    } else if (
+      event.kind === "reply"
+      && event.reply.kind === "final_report"
+      && agentId !== undefined
+      && this.replyNotificationsHandledByInbox === false
+    ) {
+      this.notifySessionEvent(agentId, "final_report");
     }
-    if (agentId !== undefined && event.kind === "activity") {
-      this.tree.updateActivity(agentId, {
-        category: event.activity.category,
-        active_count: event.activity.active_count,
-      });
-    }
+    // activity 只属于监督器本地诊断，不进入树快照、修订或 wait_agent 事件。
+    const lifecycleApplied = agentId !== undefined
+      && event.kind === "lifecycle"
+      && this.wasLifecycleEventApplied(agentId, event.event);
     let runtimeFailedAgentId: string | undefined;
     if (
       agentId !== undefined
       && (
         event.kind === "fault"
-        || (event.kind === "lifecycle" && event.event.type === "runtime_failed")
+        || (lifecycleApplied && event.kind === "lifecycle" && event.event.type === "runtime_failed")
       )
     ) {
       const status = this.tree.getStatus(agentId);
@@ -895,22 +943,29 @@ export class AgentController {
     if (
       runtimeFailedAgentId !== undefined
       && !this.terminalNotifications.has(runtimeFailedAgentId)
-      && !this.pendingTerminalNotifications.has(runtimeFailedAgentId)
     ) {
-      if (this.deliverTerminalNotification(runtimeFailedAgentId)) {
-        this.terminalNotifications.add(runtimeFailedAgentId);
-      } else {
-        this.pendingTerminalNotifications.add(runtimeFailedAgentId);
-      }
+      this.terminalNotifications.add(runtimeFailedAgentId);
+      void this.deliverTerminalNotification(runtimeFailedAgentId);
+      this.notifySessionEvent(runtimeFailedAgentId, "terminal");
     }
     if (agentId !== undefined) this.resolveWaiters(agentId);
     if (runtimeFailedAgentId !== undefined) this.startOrphanTermination(runtimeFailedAgentId);
     if (
       agentId !== undefined
+      && lifecycleApplied
       && event.kind === "lifecycle"
       && event.event.type === "resources_confirmed"
     ) {
+      this.notifySessionEvent(agentId, "terminal");
       this.releaseTerminatedSupervisor(agentId);
+    }
+    if (
+      agentId !== undefined
+      && lifecycleApplied
+      && event.kind === "lifecycle"
+      && event.event.type === "agent_settled"
+    ) {
+      this.notifySessionEvent(agentId, "idle");
     }
     this.resolveAllReadyWaiters();
   }
@@ -975,8 +1030,27 @@ export class AgentController {
     if (entry === undefined) return;
     entry.unsubscribe();
     this.agents.delete(agentId);
-    this.pendingReplyNotifications.delete(agentId);
     this.terminalNotifications.delete(agentId);
+  }
+
+  /**
+   * supervisor 事件是在树控制器成功提交后才允许登记 waiter 事实。
+   * expected_generation + 1 是唯一可证明该事件实际推进状态的代际关系；
+   * 仅凭当前 state 会把重复或迟到事件误认成新的 idle/terminal。
+   */
+  private wasLifecycleEventApplied(
+    agentId: string,
+    event: Extract<RpcSupervisorEvent, { kind: "lifecycle" }>['event'],
+  ): boolean {
+    const status = this.tree.getStatus(agentId);
+    const generation = this.tree.getLifecycleGeneration(agentId);
+    if (!status.ok || !generation.ok || generation.data !== event.expected_generation + 1) return false;
+    switch (event.type) {
+      case "agent_settled": return status.data.state === "idle";
+      case "resources_confirmed": return status.data.state === "terminated";
+      case "runtime_failed": return status.data.state === "failed";
+      default: return true;
+    }
   }
 
   private resolveAllReadyWaiters(): void {
@@ -985,9 +1059,6 @@ export class AgentController {
 
   private resolveWaiters(agentId: string): void {
     const status = this.tree.getStatus(agentId);
-    if (status.ok && !canReceiveReplyNotifications(status.data.state)) {
-      this.pendingReplyNotifications.delete(agentId);
-    }
     const set = this.waiters.get(agentId);
     if (set === undefined) return;
     if (!status.ok) {
@@ -1036,62 +1107,27 @@ export class AgentController {
   }
 
   private waitOutcome(agentId: string, status: AgentSnapshot): WaitAgentData | undefined {
-    if (status.state === "suspended") return makeWaitData(status, "suspended");
-    if (status.state === "idle") {
-      if (status.last_task?.outcome === "failed") return makeWaitData(status, "task_failed");
-      if (status.last_task?.outcome === "interrupted") return makeWaitData(status, "task_interrupted");
-      return makeWaitData(status, "task_completed");
-    }
-    if (status.state === "failed") {
-      return this.terminalNotifications.has(agentId) ? makeWaitData(status, "terminal") : undefined;
-    }
-    if (status.state === "terminated" && !this.pendingTerminalNotifications.has(agentId)) {
-      return makeWaitData(status, "terminal");
-    }
+    // 生命周期状态本身不是事件；idle 只由真实 agent_settled 事件登记。
     return undefined;
   }
 
   private takeReplyNotification(agentId: string, status: AgentSnapshot): WaitAgentData | undefined {
-    if (!canReceiveReplyNotifications(status.state)) {
-      this.pendingReplyNotifications.delete(agentId);
-      return undefined;
-    }
     const notifications = this.pendingReplyNotifications.get(agentId);
     if (notifications === undefined) return undefined;
-    for (const notification of notifications.values()) {
+    for (const [notificationId, notification] of notifications) {
       if (notification.deliveredToWaiter) continue;
       notification.deliveredToWaiter = true;
-      return makeWaitData(status, "reply");
+      notifications.delete(notificationId);
+      if (notifications.size === 0) this.pendingReplyNotifications.delete(agentId);
+      return makeWaitData(status, notification.event);
     }
     return undefined;
   }
 
-  private discardReplyNotificationsForOtherTasks(agentId: string, taskId: string): void {
-    const notifications = this.pendingReplyNotifications.get(agentId);
-    if (notifications === undefined) return;
-    for (const [notificationId, notification] of notifications) {
-      if (notification.taskId !== undefined && notification.taskId !== taskId) {
-        notifications.delete(notificationId);
-      }
-    }
-    if (notifications.size === 0) this.pendingReplyNotifications.delete(agentId);
+  private createReplyNotificationId(): string {
+    this.replyNotificationSequence += 1;
+    return `reply-${this.replyNotificationSequence}`;
   }
-
-  private createLegacyReplyNotificationId(): string {
-    this.legacyReplyNotificationSequence += 1;
-    return `legacy-${this.legacyReplyNotificationSequence}`;
-  }
-}
-
-function validReplyNotificationId(value: unknown): value is string {
-  return typeof value === "string"
-    && value.length > 0
-    && value.length <= 128
-    && /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(value);
-}
-
-function canReceiveReplyNotifications(state: AgentSnapshot["state"]): boolean {
-  return state === "working" || state === "interrupting";
 }
 
 function isSpawnInput(value: unknown): value is SpawnAgentInput {
@@ -1139,7 +1175,6 @@ function makeWaitData(status: AgentSnapshot, outcome: WaitAgentEventOutcome): Wa
     state: status.state,
     revision: status.revision,
     ...(status.error === undefined ? {} : { error: status.error }),
-    ...(status.last_task === undefined ? {} : { last_task: status.last_task }),
   });
 }
 

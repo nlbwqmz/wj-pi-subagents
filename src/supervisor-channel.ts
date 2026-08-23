@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { parseAgentSnapshot as parseSafeAgentSnapshot } from "./agent-snapshot-codec.ts";
 import {
   parseChildReplyEnvelope,
@@ -6,12 +6,12 @@ import {
 } from "./child-reply-envelope.ts";
 import { REPLY_MAX_TEXT_BYTES } from "./child-reply-limits.ts";
 import {
+  AGENT_FAULT_CODES,
   AGENT_LIFECYCLE_EVENT_TYPES,
   AGENT_LIFECYCLE_STATES,
   PUBLIC_ERROR_CODES,
   controlFailure,
   isCanonicalUuid,
-  isCanonicalUuidV4,
   type AgentFault,
   type AgentLifecycleEventType,
   type AgentSnapshot,
@@ -20,7 +20,7 @@ import {
 } from "./tree-controller.ts";
 
 /** 父子监督通道与 Pi 任务 RPC 完全隔离的固定协议版本。 */
-export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/13";
+export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/14";
 
 export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "hello",
@@ -30,19 +30,23 @@ export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "snapshot",
   "capability",
   "reply",
-  "task_assignment",
-  "task_started",
   "control_request",
   "control_response",
   "compaction_prepare",
   "compaction_prepared",
   "compaction_complete",
   "compaction_completed",
-  "ack",
   "close",
 ] as const);
 
+/** 旧 kind 仅供清理旧实例的内部 switch，公共 parser 不接受。 */
 export type SupervisorFrameKind = (typeof SUPERVISOR_FRAME_KINDS)[number];
+
+const LEGACY_SUPERVISOR_FRAME_KINDS = new Set([
+  "task_assignment",
+  "task_started",
+  "ack",
+]);
 
 const SUPERVISOR_FRAME_KEYS = new Set([
   "protocol",
@@ -69,7 +73,6 @@ export const SUPERVISOR_CHANNEL_LIMITS = Object.freeze({
   maxJsonDepth: 16,
   maxJsonEntries: 512,
   maxNodes: 64,
-  maxReplyWindow: 32,
   maxRetiredStreams: 4,
   maxDepth: 8,
 } as const);
@@ -81,7 +84,6 @@ export interface SupervisorChannelLimits {
   readonly maxJsonDepth: number;
   readonly maxJsonEntries: number;
   readonly maxNodes: number;
-  readonly maxReplyWindow: number;
   readonly maxRetiredStreams: number;
   readonly maxDepth: number;
 }
@@ -131,31 +133,8 @@ export interface SupervisorSnapshot {
 
 export type SupervisorReplyKind = ChildReplyEnvelope["kind"];
 
-/** v13 wire reply：传输序号与模型可见信封保持明确分层。 */
-export interface SupervisorReply {
-  readonly reply_seq: number;
-  readonly envelope: ChildReplyEnvelope;
-}
-
-export type SupervisorReplyInput = ChildReplyEnvelope;
-
-/** 子端回复已写入本地监督传输，但父端累计 ACK 仍异步等待。 */
-export interface SupervisorReplyPublication {
-  readonly acknowledged: Promise<void>;
-}
-
-/** 父端在投递正文前先下发的逻辑任务租约；正文不进入监督协议。 */
-export interface SupervisorTaskAssignment {
-  readonly message_id: string;
-  readonly task_id: string;
-  readonly mode: "prompt" | "steer";
-}
-
-/** child 在每个 Pi loop 开始时上报；自动重试和 Pi 原生续轮沿用 task_id。 */
-export interface SupervisorTaskStarted {
-  readonly task_id: string;
-  readonly turn_id: string;
-}
+/** 新 wire reply 只携带一个会话信封；底层帧 `seq` 不属于消息语义。 */
+export type SupervisorReply = ChildReplyEnvelope;
 
 export type SupervisorCompactionOutcome = "succeeded" | "failed" | "cancelled" | "not_started";
 
@@ -251,7 +230,6 @@ export type SupervisorProtocolErrorCode =
   | "sequence_violation"
   | "snapshot_invalid"
   | "reply_invalid"
-  | "reply_window_full"
   | "request_reused"
   | "eof"
   | "closed";
@@ -278,27 +256,17 @@ export interface SupervisorChannelPublicState {
   readonly tree_revision: number;
   readonly subtree_revision: number;
   readonly snapshot_node_count: number;
-  readonly pending_reply_count: number;
   readonly fault?: SupervisorChannelFault;
 }
 
 export interface SupervisorReceiveAccepted {
   readonly kind: "accepted";
-  readonly ack: number;
   readonly applied: boolean;
   readonly tree_revision: number;
   readonly outbound: readonly SupervisorFrame[];
   readonly replies: readonly SupervisorReply[];
-  /** child 端本次收到的累计 reply ACK；仅用于传输适配器完成本地等待。 */
-  readonly reply_ack?: number;
-  /** parent 端本次收到的普通 transport ACK；用于任务租约投递栅栏。 */
-  readonly transport_ack?: number;
-  /** child 端收到并通过身份校验的任务租约。 */
-  readonly task_assignment?: SupervisorTaskAssignment;
   /** parent 端原子缓存的 child capability manifest；不进入公开状态。 */
   readonly capability?: SupervisorCapabilityManifest;
-  /** parent 端收到的 child 任务/turn 身份事实。 */
-  readonly task_started?: SupervisorTaskStarted;
   /** parent 端收到的协调压缩屏障请求。 */
   readonly compaction_prepare?: SupervisorCompactionPrepare;
   /** child 端收到的协调压缩准备结果。 */
@@ -321,13 +289,11 @@ export interface SupervisorReceiveAccepted {
 
 export interface SupervisorReceiveDuplicate {
   readonly kind: "duplicate";
-  readonly ack: number;
   readonly outbound: readonly SupervisorFrame[];
 }
 
 export interface SupervisorReceiveGap {
   readonly kind: "gap";
-  readonly ack: number;
   readonly request_id: string;
   readonly outbound: readonly SupervisorFrame[];
 }
@@ -388,10 +354,6 @@ interface PendingSnapshotRequest {
   readonly requestId: string;
 }
 
-interface StoredReply {
-  readonly reply: SupervisorReply;
-}
-
 const SAFE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const SAFE_STREAM_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const SAFE_CAPABILITY_TOKEN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@+/-]*$/;
@@ -417,9 +379,6 @@ const EMPTY_NODES: readonly AgentSnapshot[] = Object.freeze([]);
 const EMPTY_FRAMES: readonly SupervisorFrame[] = Object.freeze([]);
 const EMPTY_REPLIES: readonly SupervisorReply[] = Object.freeze([]);
 const PUBLIC_ERROR_CODE_SET: ReadonlySet<string> = new Set(PUBLIC_ERROR_CODES);
-const CONTROL_SAFE_FIELD_NAMES = new Set([
-  "reply_outbox_pending_count",
-]);
 const CONTROL_SENSITIVE_FIELD_TOKENS = new Set([
   "prompt",
   "reply",
@@ -453,10 +412,6 @@ function maxFrameStringBytes(limits: SupervisorChannelLimits): number {
     REPLY_MAX_TEXT_BYTES,
     limits.maxControlStringBytes,
   );
-}
-
-function replySemanticDigest(envelope: ChildReplyEnvelope): string {
-  return createHash("sha256").update(JSON.stringify(envelope), "utf8").digest("base64url");
 }
 
 function cloneBytes(value: Uint8Array): Uint8Array<ArrayBuffer> {
@@ -664,7 +619,6 @@ function hasExactObjectKeys(value: Record<string, unknown>, expected: readonly s
 
 function isForbiddenControlFieldName(key: string): boolean {
   const lower = key.toLowerCase();
-  if (CONTROL_SAFE_FIELD_NAMES.has(lower)) return false;
   if (CONTROL_RESERVED_FIELD_NAMES.has(lower)) return true;
   const snakeCase = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
   const normalized = snakeCase.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
@@ -788,9 +742,11 @@ function parseFrameObject(value: unknown, limits: SupervisorChannelLimits): Inte
     if (typeof candidate.protocol === "string") frameError("protocol_mismatch");
     frameError("invalid_frame");
   }
-  if (typeof candidate.kind !== "string" || !(SUPERVISOR_FRAME_KINDS as readonly string[]).includes(candidate.kind)) {
+  if (typeof candidate.kind !== "string") {
     frameError("invalid_frame");
   }
+  if (LEGACY_SUPERVISOR_FRAME_KINDS.has(candidate.kind)) frameError("protocol_mismatch");
+  if (!(SUPERVISOR_FRAME_KINDS as readonly string[]).includes(candidate.kind)) frameError("invalid_frame");
   if (!validStreamId(candidate.stream_id, limits)) frameError("invalid_frame");
   if (typeof candidate.sender_agent_id !== "string" || !validPeerAgentId(candidate.sender_agent_id)) {
     frameError("invalid_frame");
@@ -1047,46 +1003,27 @@ function parseSnapshot(
   });
 }
 
-function parseReply(payload: Record<string, unknown>, limits: SupervisorChannelLimits): SupervisorReply {
-  if (!Number.isSafeInteger(payload.reply_seq) || (payload.reply_seq as number) < 1) frameError("reply_invalid");
-  if (Object.keys(payload).some((key) => key !== "reply_seq" && key !== "envelope")) {
+function parseReply(payload: Record<string, unknown>): SupervisorReply {
+  // clean-break：reply payload 就是信封本身。reply_seq、envelope 包装和任何
+  // 未知字段都由信封闭集解析拒绝，不再建立应用序号或确认窗口。
+  const envelope = parseChildReplyEnvelope(payload, {
+    maxTextBytes: REPLY_MAX_TEXT_BYTES,
+  });
+  if (envelope === undefined) {
+    // 旧任务/回合/提交信封必须明确归类为 clean-break 协议不匹配，
+    // 普通新协议字段错误仍保持 reply_invalid，便于区分输入损坏。
+    if (
+      payload.schema === "wj-pi-subagents.reply"
+      || payload.kind === "final"
+      || hasOwn(payload, "task_id")
+      || hasOwn(payload, "turn_id")
+      || hasOwn(payload, "commit_id")
+      || hasOwn(payload, "reply_seq")
+      || hasOwn(payload, "envelope")
+    ) frameError("protocol_mismatch");
     frameError("reply_invalid");
   }
-  const envelope = parseChildReplyEnvelope(payload.envelope, {
-    maxStringBytes: REPLY_MAX_TEXT_BYTES,
-  });
-  if (envelope === undefined) frameError("reply_invalid");
-  return Object.freeze({
-    reply_seq: payload.reply_seq as number,
-    envelope,
-  });
-}
-
-function parseTaskAssignment(payload: Record<string, unknown>): SupervisorTaskAssignment {
-  if (
-    Object.keys(payload).some((key) => !["message_id", "task_id", "mode"].includes(key))
-    || typeof payload.message_id !== "string"
-    || !/^msg_[0-9a-f-]{36}$/.test(payload.message_id)
-    || !isCanonicalUuidV4(payload.task_id)
-    || (payload.mode !== "prompt" && payload.mode !== "steer")
-  ) frameError("invalid_frame");
-  return Object.freeze({
-    message_id: payload.message_id,
-    task_id: payload.task_id,
-    mode: payload.mode,
-  });
-}
-
-function parseTaskStarted(payload: Record<string, unknown>): SupervisorTaskStarted {
-  if (
-    Object.keys(payload).some((key) => key !== "task_id" && key !== "turn_id")
-    || !isCanonicalUuidV4(payload.task_id)
-    || !isCanonicalUuidV4(payload.turn_id)
-  ) frameError("invalid_frame");
-  return Object.freeze({
-    task_id: payload.task_id,
-    turn_id: payload.turn_id,
-  });
+  return envelope;
 }
 
 function parseCapabilityTools(value: unknown): readonly string[] {
@@ -1274,25 +1211,19 @@ export class SupervisorChannel {
   private outgoingStreamId: string;
   private readonly retiredIncomingStreams = new Set<string>();
   private readonly retiredIncomingOrder: string[] = [];
-  private readonly outboundReplies = new Map<number, StoredReply>();
-  private readonly bufferedReplies = new Map<number, SupervisorReply>();
-  private readonly receivedReplyDigests = new Map<number, string>();
-  private readonly acceptedFinalTurns = new Set<string>();
+  // 新协议不保存应用消息正文、序号、窗口或去重集合；每帧在接收临界区
+  // 同步交给 onReply，返回即表示该层已接纳。
 
   private state: SupervisorChannelState = "new";
   private sendSeq = 0;
   private incomingStreamId: string | undefined;
   private incomingLastSeq = 0;
   private pendingSnapshotRequest: PendingSnapshotRequest | undefined;
-  private awaitingInitialSnapshotAckSeq: number | undefined;
   private localSubtreeRevision = 0;
   private acceptedSubtreeRevision = -1;
   private treeRevision = 0;
   private latestSnapshot: readonly AgentSnapshot[] = EMPTY_NODES;
   private localLatestSnapshot: readonly AgentSnapshot[] = EMPTY_NODES;
-  private nextReplySeq = 1;
-  private nextExpectedReplySeq = 1;
-  private highestReplyAck = 0;
   private capabilityPublished = false;
   private capability: SupervisorCapabilityManifest | undefined;
   private terminationBarrier = false;
@@ -1381,41 +1312,30 @@ export class SupervisorChannel {
       nodes: parsed.snapshot.nodes,
       ...(resetRequestId === undefined ? {} : { reset: true }),
     }, resetRequestId);
-    if (this.state === "awaiting_snapshot") this.awaitingInitialSnapshotAckSeq = frame.seq;
+    // 快照写入本地发送队列即完成握手，不等待 transport/app ACK。
+    if (this.state === "awaiting_snapshot") this.state = "ready";
     return frame;
   }
 
   /** child 仅能上行经过统一 codec 校验的结构化回复信封。 */
-  publishReply(reply: SupervisorReplyInput | SupervisorReply): SupervisorFrame {
+  publishReply(reply: SupervisorReply): SupervisorFrame {
     if (this.role !== "child" || this.terminationBarrier || this.state !== "ready") {
       throw new SupervisorProtocolError("closed");
     }
-    const directEnvelope = parseChildReplyEnvelope(reply, {
-      maxStringBytes: REPLY_MAX_TEXT_BYTES,
+    const envelope = parseChildReplyEnvelope(reply, {
+      maxTextBytes: REPLY_MAX_TEXT_BYTES,
     });
-    const wireRecord = isRecord(reply) ? reply : undefined;
-    const wireCandidate = directEnvelope === undefined
-      && wireRecord !== undefined
-      && Number.isSafeInteger(wireRecord.reply_seq)
-      && Object.prototype.hasOwnProperty.call(wireRecord, "envelope");
-    const replySeq = wireCandidate ? wireRecord.reply_seq as number : this.nextReplySeq;
-    const envelope = directEnvelope ?? (wireCandidate ? wireRecord.envelope : reply as SupervisorReplyInput);
-    const parsed = parseReply({ reply_seq: replySeq, envelope }, this.limits);
-    const messageWindow = Math.max(0, this.limits.maxReplyWindow - 1);
-    if (parsed.envelope.kind === "message" && this.outboundReplies.size >= messageWindow) {
-      throw new SupervisorProtocolError("reply_window_full");
-    }
-    if (parsed.envelope.kind === "final" && this.outboundReplies.size >= this.limits.maxReplyWindow) {
-      throw new SupervisorProtocolError("reply_window_full");
-    }
-    if (parsed.envelope.agent_id !== this.localAgentId) {
+    if (envelope === undefined) throw new SupervisorProtocolError("reply_invalid");
+    if (envelope.agent_id !== this.localAgentId) {
       throw new SupervisorProtocolError("identity_mismatch");
     }
-    if (parsed.reply_seq !== this.nextReplySeq) throw new SupervisorProtocolError("reply_invalid");
-    const frame = this.createFrame("reply", parsed as unknown as Record<string, unknown>);
-    this.outboundReplies.set(parsed.reply_seq, { reply: parsed });
-    this.nextReplySeq += 1;
-    return frame;
+    // request_id 只用于父端同步返回 Pi 接纳裁决，不进入消息信封，也不承担
+    // 应用去重、排序、窗口或重放语义。
+    return this.createFrame(
+      "reply",
+      envelope as unknown as Record<string, unknown>,
+      this.allocateRequestId(),
+    );
   }
 
   /** child 仅在普通 ready 后发布一次固定的内部能力快照。 */
@@ -1429,27 +1349,6 @@ export class SupervisorChannel {
     const parsed = parseCapabilityManifest(manifest, this.limits);
     this.capabilityPublished = true;
     return this.createFrame("capability", parsed as unknown as Record<string, unknown>);
-  }
-
-  /** parent 在 prompt/steer 之前发布任务租约；普通 transport ACK 即持久接纳点。 */
-  publishTaskAssignment(assignment: SupervisorTaskAssignment): SupervisorFrame {
-    if (this.role !== "parent" || this.terminationBarrier || this.state !== "ready") {
-      throw new SupervisorProtocolError("closed");
-    }
-    const parsed = parseTaskAssignment(assignment as unknown as Record<string, unknown>);
-    return this.createFrame("task_assignment", parsed as unknown as Record<string, unknown>);
-  }
-
-  /** child 在 reply 之前发布实际 task/turn 身份，父端据此拒绝 stale final。 */
-  publishTaskStarted(started: SupervisorTaskStarted): SupervisorFrame {
-    if (
-      this.role !== "child"
-      || this.localAgentId === null
-      || this.terminationBarrier
-      || this.state !== "ready"
-    ) throw new SupervisorProtocolError("closed");
-    const parsed = parseTaskStarted(started as unknown as Record<string, unknown>);
-    return this.createFrame("task_started", parsed as unknown as Record<string, unknown>);
   }
 
   publishCompactionPrepare(request: SupervisorCompactionPrepare): SupervisorFrame {
@@ -1537,21 +1436,6 @@ export class SupervisorChannel {
     return this.beginSnapshotRequest();
   }
 
-  /**
-   * 父会话重新可用后重试尚未注入的连续回复。只有本轮确实推进 reply_seq
-   * 才返回新的累计 ACK；回复正文始终保留在有界窗口内直至接纳成功。
-   */
-  retryPendingReplies(): SupervisorFrame | undefined {
-    if (this.role !== "parent" || this.terminationBarrier || this.state !== "ready") {
-      throw new SupervisorProtocolError("closed");
-    }
-    const previousAck = this.highestReplyAck;
-    const result = this.deliverBufferedReplies();
-    return result.ackReplySeq === previousAck
-      ? undefined
-      : this.createReplyAck(result.ackReplySeq);
-  }
-
   /** 显式建立终止屏障后，旧流和普通控制帧只会被丢弃。 */
   establishTerminationBarrier(): void {
     this.terminationBarrier = true;
@@ -1613,7 +1497,6 @@ export class SupervisorChannel {
       tree_revision: this.treeRevision,
       subtree_revision: Math.max(0, this.acceptedSubtreeRevision),
       snapshot_node_count: this.latestSnapshot.length,
-      pending_reply_count: this.outboundReplies.size + this.bufferedReplies.size,
       ...(this.state === "faulted" ? { fault: EMPTY_FAULT } : {}),
     });
   }
@@ -1692,8 +1575,7 @@ export class SupervisorChannel {
     if (frame.seq <= this.incomingLastSeq) {
       return Object.freeze({
         kind: "duplicate",
-        ack: this.incomingLastSeq,
-        outbound: Object.freeze([this.createAckFrame(this.incomingLastSeq)]),
+        outbound: EMPTY_FRAMES,
       });
     }
     if (
@@ -1712,7 +1594,6 @@ export class SupervisorChannel {
       if (this.pendingSnapshotRequest !== undefined) {
         return Object.freeze({
           kind: "gap",
-          ack: this.incomingLastSeq,
           request_id: this.pendingSnapshotRequest.requestId,
           outbound: EMPTY_FRAMES,
         });
@@ -1722,7 +1603,6 @@ export class SupervisorChannel {
       if (requestId === undefined) frameError("invalid_frame");
       return Object.freeze({
         kind: "gap",
-        ack: this.incomingLastSeq,
         request_id: requestId,
         outbound: Object.freeze([request]),
       });
@@ -1732,15 +1612,16 @@ export class SupervisorChannel {
   }
 
   private applyFrame(frame: InternalFrame): SupervisorReceiveResult {
-    if (frame.kind !== "snapshot" && frame.kind !== "snapshot_request" && frame.request_id !== undefined) {
+    if (
+      frame.kind !== "snapshot"
+      && frame.kind !== "snapshot_request"
+      && frame.kind !== "reply"
+      && frame.request_id !== undefined
+    ) {
       frameError("invalid_frame");
     }
     let applied = false;
     let replies: readonly SupervisorReply[] = EMPTY_REPLIES;
-    let replyAck: number | undefined;
-    let transportAck: number | undefined;
-    let taskAssignment: SupervisorTaskAssignment | undefined;
-    let taskStarted: SupervisorTaskStarted | undefined;
     let capability: SupervisorCapabilityManifest | undefined;
     let compactionPrepare: SupervisorCompactionPrepare | undefined;
     let compactionPrepared: SupervisorCompactionPrepared | undefined;
@@ -1776,19 +1657,13 @@ export class SupervisorChannel {
         applied = true;
         break;
       case "reply": {
-        const result = this.applyReplyFrame(frame);
-        replies = result.replies;
-        if (result.ackReplySeq > 0) outbound.push(this.createReplyAck(result.ackReplySeq));
+        const replyResult = this.applyReplyFrame(frame);
+        replies = replyResult.accepted ? Object.freeze([replyResult.reply]) : EMPTY_REPLIES;
+        if (frame.request_id !== undefined) {
+          outbound.push(this.createReplyAcceptanceResponse(frame.request_id, replyResult.accepted));
+        }
         break;
       }
-      case "task_assignment":
-        if (this.role !== "child" || this.state !== "ready") frameError("sequence_violation");
-        taskAssignment = parseTaskAssignment(frame.payload);
-        break;
-      case "task_started":
-        if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
-        taskStarted = parseTaskStarted(frame.payload);
-        break;
       case "compaction_prepare":
         if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
         compactionPrepare = parseCompactionPrepare(frame.payload);
@@ -1813,14 +1688,6 @@ export class SupervisorChannel {
         if (this.role !== "child" || this.state !== "ready") frameError("sequence_violation");
         controlResponse = parseControlResponse(frame.payload, this.limits);
         break;
-      case "ack":
-        {
-          const result = this.applyAck(frame);
-          outbound.push(...result.outbound);
-          replyAck = result.replyAck;
-          transportAck = result.transportAck;
-        }
-        break;
       case "event":
         event = this.applyEvent(frame);
         break;
@@ -1829,22 +1696,14 @@ export class SupervisorChannel {
         closeRequested = true;
         break;
     }
-    // close 由接收端完成后代清理并关闭字节流作为受控确认，不能提前 ACK。
-    if (frame.kind !== "ack" && frame.kind !== "close") {
-      outbound.push(this.createAckFrame(this.incomingLastSeq));
-    }
+    // 不发送 transport/application ACK；帧 seq 仅用于本地断序检测。
     const acceptedSnapshot = frame.kind === "snapshot" && applied ? this.getLatestSnapshot() : undefined;
     return Object.freeze({
       kind: "accepted",
-      ack: this.incomingLastSeq,
       applied,
       tree_revision: this.treeRevision,
       outbound: Object.freeze(outbound),
       replies,
-      ...(replyAck === undefined ? {} : { reply_ack: replyAck }),
-      ...(transportAck === undefined ? {} : { transport_ack: transportAck }),
-      ...(taskAssignment === undefined ? {} : { task_assignment: taskAssignment }),
-      ...(taskStarted === undefined ? {} : { task_started: taskStarted }),
       ...(capability === undefined ? {} : { capability }),
       ...(compactionPrepare === undefined ? {} : { compaction_prepare: compactionPrepare }),
       ...(compactionPrepared === undefined ? {} : { compaction_prepared: compactionPrepared }),
@@ -1938,97 +1797,37 @@ export class SupervisorChannel {
     return this.createSnapshotFrame(this.localLatestSnapshot, this.localSubtreeRevision, frame.request_id);
   }
 
-  private applyReplyFrame(frame: InternalFrame): { readonly replies: readonly SupervisorReply[]; readonly ackReplySeq: number } {
-    if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
-    const reply = parseReply(frame.payload, this.limits);
-    if (reply.envelope.agent_id !== this.peerAgentId) frameError("identity_mismatch");
-    const semantics = replySemanticDigest(reply.envelope);
-    const previousSemantics = this.receivedReplyDigests.get(reply.reply_seq);
-    if (previousSemantics !== undefined && previousSemantics !== semantics) frameError("reply_invalid");
-    if (previousSemantics === undefined) this.rememberReplySemantics(reply.reply_seq, semantics);
-    if (reply.reply_seq < this.nextExpectedReplySeq) {
-      return Object.freeze({ replies: EMPTY_REPLIES, ackReplySeq: this.highestReplyAck });
-    }
-    if (!this.bufferedReplies.has(reply.reply_seq) && this.bufferedReplies.size >= this.limits.maxReplyWindow) {
-      frameError("reply_window_full");
-    }
-    this.bufferedReplies.set(reply.reply_seq, reply);
-    return this.deliverBufferedReplies();
-  }
-
-  private deliverBufferedReplies(): { readonly replies: readonly SupervisorReply[]; readonly ackReplySeq: number } {
-    const delivered: SupervisorReply[] = [];
-    let current = this.bufferedReplies.get(this.nextExpectedReplySeq);
-    while (current !== undefined) {
-      const duplicateFinal = current.envelope.kind === "final"
-        && this.acceptedFinalTurns.has(current.envelope.turn_id);
-      let accepted = duplicateFinal;
-      if (!duplicateFinal) {
-        accepted = true;
-        try {
-          accepted = this.onReply?.(current) ?? true;
-        } catch {
-          accepted = false;
-        }
-      }
-      // 注入失败时保留当前 reply；传输 ACK 仍可推进，但 reply ACK 必须等待
-      // 当前或 reload 后的新父会话真正接纳正文。同一 turn 的后续 final 只作为
-      // 已完成提交的幂等重放处理，不得覆盖首个已接纳 final。
-      if (!accepted) break;
-      this.bufferedReplies.delete(current.reply_seq);
-      if (!duplicateFinal) {
-        delivered.push(current);
-        if (current.envelope.kind === "final") this.acceptedFinalTurns.add(current.envelope.turn_id);
-      }
-      this.highestReplyAck = current.reply_seq;
-      this.nextExpectedReplySeq += 1;
-      current = this.bufferedReplies.get(this.nextExpectedReplySeq);
-    }
-    return Object.freeze({ replies: Object.freeze(delivered), ackReplySeq: this.highestReplyAck });
-  }
-
-  private rememberReplySemantics(replySeq: number, semantics: string): void {
-    this.receivedReplyDigests.set(replySeq, semantics);
-  }
-
-  private applyAck(frame: InternalFrame): {
-    readonly outbound: readonly SupervisorFrame[];
-    readonly replyAck?: number;
-    readonly transportAck?: number;
+  private applyReplyFrame(frame: InternalFrame): {
+    readonly reply: SupervisorReply;
+    readonly accepted: boolean;
   } {
-    const payload = frame.payload;
-    const kind = payload.kind;
-    if (kind === "transport") {
-      if (!Number.isSafeInteger(payload.seq) || (payload.seq as number) < 0) frameError("invalid_frame");
-      if (Object.keys(payload).some((key) => key !== "kind" && key !== "seq")) frameError("invalid_frame");
-      const acknowledged = payload.seq as number;
-      if (acknowledged > this.sendSeq) frameError("sequence_violation");
-      if (
-        this.role === "child" &&
-        this.state === "awaiting_snapshot" &&
-        this.awaitingInitialSnapshotAckSeq !== undefined &&
-        acknowledged >= this.awaitingInitialSnapshotAckSeq
-      ) {
-        this.awaitingInitialSnapshotAckSeq = undefined;
-        this.state = "ready";
-        return Object.freeze({
-          outbound: this.replayUnacknowledgedReplies(),
-          transportAck: acknowledged,
-        });
-      }
-      return Object.freeze({ outbound: EMPTY_FRAMES, transportAck: acknowledged });
+    if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
+    const reply = parseReply(frame.payload);
+    if (reply.agent_id !== this.peerAgentId) frameError("identity_mismatch");
+    let accepted = true;
+    // 父端接纳回调是唯一的 Pi 同步裁决点。回调缺失时，协议端点只能把
+    // 该帧视为已通过传输边界，生产装配会始终提供 ParentReplyInbox 回调。
+    try {
+      accepted = this.onReply === undefined ? true : this.onReply(reply) === true;
+    } catch {
+      accepted = false;
     }
-    if (kind !== "reply" || !Number.isSafeInteger(payload.reply_seq) || (payload.reply_seq as number) < 0) {
-      frameError("invalid_frame");
-    }
-    if (Object.keys(payload).some((key) => key !== "kind" && key !== "reply_seq")) frameError("invalid_frame");
-    if (this.role !== "child") frameError("sequence_violation");
-    const acknowledged = payload.reply_seq as number;
-    if (acknowledged > this.nextReplySeq - 1) frameError("reply_invalid");
-    for (const replySeq of this.outboundReplies.keys()) {
-      if (replySeq <= acknowledged) this.outboundReplies.delete(replySeq);
-    }
-    return Object.freeze({ outbound: EMPTY_FRAMES, replyAck: acknowledged });
+    return Object.freeze({ reply, accepted });
+  }
+
+  /**
+   * 用控制响应返回一次同步 Pi 接纳裁决。它不携带正文、消息身份、序号、
+   * ACK 或重放状态；operation_id 只是本次控制调用的传输相关性值。
+   */
+  private createReplyAcceptanceResponse(operationId: string, accepted: boolean): SupervisorFrame {
+    return this.createFrame("control_response", {
+      operation_id: operationId,
+      ok: true,
+      data: {
+        kind: "reply_acceptance",
+        accepted,
+      },
+    });
   }
 
   private applyEvent(frame: InternalFrame): SupervisorEvent {
@@ -2044,28 +1843,22 @@ export class SupervisorChannel {
       !(AGENT_LIFECYCLE_EVENT_TYPES as readonly string[]).includes(payload.type)
     ) frameError("invalid_frame");
     if (
-      payload.expected_generation !== undefined &&
-      (!Number.isSafeInteger(payload.expected_generation) || (payload.expected_generation as number) < 0)
+      !hasOwn(payload, "expected_generation")
+      || !Number.isSafeInteger(payload.expected_generation)
+      || (payload.expected_generation as number) < 0
     ) frameError("invalid_frame");
     if (!this.eventAgentIsInScope(payload.agent_id as string)) frameError("identity_mismatch");
     if (Object.keys(payload).some((key) => !["root_id", "agent_id", "type", "expected_generation", "error_code"].includes(key))) {
       frameError("invalid_frame");
     }
-    if (payload.error_code !== undefined && ![
-      "spawn_failed",
-      "spawn_timeout",
-      "capability_mismatch",
-      "message_delivery_failed",
-      "termination_incomplete",
-      "internal_error",
-    ].includes(payload.error_code as string)) frameError("invalid_frame");
+    if (payload.error_code !== undefined && !(AGENT_FAULT_CODES as readonly string[]).includes(payload.error_code as string)) {
+      frameError("invalid_frame");
+    }
     return Object.freeze({
       root_id: this.rootId,
       agent_id: payload.agent_id as string,
       type: payload.type as AgentLifecycleEventType,
-      ...(payload.expected_generation === undefined
-        ? {}
-        : { expected_generation: payload.expected_generation as number }),
+      expected_generation: payload.expected_generation as number,
       ...(payload.error_code === undefined
         ? {}
         : { error_code: payload.error_code as AgentFault["code"] }),
@@ -2110,14 +1903,6 @@ export class SupervisorChannel {
     return frame;
   }
 
-  private createAckFrame(acknowledgedSeq: number): SupervisorFrame {
-    return this.createFrame("ack", { kind: "transport", seq: acknowledgedSeq });
-  }
-
-  private createReplyAck(replySeq: number): SupervisorFrame {
-    return this.createFrame("ack", { kind: "reply", reply_seq: replySeq });
-  }
-
   private beginSnapshotRequest(): SupervisorFrame {
     if (this.role !== "parent" || this.pendingSnapshotRequest !== undefined) {
       throw new SupervisorProtocolError("sequence_violation");
@@ -2144,13 +1929,6 @@ export class SupervisorChannel {
     return streamId;
   }
 
-  private replayUnacknowledgedReplies(): readonly SupervisorFrame[] {
-    const replayed = Array.from(this.outboundReplies.values(), ({ reply }) => {
-      return this.createFrame("reply", reply as unknown as Record<string, unknown>);
-    });
-    return Object.freeze(replayed);
-  }
-
   private beginReconnect(): void {
     if (this.incomingStreamId !== undefined && !this.retireIncomingStream(this.incomingStreamId)) {
       // 旧流集合不淘汰，达到固定窗口后不再接受任何可能被回放的流。
@@ -2160,7 +1938,6 @@ export class SupervisorChannel {
     this.incomingStreamId = undefined;
     this.incomingLastSeq = 0;
     this.pendingSnapshotRequest = undefined;
-    this.awaitingInitialSnapshotAckSeq = undefined;
     this.sendSeq = 0;
     this.outgoingStreamId = this.allocateStreamId();
     this.state = "resyncing";
@@ -2252,12 +2029,6 @@ export class FakeSupervisorChannel extends SupervisorChannel {
     subtreeRevision?: number,
   ): SupervisorFrame {
     const frame = this.publishSnapshot(nodes, subtreeRevision);
-    this.send(frame);
-    return frame;
-  }
-
-  sendReply(reply: SupervisorReplyInput | SupervisorReply): SupervisorFrame {
-    const frame = this.publishReply(reply);
     this.send(frame);
     return frame;
   }

@@ -14,12 +14,8 @@ import {
   type SupervisorEvent,
   type SupervisorReceiveResult,
   type SupervisorReply,
-  type SupervisorReplyInput,
-  type SupervisorReplyPublication,
   type SupervisorSnapshot,
   type SupervisorChannelPublicState,
-  type SupervisorTaskAssignment,
-  type SupervisorTaskStarted,
 } from "./supervisor-channel.ts";
 import type {
   RpcSupervisorChannel,
@@ -52,6 +48,8 @@ export interface StreamSupervisorChannelOptions extends SupervisorChannelOptions
   readonly onCapability?: (capability: SupervisorCapabilityManifest) => void;
   /** child 收到 close 后执行后代优先清理；只有 true 才关闭本地字节流。 */
   readonly onCloseRequested?: () => boolean | Promise<boolean>;
+  /** child 等待父端同步返回 Pi 接纳裁决的内部期限。 */
+  readonly replyAcceptanceTimeoutMs?: number;
 }
 
 /**
@@ -65,16 +63,14 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
   private readonly initialSnapshot: readonly unknown[];
   private readonly initialSubtreeRevision: number | undefined;
   private readonly onCloseRequested: (() => boolean | Promise<boolean>) | undefined;
+  private readonly replyAcceptanceTimeoutMs: number;
   private readonly ready = createDeferred<void>();
   private readonly closed = createDeferred<void>();
-  private readonly replyAcknowledgements = new Map<number, Deferred<void>>();
-  private readonly transportAcknowledgements = new Map<number, Deferred<void>>();
+  private readonly replyAcceptances = new Map<string, Deferred<boolean>>();
   private readonly compactionPrepared = new Map<string, Deferred<boolean>>();
   private readonly compactionCompleted = new Map<string, Deferred<boolean>>();
   private readonly compactionPrepareListeners = new Set<(request: SupervisorCompactionPrepare) => void>();
   private readonly compactionCompleteListeners = new Set<(request: SupervisorCompactionComplete) => void>();
-  private readonly taskAssignmentListeners = new Set<(assignment: SupervisorTaskAssignment) => void>();
-  private readonly taskStartedListeners = new Set<(started: SupervisorTaskStarted) => void>();
   private readonly faults = new Set<(fault: RpcSupervisorChannelFault) => void>();
   private readonly eventListeners = new Set<(event: SupervisorEvent) => void>();
   private readonly snapshotListeners = new Set<(snapshot: SupervisorSnapshot) => void>();
@@ -114,6 +110,11 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     this.initialSnapshot = Object.freeze([...(options.initialSnapshot ?? [])]);
     this.initialSubtreeRevision = options.initialSubtreeRevision;
     this.onCloseRequested = options.onCloseRequested;
+    this.replyAcceptanceTimeoutMs = validPositiveDuration(options.replyAcceptanceTimeoutMs)
+      ? options.replyAcceptanceTimeoutMs
+      : validPositiveDuration(options.resyncTimeoutMs)
+        ? options.resyncTimeoutMs
+        : 5_000;
     // child 可能在父端等待握手前先收到 EOF；不能让内部 ready 拒绝升级为
     // 未处理拒绝，但 waitForReady 仍需观察原始失败。
     void this.ready.promise.catch(() => {});
@@ -154,97 +155,29 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     return this.publicState().state === "ready";
   }
 
-  async publishReply(reply: SupervisorReplyInput | SupervisorReply): Promise<void> {
-    await this.send(this.protocol.publishReply(reply));
-  }
-
-  /** 发布 reply 帧后只等待本地写入；累计父端 ACK 通过句柄异步完成。 */
-  async publishReplyWithAck(
-    reply: SupervisorReplyInput | SupervisorReply,
-  ): Promise<SupervisorReplyPublication> {
+  async publishReply(
+    reply: SupervisorReply,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (signal?.aborted === true) throw supervisorAbortError();
     const frame = this.protocol.publishReply(reply);
-    const replySeq = readReplySeq(frame);
-    const waiter = createDeferred<void>();
+    const requestId = frame.request_id;
+    if (requestId === undefined) throw new Error("message_delivery_failed");
+    const waiter = createDeferred<boolean>();
     void waiter.promise.catch(() => {});
-    this.replyAcknowledgements.set(replySeq, waiter);
+    this.replyAcceptances.set(requestId, waiter);
     try {
       await this.send(frame);
-      return Object.freeze({ acknowledged: waiter.promise });
-    } catch (error) {
-      if (this.replyAcknowledgements.get(replySeq) === waiter) this.replyAcknowledgements.delete(replySeq);
-      if (error instanceof Error && error.name === "AbortError") throw error;
-      this.fail("protocol_fault");
-      throw new Error("监督回复未获确认");
+      const accepted = await this.waitForReplyAcceptance(waiter, signal);
+      if (!accepted) throw new Error("message_delivery_failed");
+    } finally {
+      if (this.replyAcceptances.get(requestId) === waiter) this.replyAcceptances.delete(requestId);
     }
   }
 
   /** child 在普通 ready 后发布一次内部 capability manifest。 */
   async publishCapability(capability: SupervisorCapabilityManifest): Promise<void> {
     await this.send(this.protocol.publishCapability(capability));
-  }
-
-  /** 发布 reply 并等待父端累计 ACK；同一 reply_seq 只创建一次逻辑消息。 */
-  async publishReplyAndWaitForAck(
-    reply: SupervisorReplyInput | SupervisorReply,
-    signal?: AbortSignal,
-  ): Promise<void> {
-    const frame = this.protocol.publishReply(reply);
-    const replySeq = readReplySeq(frame);
-    const waiter = createDeferred<void>();
-    void waiter.promise.catch(() => {});
-    this.replyAcknowledgements.set(replySeq, waiter);
-    try {
-      await this.send(frame);
-      if (signal === undefined) await waiter.promise;
-      else await raceSupervisorAbort(waiter.promise, signal);
-    } catch (error) {
-      if (this.replyAcknowledgements.get(replySeq) === waiter) this.replyAcknowledgements.delete(replySeq);
-      if (error instanceof Error && error.name === "AbortError") throw error;
-      this.fail("protocol_fault");
-      throw new Error("监督回复未获确认");
-    }
-  }
-
-  async retryPendingReplies(): Promise<void> {
-    const replyAck = this.protocol.retryPendingReplies();
-    if (replyAck !== undefined) await this.send(replyAck);
-  }
-
-  async publishTaskAssignmentAndWaitForAck(
-    assignment: SupervisorTaskAssignment,
-    signal?: AbortSignal,
-  ): Promise<void> {
-    const frame = this.protocol.publishTaskAssignment(assignment);
-    const waiter = createDeferred<void>();
-    void waiter.promise.catch(() => {});
-    this.transportAcknowledgements.set(frame.seq, waiter);
-    try {
-      await this.send(frame);
-      if (signal === undefined) await waiter.promise;
-      else await raceSupervisorAbort(waiter.promise, signal);
-    } finally {
-      if (this.transportAcknowledgements.get(frame.seq) === waiter) {
-        this.transportAcknowledgements.delete(frame.seq);
-      }
-    }
-  }
-
-  onTaskAssignment(listener: (assignment: SupervisorTaskAssignment) => void): () => void {
-    this.taskAssignmentListeners.add(listener);
-    return () => this.taskAssignmentListeners.delete(listener);
-  }
-
-  /**
-   * task_started 与后续 reply 共用同一有序监督流。这里只等待帧写入；若等待
-   * transport ACK，会把累计确认退化为 stop-and-wait，并阻塞同 turn 的 final。
-   */
-  async publishTaskStarted(started: SupervisorTaskStarted): Promise<void> {
-    await this.send(this.protocol.publishTaskStarted(started));
-  }
-
-  onTaskStarted(listener: (started: SupervisorTaskStarted) => void): () => void {
-    this.taskStartedListeners.add(listener);
-    return () => this.taskStartedListeners.delete(listener);
   }
 
   /** child 端发布已经由 SupervisorChannel 校验的生命周期事实。 */
@@ -339,10 +272,8 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     if (this.released) return;
     this.released = true;
     this.endpointClosed = true;
-    for (const waiter of this.replyAcknowledgements.values()) waiter.reject(new Error("监督通道已关闭"));
-    this.replyAcknowledgements.clear();
-    for (const waiter of this.transportAcknowledgements.values()) waiter.reject(new Error("监督通道已关闭"));
-    this.transportAcknowledgements.clear();
+    for (const waiter of this.replyAcceptances.values()) waiter.reject(new Error("监督通道已关闭"));
+    this.replyAcceptances.clear();
     this.rejectCompactionWaiters("监督通道已关闭");
     try {
       if (!this.transport.stdin.destroyed) this.transport.stdin.destroy();
@@ -442,7 +373,12 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
       notifySupervisorListeners(this.controlRequestListeners, result.control_request);
     }
     if (result.kind === "accepted" && result.control_response !== undefined) {
-      notifySupervisorListeners(this.controlResponseListeners, result.control_response);
+      const acceptance = readReplyAcceptance(result.control_response);
+      if (acceptance === undefined) {
+        notifySupervisorListeners(this.controlResponseListeners, result.control_response);
+      } else {
+        this.resolveReplyAcceptance(acceptance.operationId, acceptance.accepted);
+      }
     }
     if (result.kind === "accepted" && result.compaction_prepare !== undefined) {
       notifySupervisorListeners(this.compactionPrepareListeners, result.compaction_prepare);
@@ -455,18 +391,6 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     }
     if (result.kind === "accepted" && result.compaction_completed !== undefined) {
       this.resolveCompactionAcknowledgement(this.compactionCompleted, result.compaction_completed);
-    }
-    if (result.kind === "accepted" && result.reply_ack !== undefined) {
-      this.resolveReplyAcknowledgements(result.reply_ack);
-    }
-    if (result.kind === "accepted" && result.transport_ack !== undefined) {
-      this.resolveTransportAcknowledgements(result.transport_ack);
-    }
-    if (result.kind === "accepted" && result.task_assignment !== undefined) {
-      notifySupervisorListeners(this.taskAssignmentListeners, result.task_assignment);
-    }
-    if (result.kind === "accepted" && result.task_started !== undefined) {
-      notifySupervisorListeners(this.taskStartedListeners, result.task_started);
     }
     if (result.kind === "accepted" && result.close_requested === true) {
       this.handleCloseRequested();
@@ -554,19 +478,27 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     for (const item of pending) item.completion.reject(new Error("监督通道不可用"));
   }
 
-  private resolveReplyAcknowledgements(replySeq: number): void {
-    for (const [sequence, waiter] of this.replyAcknowledgements) {
-      if (sequence > replySeq) continue;
-      this.replyAcknowledgements.delete(sequence);
-      waiter.resolve();
-    }
+  private resolveReplyAcceptance(operationId: string, accepted: boolean): void {
+    const waiter = this.replyAcceptances.get(operationId);
+    if (waiter === undefined) return;
+    this.replyAcceptances.delete(operationId);
+    waiter.resolve(accepted);
   }
 
-  private resolveTransportAcknowledgements(acknowledgedSeq: number): void {
-    for (const [sequence, waiter] of this.transportAcknowledgements) {
-      if (sequence > acknowledgedSeq) continue;
-      this.transportAcknowledgements.delete(sequence);
-      waiter.resolve();
+  private async waitForReplyAcceptance(
+    waiter: Deferred<boolean>,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<boolean>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("message_delivery_failed")), this.replyAcceptanceTimeoutMs);
+      timer.unref?.();
+    });
+    try {
+      const pending = Promise.race([waiter.promise, timeout]);
+      return signal === undefined ? await pending : await raceSupervisorAbort(pending, signal);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
     }
   }
 
@@ -642,10 +574,8 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     if (this.faultNotified) return;
     this.faultNotified = true;
     this.closed.resolve();
-    for (const waiter of this.replyAcknowledgements.values()) waiter.reject(new Error("监督通道不可用"));
-    this.replyAcknowledgements.clear();
-    for (const waiter of this.transportAcknowledgements.values()) waiter.reject(new Error("监督通道不可用"));
-    this.transportAcknowledgements.clear();
+    for (const waiter of this.replyAcceptances.values()) waiter.reject(new Error("监督通道不可用"));
+    this.replyAcceptances.clear();
     this.rejectCompactionWaiters("监督通道不可用");
     if (!this.ready.settled()) this.ready.reject(new Error("监督通道不可用"));
     for (const listener of this.faults) {
@@ -658,10 +588,17 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
   }
 }
 
-function readReplySeq(frame: SupervisorFrame): number {
-  const value = frame.payload.reply_seq;
-  if (!Number.isSafeInteger(value) || (value as number) < 1) {
-    throw new Error("监督回复序号无效");
+function readReplyAcceptance(
+  response: SupervisorControlResponse,
+): { readonly operationId: string; readonly accepted: boolean } | undefined {
+  if (!response.ok || typeof response.data !== "object" || response.data === null || Array.isArray(response.data)) {
+    return undefined;
   }
-  return value as number;
+  const data = response.data as Record<string, unknown>;
+  if (data.kind !== "reply_acceptance" || typeof data.accepted !== "boolean") return undefined;
+  return Object.freeze({ operationId: response.operation_id, accepted: data.accepted });
+}
+
+function validPositiveDuration(value: number | undefined): value is number {
+  return value !== undefined && Number.isSafeInteger(value) && value > 0;
 }

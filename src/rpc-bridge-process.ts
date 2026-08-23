@@ -409,21 +409,6 @@ async function closeLocalSupervisor(): Promise<void> {
   if (listener !== undefined) await listener.close();
 }
 
-function parseArgs(): void {
-  // 兼容旧 bridge 入口；生产节点已改为在首个有界 start 命令中传递配置，
-  // 防止模板正文因 Windows 命令行编码膨胀而无法启动。
-  const index = process.argv.indexOf("--config");
-  const encoded = index >= 0 ? process.argv[index + 1] : undefined;
-  if (encoded === undefined) return;
-  try {
-    const decoded = Buffer.from(encoded, "base64url").toString("utf8");
-    const parsed: unknown = JSON.parse(decoded);
-    if (isRecord(parsed)) config = parsed;
-  } catch {
-    config = {};
-  }
-}
-
 function normalizeBridgeConfig(value: unknown): Record<string, unknown> | undefined {
   if (!isRecord(value) || !hasOnlyKeys(value, ["rpc"]) || !isRecord(value.rpc)) return undefined;
   return Object.freeze({ rpc: Object.freeze({ ...value.rpc }) });
@@ -913,7 +898,6 @@ function flushOutput(): Promise<void> {
   return outputQueue;
 }
 
-parseArgs();
 process.stdin.on("data", (chunk: Uint8Array | string) => {
   consume(typeof chunk === "string" ? new TextEncoder().encode(chunk) : new Uint8Array(chunk));
 });

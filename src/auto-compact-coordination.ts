@@ -36,7 +36,6 @@ export interface AutoCompactCoordinationRuntime {
   readonly replyInbox: ParentReplyInbox;
   readonly replyCoordinator?: ChildReplyCoordinator;
   readonly upstream?: { readonly channel: StreamSupervisorChannel };
-  retryPendingReplies(): Promise<void>;
 }
 
 export interface AutoCompactCoordinationParticipantOptions {
@@ -136,7 +135,6 @@ export class AutoCompactCoordinationParticipant {
           await this.cleanupUpstream(upstream.channel, completed.requestId);
         }
         this.releaseLocal(completed.requestId, completed.runtime, "not_started");
-        void completed.runtime.retryPendingReplies().catch(() => {});
       }
       this.pending.clear();
       this.transactions.clear();
@@ -301,7 +299,6 @@ export class AutoCompactCoordinationParticipant {
           );
         }
         this.releaseLocal(requestId, runtime);
-        void runtime.retryPendingReplies().catch(() => {});
         return false;
       }
       this.barriers.set(requestId, Object.freeze({
@@ -315,7 +312,6 @@ export class AutoCompactCoordinationParticipant {
         await this.releaseRequestedUpstream(runtime.upstream.channel, requestId, "not_started", true);
       }
       this.releaseLocal(requestId, runtime);
-      void runtime.retryPendingReplies().catch(() => {});
       return false;
     } finally {
       this.pending.delete(requestId);
@@ -353,7 +349,6 @@ export class AutoCompactCoordinationParticipant {
             }
             this.completedLocalSuccess = undefined;
             this.releaseLocal(request.requestId, completed.runtime, "not_started");
-            void completed.runtime.retryPendingReplies().catch(() => {});
           }
           terminal.compensationAccepted = accepted;
         }
@@ -447,7 +442,6 @@ export class AutoCompactCoordinationParticipant {
           )
       : true;
     this.releaseLocal(requestId, barrier.runtime, accepted ? outcome : "not_started");
-    void barrier.runtime.retryPendingReplies().catch(() => {});
     return accepted;
   }
 
