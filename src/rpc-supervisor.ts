@@ -1,5 +1,6 @@
 import type { ChildReplyEnvelope } from "./child-reply-envelope.ts";
 import {
+  ManagedRpcCommandRejectedError,
   type ManagedRpcNodeLike,
   type ManagedRpcNodeStartContext,
 } from "./managed-rpc-node.ts";
@@ -420,7 +421,7 @@ export type RpcSupervisorCommandResult =
     }
   | {
       readonly ok: false;
-      readonly code: "agent_unavailable" | "message_delivery_failed";
+      readonly code: "agent_unavailable" | "message_delivery_failed" | "compaction_active";
     };
 
 export type RpcSupervisorInterruptResult =
@@ -1475,7 +1476,7 @@ export class RpcSupervisor {
       || this.lifecycleState === "failed"
     ) return Object.freeze({ ok: false, code: "message_delivery_failed" });
     if (this.compactionBarrierActive()) {
-      return Object.freeze({ ok: false, code: "message_delivery_failed" });
+      return Object.freeze({ ok: false, code: "compaction_active" });
     }
     const submissionMode = mode ?? (this.lifecycleState === "working" ? "steer" : "prompt");
     try {
@@ -1485,7 +1486,10 @@ export class RpcSupervisor {
       const response = await this.withMessageTimeout(operation);
       if (!isSynchronousAcceptance(response)) throw new Error("message_delivery_failed");
       return Object.freeze({ ok: true, accepted: true }) as unknown as RpcSupervisorCommandResult;
-    } catch {
+    } catch (error) {
+      if (error instanceof ManagedRpcCommandRejectedError && error.reason === "compaction_active") {
+        return Object.freeze({ ok: false, code: "compaction_active" });
+      }
       // Pi 拒绝、调用异常或响应未知只结算本次消息，不升级生命周期。
       return Object.freeze({ ok: false, code: "message_delivery_failed" });
     }

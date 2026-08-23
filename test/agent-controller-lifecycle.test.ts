@@ -146,6 +146,21 @@ test("send_message 失败只结算本次调用，wait_agent 返回独立消息�
   assert.equal(working.ok, true);
   if (working.ok) assert.equal(working.data.state, "working");
 
+  fake.sendResult = { ok: false, code: "compaction_active" };
+  const compacting = await controller.sendMessage({ agent_id: AGENT_ID, message: "压缩期间发送" });
+  assert.deepEqual(compacting, {
+    ok: false,
+    error: {
+      code: "compaction_active",
+      message: "Message delivery blocked while compaction is active; retry after compaction finishes",
+      retryable: true,
+      details: {},
+    },
+  });
+  const stillWorking = tree.getStatus(AGENT_ID);
+  assert.equal(stillWorking.ok, true);
+  if (stillWorking.ok) assert.equal(stillWorking.data.state, "working");
+
   fake.sendResult = { ok: true, accepted: true };
   assert.deepEqual(await controller.sendMessage({ agent_id: AGENT_ID, message: "继续会话" }), {
     ok: true,

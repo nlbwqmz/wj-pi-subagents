@@ -16,6 +16,9 @@ import {
   ROOT_TREE_ACTOR,
   TreeController,
 } from "../src/tree-controller.ts";
+import {
+  ManagedRpcCommandRejectedError,
+} from "../src/managed-rpc-node.ts";
 import type {
   ExitObservation,
   ResourceObservation,
@@ -101,6 +104,16 @@ class TestManagedRpcNode {
   }
 
   async release(): Promise<void> {}
+}
+
+class ExplicitlyRejectingManagedRpcNode extends TestManagedRpcNode {
+  override prompt(_message: string): Promise<void> {
+    return Promise.reject(new ManagedRpcCommandRejectedError("compaction_active"));
+  }
+
+  override steer(_message: string): Promise<void> {
+    return Promise.reject(new ManagedRpcCommandRejectedError("compaction_active"));
+  }
 }
 
 function emitPiEvent(rpc: FakeRpcClient, rawEvent: unknown): void {
@@ -227,9 +240,17 @@ test("真实 Pi 手动压缩事件与监督 ACK 并发时保留协调授权", as
 
     const transactionId = "compaction-transaction-1";
     assert.equal(await channels.child.requestCompactionPrepare(transactionId), true);
+    assert.deepEqual(await supervisor.sendMessage("压缩期间发送"), {
+      ok: false,
+      code: "compaction_active",
+    });
     emitPiEvent(rpc, { type: "agent_start" });
     emitPiEvent(rpc, { type: "queue_update", steering: [], followUp: [] });
     emitPiEvent(rpc, { type: "compaction_start", reason: "manual" });
+    assert.deepEqual(await supervisor.sendMessage("压缩进行中发送"), {
+      ok: false,
+      code: "compaction_active",
+    });
     assert.equal(supervisorEvents.some((event) => event.kind === "fault"), false);
     emitPiEvent(rpc, {
       type: "compaction_end",
@@ -301,6 +322,48 @@ test("真实 Pi 手动压缩事件与监督 ACK 并发时保留协调授权", as
     await channels.child.release();
   }
 });
+test("Pi 明确拒绝压缩期间命令时保留 compaction_active 原因", async () => {
+  const channels = pair(() => true, 200, "idle");
+  const rpc = new FakeRpcClient();
+  const node = new ExplicitlyRejectingManagedRpcNode(rpc);
+  const tree = new TreeController({
+    config: {
+      maxDepth: 2,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 8,
+      waitTimeoutMs: 1_000,
+    },
+    idFactory: () => CHILD_ID,
+  });
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "流式子代理" },
+    managedNode: node,
+    channel: channels.parent,
+    startupTimeoutMs: 1_000,
+    gracefulShutdownMs: 1_000,
+  });
+  const signal = new AbortController().signal;
+  try {
+    const startup = supervisor.start();
+    await channels.child.bind(signal);
+    assert.deepEqual(await startup, {
+      ok: true,
+      agent_id: CHILD_ID,
+      state: "idle",
+    });
+    await channels.child.waitForReady(signal);
+    assert.deepEqual(await supervisor.sendMessage("压缩期间 prompt"), {
+      ok: false,
+      code: "compaction_active",
+    });
+  } finally {
+    await channels.parent.release();
+    await channels.child.release();
+  }
+});
+
 test("流式监督通道等待父端 reply_acceptance，拒绝不进入普通 control response", async () => {
   let accepted = false;
   const channels = pair(() => accepted);

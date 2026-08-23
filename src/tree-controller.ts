@@ -43,6 +43,7 @@ export const PUBLIC_ERROR_CODES = Object.freeze([
   "spawn_timeout",
   "agent_unavailable",
   "message_delivery_failed",
+  "compaction_active",
   "protocol_mismatch",
   "termination_incomplete",
   "internal_error",
@@ -90,6 +91,10 @@ const ERROR_METADATA: Readonly<Record<PublicErrorCode, Readonly<{
   spawn_timeout: AGENT_FAULT_METADATA.spawn_timeout,
   agent_unavailable: Object.freeze({ message: "Subagent currently unavailable", retryable: false }),
   message_delivery_failed: AGENT_FAULT_METADATA.message_delivery_failed,
+  compaction_active: Object.freeze({
+    message: "Message delivery blocked while compaction is active; retry after compaction finishes",
+    retryable: true,
+  }),
   protocol_mismatch: AGENT_FAULT_METADATA.protocol_mismatch,
   termination_incomplete: AGENT_FAULT_METADATA.termination_incomplete,
   internal_error: AGENT_FAULT_METADATA.internal_error,

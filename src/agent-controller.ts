@@ -368,7 +368,11 @@ export class AgentController {
     } catch {
       return controlFailure("message_delivery_failed");
     }
-    if (!result.ok || result.accepted !== true) return controlFailure("message_delivery_failed");
+    if (!result.ok || result.accepted !== true) {
+      return controlFailure(result.ok === false && result.code === "compaction_active"
+        ? "compaction_active"
+        : "message_delivery_failed");
+    }
     return Object.freeze({
       ok: true,
       data: Object.freeze({

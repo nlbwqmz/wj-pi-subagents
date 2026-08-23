@@ -188,7 +188,7 @@ export const PARENT_COORDINATION_GUIDELINES = Object.freeze({
   sendMessageReply: "中途回复：只有在本次 send_message 明确要求子代理在当前工作完成前返回进度、回答问题或报告阻塞时，才在消息正文中要求其使用 reply_to_parent。需要父代理看到阶段性成果、明确交付物或需要单独记录的报告时，要求其调用 final_report。首次下发消息、追加要求、异常恢复指令，以及只需等待结果的消息，不要额外要求中途回复。",
   waitAgent: DELIVERY_AND_WAITING_GUIDELINE,
   slowProgress: "慢进展：working 或 timeout 不代表失败。不要仅因耗时就要求子代理停止探索、提前报告或调用 interrupt_agent、terminate_agent；需要了解情况时，可以用 send_message 询问进度，再继续 wait_agent。",
-  sessionRecovery: "异常恢复：message_delivery_failed、reply_too_large 或等待超时只影响本次操作，不自动解释为子代理故障。先使用 get_agent_status 核对 state 和已有事件，再由模型决定是否发送一条新的独立消息。",
+  sessionRecovery: "异常恢复：compaction_active 表示子代理正在压缩，等待压缩结束后再显式发送一条独立消息；message_delivery_failed、reply_too_large 或等待超时只影响本次操作，不自动解释为子代理故障。先使用 get_agent_status 核对 state 和已有事件，再由模型决定下一步。",
   retryPolicy: "重试：消息调用不会自动重试、暗存或重放正文。只有在确认失败原因、且明确知道重复发送不会造成副作用后，才由模型显式发起新的调用；不要因为结果不确定而盲目重复发送。",
   agentCleanup: "子代理回收：interrupt_agent 只建立 interrupting 屏障，必须等真实 idle 或后续控制结果；释放节点和子树资源必须调用 terminate_agent 并等待 terminated。是否发送 final_report 不决定回收时机。",
   capacityCleanup: "容量回收：spawn_agent 返回 max_children_reached 或 max_tree_agents_reached 时，检查现有子代理，优先使用 terminate_agent 回收已完成且暂不使用或已不可恢复的节点；确认名额释放后再重试创建。",
