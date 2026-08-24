@@ -64,7 +64,7 @@ test("新消息信封只接受 message/final_report 闭集并拒绝旧字段", (
   }), undefined);
 });
 
-test("显式 reply_to_parent 和 final_report 可在同一活动回合交错多次发送", async () => {
+test("显式 normal_reply 和 final_report 可在同一活动回合交错多次发送", async () => {
   const sent: ChildReplyEnvelope[] = [];
   let failNext = false;
   const port: ChildReplyPort = {
@@ -79,10 +79,10 @@ test("显式 reply_to_parent 和 final_report 可在同一活动回合交错多�
   const coordinator = new ChildReplyCoordinator({ agentId: AGENT_ID, port });
 
   coordinator.observeAgentStart();
-  assert.deepEqual(await coordinator.replyToParent({ message: "一" }), { ok: true, data: { accepted: true } });
+  assert.deepEqual(await coordinator.normalReply({ message: "一" }), { ok: true, data: { accepted: true } });
   assert.deepEqual(await coordinator.finalReport({ message: "报告一" }), { ok: true, data: { accepted: true } });
   assert.deepEqual(await coordinator.finalReport({ message: "报告二" }), { ok: true, data: { accepted: true } });
-  assert.deepEqual(await coordinator.replyToParent({ message: "二" }), { ok: true, data: { accepted: true } });
+  assert.deepEqual(await coordinator.normalReply({ message: "二" }), { ok: true, data: { accepted: true } });
   assert.deepEqual(sent.map((item) => [item.kind, item.text]), [
     ["message", "一"],
     ["final_report", "报告一"],
@@ -94,7 +94,7 @@ test("显式 reply_to_parent 和 final_report 可在同一活动回合交错多�
   const failed = await coordinator.finalReport({ message: "发送失败" });
   assert.equal(failed.ok, false);
   if (!failed.ok) assert.equal(failed.error.code, "message_delivery_failed");
-  assert.deepEqual(await coordinator.replyToParent({ message: "失败后仍可继续" }), {
+  assert.deepEqual(await coordinator.normalReply({ message: "失败后仍可继续" }), {
     ok: true,
     data: { accepted: true },
   });
@@ -118,7 +118,7 @@ test("压缩或协调压缩屏障返回 compaction_active，普通传输失败�
   });
   coordinator.observeAgentStart();
   coordinator.observeCompactionStart("threshold");
-  const localBlocked = await coordinator.replyToParent({ message: "压缩期间消息" });
+  const localBlocked = await coordinator.normalReply({ message: "压缩期间消息" });
   assert.equal(localBlocked.ok, false);
   if (!localBlocked.ok) assert.equal(localBlocked.error.code, "compaction_active");
   coordinator.observeCompactionEnd("threshold");
@@ -129,7 +129,7 @@ test("压缩或协调压缩屏障返回 compaction_active，普通传输失败�
   if (!coordinatedBlocked.ok) assert.equal(coordinatedBlocked.error.code, "compaction_active");
   coordinator.completeCoordinationBarrier("parent-compaction", "succeeded");
 
-  const failed = await coordinator.replyToParent({ message: "普通失败" });
+  const failed = await coordinator.normalReply({ message: "普通失败" });
   assert.equal(failed.ok, false);
   if (!failed.ok) assert.equal(failed.error.code, "message_delivery_failed");
 });

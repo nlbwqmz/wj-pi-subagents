@@ -42,7 +42,7 @@ export const AGENT_TOOL_NAMES = Object.freeze([
 ] as const);
 
 /** 子代理向唯一直接父会话上行工作中回复的专用工具；不属于管理工具集合。 */
-export const CHILD_REPLY_TOOL_NAME = "reply_to_parent" as const;
+export const CHILD_REPLY_TOOL_NAME = "normal_reply" as const;
 export const CHILD_FINAL_REPORT_TOOL_NAME = "final_report" as const;
 
 export type AgentToolName = (typeof AGENT_TOOL_NAMES)[number];
@@ -182,11 +182,11 @@ export const PARENT_COORDINATION_GUIDELINES = Object.freeze({
   workBoundary: "任务所有权：每个任务只能有一个负责人。委派前明确任务范围、排除范围、验收标准和产物。子代理明确交付、取消或确认失败前，父代理及其他子代理不得执行、探索或重新实现相同范围，只能处理无范围和写入冲突的独立工作。",
   delivery: "任务委派：创建子代理后必须使用 send_message 发送首个任务。send_message 返回 accepted: true 后，任务即视为已委派。accepted: true 是任务所有权转移的硬边界；从这一刻起，父代理必须停止处理该范围。该结果只表示消息已被接纳，不表示子代理已读取、开始或完成，不得因此重复发送相同任务。后续消息只能用于补充信息、范围变更、明确取消或必要的进度询问，不得重复原任务。",
   waiting: "等待规则：wait_agent 的 timeout 只表示本次等待结束，不表示任务失败、完成或需要接管。执行较慢、没有回复、重复超时、处于 working，或处于 idle 但没有最终报告，都不是中断或接管理由。默认继续等待或查询状态，不得要求子代理提前收尾。",
-  idleHandling: "Idle 状态处理：子代理进入 `idle` 状态但未调用 `final_report` 提交报告时，`idle` 仅表示当前没有正在执行的 turn，不表示任务已经完成。父代理应通过 `send_message` 向该子代理发送一次简短的状态询问，并明确要求：若任务已完成，调用 `final_report` 提交最终报告；若任务尚未完成，使用 `reply_to_parent` 说明当前进度、问题或阻塞，并继续执行尚未完成的任务。在收到明确的阶段性或最终报告前，父代理不得将任务判定为已完成，也不得重复委派、重新实现或接管相同任务。",
+  idleHandling: "Idle 状态处理：子代理进入 `idle` 状态但未调用 `final_report` 提交报告时，`idle` 仅表示当前没有正在执行的 turn，不表示任务已经完成。父代理应通过 `send_message` 向该子代理发送一次简短的状态询问，并明确要求：若任务已完成，调用 `final_report` 提交最终报告；若任务尚未完成，使用 `normal_reply` 说明当前进度、问题或阻塞，并继续执行尚未完成的任务。在收到明确的阶段性或最终报告前，父代理不得将任务判定为已完成，也不得重复委派、重新实现或接管相同任务。",
   timeout: "超时处理：wait_agent 超时后不得重发任务、重新执行任务或调用 interrupt_agent。确需了解进度时，只发送一次简短的进度询问。",
   failure: "错误处理：send_message 失败只影响本次发送，不得盲目重试。reply_too_large 需精简后重发；compaction_active 需等待屏障解除后确认是否仍需发送。accepted: true 的消息不得再次发送。",
-  completion: "完成判断：reply_to_parent 只表示进度、问题或阻塞；final_report 表示阶段性或最终交付，但不会自动结束子代理。idle、terminal、failed 也不自动表示任务完成，必须结合报告、产物、state 和 error 判断。",
-  messaging: "消息回传要求（必须落实到 send_message 正文）：每次向子代理发送任务或补充要求时，必须明确回传方式和触发条件，不得只写“有进展告诉我”“完成后回复我”等模糊表述。\n- 需要中途进度、问题或阻塞：必须在消息中明确写出“使用 `reply_to_parent` 回复当前进度/问题/阻塞”。\n- 只需要阶段性成果或最终结果：必须明确写出“形成交付物或完成任务后，请调用 `final_report` 提交报告”。\n- 两者都需要：同时写明上述两种工具及其各自触发条件。\n- `reply_to_parent` 用于中途进度、问题和阻塞；`final_report` 用于阶段性成果或最终交付。工具调用才构成发给父代理的上行消息。",
+  completion: "完成判断：normal_reply 只表示进度、问题或阻塞；final_report 表示阶段性或最终交付，但不会自动结束子代理。idle、terminal、failed 也不自动表示任务完成，必须结合报告、产物、state 和 error 判断。",
+  messaging: "消息回传要求（必须落实到 send_message 正文）：每次向子代理发送任务或补充要求时，必须明确回传方式和触发条件，不得只写“有进展告诉我”“完成后回复我”等模糊表述。\n- 需要中途进度、问题或阻塞：必须在消息中明确写出“使用 `normal_reply` 回复当前进度/问题/阻塞”。\n- 只需要阶段性成果或最终结果：必须明确写出“形成交付物或完成任务后，请调用 `final_report` 提交报告”。\n- 两者都需要：同时写明上述两种工具及其各自触发条件。\n- `normal_reply` 用于中途进度、问题和阻塞；`final_report` 用于阶段性成果或最终交付。工具调用才构成发给父代理的上行消息。",
   reclaim: "回收规则：子代理已完成当前任务且后续不再需要时，应调用 terminate_agent 释放资源。若 spawn_agent 返回 max_children_reached 或 max_tree_agents_reached，应优先清理已完成当前任务的子代理以释放资源，再重试 spawn_agent。不得清理正在执行任务的子代理。",
   takeover: "接管规则：只有用户或上游任务明确要求取消或改目标、子代理明确请求接管、已确认不可恢复故障，或存在必须停止的资源、安全或协议问题时，才允许接管。working 状态下必须先调用 interrupt_agent；只有返回 interrupting 后，才可等待 idle 或 terminal。terminate_agent 仅用于确认不再复用的分支。",
 });
@@ -210,22 +210,22 @@ export const CHILD_EXECUTION_GUIDELINE =
   "任务执行：只向直接父代理报告。按照父代理给出的范围和验收标准执行，不得因父代理暂时没有回复或任务耗时较长而提前结束。";
 
 export const CHILD_REPLY_GUIDELINE =
-  "中途回复：当父代理在任务消息中明确要求进度、问题或阻塞回报时，子代理应在约定触发点调用 `reply_to_parent`；该工具调用才构成发给父代理的中途回复。若遇到需要父代理处理或裁决的阻塞，也应调用该工具。消息应简要说明当前状态、已完成内容、问题和所需决定。";
+  "中途回复：当父代理在任务消息中明确要求进度、问题或阻塞回报时，子代理应在约定触发点调用 `normal_reply`；该工具调用才构成发给父代理的中途回复。若遇到需要父代理处理或裁决的阻塞，也应调用该工具。消息应简要说明当前状态、已完成内容、问题和所需决定。";
 
 export const CHILD_REPLY_TOO_LARGE_GUIDELINE =
   "回传失败：reply_too_large 表示当前消息未被接纳。精简后使用原工具重发，禁止原样重试；成功返回 accepted: true 前，不得视为已送达。compaction_active 表示当前消息未被接纳；不要在压缩或协调屏障期间重发，屏障解除后确认消息仍有必要，再使用原工具发送。";
 
 export const CHILD_MESSAGE_GUIDELINE =
-  "工具语义：reply_to_parent 和 final_report 都不会自动结束当前工作或生命周期。普通 assistant 文本不会自动通知父代理；accepted: true 只表示父端已接纳消息，不表示父代理已读取、处理或任务已完成。";
+  "工具语义：normal_reply 和 final_report 都不会自动结束当前工作或生命周期。普通 assistant 文本不会自动通知父代理；accepted: true 只表示父端已接纳消息，不表示父代理已读取、处理或任务已完成。";
 
 export const CHILD_NORMAL_REPLY_GUIDELINE =
   "普通答复：普通 assistant 文本、message_end、agent_end、agent_settled、自然停止或压缩完成不会自动生成父端消息。需要父代理看到进度、问题或结果时，必须显式调用对应工具。";
 
 export const CHILD_COMPLETION_GUIDELINE =
-  "阶段性和最终结果：形成阶段性成果、最终结果或正式阻塞报告时，调用 final_report。报告应包含结论、产物位置、验证结果和遗留问题。任务完成时默认调用一次 final_report，除非父代理明确表示不需要。没有新增信息时不得重复调用回传工具，同一内容不得同时调用 reply_to_parent 和 final_report。完成任务并调用 final_report 提交报告后，禁止在后续普通 assistant 回复中重复报告正文。普通回复只需简短确认报告已提交。";
+  "阶段性和最终结果：形成阶段性成果、最终结果或正式阻塞报告时，调用 final_report。报告应包含结论、产物位置、验证结果和遗留问题。任务完成时默认调用一次 final_report，除非父代理明确表示不需要。没有新增信息时不得重复调用回传工具，同一内容不得同时调用 normal_reply 和 final_report。完成任务并调用 final_report 提交报告后，禁止在后续普通 assistant 回复中重复报告正文。普通回复只需简短确认报告已提交。";
 
 const childReplyDescription =
-  "Call reply_to_parent only when your direct parent explicitly asks for a progress report or when blocked on an issue that the parent must handle or decide.";
+  "Call normal_reply only when your direct parent explicitly asks for a progress report or when blocked on an issue that the parent must handle or decide.";
 
 const childFinalReportDescription =
   "Send an explicit report to the direct parent. A successful call only means the parent Pi accepted this message; it does not end the current turn or session, and it may be called multiple times.";
@@ -343,7 +343,7 @@ export type ChildReplyCoordinatorProvider = (
 ) => ChildReplyCoordinator | undefined | Promise<ChildReplyCoordinator | undefined>;
 
 /** 只在 child runtime 注册；工具始终独立于八个管理工具的能力开关。 */
-export function registerReplyToParentTool(
+export function registerNormalReplyTool(
   api: AgentToolRegistrationApi,
   provider: ChildReplyCoordinatorProvider,
 ): void {
@@ -376,7 +376,7 @@ export function registerReplyToParentTool(
       if (coordinator === undefined) {
         throw new SubagentToolError(controlFailure("agent_unavailable").error);
       }
-      return toolResult(await coordinator.replyToParent(params, signal));
+      return toolResult(await coordinator.normalReply(params, signal));
     },
   });
   api.registerTool({

@@ -13,7 +13,7 @@ Blocked by: 01, 02, 03, 04, 05, 06, 07, 08
 验收规格采用四层测试体系，所有并发场景使用可控 fake Pi、延迟 Promise、人工事件注入和明确屏障，不使用真实睡眠或时间窗口碰运气：
 
 1. **生命周期归约与事件投影单元层**：覆盖合法转换矩阵、非法转换、迟到代际、`terminated` 吸收态、消息/报告与生命周期解耦，以及 `wait_agent` 事件和独立 state 的投影。可用属性测试验证每条非法或迟到事实都保持当前快照不变。
-2. **协议与工具契约层**：覆盖新 wire 和信封解析、版本拒绝、`send_message`、`reply_to_parent`、`final_report` 的同步 Pi 接纳、稳定错误、`ParentReplyInbox` 接纳点和不依赖父端 context/UI 的事件登记。
+2. **协议与工具契约层**：覆盖新 wire 和信封解析、版本拒绝、`send_message`、`normal_reply`、`final_report` 的同步 Pi 接纳、稳定错误、`ParentReplyInbox` 接纳点和不依赖父端 context/UI 的事件登记。
 3. **运行时集成层**：用可控 Pi 事件序列覆盖自然停止、显式报告、普通回复、压缩、中断、终止和 `wait_agent`；验证事件不会因后续 state 变化而被吞掉。
 4. **监督进程与资源 smoke 层**：覆盖同规格 reload、协议不匹配、监督通道故障、父子进程资源回收和终止收尾；只保留少量跨进程测试，详细状态矩阵在前两层完成。
 
@@ -21,7 +21,7 @@ Blocked by: 01, 02, 03, 04, 05, 06, 07, 08
 
 - 对外只允许 `starting`、`idle`、`working`、`interrupting`、`terminating`、`terminated`、`failed`；`suspended`、消息状态、任务结果和 `last_task` 均不属于公开模型。
 - 树控制器/根权威是生命周期唯一写入者。监督事实必须经过代际和合法转换校验；非法或迟到事实不得改变快照，并产生稳定诊断。`terminated` 没有出边，迟到事实不能复活节点。
-- 健康节点上 `send_message`、`reply_to_parent`、`final_report` 的成功或失败都不改生命周期。发送失败只结算本次调用，不暗存正文、不自动重试、不自动重放。
+- 健康节点上 `send_message`、`normal_reply`、`final_report` 的成功或失败都不改生命周期。发送失败只结算本次调用，不暗存正文、不自动重试、不自动重放。
 - 只有真实 Pi/RPC/监督通道或受管资源故障进入 `failed`。provider/assistant 错误、没有报告、报告发送失败、`reply_too_large` 和压缩失败（Pi 仍健康时）不构成生命周期故障。
 - `interrupting` 只能由已接纳的中断意图建立，并须等待真实 `agent_settled` 才能回到 `idle`；`terminating` 在接纳终止意图时建立不可逆屏障，资源确认后才进入 `terminated`。
 

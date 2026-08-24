@@ -22,7 +22,7 @@ import {
   CHILD_REPLY_TOOL_NAME,
   PARENT_COORDINATION_GUIDELINES,
   registerAgentTools,
-  registerReplyToParentTool,
+  registerNormalReplyTool,
   type AgentToolRegistrationApi,
 } from "./agent-tools.ts";
 import { ChildReplyCoordinator } from "./child-reply-coordinator.ts";
@@ -317,7 +317,7 @@ function isRuntimeTransfer(value: unknown): value is RuntimeTransfer {
     && typeof value.replyInbox.accept === "function"
     && (!value.isChild || (
       isRecord(value.replyCoordinator)
-      && typeof value.replyCoordinator.replyToParent === "function"
+      && typeof value.replyCoordinator.normalReply === "function"
       && typeof value.replyCoordinator.settle === "function"
     ))
     && typeof value.createSupervisor === "function";
@@ -799,7 +799,7 @@ export function createWjPiSubagentsRuntimeActivator(
     });
 
     if (bootstrapAtActivation.kind === "child") {
-      registerReplyToParentTool(api, async (toolContext) => {
+      registerNormalReplyTool(api, async (toolContext) => {
         if (active !== undefined) active.bindings.context = readContext(toolContext);
         if (active?.handoffPending === true) return undefined;
         return active?.replyCoordinator;

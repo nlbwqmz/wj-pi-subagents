@@ -247,7 +247,7 @@ export function renderAgentToolCall(
       title(`${name} · ${readString(input, "agent_id")}`),
     ], theme, context);
   }
-  if (name === "reply_to_parent" || name === "final_report") {
+  if (name === "normal_reply" || name === "final_report") {
     return createMessageCallComponent(name, input, theme, context, expanded);
   }
 
@@ -261,7 +261,7 @@ function createMessageCallComponent(
   context: AgentToolRenderContext,
   expanded: boolean,
 ): AgentToolRenderComponent {
-  const agentId = name === "reply_to_parent" ? undefined : readOptionalString(input, "agent_id");
+  const agentId = name === "normal_reply" ? undefined : readOptionalString(input, "agent_id");
   const message = readOptionalString(input, "message") ?? "";
   const lines: SafeRenderLine[] = [{
     text: agentId === undefined ? name : `${name} · ${agentId}`,
@@ -309,7 +309,7 @@ export function renderAgentToolResult(
   if (name === "terminate_agent") return renderTerminateResult(result, theme, context, lookups);
   if (name === "get_agent_status") return renderStatusResult(result, options, theme, context);
   if (name === "get_agent_tree") return renderTreeResult(result, options, theme, context);
-  if (name === "reply_to_parent" || name === "final_report") {
+  if (name === "normal_reply" || name === "final_report") {
     const details = readRecord(readProperty(result, "details"));
     return readProperty(details, "accepted") === true
       ? createSafeTextComponent([{

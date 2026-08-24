@@ -185,7 +185,7 @@ test("未注册业务工具可用，九个系统保留工具均被拒绝", () =>
     "terminate_agent",
     "get_agent_status",
     "get_agent_tree",
-    "reply_to_parent",
+    "normal_reply",
   ];
   const snapshot = discoverUserTemplates(new Map([
     ["business.md", "---\ndescription: 业务工具\ntools: [future_business_tool]\n---\n"],

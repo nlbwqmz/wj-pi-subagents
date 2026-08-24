@@ -10,7 +10,7 @@ Blocked by: 01, 02, 04
 
 ## Answer
 
-本 effort 不再建模“任务”或“任务结果”。持续会话中的父消息、普通 `reply_to_parent`、显式 `final_report` 和 Pi 回合收束都不启动、结束或更新任务，也不维护 `task_result`、`last_task` 或任何任务/回合/提交身份。
+本 effort 不再建模“任务”或“任务结果”。持续会话中的父消息、普通 `normal_reply`、显式 `final_report` 和 Pi 回合收束都不启动、结束或更新任务，也不维护 `task_result`、`last_task` 或任何任务/回合/提交身份。
 
 `wait_agent` 的公开投影只包含两类相互独立的事实：
 

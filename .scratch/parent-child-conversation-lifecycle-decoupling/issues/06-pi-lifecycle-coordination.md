@@ -10,7 +10,7 @@ Blocked by: 01, 02, 03, 04
 
 ## Answer
 
-自动 final 相关职责全部移除。持续会话不再从 assistant `message_end`、`agent_end`、`agent_settled` 或任何 ACK 推导隐式报告、结算或结果；不保留旧 `ChildReplyCoordinator` 的任务、回合、提交、候选、prepared/accepted commit、settle 触发和 ACK 回调状态，也不引入替代性的会话协调器。`reply_to_parent` 与 `final_report` 工具直接使用当前子运行时的监督发送端口，父端 `ParentReplyInbox` 负责 Pi 接纳和事件登记，生命周期事实由唯一生命周期权威归约。
+自动 final 相关职责全部移除。持续会话不再从 assistant `message_end`、`agent_end`、`agent_settled` 或任何 ACK 推导隐式报告、结算或结果；不保留旧 `ChildReplyCoordinator` 的任务、回合、提交、候选、prepared/accepted commit、settle 触发和 ACK 回调状态，也不引入替代性的会话协调器。`normal_reply` 与 `final_report` 工具直接使用当前子运行时的监督发送端口，父端 `ParentReplyInbox` 负责 Pi 接纳和事件登记，生命周期事实由唯一生命周期权威归约。
 
 ### Pi 事件职责
 

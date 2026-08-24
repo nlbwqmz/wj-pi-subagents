@@ -188,7 +188,7 @@ const RESERVED_SYSTEM_TOOL_NAMES = new Set<string>([
   "terminate_agent",
   "get_agent_status",
   "get_agent_tree",
-  "reply_to_parent",
+  "normal_reply",
 ]);
 
 const nativeFileSystem: TemplateDiscoveryFileSystem = {

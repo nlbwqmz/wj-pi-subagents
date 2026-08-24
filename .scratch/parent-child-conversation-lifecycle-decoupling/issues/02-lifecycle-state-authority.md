@@ -23,9 +23,9 @@ Type: grilling
 
 树控制器/根权威是公开生命周期状态的唯一写入者。监督器只提交带生命周期代际的运行事实，由树控制器归约和校验；报告、普通消息和 Pi 的 assistant 文本都不能改写生命周期。子树快照也不能覆盖其作用域根节点的生命周期。生命周期代际只是拒绝迟到事实的传输校验元数据，不是另一种操作状态。
 
-本 effort 不维护插件侧 `AgentTaskMailbox`、父端派发队列或消息待处理队列。`send_message`、`reply_to_parent` 和 `final_report` 直接同步调用接收侧 Pi 的接口；成功只表示 Pi 接纳调用，失败返回稳定的消息发送错误。Pi 内部若有排队，不进入本领域模型，也不据此把节点从 `idle` 猜成 `working`。消息在 `idle` 节点被 Pi 接纳后，公开状态仍保持 `idle`，直到收到真实回合开始事实；正在运行的节点保持 `working`。
+本 effort 不维护插件侧 `AgentTaskMailbox`、父端派发队列或消息待处理队列。`send_message`、`normal_reply` 和 `final_report` 直接同步调用接收侧 Pi 的接口；成功只表示 Pi 接纳调用，失败返回稳定的消息发送错误。Pi 内部若有排队，不进入本领域模型，也不据此把节点从 `idle` 猜成 `working`。消息在 `idle` 节点被 Pi 接纳后，公开状态仍保持 `idle`，直到收到真实回合开始事实；正在运行的节点保持 `working`。
 
-故障分类保持解耦：provider/assistant 回合错误、没有报告、`reply_too_large`，以及 `send_message`/`reply_to_parent`/`final_report` 的同步发送失败，不自动进入 `failed`。健康 Pi 的执行错误或中断真实收束后只按生命周期事实回到 `idle`，不产生任务或运行结果字段。只有 Pi/RPC/监督通道 EOF、非法协议、受管资源丢失或内部运行不变量破坏等真实运行故障，才提交 `runtime_failed` 并进入 `failed`。压缩失败但 Pi 仍健康时也不进入 `failed`。
+故障分类保持解耦：provider/assistant 回合错误、没有报告、`reply_too_large`，以及 `send_message`/`normal_reply`/`final_report` 的同步发送失败，不自动进入 `failed`。健康 Pi 的执行错误或中断真实收束后只按生命周期事实回到 `idle`，不产生任务或运行结果字段。只有 Pi/RPC/监督通道 EOF、非法协议、受管资源丢失或内部运行不变量破坏等真实运行故障，才提交 `runtime_failed` 并进入 `failed`。压缩失败但 Pi 仍健康时也不进入 `failed`。
 
 `interrupt_agent` 只有在中断调用被接纳且节点仍有活动运行时才使状态进入 `interrupting`；调用抛错或未被接纳时保持原状态。进入 `interrupting` 后，缺失 `agent_settled` 不能自动伪造 `idle` 或 `failed`；可以由显式终止进入 `terminating`，或由独立的真实资源/传输故障进入 `failed`。终止请求立即建立 `terminating` 屏障并停止继续派发；资源不完整只记录 `termination_incomplete`，终态的 `termination_result` 独立保留历史故障或清理不完整分类，不能把 `terminating` 重新改成 `failed`。
 

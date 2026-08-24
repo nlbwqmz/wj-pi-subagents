@@ -16,11 +16,11 @@ import {
   type ReplyAcceptance,
 } from "./reply-acceptance.ts";
 
-export interface ReplyToParentInput {
+export interface NormalReplyInput {
   readonly message: string;
 }
 
-export interface ReplyToParentData {
+export interface NormalReplyData {
   readonly accepted: true;
 }
 
@@ -28,7 +28,7 @@ export interface FinalReportInput {
   readonly message: string;
 }
 
-export type FinalReportData = ReplyToParentData;
+export type FinalReportData = NormalReplyData;
 
 export type ChildCompactionReason = "manual" | "threshold" | "overflow";
 
@@ -102,13 +102,13 @@ export class ChildReplyCoordinator {
   }
 
   observeAssistantMessageEnd(_event: unknown): void {
-    // assistant 文本不是父端消息；只有显式 reply_to_parent/final_report 才出站。
+    // assistant 文本不是父端消息；只有显式 normal_reply/final_report 才出站。
   }
 
-  async replyToParent(
-    input: ReplyToParentInput | unknown,
+  async normalReply(
+    input: NormalReplyInput | unknown,
     signal?: AbortSignal,
-  ): Promise<ControlResult<ReplyToParentData>> {
+  ): Promise<ControlResult<NormalReplyData>> {
     return this.sendMessage(input, "message", signal);
   }
 
@@ -134,11 +134,11 @@ export class ChildReplyCoordinator {
   }
 
   private async sendMessage(
-    input: ReplyToParentInput | unknown,
+    input: NormalReplyInput | FinalReportInput | unknown,
     kind: "message" | "final_report",
     signal?: AbortSignal,
-  ): Promise<ControlResult<ReplyToParentData>> {
-    if (!isReplyToParentInput(input)) return controlFailure("invalid_argument");
+  ): Promise<ControlResult<NormalReplyData>> {
+    if (!isNormalReplyInput(input)) return controlFailure("invalid_argument");
     if (utf8Length(input.message) > REPLY_MAX_TEXT_BYTES) return controlFailure("reply_too_large");
     if (
       !this.runActive
@@ -186,7 +186,7 @@ function isSynchronousAcceptance(value: unknown): boolean {
     && record.accepted !== false;
 }
 
-function isReplyToParentInput(value: unknown): value is ReplyToParentInput {
+function isNormalReplyInput(value: unknown): value is NormalReplyInput {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const candidate = value as Record<string, unknown>;
   return typeof candidate.message === "string"

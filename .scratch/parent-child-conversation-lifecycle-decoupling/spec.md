@@ -12,11 +12,11 @@ Status: ready-for-agent
 
 ## Solution
 
-父代理与子代理之间采用持续会话模型。`send_message`、`reply_to_parent` 和 `final_report` 都是独立的同步消息发送操作；只有接收侧 Pi 的消息接口正常返回，调用才被视为 Pi 已接纳。调用成功不代表模型已读取、已完成处理或已产生下一次生命周期转换；调用失败只结算本次消息操作，不修改健康子代理的生命周期，不暗存正文，不自动重试或重放。
+父代理与子代理之间采用持续会话模型。`send_message`、`normal_reply` 和 `final_report` 都是独立的同步消息发送操作；只有接收侧 Pi 的消息接口正常返回，调用才被视为 Pi 已接纳。调用成功不代表模型已读取、已完成处理或已产生下一次生命周期转换；调用失败只结算本次消息操作，不修改健康子代理的生命周期，不暗存正文，不自动重试或重放。
 
 子代理生命周期只由树控制器/根权威根据监督器提交的真实运行事实归约。公开状态固定为 `starting`、`idle`、`working`、`interrupting`、`terminating`、`terminated`、`failed` 七个状态，移除 `suspended`。任务、任务结果、`last_task`、任务租约和消息身份不再属于本 effort 的领域模型或公开投影。
 
-`final_report` 是子代理在活动 Pi 回合中主动发送给直接父代理的显式报告事件。它可以在同一回合多次调用，也可以和普通 `reply_to_parent` 交错；成功发送不结束回合、会话或生命周期，也不赋予最后一次调用特殊权力。Pi assistant 文本、`message_end`、自然停止和 `agent_settled` 不会自动生成报告。没有显式报告的自然停止只在真实收束且没有待处理输入、压缩屏障或控制收尾时登记 `idle`。
+`final_report` 是子代理在活动 Pi 回合中主动发送给直接父代理的显式报告事件。它可以在同一回合多次调用，也可以和普通 `normal_reply` 交错；成功发送不结束回合、会话或生命周期，也不赋予最后一次调用特殊权力。Pi assistant 文本、`message_end`、自然停止和 `agent_settled` 不会自动生成报告。没有显式报告的自然停止只在真实收束且没有待处理输入、压缩屏障或控制收尾时登记 `idle`。
 
 `wait_agent` 只投影会话事件和独立生命周期快照。会话事件至少包括 `reply`、`final_report`、`idle` 和 `terminal`，另有 `timeout` 作为等待结果；当目标已经处于 `idle`、`failed` 或 `terminated` 等不会自行推进的稳定状态且没有更新事件时，等待应立即返回对应的当前快照，但不额外生成新的会话事件。结果不得包含任务结果、`task_*`、`suspended`、`last_task` 或报告正文。并发来源之间不承诺公开相对顺序，但每次 Pi 已接纳的报告或普通回复都必须作为不可覆盖、可观察的独立事件处理。当前 assistant message 内重复 `wait_agent` 调用可以继续使用工具层批次合并，`batch_released` 只能是工具调用外壳，不能成为会话事件或生命周期状态。
 
@@ -28,11 +28,11 @@ Status: ready-for-agent
 2. 作为父代理，我希望消息发送失败只返回稳定的消息错误，以便不会把一次交付问题误判为子代理运行故障。
 3. 作为父代理，我希望在子代理处于 `working` 时发送失败后仍能读取到 `working`，以便健康会话不会被错误锁死。
 4. 作为父代理，我希望在 Pi 接纳一次 steering 或 prompt 后继续显式发送后续消息，以便持续会话不依赖任务租约或隐式回合身份。
-5. 作为子代理，我希望向直接父代理发送普通 `reply_to_parent`，以便交付工作中的进度或阻塞信息而不结束当前 Pi 回合。
+5. 作为子代理，我希望向直接父代理发送普通 `normal_reply`，以便交付工作中的进度或阻塞信息而不结束当前 Pi 回合。
 6. 作为子代理，我希望显式调用 `final_report`，以便只有我主动选择的内容才成为父端可见的报告。
 7. 作为子代理，我希望 `final_report` 成功后继续执行当前 Pi 回合，以便报告不是隐式的生命周期终态或强制收束操作。
 8. 作为子代理，我希望同一活动回合可以多次发送 `final_report`，以便后续报告不会覆盖或伪造前一次报告。
-9. 作为父代理，我希望区分普通 `reply_to_parent` 和 `final_report` 事件，以便理解消息性质而不依赖任务结果或提交身份。
+9. 作为父代理，我希望区分普通 `normal_reply` 和 `final_report` 事件，以便理解消息性质而不依赖任务结果或提交身份。
 10. 作为父代理，我希望报告发送失败只影响本次报告调用，以便子代理可以继续保持健康并由模型显式决定后续动作。
 11. 作为父代理，我希望子代理自然停止但没有调用 `final_report` 时只回到 `idle`，以便系统不会生成未经授权的自动 final 或 `no_output` 结果。
 12. 作为父代理，我希望 assistant 的普通文本、`message_end` 和 `agent_end` 不自动进入父端报告流，以便只有显式消息发送才产生会话报告事件。
@@ -70,11 +70,11 @@ Status: ready-for-agent
 - **合法生命周期转换**：允许 `starting -> idle`、`starting -> failed`、`idle -> working`、`working -> idle`、`working -> interrupting`、`interrupting -> idle`、健康未终态到 `failed`，以及任一未终态到 `terminating`、`terminating -> terminated`。真实运行故障可从 `idle`、`working` 或 `interrupting` 进入 `failed`；失败节点随后通过终止清理，不把消息错误或清理不完整重新解释为新的生命周期状态。
 - **Pi 事件职责**：`agent_start` 是真实回合开始事实；`agent_end` 只离开本轮模型循环，不直接产生 `idle`；`agent_settled` 在没有待处理输入、上下文一致性屏障和控制收尾时才允许 `working -> idle` 并登记 `idle` 事件；`message_end` 只保留必要的本地运行诊断，不复制 assistant 正文；队列、工具活动和可继续运行的扩展错误不直接写公开生命周期。`wait_agent` 仍可在观察到已有稳定 `idle`/terminal 快照时立即返回，不把该快照伪造成新的生命周期事件。
 - **管理面测试 seam**：保留以 `AgentController` 为高层入口、注入 fake `AgentSupervisor` 的测试边界。管理工具、等待、中断、终止和生命周期投影的行为测试不依赖真实进程、RPC 或 Pi provider。监督器接口只暴露命令接纳、控制接纳、真实事件观察和必要的资源清理结果。
-- **消息发送接纳**：`send_message`、`reply_to_parent` 和 `final_report` 都以接收侧 Pi 消息接口同步正常返回作为唯一接纳点。成功不代表模型已读、已开始或已完成；调用抛错、明确拒绝或响应未知统一结算为 `message_delivery_failed`。参数非法、正文超限和目标不可用继续使用各自稳定错误。发送失败不改变生命周期，不暗存正文，不自动重试或重放。
+- **消息发送接纳**：`send_message`、`normal_reply` 和 `final_report` 都以接收侧 Pi 消息接口同步正常返回作为唯一接纳点。成功不代表模型已读、已开始或已完成；调用抛错、明确拒绝或响应未知统一结算为 `message_delivery_failed`。参数非法、正文超限和目标不可用继续使用各自稳定错误。发送失败不改变生命周期，不暗存正文，不自动重试或重放。
 - **会话接纳 seam**：保留以 `ParentReplyInbox` 为父端接纳边界、注入 fake `ParentConversationApi` 的契约测试。inbox 负责信封解析、直接父身份校验、调用父 Pi 和登记 `reply`/`final_report` 事件；父端 context、UI 通知和 renderer 观察不参与消息成功或事件成立。context 观察最多提供展示后的附加观察，不得重复注入或撤销已接纳事件。
 - **新消息协议**：建立新的监督 wire 和消息信封闭集。普通消息和显式报告使用独立的消息种类；控制请求/响应、生命周期事实和运行故障通知使用独立协议域。移除 `message_id`、`task_id`、`turn_id`、`commit_id`、任务租约帧、`reply_seq`、应用 ACK、发送窗口和应用消息重放。底层 `stream_id` 或帧序号如仍由传输层使用，只能用于帧完整性、连接管理和诊断。
-- **显式 `final_report`**：子代理只能在当前活动 Pi 回合中主动调用 `final_report`。每次成功调用都是独立的 `final_report` 会话事件，允许同回合多次调用，也允许与普通 `reply_to_parent` 交错；报告成功不改变生命周期、不结束回合、不结束会话，不覆盖前一条报告。无活动回合或控制/压缩屏障生效时，调用按稳定消息接纳错误处理。
-- **普通 `reply_to_parent`**：普通回复只表示一条父端可见的会话消息，不表示任务完成或生命周期变化。它遵循与 `final_report` 相同的同步接纳和失败边界，成功后形成独立 `reply` 事件；报告正文不通过 `wait_agent` 重复携带。
+- **显式 `final_report`**：子代理只能在当前活动 Pi 回合中主动调用 `final_report`。每次成功调用都是独立的 `final_report` 会话事件，允许同回合多次调用，也允许与普通 `normal_reply` 交错；报告成功不改变生命周期、不结束回合、不结束会话，不覆盖前一条报告。无活动回合或控制/压缩屏障生效时，调用按稳定消息接纳错误处理。
+- **普通 `normal_reply`**：普通回复只表示一条父端可见的会话消息，不表示任务完成或生命周期变化。它遵循与 `final_report` 相同的同步接纳和失败边界，成功后形成独立 `reply` 事件；报告正文不通过 `wait_agent` 重复携带。
 - **自然停止与错误**：没有显式 `final_report` 的自然停止不生成自动 final、`no_output`、任务完成或其他隐式结果。provider/assistant 回合错误、中断真实收束、`reply_too_large`、报告发送失败和 Pi 健康时的压缩失败都不自动进入 `failed`；只有真实 Pi/RPC/监督通道 EOF、非法协议、受管资源丢失或运行不变量破坏才进入 `failed`。
 - **`wait_agent` 结果投影**：等待结果只包含目标 `agent_id`、会话事件类型、独立生命周期 `state`、安全 revision 和必要的安全故障信息。事件类型为 `reply`、`final_report`、`idle`、`terminal` 或 `timeout`；当没有更新事件但快照已经是 `idle`、`failed` 或 `terminated` 时，复用 `idle`/`terminal` 投影立即返回当前稳定状态，不额外登记事件。`terminal` 覆盖真实终止/运行故障事实，但不得取代独立 state。结果不包含任务字段、`last_task`、`suspended`、报告正文或 context/UI 后续观察结果。
 - **等待事件可观察性**：每次 Pi 已接纳的普通回复或显式报告都形成不可覆盖事件；当前等待调用至多因该事件完成一次，事件不因 context/UI 失败而丢失，也不被后续 state 覆盖。父端每个 `turn_start` 建立内部观察水位，回合开始前已经进入父会话的通知不会在后续 `wait_agent` 中重复返回，回合开始后新到达的通知仍可唤醒当前回合内的等待。多目标等待可因任一目标的下一个可观察事件完成；并发来源的公开相对顺序不属于协议契约，测试只断言事件存在、次数和独立 state。
@@ -107,7 +107,7 @@ Status: ready-for-agent
 
 - 用户配置格式、配置读取逻辑、配置迁移和配置兼容。
 - 子代理模板发现结果、模板字段语义、业务工具目录和模板授权策略。
-- `send_message`、`reply_to_parent`、`final_report` 的新增或重设计自动重试策略。
+- `send_message`、`normal_reply`、`final_report` 的新增或重设计自动重试策略。
 - 任务、任务结果、任务租约、`last_task`/`task_result` 及其历史关联。
 - `message_id`、`task_id`、`turn_id`、`commit_id`、`reply_seq`、ACK、发送窗口、应用 FIFO、应用去重和应用消息重放。
 - 旧协议与新协议之间的版本协商、滚动升级、双版本并存、旧运行实例接管、在途应用消息迁移和上下文迁移。

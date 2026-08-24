@@ -14,7 +14,7 @@ Blocked by: 01, 02, 03, 04, 06
 
 ### 同步发送
 
-`send_message`、`reply_to_parent` 和 `final_report` 都是独立的同步接纳操作：调用接收侧 Pi 的消息接口，正常返回即成功，抛错、明确拒绝或响应未知即返回稳定的发送错误。调用方不等待模型读取、Pi 回合收束、context/UI 观察或任何监督层 ACK。消息路径不使用 transport ACK、reply ACK、累计确认、发送窗口或应用消息重放。
+`send_message`、`normal_reply` 和 `final_report` 都是独立的同步接纳操作：调用接收侧 Pi 的消息接口，正常返回即成功，抛错、明确拒绝或响应未知即返回稳定的发送错误。调用方不等待模型读取、Pi 回合收束、context/UI 观察或任何监督层 ACK。消息路径不使用 transport ACK、reply ACK、累计确认、发送窗口或应用消息重放。
 
 每次调用的成功结果只说明正文已交给接收侧 Pi；它不表示后续模型处理完成，也不改变子代理生命周期。Pi 内部的 steer/follow-up 队列和处理顺序不进入会话模型。相同正文的再次调用是新的消息事件。
 

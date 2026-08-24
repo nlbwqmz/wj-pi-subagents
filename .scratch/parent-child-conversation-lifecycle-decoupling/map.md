@@ -21,7 +21,7 @@ Label: wayfinder:map
 
 <!-- closed ticket 的索引；开放票据由 issues 查询，不在这里重复列出 -->
 
-- [显式 final_report 的持续会话语义](issues/01-explicit-final-report-semantics.md) — `final_report` 是活动回合中的独立、可重复报告事件，不结束回合或会话；未报告自然停止直接回到 `idle`；`final_report`、普通 `reply_to_parent` 和进入 `idle` 都唤醒 `wait_agent`，且不重复携带报告正文。
+- [显式 final_report 的持续会话语义](issues/01-explicit-final-report-semantics.md) — `final_report` 是活动回合中的独立、可重复报告事件，不结束回合或会话；未报告自然停止直接回到 `idle`；`final_report`、普通 `normal_reply` 和进入 `idle` 都唤醒 `wait_agent`，且不重复携带报告正文。
 - [子代理生命周期状态的唯一事实源](issues/02-lifecycle-state-authority.md) — 对外只保留七个生命周期状态，由树控制器/根权威依据监督器真实事实唯一写入；消息和报告不改状态；插件不维护 mailbox/派发队列，消息工具直接同步交给 Pi。
 - [连续会话消息的最小协议与身份元数据](issues/03-message-protocol-identities.md) — 删除 `message_id`、`task_id`、`turn_id`、`commit_id` 及任务租约帧；不建模任务或任务结果；消息信封不携带 `reply_seq`，底层传输元数据不进入会话语义，控制与生命周期事件各走独立协议域。
 - [父端接纳与消息发送失败语义](issues/04-synchronous-message-delivery.md) — 三类发送以接收侧 Pi 正常返回为同步接纳点；逐条返回接纳或稳定错误，不使用 transport/reply ACK、消息窗口、排序去重或应用消息重放，发送失败不改生命周期、不自动重试。
@@ -37,6 +37,6 @@ Label: wayfinder:map
 ## Out of scope
 
 - 用户配置格式、配置读取逻辑、子代理模板发现结果和模板字段语义。
-- 本 effort 新增或重设计 `send_message`、`reply_to_parent`、`final_report` 的自动重试策略。
+- 本 effort 新增或重设计 `send_message`、`normal_reply`、`final_report` 的自动重试策略。
 - 本地图内直接完成代码实现不属于本 effort；地图结束后再交给实现会话执行。
 - 任务、任务结果、`last_task`/`task_result` 及其历史关联不属于本 effort；`wait_agent` 不提供这些字段。
