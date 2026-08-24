@@ -224,6 +224,81 @@ test("send_message 失败只结算本次调用，wait_agent 返回独立消息�
   if (report.ok) assert.equal(report.data.outcome, "final_report");
 });
 
+test("回合水位丢弃上一回合已观察事件，但保留当前回合新事件", async () => {
+  const fake = new FakeSupervisor();
+  const { controller, tree } = makeController(fake);
+  const spawned = await controller.spawnAgent({ template_id: "demo", name: "回合边界测试" });
+  assert.equal(spawned.ok, true, JSON.stringify(spawned));
+
+  fake.emitLifecycle({ type: "agent_start", expected_generation: generation(tree) });
+  controller.beginParentTurn();
+  fake.emitReply("message", "上一回合已接纳");
+
+  // 新回合开始时，上一回合已经进入父会话的事件不应再次唤醒 wait_agent。
+  controller.beginParentTurn();
+  const abort = new AbortController();
+  let settled = false;
+  const wait = controller.waitAgents(
+    { agent_ids: [AGENT_ID], timeout_ms: 10_000 },
+    abort.signal,
+  ).then((result) => {
+    settled = true;
+    return result;
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+
+  // 当前回合开始后到达的消息，即使 wait_agent 之前没有 waiter，也必须保留。
+  fake.emitReply("final_report", "当前回合新报告");
+  const currentTurn = await wait;
+  assert.equal(currentTurn.ok, true);
+  if (currentTurn.ok) assert.equal(currentTurn.data.outcome, "final_report");
+
+  controller.beginParentTurn();
+  fake.emitReply("message", "当前回合先到消息");
+  const beforeWait = await waitForEvent(controller);
+  assert.equal(beforeWait.ok, true);
+  if (beforeWait.ok) assert.equal(beforeWait.data.outcome, "reply");
+});
+
+test("稳定 idle 和 failed 状态无需等待后续事件", async () => {
+  const fake = new FakeSupervisor();
+  const { controller, tree } = makeController(fake);
+  const spawned = await controller.spawnAgent({ template_id: "demo", name: "稳定状态测试" });
+  assert.equal(spawned.ok, true, JSON.stringify(spawned));
+
+  fake.emitLifecycle({ type: "agent_start", expected_generation: generation(tree) });
+  const idleEventWait = waitForEvent(controller);
+  fake.emitLifecycle({ type: "agent_settled", expected_generation: generation(tree) });
+  const idleEvent = await idleEventWait;
+  assert.equal(idleEvent.ok, true);
+  if (idleEvent.ok) assert.equal(idleEvent.data.outcome, "idle");
+
+  const idleSnapshot = await waitForEvent(controller);
+  assert.equal(idleSnapshot.ok, true);
+  if (idleSnapshot.ok) {
+    assert.equal(idleSnapshot.data.outcome, "idle");
+    assert.equal(idleSnapshot.data.state, "idle");
+  }
+
+  fake.emitLifecycle({ type: "agent_start", expected_generation: generation(tree) });
+  const terminalEventWait = waitForEvent(controller);
+  fake.emitLifecycle({ type: "runtime_failed", expected_generation: generation(tree) });
+  const terminalEvent = await terminalEventWait;
+  assert.equal(terminalEvent.ok, true);
+  if (terminalEvent.ok) {
+    assert.equal(terminalEvent.data.outcome, "terminal");
+    assert.equal(terminalEvent.data.state, "failed");
+  }
+
+  const failedSnapshot = await waitForEvent(controller);
+  assert.equal(failedSnapshot.ok, true);
+  if (failedSnapshot.ok) {
+    assert.equal(failedSnapshot.data.outcome, "terminal");
+    assert.equal(failedSnapshot.data.state, "failed");
+  }
+});
+
 test("interrupting 必须等待真实 agent_settled，idle 不会误报 starting 就绪", async () => {
   const fake = new FakeSupervisor();
   const { controller, tree } = makeController(fake);
@@ -296,6 +371,12 @@ test("父端接纳事件可以在 settled 后登记，terminate 建立不可逆�
   if (terminal.ok) {
     assert.equal(terminal.data.outcome, "terminal");
     assert.equal(terminal.data.state, "terminated");
+  }
+  const terminalSnapshot = await waitForEvent(controller);
+  assert.equal(terminalSnapshot.ok, true);
+  if (terminalSnapshot.ok) {
+    assert.equal(terminalSnapshot.data.outcome, "terminal");
+    assert.equal(terminalSnapshot.data.state, "terminated");
   }
   const after = await controller.sendMessage({ agent_id: AGENT_ID, message: "终止后" });
   assert.equal(after.ok, false);

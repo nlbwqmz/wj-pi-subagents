@@ -15,7 +15,7 @@ Type: grilling
 
 取消自动 final 后，Pi 的 assistant `message_end`、自然停止或 `agent_settled` 都不会自动复制正文或生成报告。子代理自然停止且没有报告时，在没有待处理工作的条件下直接回到 `idle`；不添加“未报告”标记，也不把这种情况推断为失败、`no_output` 或生命周期故障。未通过 `final_report` 提交的 assistant 文本不进入父端报告。
 
-`wait_agent` 观察的是独立的会话事件和生命周期快照：`final_report` 到达、普通 `reply_to_parent` 到达，以及子代理状态变为 `idle`，都必须唤醒等待者。等待结果使用事件语义（至少区分 `final_report`、`reply` 和 `idle`），不使用 `task_completed`、`task_failed` 或 `task_interrupted` 这些任务状态名称；本 effort 不提供任务结果字段。报告事件不重复携带报告正文；返回的生命周期状态与事件类型由各自事实投影提供。报告在子代理仍为 `working` 时即可唤醒等待者；随后进入 `idle` 的事实作为另一个可观察事件处理。事件按接收侧顺序逐项保留，不能因后续状态变化而吞掉先到的报告或普通回复。
+`wait_agent` 观察的是独立的会话事件和生命周期快照：`final_report` 到达、普通 `reply_to_parent` 到达，以及子代理状态变为 `idle`，都必须唤醒等待者；如果没有新事件而目标已经是稳定的 `idle`、`failed` 或 `terminated`，则立即返回当前快照，不额外生成事件。等待结果使用事件语义（至少区分 `final_report`、`reply` 和 `idle`），不使用 `task_completed`、`task_failed` 或 `task_interrupted` 这些任务状态名称；本 effort 不提供任务结果字段。报告事件不重复携带报告正文；返回的生命周期状态与事件类型由各自事实投影提供。报告在子代理仍为 `working` 时即可唤醒等待者；随后进入 `idle` 的事实作为另一个可观察事件处理。事件按接收侧顺序逐项保留，不能因后续状态变化而吞掉先到的报告或普通回复。
 
 本票据只确定显式报告、普通回复和 `idle` 唤醒的语义；报告身份/去重元数据、并发排序的完整裁决，以及终止状态的具体返回外壳分别由后续协议、并发和结果投影票据确定。
 

@@ -18,7 +18,7 @@ Status: ready-for-agent
 
 `final_report` 是子代理在活动 Pi 回合中主动发送给直接父代理的显式报告事件。它可以在同一回合多次调用，也可以和普通 `reply_to_parent` 交错；成功发送不结束回合、会话或生命周期，也不赋予最后一次调用特殊权力。Pi assistant 文本、`message_end`、自然停止和 `agent_settled` 不会自动生成报告。没有显式报告的自然停止只在真实收束且没有待处理输入、压缩屏障或控制收尾时登记 `idle`。
 
-`wait_agent` 只投影会话事件和独立生命周期快照。会话事件至少包括 `reply`、`final_report`、`idle` 和 `terminal`，另有 `timeout` 作为等待结果；结果不得包含任务结果、`task_*`、`suspended`、`last_task` 或报告正文。并发来源之间不承诺公开相对顺序，但每次 Pi 已接纳的报告或普通回复都必须作为不可覆盖、可观察的独立事件处理。当前 assistant message 内重复 `wait_agent` 调用可以继续使用工具层批次合并，`batch_released` 只能是工具调用外壳，不能成为会话事件或生命周期状态。
+`wait_agent` 只投影会话事件和独立生命周期快照。会话事件至少包括 `reply`、`final_report`、`idle` 和 `terminal`，另有 `timeout` 作为等待结果；当目标已经处于 `idle`、`failed` 或 `terminated` 等不会自行推进的稳定状态且没有更新事件时，等待应立即返回对应的当前快照，但不额外生成新的会话事件。结果不得包含任务结果、`task_*`、`suspended`、`last_task` 或报告正文。并发来源之间不承诺公开相对顺序，但每次 Pi 已接纳的报告或普通回复都必须作为不可覆盖、可观察的独立事件处理。当前 assistant message 内重复 `wait_agent` 调用可以继续使用工具层批次合并，`batch_released` 只能是工具调用外壳，不能成为会话事件或生命周期状态。
 
 压缩、interrupt 和 terminate 只建立上下文或控制屏障。屏障建立前已被 Pi 接纳的消息不回滚；屏障建立后新发起的消息、报告和续跑调用被拒绝。屏障和消息结果不改变生命周期，终止屏障不可逆。reload 只允许同一新规格内的 lease 交接，保留可观察运行时事实但不重放应用正文；旧协议、旧运行实例和旧 lease 立即以 `protocol_mismatch` 拒绝并进入故障清理。
 
@@ -46,7 +46,7 @@ Status: ready-for-agent
 20. 作为根权威，我希望迟到代际和非法转换被拒绝且不改变快照，以便旧运行事实不能重启或降级当前节点。
 21. 作为父代理，我希望 `wait_agent` 因一条已接纳的普通回复唤醒，以便能在不等待任务完成的情况下观察会话进展。
 22. 作为父代理，我希望 `wait_agent` 因一条已接纳的 `final_report` 唤醒，以便显式报告可以独立于生命周期被观察。
-23. 作为父代理，我希望 `wait_agent` 因真实 `working -> idle` 唤醒，以便观察自然收束，但启动就绪的 `starting -> idle` 不被误报为工作完成。
+23. 作为父代理，我希望 `wait_agent` 因真实 `working -> idle` 唤醒，且在目标已经是稳定 `idle`、`failed` 或 `terminated` 时立即返回当前快照，以便不会在不会自行变化的状态上无期限等待；启动就绪的 `starting -> idle` 不被误报为新的 `idle` 事件。
 24. 作为父代理，我希望 `wait_agent` 返回会话事件和独立的生命周期 `state`，以便事件名称不会覆盖或推断运行状态。
 25. 作为父代理，我希望 `wait_agent` 不返回任务结果、`last_task`、报告正文或 `suspended`，以便持续会话不会重新引入任务叙事。
 26. 作为父代理，我希望同时等待多个直接子代理，并在任一可观察事件到达时得到安全结果，以便可以集中协调树而不创建业务消息队列。
@@ -68,7 +68,7 @@ Status: ready-for-agent
 - **领域模型与公开投影**：生命周期状态只保留 `starting`、`idle`、`working`、`interrupting`、`terminating`、`terminated`、`failed`。移除 `suspended`、任务结果、`last_task`、任务租约、任务活动队列和消息状态。`agent_id` 仍是树节点身份和直接父范围校验所需的身份，不承担任务或会话工作流身份。
 - **生命周期唯一事实源**：树控制器/根权威是公开生命周期的唯一写入者。监督器提交带生命周期代际的真实事实，控制器验证代际、作用域和合法转换后再更新快照。非法转换和迟到事实保持当前快照不变并产生稳定诊断；`terminated` 没有出边。
 - **合法生命周期转换**：允许 `starting -> idle`、`starting -> failed`、`idle -> working`、`working -> idle`、`working -> interrupting`、`interrupting -> idle`、健康未终态到 `failed`，以及任一未终态到 `terminating`、`terminating -> terminated`。真实运行故障可从 `idle`、`working` 或 `interrupting` 进入 `failed`；失败节点随后通过终止清理，不把消息错误或清理不完整重新解释为新的生命周期状态。
-- **Pi 事件职责**：`agent_start` 是真实回合开始事实；`agent_end` 只离开本轮模型循环，不直接产生 `idle`；`agent_settled` 在没有待处理输入、上下文一致性屏障和控制收尾时才允许 `working -> idle` 并登记 `idle` 事件；`message_end` 只保留必要的本地运行诊断，不复制 assistant 正文；队列、工具活动和可继续运行的扩展错误不直接写公开生命周期。
+- **Pi 事件职责**：`agent_start` 是真实回合开始事实；`agent_end` 只离开本轮模型循环，不直接产生 `idle`；`agent_settled` 在没有待处理输入、上下文一致性屏障和控制收尾时才允许 `working -> idle` 并登记 `idle` 事件；`message_end` 只保留必要的本地运行诊断，不复制 assistant 正文；队列、工具活动和可继续运行的扩展错误不直接写公开生命周期。`wait_agent` 仍可在观察到已有稳定 `idle`/terminal 快照时立即返回，不把该快照伪造成新的生命周期事件。
 - **管理面测试 seam**：保留以 `AgentController` 为高层入口、注入 fake `AgentSupervisor` 的测试边界。管理工具、等待、中断、终止和生命周期投影的行为测试不依赖真实进程、RPC 或 Pi provider。监督器接口只暴露命令接纳、控制接纳、真实事件观察和必要的资源清理结果。
 - **消息发送接纳**：`send_message`、`reply_to_parent` 和 `final_report` 都以接收侧 Pi 消息接口同步正常返回作为唯一接纳点。成功不代表模型已读、已开始或已完成；调用抛错、明确拒绝或响应未知统一结算为 `message_delivery_failed`。参数非法、正文超限和目标不可用继续使用各自稳定错误。发送失败不改变生命周期，不暗存正文，不自动重试或重放。
 - **会话接纳 seam**：保留以 `ParentReplyInbox` 为父端接纳边界、注入 fake `ParentConversationApi` 的契约测试。inbox 负责信封解析、直接父身份校验、调用父 Pi 和登记 `reply`/`final_report` 事件；父端 context、UI 通知和 renderer 观察不参与消息成功或事件成立。context 观察最多提供展示后的附加观察，不得重复注入或撤销已接纳事件。
@@ -76,8 +76,8 @@ Status: ready-for-agent
 - **显式 `final_report`**：子代理只能在当前活动 Pi 回合中主动调用 `final_report`。每次成功调用都是独立的 `final_report` 会话事件，允许同回合多次调用，也允许与普通 `reply_to_parent` 交错；报告成功不改变生命周期、不结束回合、不结束会话，不覆盖前一条报告。无活动回合或控制/压缩屏障生效时，调用按稳定消息接纳错误处理。
 - **普通 `reply_to_parent`**：普通回复只表示一条父端可见的会话消息，不表示任务完成或生命周期变化。它遵循与 `final_report` 相同的同步接纳和失败边界，成功后形成独立 `reply` 事件；报告正文不通过 `wait_agent` 重复携带。
 - **自然停止与错误**：没有显式 `final_report` 的自然停止不生成自动 final、`no_output`、任务完成或其他隐式结果。provider/assistant 回合错误、中断真实收束、`reply_too_large`、报告发送失败和 Pi 健康时的压缩失败都不自动进入 `failed`；只有真实 Pi/RPC/监督通道 EOF、非法协议、受管资源丢失或运行不变量破坏才进入 `failed`。
-- **`wait_agent` 结果投影**：等待结果只包含目标 `agent_id`、会话事件类型、独立生命周期 `state`、安全 revision 和必要的安全故障信息。事件类型为 `reply`、`final_report`、`idle`、`terminal` 或 `timeout`；`terminal` 覆盖真实终止/运行故障事实，但不得取代独立 state。结果不包含任务字段、`last_task`、`suspended`、报告正文或 context/UI 后续观察结果。
-- **等待事件可观察性**：每次 Pi 已接纳的普通回复或显式报告都形成不可覆盖事件；当前等待调用至多因该事件完成一次，事件不因 context/UI 失败而丢失，也不被后续 state 覆盖。多目标等待可因任一目标的下一个可观察事件完成；并发来源的公开相对顺序不属于协议契约，测试只断言事件存在、次数和独立 state。
+- **`wait_agent` 结果投影**：等待结果只包含目标 `agent_id`、会话事件类型、独立生命周期 `state`、安全 revision 和必要的安全故障信息。事件类型为 `reply`、`final_report`、`idle`、`terminal` 或 `timeout`；当没有更新事件但快照已经是 `idle`、`failed` 或 `terminated` 时，复用 `idle`/`terminal` 投影立即返回当前稳定状态，不额外登记事件。`terminal` 覆盖真实终止/运行故障事实，但不得取代独立 state。结果不包含任务字段、`last_task`、`suspended`、报告正文或 context/UI 后续观察结果。
+- **等待事件可观察性**：每次 Pi 已接纳的普通回复或显式报告都形成不可覆盖事件；当前等待调用至多因该事件完成一次，事件不因 context/UI 失败而丢失，也不被后续 state 覆盖。父端每个 `turn_start` 建立内部观察水位，回合开始前已经进入父会话的通知不会在后续 `wait_agent` 中重复返回，回合开始后新到达的通知仍可唤醒当前回合内的等待。多目标等待可因任一目标的下一个可观察事件完成；并发来源的公开相对顺序不属于协议契约，测试只断言事件存在、次数和独立 state。
 - **工具层批次**：保留同一 assistant message 内重复 `wait_agent` 的批次合并和共享超时，以便适配 Pi 的并行工具调用。`batch_released` 只能表达工具调用层的释放关系，不能进入会话事件闭集、生命周期状态或任务结果；批次逻辑不得成为新的会话协调器、消息队列或排序域。
 - **控制屏障**：已接纳的 `interrupt_agent` 建立 `interrupting` 屏障；只有真实 `agent_settled` 才能回到 `idle`，缺失 settled 不得伪造 `idle` 或 `failed`。已接纳的 `terminate_agent` 建立不可逆 `terminating` 屏障并停止新消息、报告和续跑；资源全部确认释放后进入 `terminated`。控制接纳结果不由消息成功或失败推断。
 - **上下文一致性屏障**：自动和手动压缩只保护父子上下文顺序和压缩收尾。屏障期间新发起的消息、报告和续跑调用被拒绝；已经被 Pi 接纳的消息不回滚；解除屏障后由真实 Pi 事件决定是否继续工作。压缩失败不生成 final、不提交会话完成、不改变健康生命周期，且不自动重放应用正文。

@@ -27,9 +27,9 @@ Blocked by: 01, 02, 03, 04, 05, 06, 07, 08
 
 ### `wait_agent` 投影契约
 
-`wait_agent` 的子代理会话结果只允许 `reply`、`final_report`、`idle`、`terminal` 和 `timeout`。结果中的 `state`、revision 和安全故障信息是独立生命周期快照，不由事件名称推断；结果不包含任务结果、`task_*`、`suspended`、`last_task` 或报告正文。
+`wait_agent` 的子代理会话结果只允许 `reply`、`final_report`、`idle`、`terminal` 和 `timeout`。结果中的 `state`、revision 和安全故障信息是独立生命周期快照，不由事件名称推断；如果没有更新事件但快照已经是稳定的 `idle`、`failed` 或 `terminated`，可立即复用 `idle`/`terminal` 投影返回当前状态，且不额外登记事件。结果不包含任务结果、`task_*`、`suspended`、`last_task` 或报告正文。
 
-保留同一 assistant message 内重复 `wait_agent` 调用的工具层批次合并。`batch_released` 若仍作为调用外壳存在，只表示本次工具调用由同批次另一调用释放，不是子代理会话事件、生命周期状态或任务结果。`interrupting`、`terminating` 只改变 state，不单独产生会话事件；启动就绪的 `starting -> idle` 不伪造 `idle`，活动回合真实收束后的 `working -> idle` 才产生 `idle` 事件。
+保留同一 assistant message 内重复 `wait_agent` 调用的工具层批次合并。`batch_released` 若仍作为调用外壳存在，只表示本次工具调用由同批次另一调用释放，不是子代理会话事件、生命周期状态或任务结果。`interrupting`、`terminating` 只改变 state，不单独产生会话事件；启动就绪的 `starting -> idle` 不伪造 `idle` 事件，但 `wait_agent` 观察到已经稳定的 `idle` 快照时可以立即返回；活动回合真实收束后的 `working -> idle` 仍产生 `idle` 事件。
 
 每次 Pi 已接纳的 `reply` 或 `final_report` 都形成不可覆盖的可观察事件；当前等待调用至多因该事件完成一次，context/UI 是否观察成功不影响事件成立，也不能造成重复注入。多次报告和普通消息不去重、不合并、不覆盖。并发来源之间不承诺公开相对顺序，测试只断言事件存在、次数、可观察性和独立 state，不断言 `reply` 与 `final_report` 的顺序；不为此引入 `message_id`、`reply_seq`、ACK、发送窗口或应用消息队列。
 

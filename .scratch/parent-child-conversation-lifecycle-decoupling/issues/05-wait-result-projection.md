@@ -17,6 +17,8 @@ Blocked by: 01, 02, 04
 - 会话事件：至少区分 `reply`、`final_report`、`idle` 和终止/故障的 `terminal` 事件；事件说明这次等待为何被唤醒。
 - 生命周期快照：独立返回七个生命周期状态之一及其安全修订/故障字段；事件名称不能覆盖或推断 `state`。
 
+当没有新的会话事件但快照已经是稳定的 `idle`、`failed` 或 `terminated` 时，`wait_agent` 立即复用对应的 `idle`/`terminal` 投影返回当前状态，不额外登记会话事件。
+
 成功的 Pi 接纳在返回成功的同一接纳点登记对应的 `reply` 或 `final_report` 事件并唤醒 `wait_agent`。这不是等待父端 context、UI 通知确认、模型读取或后续处理；那些后续事实不再参与发送成功或事件成立。报告正文仍只通过父端 Pi 已接纳的 custom message 可见，`wait_agent` 不重复携带正文。
 
 同一回合内每次成功的 `final_report` 都是独立事件，不结束回合或会话，不覆盖任何结果，也不因正文相同而去重。报告发送失败只返回 `message_delivery_failed`，不登记事件、不暗存正文、不自动补发；普通回复遵循同一接纳与事件规则。

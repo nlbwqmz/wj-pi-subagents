@@ -853,9 +853,18 @@ export function createWjPiSubagentsRuntimeActivator(
       refreshContextUsage(current, rawContext);
     });
 
+    api.on("turn_start", (_event, rawContext) => {
+      const current = active;
+      if (current === undefined || current.handoffPending === true) return;
+      current.controller.beginParentTurn();
+      refreshContextUsage(current, rawContext);
+    });
+
     api.on("agent_start", (_event, rawContext) => {
       const current = active;
       if (current === undefined || current.handoffPending === true) return;
+      // 作为首个回合的兜底边界；后续每个模型回合由 turn_start 更新水位。
+      current.controller.beginParentTurn();
       current.replyInbox.observeCompactionEnd();
       if (!current.isChild) return;
       coordinationParticipant?.observeAgentStart();

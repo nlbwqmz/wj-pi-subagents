@@ -119,6 +119,7 @@ interface PendingWaiter {
 
 interface PendingReplyNotification {
   readonly event: "reply" | "final_report" | "idle" | "terminal";
+  readonly sequence: number;
   deliveredToWaiter: boolean;
 }
 
@@ -197,9 +198,12 @@ export class AgentController {
   private readonly unassignedSupervisors = new Map<AgentSupervisor, () => void>();
   private readonly waiters = new Map<string, Set<PendingWaiter>>();
   private readonly pendingWaiters = new Set<PendingWaiter>();
-  /** 已注入但尚未被父模型上下文观察的工作中 reply。 */
+  /** 已接纳但尚未被父模型上下文观察的会话通知。 */
   private readonly pendingReplyNotifications = new Map<string, Map<string, PendingReplyNotification>>();
   private replyNotificationSequence = 0;
+  /** 当前父 Pi 回合开始前已经进入父会话的通知水位。 */
+  private parentTurnNotificationWatermark = 0;
+  private readyWaitersResolutionScheduled = false;
   /** 终止事实只允许产生一次 terminal 事件，即使资源确认和故障观察重复抵达。 */
   private readonly observedTerminalEvents = new Set<string>();
   private readonly terminalNotifications = new Set<string>();
@@ -439,6 +443,16 @@ export class AgentController {
     return this.waitTimeoutMs;
   }
 
+  /**
+   * 记录父 Pi 新回合的通知观察边界。回合开始前已经被 Pi 接纳的消息属于
+   * 当前回合输入，不应在本回合或后续回合再次作为 wait_agent 事件返回；回合
+   * 开始后新到达的消息仍保留给当前回合内的等待。
+   */
+  beginParentTurn(): void {
+    this.parentTurnNotificationWatermark = this.replyNotificationSequence;
+    this.discardObservedReplyNotifications();
+  }
+
   /** Pi 已同步接纳一条显式会话消息后的唯一事件登记点。 */
   notifySessionEvent(
     agentId: unknown,
@@ -493,7 +507,9 @@ export class AgentController {
       if (this.observedTerminalEvents.has(agentId)) return true;
       this.observedTerminalEvents.add(agentId);
     }
-    const id = this.createReplyNotificationId();
+    const sequence = this.replyNotificationSequence + 1;
+    this.replyNotificationSequence = sequence;
+    const id = `reply-${sequence}`;
     let notifications = this.pendingReplyNotifications.get(agentId);
     if (notifications === undefined) {
       notifications = new Map<string, PendingReplyNotification>();
@@ -503,6 +519,7 @@ export class AgentController {
     if (notification === undefined) {
       notification = {
         event,
+        sequence,
         deliveredToWaiter: false,
       };
       notifications.set(id, notification);
@@ -955,7 +972,6 @@ export class AgentController {
       void this.deliverTerminalNotification(runtimeFailedAgentId);
       this.notifySessionEvent(runtimeFailedAgentId, "terminal");
     }
-    if (agentId !== undefined) this.resolveWaiters(agentId);
     if (runtimeFailedAgentId !== undefined) this.startOrphanTermination(runtimeFailedAgentId);
     if (
       agentId !== undefined
@@ -974,6 +990,9 @@ export class AgentController {
     ) {
       this.notifySessionEvent(agentId, "idle");
     }
+    // 先登记真实生命周期事件，再用稳定状态兜底；否则 tree.onChange 可能
+    // 在事件登记前把同一事实当成 idle/terminal 快照并留下重复通知。
+    if (agentId !== undefined) this.resolveWaiters(agentId);
     this.resolveAllReadyWaiters();
   }
 
@@ -1061,7 +1080,13 @@ export class AgentController {
   }
 
   private resolveAllReadyWaiters(): void {
-    for (const agentId of [...this.waiters.keys()]) this.resolveWaiters(agentId);
+    if (this.readyWaitersResolutionScheduled) return;
+    this.readyWaitersResolutionScheduled = true;
+    queueMicrotask(() => {
+      this.readyWaitersResolutionScheduled = false;
+      if (this.disposed) return;
+      for (const agentId of [...this.waiters.keys()]) this.resolveWaiters(agentId);
+    });
   }
 
   private resolveWaiters(agentId: string): void {
@@ -1114,7 +1139,12 @@ export class AgentController {
   }
 
   private waitOutcome(agentId: string, status: AgentSnapshot): WaitAgentData | undefined {
-    // 生命周期状态本身不是事件；idle 只由真实 agent_settled 事件登记。
+    // 稳定状态不会自行产生后续会话事件；等待时直接返回当前快照，避免
+    // idle/failed/terminated 节点在没有外部控制操作时一直等待到超时。
+    if (status.state === "idle") return makeWaitData(status, "idle");
+    if (status.state === "failed" || status.state === "terminated") {
+      return makeWaitData(status, "terminal");
+    }
     return undefined;
   }
 
@@ -1122,18 +1152,29 @@ export class AgentController {
     const notifications = this.pendingReplyNotifications.get(agentId);
     if (notifications === undefined) return undefined;
     for (const [notificationId, notification] of notifications) {
+      if (notification.sequence <= this.parentTurnNotificationWatermark) {
+        notifications.delete(notificationId);
+        continue;
+      }
       if (notification.deliveredToWaiter) continue;
       notification.deliveredToWaiter = true;
       notifications.delete(notificationId);
       if (notifications.size === 0) this.pendingReplyNotifications.delete(agentId);
       return makeWaitData(status, notification.event);
     }
+    if (notifications.size === 0) this.pendingReplyNotifications.delete(agentId);
     return undefined;
   }
 
-  private createReplyNotificationId(): string {
-    this.replyNotificationSequence += 1;
-    return `reply-${this.replyNotificationSequence}`;
+  private discardObservedReplyNotifications(): void {
+    for (const [agentId, notifications] of this.pendingReplyNotifications) {
+      for (const [notificationId, notification] of notifications) {
+        if (notification.sequence <= this.parentTurnNotificationWatermark) {
+          notifications.delete(notificationId);
+        }
+      }
+      if (notifications.size === 0) this.pendingReplyNotifications.delete(agentId);
+    }
   }
 }
 
