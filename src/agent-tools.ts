@@ -177,23 +177,14 @@ const descriptions: Readonly<Record<AgentToolName, string>> = Object.freeze({
   get_agent_tree: "Read the read-only agent tree visible to the current caller.",
 });
 
-const DELIVERY_AND_WAITING_GUIDELINE =
-  "交付与等待：消息被接纳不等于模型已读或工作完成；交付不确定时先核对状态和已有事件，不要盲目重发。wait_agent 等待目标子代理的下一条独立 reply、final_report、idle 或 terminal 事件。";
-const TAKEOVER_GUIDELINE =
-  "需要接管时，先 interrupt_agent，再 wait_agent 确认子代理已结束。";
-
 export const PARENT_COORDINATION_GUIDELINES = Object.freeze({
-  sessionOwnership: "工作边界：send_message 返回 accepted: true，只表示接收侧 Pi 已接纳这条消息；目标子代理继续负责当前工作范围，但这不代表模型已经读取、开始处理或完成。父会话不得重复调查或代做同一范围（包括读取、搜索、扫描、分析、实现、测试和评审），只能等待、查询状态、发送新的 steering，或处理事先明确拆分且无数据依赖、无共享写资源的独立工作。需要接管时，先 interrupt_agent，再 wait_agent 确认子代理已结束。",
-  sendMessage: "交付与等待：消息被接纳不等于模型已读或工作完成；交付不确定时先核对状态和已有事件，不要盲目重发。wait_agent 等待目标子代理的下一条独立 reply、final_report、idle 或 terminal 事件。",
-  sendMessageReply: "中途回复：只有在本次 send_message 明确要求子代理在当前工作完成前返回进度、回答问题或报告阻塞时，才在消息正文中要求其使用 reply_to_parent。需要父代理看到阶段性成果、明确交付物或需要单独记录的报告时，要求其调用 final_report。首次下发消息、追加要求、异常恢复指令，以及只需等待结果的消息，不要额外要求中途回复。",
-  waitAgent: DELIVERY_AND_WAITING_GUIDELINE,
-  slowProgress: "慢进展：working 或 timeout 不代表失败。不要仅因耗时就要求子代理停止探索、提前报告或调用 interrupt_agent、terminate_agent；需要了解情况时，可以用 send_message 询问进度，再继续 wait_agent。",
-  sessionRecovery: "异常恢复：compaction_active 表示发送方或接收方会话正在压缩，等待压缩结束后再显式发送一条独立消息；message_delivery_failed、reply_too_large 或等待超时只影响本次操作，不自动解释为子代理故障。先使用 get_agent_status 核对 state 和已有事件，再由模型决定下一步。",
-  retryPolicy: "重试：消息调用不会自动重试、暗存或重放正文。只有在确认失败原因、且明确知道重复发送不会造成副作用后，才由模型显式发起新的调用；不要因为结果不确定而盲目重复发送。",
-  agentCleanup: "子代理回收：interrupt_agent 只建立 interrupting 屏障，必须等真实 idle 或后续控制结果；释放节点和子树资源必须调用 terminate_agent 并等待 terminated。是否发送 final_report 不决定回收时机。",
-  capacityCleanup: "容量回收：spawn_agent 返回 max_children_reached 或 max_tree_agents_reached 时，检查现有子代理，优先使用 terminate_agent 回收已完成且暂不使用或已不可恢复的节点；确认名额释放后再重试创建。",
-  replyTooLarge: "若收到 reply_too_large，说明本次消息过长而未被 Pi 接纳，不代表代理故障；精炼后由模型显式重新发送，不要终止、替换或自动重跑原工作。",
-  interruptAgent: TAKEOVER_GUIDELINE,
+  roleScope: "角色范围：本段只约束你对直接子代理的管理。若当前会话同时是子代理，向直接父代理报告时另遵守“子代理任务与回复/显式报告要求”。",
+  workBoundary: "工作边界：子代理处于 working 且尚未交付时，不要并行重复执行同一未交付范围。可以发送任务或 steering、等待事件、查看状态，或处理已明确拆分且无数据依赖、无共享写资源的独立工作。收到明确交付后，可以读取产物并进行必要的整合、验证和测试；若仅确认 idle、failed、terminal 或中断结束，可以接管未完成工作，但不得把 idle 当作任务完成。",
+  delivery: "创建与交付：创建子代理后使用 send_message 发送首个任务。send_message 返回 accepted: true 只表示接收侧 Pi 已接纳消息，不表示模型已读取、开始处理或完成；",
+  waiting: "等待与状态：wait_agent 等待目标直接子代理的下一条未消费 reply、final_report、idle 或 terminal 事件，返回生命周期状态和修订信息，不返回报告正文。get_agent_status 只提供最近确认的状态快照，不是事件历史。idle 不等于任务完成；terminal 必须结合 state 和 error 判断。",
+  timeout: "超时：一次 wait_agent 超时不表示子代理失败。可以继续等待，或在确有必要时询问一次进度；不要仅因一次超时就 interrupt_agent 或 terminate_agent。",
+  failure: "失败处理：reply_too_large 表示原消息未被接纳，精简后显式重发，不要原样重试。compaction_active 时不要在当前回合重放消息；待屏障解除后确认任务仍需要，再显式发送。",
+  takeover: "接管与回收：需要接管 working 子代理时先调用 interrupt_agent。仅当结果为 interrupting 时，才用 wait_agent 等待 idle 或 terminal；若已返回终态，直接继续判断。terminate_agent 成功返回 terminated 即表示资源已回收。不要仅因 idle 就回收；只在已确认交付、明确放弃、不可恢复故障，或确有容量需要且分支不再使用时调用 terminate_agent。确认回收后再重试创建。",
 });
 
 const childReplySchema: JsonSchema = Object.freeze({
@@ -212,10 +203,19 @@ const childReplySchema: JsonSchema = Object.freeze({
 const childFinalReportSchema: JsonSchema = childReplySchema;
 
 export const CHILD_REPLY_GUIDELINE =
-  "仅在直接父代理明确要求你回报进度、回答问题，或遇到必须由父代理处理或裁决的阻塞时调用 reply_to_parent。它表示一条独立的父端可见消息，不结束当前 Pi 回合、当前工作或生命周期；若返回 compaction_active，等待压缩结束后再显式重试。";
+  "上行路由：reply_to_parent 仅用于直接父代理明确要求的进度或问题回答，或需要父代理立即处理、裁决的阻塞；内容应简短并说明当前状态、问题和所需决定。final_report 用于父代理需要单独消费的阶段性或最终交付物、结论、风险或正式阻塞报告。完成委派任务时默认调用一次 final_report；父代理明确不需要报告时除外。没有新增信息时不要重复调用，也不要因同一内容同时调用两个工具。";
 
 export const CHILD_REPLY_TOO_LARGE_GUIDELINE =
-  "若 reply_to_parent 或 final_report 返回 reply_too_large，说明本次消息过长而未被父端 Pi 接纳，不影响当前工作；请精炼后由模型显式重新调用，不要原样重试。";
+  "失败处理：reply_too_large 表示消息未被接纳，精简后显式重发，不要原样重试。compaction_active 时不要在当前回合重放消息；待屏障解除后，在可执行回合确认仍需要再调用。";
+
+export const CHILD_MESSAGE_GUIDELINE =
+  "消息语义：reply_to_parent 和 final_report 都是独立的父端可见消息，不结束当前 Pi 回合、当前工作或生命周期。任一工具返回 accepted: true 只表示父端 Pi 已接纳消息，不表示父代理模型已读取、处理或完成。";
+
+export const CHILD_NORMAL_REPLY_GUIDELINE =
+  "普通答复：普通 assistant 文本、message_end、agent_end、agent_settled、自然停止或压缩完成不会自动生成父端消息。需要父代理看到内容时，必须显式调用相应工具。";
+
+export const CHILD_COMPLETION_GUIDELINE =
+  "任务结束：需要 final_report 时先发送精炼报告，再输出非空且简短的正常 assistant 答复，说明完成内容和产物位置。不要在两个通道重复全文。";
 
 const childReplyDescription =
   "Call reply_to_parent only when your direct parent explicitly asks for a progress report or when blocked on an issue that the parent must handle or decide.";
