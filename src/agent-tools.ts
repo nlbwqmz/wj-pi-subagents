@@ -221,7 +221,7 @@ export const CHILD_NORMAL_REPLY_GUIDELINE =
   "普通答复：普通 assistant 文本、message_end、agent_end、agent_settled、自然停止或压缩完成不会自动生成父端消息。需要父代理看到进度、问题或结果时，必须显式调用对应工具。";
 
 export const CHILD_COMPLETION_GUIDELINE =
-  "阶段性和最终结果：形成阶段性成果、最终结果或正式阻塞报告时，调用 final_report。报告应包含结论、产物位置、验证结果和遗留问题。任务完成时默认调用一次 final_report，除非父代理明确表示不需要。没有新增信息时不得重复调用回传工具，同一内容不得同时调用 reply_to_parent 和 final_report。";
+  "阶段性和最终结果：形成阶段性成果、最终结果或正式阻塞报告时，调用 final_report。报告应包含结论、产物位置、验证结果和遗留问题。任务完成时默认调用一次 final_report，除非父代理明确表示不需要。没有新增信息时不得重复调用回传工具，同一内容不得同时调用 reply_to_parent 和 final_report。完成任务并调用 final_report 提交报告后，禁止在后续普通 assistant 回复中重复报告正文。普通回复只需简短确认报告已提交。";
 
 const childReplyDescription =
   "Call reply_to_parent only when your direct parent explicitly asks for a progress report or when blocked on an issue that the parent must handle or decide.";
