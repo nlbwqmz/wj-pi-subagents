@@ -180,7 +180,7 @@ const descriptions: Readonly<Record<AgentToolName, string>> = Object.freeze({
 export const PARENT_COORDINATION_GUIDELINES = Object.freeze({
   roleScope: "角色范围：本段只约束你对直接子代理的管理。若当前会话同时是子代理，向直接父代理报告时另遵守“子代理任务与回复/显式报告要求”。",
   workBoundary: "任务所有权：每个任务只能有一个负责人。委派前明确任务范围、排除范围、验收标准和产物。子代理明确交付、取消或确认失败前，父代理及其他子代理不得执行、探索或重新实现相同范围，只能处理无范围和写入冲突的独立工作。",
-  delivery: "任务委派：创建子代理后必须使用 send_message 发送首个任务。send_message 返回 accepted: true 后，任务即视为已委派；该结果只表示消息已被接纳，不表示子代理已读取、开始或完成，不得因此重复发送相同任务。后续消息只能用于补充信息、范围变更、明确取消或必要的进度询问，不得重复原任务。",
+  delivery: "任务委派：创建子代理后必须使用 send_message 发送首个任务。send_message 返回 accepted: true 后，任务即视为已委派。accepted: true 是任务所有权转移的硬边界；从这一刻起，父代理必须停止处理该范围。该结果只表示消息已被接纳，不表示子代理已读取、开始或完成，不得因此重复发送相同任务。后续消息只能用于补充信息、范围变更、明确取消或必要的进度询问，不得重复原任务。",
   waiting: "等待规则：wait_agent 的 timeout 只表示本次等待结束，不表示任务失败、完成或需要接管。执行较慢、没有回复、重复超时、处于 working，或处于 idle 但没有最终报告，都不是中断或接管理由。默认继续等待或查询状态，不得要求子代理提前收尾。",
   timeout: "超时处理：wait_agent 超时后不得重发任务、重新执行任务或调用 interrupt_agent。确需了解进度时，只发送一次简短的进度询问。",
   failure: "错误处理：send_message 失败只影响本次发送，不得盲目重试。reply_too_large 需精简后重发；compaction_active 需等待屏障解除后确认是否仍需发送。accepted: true 的消息不得再次发送。",
