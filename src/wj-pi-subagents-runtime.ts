@@ -13,6 +13,7 @@ import {
 import {
   AGENT_TOOL_NAMES,
   CHILD_COMPLETION_GUIDELINE,
+  CHILD_EXECUTION_GUIDELINE,
   CHILD_MESSAGE_GUIDELINE,
   CHILD_NORMAL_REPLY_GUIDELINE,
   CHILD_REPLY_GUIDELINE,
@@ -249,13 +250,16 @@ const SYSTEM_TOOL_NAMES = new Set<string>([
 ]);
 
 const PARENT_COORDINATION_GUIDANCE = [
-  "父子任务协作要求（管理直接子代理）：",
+  "父子任务协作要求（父代理，必须遵守）：",
   PARENT_COORDINATION_GUIDELINES.roleScope,
   `- ${PARENT_COORDINATION_GUIDELINES.workBoundary}`,
   `- ${PARENT_COORDINATION_GUIDELINES.delivery}`,
   `- ${PARENT_COORDINATION_GUIDELINES.waiting}`,
   `- ${PARENT_COORDINATION_GUIDELINES.timeout}`,
   `- ${PARENT_COORDINATION_GUIDELINES.failure}`,
+  `- ${PARENT_COORDINATION_GUIDELINES.completion}`,
+  `- ${PARENT_COORDINATION_GUIDELINES.messaging}`,
+  `- ${PARENT_COORDINATION_GUIDELINES.reclaim}`,
   `- ${PARENT_COORDINATION_GUIDELINES.takeover}`,
 ].join("\n");
 
@@ -271,6 +275,7 @@ function formatAgentTemplateCatalog(templates: readonly AgentTemplateListItem[])
 const CHILD_FINAL_REPLY_GUIDANCE = [
   "子代理任务与回复/显式报告要求（向直接父代理报告）：",
   "本节只约束你向直接父代理的上行报告。若当前会话同时管理子代理，对它们遵守“父子任务协作要求”。",
+  `- ${CHILD_EXECUTION_GUIDELINE}`,
   `- ${CHILD_REPLY_GUIDELINE}`,
   `- ${CHILD_MESSAGE_GUIDELINE}`,
   `- ${CHILD_NORMAL_REPLY_GUIDELINE}`,

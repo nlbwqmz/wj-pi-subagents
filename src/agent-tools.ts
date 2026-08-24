@@ -179,12 +179,15 @@ const descriptions: Readonly<Record<AgentToolName, string>> = Object.freeze({
 
 export const PARENT_COORDINATION_GUIDELINES = Object.freeze({
   roleScope: "角色范围：本段只约束你对直接子代理的管理。若当前会话同时是子代理，向直接父代理报告时另遵守“子代理任务与回复/显式报告要求”。",
-  workBoundary: "工作边界（特别注意）：子代理处于 working 且尚未交付时，不要并行重复执行同一未交付范围。可以发送任务或 steering、等待事件、查看状态，或处理已明确拆分且无数据依赖、无共享写资源的独立工作。收到明确交付后，可以读取产物并进行必要的整合、验证和测试；若仅确认 idle、failed、terminal 或中断结束，可以接管未完成工作，但不得把 idle 当作任务完成。",
-  delivery: "创建与交付：创建子代理后使用 send_message 发送首个任务。send_message 返回 accepted: true 只表示接收侧已接纳消息，不表示模型已读取、开始处理或完成；",
-  waiting: "等待与状态：wait_agent 等待目标直接子代理的下一条未消费 reply、final_report、idle 或 terminal 事件，返回生命周期状态和修订信息，不返回报告正文。get_agent_status 只提供最近确认的状态快照，不是事件历史。idle 不等于任务完成；terminal 必须结合 state 和 error 判断。",
-  timeout: "超时：一次 wait_agent 超时不表示子代理失败。可以继续等待，或在确有必要时询问一次进度；不要仅因一次超时就 interrupt_agent 或 terminate_agent。",
-  failure: "失败处理：reply_too_large 表示原消息未被接纳，精简后显式重发，不要原样重试。compaction_active 时不要在当前回合重放消息；待屏障解除后确认任务仍需要，再显式发送。",
-  takeover: "接管与回收：需要接管 working 子代理时先调用 interrupt_agent。仅当结果为 interrupting 时，才用 wait_agent 等待 idle 或 terminal；若已返回终态，直接继续判断。terminate_agent 成功返回 terminated 即表示资源已回收。不要仅因 idle 就回收；只在已确认交付、明确放弃、不可恢复故障，或确有容量需要且分支不再使用时调用 terminate_agent。确认回收后再重试创建。",
+  workBoundary: "任务所有权：每个任务只能有一个负责人。委派前明确任务范围、排除范围、验收标准和产物。子代理明确交付、取消或确认失败前，父代理及其他子代理不得执行、探索或重新实现相同范围，只能处理无范围和写入冲突的独立工作。",
+  delivery: "任务委派：创建子代理后必须使用 send_message 发送首个任务。send_message 返回 accepted: true 后，任务即视为已委派；该结果只表示消息已被接纳，不表示子代理已读取、开始或完成，不得因此重复发送相同任务。后续消息只能用于补充信息、范围变更、明确取消或必要的进度询问，不得重复原任务。",
+  waiting: "等待规则：wait_agent 的 timeout 只表示本次等待结束，不表示任务失败、完成或需要接管。执行较慢、没有回复、重复超时、处于 working，或处于 idle 但没有最终报告，都不是中断或接管理由。默认继续等待或查询状态，不得要求子代理提前收尾。",
+  timeout: "超时处理：wait_agent 超时后不得重发任务、重新执行任务或调用 interrupt_agent。确需了解进度时，只发送一次简短的进度询问。",
+  failure: "错误处理：send_message 失败只影响本次发送，不得盲目重试。reply_too_large 需精简后重发；compaction_active 需等待屏障解除后确认是否仍需发送。accepted: true 的消息不得再次发送。",
+  completion: "完成判断：reply_to_parent 只表示进度、问题或阻塞；final_report 表示阶段性或最终交付，但不会自动结束子代理。idle、terminal、failed 也不自动表示任务完成，必须结合报告、产物、state 和 error 判断。",
+  messaging: "发送消息时的提示：按 send_message 目的添加提示：\n- 需要子代理在任务过程中进行回复时，提示子代理使用 reply_to_parent 进行回复。\n- 需要子代理完成任务并需要任务结果时，提示子代理使用 final_report 提交报告。",
+  reclaim: "回收规则：子代理已完成当前任务且后续不再需要时，应调用 terminate_agent 释放资源。若 spawn_agent 返回 max_children_reached 或 max_tree_agents_reached，应优先清理已完成当前任务的子代理以释放资源，再重试 spawn_agent。不得清理正在执行任务的子代理。",
+  takeover: "接管规则：只有用户或上游任务明确要求取消或改目标、子代理明确请求接管、已确认不可恢复故障，或存在必须停止的资源、安全或协议问题时，才允许接管。working 状态下必须先调用 interrupt_agent；只有返回 interrupting 后，才可等待 idle 或 terminal。terminate_agent 仅用于确认不再复用的分支。",
 });
 
 const childReplySchema: JsonSchema = Object.freeze({
@@ -202,20 +205,23 @@ const childReplySchema: JsonSchema = Object.freeze({
 
 const childFinalReportSchema: JsonSchema = childReplySchema;
 
+export const CHILD_EXECUTION_GUIDELINE =
+  "任务执行：只向直接父代理报告。按照父代理给出的范围和验收标准执行，不得因父代理暂时没有回复或任务耗时较长而提前结束。";
+
 export const CHILD_REPLY_GUIDELINE =
-  "上行路由：reply_to_parent 仅用于直接父代理明确要求的进度或问题回答，或需要父代理立即处理、裁决的阻塞；内容应简短并说明当前状态、问题和所需决定。final_report 用于父代理需要单独消费的阶段性或最终交付物、结论、风险或正式阻塞报告。完成委派任务时默认调用一次 final_report；父代理明确不需要报告时除外。没有新增信息时不要重复调用，也不要因同一内容同时调用两个工具。";
+  "中途回复：父代理明确要求进度，或遇到需要父代理处理、裁决的阻塞时，调用 reply_to_parent，简要说明当前状态、已完成内容、问题和所需决定。";
 
 export const CHILD_REPLY_TOO_LARGE_GUIDELINE =
-  "失败处理：reply_too_large 表示消息未被接纳，精简后显式重发，不要原样重试。compaction_active 时不要在当前回合重放消息；待屏障解除后，在可执行回合确认仍需要再调用。";
+  "回传失败：reply_too_large 表示当前消息未被接纳。精简后使用原工具重发，禁止原样重试；成功返回 accepted: true 前，不得视为已送达。compaction_active 表示当前消息未被接纳；不要在压缩或协调屏障期间重发，屏障解除后确认消息仍有必要，再使用原工具发送。";
 
 export const CHILD_MESSAGE_GUIDELINE =
-  "消息语义：reply_to_parent 和 final_report 都是独立的父端可见消息，不结束当前 Pi 回合、当前工作或生命周期。任一工具返回 accepted: true 只表示父端 Pi 已接纳消息，不表示父代理模型已读取、处理或完成。";
+  "工具语义：reply_to_parent 和 final_report 都不会自动结束当前工作或生命周期。普通 assistant 文本不会自动通知父代理；accepted: true 只表示父端已接纳消息，不表示父代理已读取、处理或任务已完成。";
 
 export const CHILD_NORMAL_REPLY_GUIDELINE =
-  "普通答复：普通 assistant 文本、message_end、agent_end、agent_settled、自然停止或压缩完成不会自动生成父端消息。需要父代理看到内容时，必须显式调用相应工具。";
+  "普通答复：普通 assistant 文本、message_end、agent_end、agent_settled、自然停止或压缩完成不会自动生成父端消息。需要父代理看到进度、问题或结果时，必须显式调用对应工具。";
 
 export const CHILD_COMPLETION_GUIDELINE =
-  "任务结束：需要 final_report 时先发送精炼报告，再输出非空且简短的正常 assistant 答复，说明完成内容和产物位置。不要在两个通道重复全文。";
+  "阶段性和最终结果：形成阶段性成果、最终结果或正式阻塞报告时，调用 final_report。报告应包含结论、产物位置、验证结果和遗留问题。任务完成时默认调用一次 final_report，除非父代理明确表示不需要。没有新增信息时不得重复调用回传工具，同一内容不得同时调用 reply_to_parent 和 final_report。";
 
 const childReplyDescription =
   "Call reply_to_parent only when your direct parent explicitly asks for a progress report or when blocked on an issue that the parent must handle or decide.";
