@@ -185,7 +185,7 @@ export const PARENT_COORDINATION_GUIDELINES = Object.freeze({
   timeout: "超时处理：wait_agent 超时后不得重发任务、重新执行任务或调用 interrupt_agent。确需了解进度时，只发送一次简短的进度询问。",
   failure: "错误处理：send_message 失败只影响本次发送，不得盲目重试。reply_too_large 需精简后重发；compaction_active 需等待屏障解除后确认是否仍需发送。accepted: true 的消息不得再次发送。",
   completion: "完成判断：reply_to_parent 只表示进度、问题或阻塞；final_report 表示阶段性或最终交付，但不会自动结束子代理。idle、terminal、failed 也不自动表示任务完成，必须结合报告、产物、state 和 error 判断。",
-  messaging: "发送消息时的提示：按 send_message 目的添加提示：\n- 需要子代理在任务过程中进行回复时，提示子代理使用 reply_to_parent 进行回复。\n- 需要子代理完成任务并需要任务结果时，提示子代理使用 final_report 提交报告。",
+  messaging: "发送消息时的提示（特别注意）：按 send_message 目的添加提示：\n- 需要子代理在任务过程中进行回复时，提示子代理使用 reply_to_parent 进行回复。\n- 需要子代理完成任务并需要任务结果时，提示子代理使用 final_report 提交报告。",
   reclaim: "回收规则：子代理已完成当前任务且后续不再需要时，应调用 terminate_agent 释放资源。若 spawn_agent 返回 max_children_reached 或 max_tree_agents_reached，应优先清理已完成当前任务的子代理以释放资源，再重试 spawn_agent。不得清理正在执行任务的子代理。",
   takeover: "接管规则：只有用户或上游任务明确要求取消或改目标、子代理明确请求接管、已确认不可恢复故障，或存在必须停止的资源、安全或协议问题时，才允许接管。working 状态下必须先调用 interrupt_agent；只有返回 interrupting 后，才可等待 idle 或 terminal。terminate_agent 仅用于确认不再复用的分支。",
 });
