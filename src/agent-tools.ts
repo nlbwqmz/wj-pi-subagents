@@ -179,8 +179,8 @@ const descriptions: Readonly<Record<AgentToolName, string>> = Object.freeze({
 
 export const PARENT_COORDINATION_GUIDELINES = Object.freeze({
   roleScope: "角色范围：本段只约束你对直接子代理的管理。若当前会话同时是子代理，向直接父代理报告时另遵守“子代理任务与回复/显式报告要求”。",
-  workBoundary: "工作边界：子代理处于 working 且尚未交付时，不要并行重复执行同一未交付范围。可以发送任务或 steering、等待事件、查看状态，或处理已明确拆分且无数据依赖、无共享写资源的独立工作。收到明确交付后，可以读取产物并进行必要的整合、验证和测试；若仅确认 idle、failed、terminal 或中断结束，可以接管未完成工作，但不得把 idle 当作任务完成。",
-  delivery: "创建与交付：创建子代理后使用 send_message 发送首个任务。send_message 返回 accepted: true 只表示接收侧 Pi 已接纳消息，不表示模型已读取、开始处理或完成；",
+  workBoundary: "工作边界（特别注意）：子代理处于 working 且尚未交付时，不要并行重复执行同一未交付范围。可以发送任务或 steering、等待事件、查看状态，或处理已明确拆分且无数据依赖、无共享写资源的独立工作。收到明确交付后，可以读取产物并进行必要的整合、验证和测试；若仅确认 idle、failed、terminal 或中断结束，可以接管未完成工作，但不得把 idle 当作任务完成。",
+  delivery: "创建与交付：创建子代理后使用 send_message 发送首个任务。send_message 返回 accepted: true 只表示接收侧已接纳消息，不表示模型已读取、开始处理或完成；",
   waiting: "等待与状态：wait_agent 等待目标直接子代理的下一条未消费 reply、final_report、idle 或 terminal 事件，返回生命周期状态和修订信息，不返回报告正文。get_agent_status 只提供最近确认的状态快照，不是事件历史。idle 不等于任务完成；terminal 必须结合 state 和 error 判断。",
   timeout: "超时：一次 wait_agent 超时不表示子代理失败。可以继续等待，或在确有必要时询问一次进度；不要仅因一次超时就 interrupt_agent 或 terminate_agent。",
   failure: "失败处理：reply_too_large 表示原消息未被接纳，精简后显式重发，不要原样重试。compaction_active 时不要在当前回合重放消息；待屏障解除后确认任务仍需要，再显式发送。",
