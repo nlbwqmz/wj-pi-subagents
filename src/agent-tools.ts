@@ -185,7 +185,7 @@ export const PARENT_COORDINATION_GUIDELINES = Object.freeze({
   timeout: "超时处理：wait_agent 超时后不得重发任务、重新执行任务或调用 interrupt_agent。确需了解进度时，只发送一次简短的进度询问。",
   failure: "错误处理：send_message 失败只影响本次发送，不得盲目重试。reply_too_large 需精简后重发；compaction_active 需等待屏障解除后确认是否仍需发送。accepted: true 的消息不得再次发送。",
   completion: "完成判断：reply_to_parent 只表示进度、问题或阻塞；final_report 表示阶段性或最终交付，但不会自动结束子代理。idle、terminal、failed 也不自动表示任务完成，必须结合报告、产物、state 和 error 判断。",
-  messaging: "发送消息时的提示（特别注意）：按 send_message 目的添加提示：\n- 需要子代理在任务过程中进行回复时，提示子代理使用 reply_to_parent 进行回复。\n- 需要子代理完成任务并需要任务结果时，提示子代理使用 final_report 提交报告。",
+  messaging: "消息回传要求（必须落实到 send_message 正文）：每次向子代理发送任务或补充要求时，必须明确回传方式和触发条件，不得只写“有进展告诉我”“完成后回复我”等模糊表述。\n- 需要中途进度、问题或阻塞：必须在消息中明确写出“中途需要汇报时，请调用 `reply_to_parent` 回复”，并说明触发条件，例如完成指定阶段、遇到阻塞或需要父代理决策。\n- 只需要阶段性成果或最终结果：必须明确写出“形成交付物或完成任务后，请调用 `final_report` 提交报告”。\n- 两者都需要：同时写明上述两种工具及其各自触发条件。\n- `reply_to_parent` 用于中途进度、问题和阻塞；`final_report` 用于阶段性成果或最终交付。工具调用才构成发给父代理的上行消息。",
   reclaim: "回收规则：子代理已完成当前任务且后续不再需要时，应调用 terminate_agent 释放资源。若 spawn_agent 返回 max_children_reached 或 max_tree_agents_reached，应优先清理已完成当前任务的子代理以释放资源，再重试 spawn_agent。不得清理正在执行任务的子代理。",
   takeover: "接管规则：只有用户或上游任务明确要求取消或改目标、子代理明确请求接管、已确认不可恢复故障，或存在必须停止的资源、安全或协议问题时，才允许接管。working 状态下必须先调用 interrupt_agent；只有返回 interrupting 后，才可等待 idle 或 terminal。terminate_agent 仅用于确认不再复用的分支。",
 });
@@ -209,7 +209,7 @@ export const CHILD_EXECUTION_GUIDELINE =
   "任务执行：只向直接父代理报告。按照父代理给出的范围和验收标准执行，不得因父代理暂时没有回复或任务耗时较长而提前结束。";
 
 export const CHILD_REPLY_GUIDELINE =
-  "中途回复：父代理明确要求进度，或遇到需要父代理处理、裁决的阻塞时，调用 reply_to_parent，简要说明当前状态、已完成内容、问题和所需决定。";
+  "中途回复：当父代理在任务消息中明确要求进度、问题或阻塞回报时，子代理应在约定触发点调用 `reply_to_parent`；该工具调用才构成发给父代理的中途回复。若遇到需要父代理处理或裁决的阻塞，也应调用该工具。消息应简要说明当前状态、已完成内容、问题和所需决定。";
 
 export const CHILD_REPLY_TOO_LARGE_GUIDELINE =
   "回传失败：reply_too_large 表示当前消息未被接纳。精简后使用原工具重发，禁止原样重试；成功返回 accepted: true 前，不得视为已送达。compaction_active 表示当前消息未被接纳；不要在压缩或协调屏障期间重发，屏障解除后确认消息仍有必要，再使用原工具发送。";
