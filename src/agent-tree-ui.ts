@@ -43,12 +43,7 @@ interface BranchAggregate {
   readonly descendants: number;
   readonly working: number;
   readonly failed: number;
-}
-
-interface FinishedAggregate {
-  readonly completed: number;
-  readonly failed: number;
-  readonly incomplete: number;
+  readonly terminated: number;
 }
 
 export interface AgentTreePanelPublicState {
@@ -57,7 +52,6 @@ export interface AgentTreePanelPublicState {
   readonly selected_key?: string;
   readonly scroll_offset: number;
   readonly expanded_agent_ids: readonly string[];
-  readonly finished_expanded: boolean;
 }
 
 export interface AgentTreeSnapshotSource {
@@ -116,7 +110,7 @@ const WORKING_SPINNER_INTERVAL_MS = 80;
 const INITIAL_WORKING_SPINNER_FRAME = WORKING_SPINNER_FRAMES[0] ?? "⠋";
 const DEFAULT_PANEL_VIEWPORT_HEIGHT = 12;
 const AGENT_TREE_OVERLAY_OPTIONS = Object.freeze({
-  width: 96,
+  width: 120,
   anchor: "center" as const,
   margin: 1,
 });
@@ -461,7 +455,6 @@ export class AgentTreePanelModel {
   private status: "ready" | "error" = "ready";
   private readonly viewportHeight: number;
   private readonly expandedAgentIds = new Set<string>();
-  private finishedExpanded = false;
   private selectedIndex = 0;
   private scrollOffset = 0;
 
@@ -576,7 +569,6 @@ export class AgentTreePanelModel {
       expanded_agent_ids: Object.freeze(this.snapshot.nodes
         .filter((node) => this.expandedAgentIds.has(node.agent_id))
         .map((node) => node.agent_id)),
-      finished_expanded: this.finishedExpanded,
     });
   }
 
@@ -593,26 +585,11 @@ export class AgentTreePanelModel {
       );
       rows.push(Object.freeze({
         key: node.agent_id,
-        text: `${"  ".repeat(level)}${marker} ${formatAgentFacts(node)}${aggregate}`,
+        text: `${"  ".repeat(level)}${marker} ${formatAgentFacts(node, true)}${aggregate}`,
       }));
       if (expanded) for (const child of children) append(child, level + 1);
     };
     for (const node of this.sortedTopLevelNodes(childrenByParent)) append(node, 0);
-    const finished = this.finishedAggregate();
-    if (finished.completed + finished.failed + finished.incomplete > 0) {
-      rows.push(Object.freeze({
-        key: "finished",
-        text: `${this.finishedExpanded ? "▾" : "▸"} finished · completed ${finished.completed} · failed ${finished.failed} · incomplete ${finished.incomplete}`,
-      }));
-      if (this.finishedExpanded) {
-        for (const node of this.finishedNodes()) {
-          rows.push(Object.freeze({
-            key: `finished:${node.agent_id}`,
-            text: `  · ${safeUiFact(node.template_id)} · ${safeUiFact(node.name)} · ${finishedKind(node)}${node.error === undefined ? "" : ` · ${node.error.code}`}`,
-          }));
-        }
-      }
-    }
     return Object.freeze(rows);
   }
 
@@ -621,14 +598,14 @@ export class AgentTreePanelModel {
       ? null
       : this.snapshot.scope.agent_id ?? null;
     return this.snapshot.nodes.filter((node) =>
-      node.parent_agent_id === parentAgentId && node.state !== "terminated",
+      node.parent_agent_id === parentAgentId,
     );
   }
 
   private childrenByParent(): ReadonlyMap<string, readonly AgentSnapshot[]> {
     const result = new Map<string, AgentSnapshot[]>();
     for (const node of this.snapshot.nodes) {
-      if (node.parent_agent_id === null || node.state === "terminated") continue;
+      if (node.parent_agent_id === null) continue;
       const children = result.get(node.parent_agent_id) ?? [];
       children.push(node);
       result.set(node.parent_agent_id, children);
@@ -654,6 +631,7 @@ export class AgentTreePanelModel {
     node: AgentSnapshot,
     childrenByParent: ReadonlyMap<string, readonly AgentSnapshot[]>,
   ): boolean {
+    if (node.state === "terminated") return false;
     if (
       node.state !== "idle"
       || node.error !== undefined
@@ -669,33 +647,18 @@ export class AgentTreePanelModel {
     let descendants = 0;
     let working = 0;
     let failed = 0;
+    let terminated = 0;
     const visit = (parentId: string): void => {
       for (const child of childrenByParent.get(parentId) ?? []) {
         descendants += 1;
         if (child.state === "working") working += 1;
         if (child.state === "failed") failed += 1;
+        if (child.state === "terminated") terminated += 1;
         visit(child.agent_id);
       }
     };
     visit(agentId);
-    return Object.freeze({ descendants, working, failed });
-  }
-
-  private finishedAggregate(): FinishedAggregate {
-    let completed = 0;
-    let failed = 0;
-    let incomplete = 0;
-    for (const node of this.snapshot.nodes) {
-      if (node.state !== "terminated") continue;
-      if (node.termination_result === "completed") completed += 1;
-      if (node.termination_result === "failed") failed += 1;
-      if (node.termination_result === "incomplete") incomplete += 1;
-    }
-    return Object.freeze({ completed, failed, incomplete });
-  }
-
-  private finishedNodes(): readonly AgentSnapshot[] {
-    return this.snapshot.nodes.filter((node) => node.state === "terminated");
+    return Object.freeze({ descendants, working, failed, terminated });
   }
 
   private clampSelection(rowCount: number): void {
@@ -709,11 +672,6 @@ export class AgentTreePanelModel {
   }
 
   private expandSelected(key: string): AgentTreePanelInputOutcome {
-    if (key === "finished") {
-      if (this.finishedExpanded) return "ignored";
-      this.finishedExpanded = true;
-      return "changed";
-    }
     const hasChildren = (this.childrenByParent().get(key) ?? []).length > 0;
     if (!hasChildren || this.expandedAgentIds.has(key)) return "ignored";
     this.expandedAgentIds.add(key);
@@ -721,11 +679,6 @@ export class AgentTreePanelModel {
   }
 
   private collapseSelected(key: string): AgentTreePanelInputOutcome {
-    if (key === "finished") {
-      if (!this.finishedExpanded) return "ignored";
-      this.finishedExpanded = false;
-      return "changed";
-    }
     if (this.expandedAgentIds.has(key)) {
       this.expandedAgentIds.delete(key);
       this.clampSelection(this.buildRows().length);
@@ -936,7 +889,7 @@ function formatAgentStateIcon(node: AgentSnapshot, workingFrame: string): string
   return "·";
 }
 
-function formatAgentFacts(node: AgentSnapshot): string {
+function formatAgentFacts(node: AgentSnapshot, includeTerminationResult = false): string {
   const facts = [safeUiFact(node.template_id), safeUiFact(node.name), node.state];
   if (node.activity !== undefined) facts.push(node.activity.phase);
   if (node.context_window_tokens !== undefined) {
@@ -944,6 +897,9 @@ function formatAgentFacts(node: AgentSnapshot): string {
       ? "?"
       : `${node.context_usage_percent.toFixed(1)}%`;
     facts.push(`${percent}/${formatTokens(node.context_window_tokens)}`);
+  }
+  if (includeTerminationResult && node.state === "terminated" && node.termination_result !== undefined) {
+    facts.push(node.termination_result);
   }
   if (node.state !== "starting" && node.working_elapsed_ms !== undefined) {
     facts.push(formatElapsed(node.working_elapsed_ms));
@@ -959,11 +915,7 @@ function formatAgentFacts(node: AgentSnapshot): string {
 }
 
 function formatBranchAggregate(aggregate: BranchAggregate): string {
-  return ` · descendants ${aggregate.descendants} · working ${aggregate.working} · failed ${aggregate.failed}`;
-}
-
-function finishedKind(node: AgentSnapshot): "completed" | "failed" | "incomplete" {
-  return node.termination_result ?? "completed";
+  return ` · descendants ${aggregate.descendants} · working ${aggregate.working} · failed ${aggregate.failed} · terminated ${aggregate.terminated}`;
 }
 
 function stablePrioritySort(
