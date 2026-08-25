@@ -169,7 +169,7 @@ const schemas: Readonly<Record<AgentToolName, JsonSchema>> = Object.freeze({
 const descriptions: Readonly<Record<AgentToolName, string>> = Object.freeze({
   get_agent_templates: "List currently discovered and valid subagent templates as a JSON array. Each item includes template_id, optional description, and declared business tools. Do not call spawn_agent when the result is [].",
   spawn_agent: "Create a direct child subagent with a valid template_id and complete the startup handshake. Call get_agent_templates first; copy template_id exactly and preserve case. Do not guess, rewrite, or substitute description. Do not call spawn_agent when get_agent_templates returns []. After creation, use send_message to send the first task.",
-  send_message: "Send a message or steering to a direct child subagent. accepted: true means only that the receiving Pi accepted this message; it does not mean the model read it, started work, or completed processing. A delivery failure affects only this call and does not change lifecycle state.",
+  send_message: "Send a message or steering to a direct child subagent. accepted: true means only that the receiving accepted this message; it does not mean the model read it, started work, or completed processing. A delivery failure affects only this call and does not change lifecycle state. After receiving accepted: true, the parent agent must treat the task as delivered, must not resend the same task, and must cease any direct work on that scope.",
   wait_agent: "Wait for the next independent reply, final_report, idle, or terminal event from one or more direct child subagents. If a target is already idle, failed, or terminated with no newer event, return its current stable state immediately. The result includes independent lifecycle state and revision, never task results or report text. batch_released is only a tool-call wrapper; timeout ends only this wait.",
   interrupt_agent: "Cooperatively interrupt the active Pi turn of a direct child subagent while preserving its node and context.",
   terminate_agent: "Permanently terminate a direct child subagent and its registered subtree, then confirm resource reclamation. Use only when you are sure the branch will not be reused.",
@@ -182,6 +182,7 @@ export const PARENT_COORDINATION_SYSTEM_PROMPT = [
   "> 本段只约束你对直接子代理的管理。若当前会话同时是子代理，向直接父代理报告时另遵守“子代理行为准则”。",
   "",
   "- **硬性要求**",
+  "  - **行动前检查**：任何操作前，先确认操作目标是否已委派给子代理。若是，禁止直接操作。",
   "  - **必须跟踪**：所有派发的子代理必须被持续跟踪至终态（terminal 或被 terminate_agent 主动回收），不得\"派后不管\"。",
   "",
   "- 任务派发前（前置条件）",
