@@ -263,6 +263,8 @@ function createMessageCallComponent(
 ): AgentToolRenderComponent {
   const agentId = name === "normal_reply" ? undefined : readOptionalString(input, "agent_id");
   const message = readOptionalString(input, "message") ?? "";
+  // send_message 的正文是父代理提交的协作内容，始终完整展示。
+  const showFullMessage = expanded || name === "send_message";
   const lines: SafeRenderLine[] = [{
     text: agentId === undefined ? name : `${name} · ${agentId}`,
     color: "toolTitle",
@@ -271,7 +273,7 @@ function createMessageCallComponent(
     text: message,
     color: "dim",
     multiline: true,
-    ...(expanded ? {} : {
+    ...(showFullMessage ? {} : {
       maxLines: MAX_COLLAPSED_BODY_LINES,
       overflowText: "… (expand to view full content)",
     }),
