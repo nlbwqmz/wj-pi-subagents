@@ -5,6 +5,7 @@ import {
   AGENT_ACTIVITY_PHASES,
   AGENT_FAULT_CODES,
   AGENT_FAULT_METADATA,
+  DEFAULT_AGENT_ACTIVITY,
   isCanonicalAgentUuid,
   parseAgentActivitySummary,
   parseAgentSnapshot,
@@ -518,6 +519,14 @@ function isManagementState(state: InternalAgentLifecycleState): boolean {
 /** 工作时长覆盖任务实际处理和中断收尾，不计入静止、挂起或资源清理。 */
 function isWorkingTimeState(state: InternalAgentLifecycleState): boolean {
   return state === "working" || state === "interrupting";
+}
+
+/** 将工作态缺失的活动阶段归一化，确保所有公开树记录满足状态不变量。 */
+function activityForState(
+  state: InternalAgentLifecycleState,
+  activity: AgentActivitySummary | undefined,
+): AgentActivitySummary | undefined {
+  return isWorkingTimeState(state) ? activity ?? DEFAULT_AGENT_ACTIVITY : undefined;
 }
 
 function isQuotaConsumingState(state: InternalAgentLifecycleState): boolean {
@@ -1133,8 +1142,6 @@ export class TreeController {
     const additions: AgentRecord[] = [];
     const additionById = new Map<string, AgentRecord>();
     let scopeContextUsage: AgentContextUsageInput | undefined;
-    let scopeActivity: AgentActivitySummary | undefined;
-    let scopeActivityObserved = false;
     for (const node of parsed.data) {
       const current = this.agents.get(node.agent_id);
       if (current === undefined) {
@@ -1163,7 +1170,7 @@ export class TreeController {
           accumulatedWorkingElapsedMs: node.working_elapsed_ms ?? 0,
           contextWindowTokens: node.context_window_tokens,
           contextUsagePercent: node.context_usage_percent,
-          activity: node.activity,
+          activity: activityForState(node.state, node.activity),
           error: node.error,
           terminationResult: node.termination_result,
           terminationHadFailure: snapshotHadTerminationFailure(node),
@@ -1185,8 +1192,6 @@ export class TreeController {
               : { context_usage_percent: node.context_usage_percent }),
           });
         }
-        scopeActivityObserved = true;
-        scopeActivity = node.activity;
         continue;
       }
       if (current.state === "terminated" && node.revision !== current.revision) {
@@ -1222,19 +1227,13 @@ export class TreeController {
           contextWindowTokens: scopeContextUsage.context_window_tokens,
           contextUsagePercent: scopeContextUsage.context_usage_percent ?? null,
         }, safeWallClockNow(this.now), monotonicAt);
-    const scopeActivityChanged = !scopeActivityObserved
-      || (scope.state !== "working" && scope.state !== "interrupting")
-      ? false
-      : this.applyMutation(scope, {
-          activity: scopeActivity ?? null,
-        }, safeWallClockNow(this.now), monotonicAt);
     this.subtreeRevisions.set(scope.agentId, input.subtree_revision);
-    if (additions.length > 0 || changes.length > 0 || scopeContextChanged || scopeActivityChanged) {
+    if (additions.length > 0 || changes.length > 0 || scopeContextChanged) {
       this.treeRevision += 1;
       this.notifyChange();
     }
     return controlSuccess(Object.freeze({
-      applied: additions.length > 0 || changes.length > 0 || scopeContextChanged || scopeActivityChanged,
+      applied: additions.length > 0 || changes.length > 0 || scopeContextChanged,
       scope_agent_id: scope.agentId,
       subtree_revision: input.subtree_revision,
       tree_revision: this.treeRevision,
@@ -1245,10 +1244,18 @@ export class TreeController {
     scope: AgentRecord,
     nodes: readonly AgentSnapshot[],
   ): ControlResult<readonly AgentSnapshot[]> {
-    if (nodes.length === 0 || nodes[0]?.agent_id !== scope.agentId) return controlFailure("invalid_argument");
+    const normalizedNodes: AgentSnapshot[] = [];
+    for (const node of nodes) {
+      const normalized = parseAgentSnapshot(node);
+      if (normalized === undefined) return controlFailure("invalid_argument");
+      normalizedNodes.push(normalized);
+    }
+    if (normalizedNodes.length === 0 || normalizedNodes[0]?.agent_id !== scope.agentId) {
+      return controlFailure("invalid_argument");
+    }
     const ids = new Set<string>();
-    for (let index = 0; index < nodes.length; index += 1) {
-      const node = nodes[index]!;
+    for (let index = 0; index < normalizedNodes.length; index += 1) {
+      const node = normalizedNodes[index]!;
       if (ids.has(node.agent_id)) return controlFailure("invalid_argument");
       ids.add(node.agent_id);
       if (node.agent_id === scope.agentId) {
@@ -1258,18 +1265,18 @@ export class TreeController {
         if (node.template_id !== scope.templateId || node.name !== scope.name) return controlFailure("invalid_argument");
       } else {
         if (node.parent_agent_id === null) return controlFailure("invalid_argument");
-        const parentIndex = nodes.findIndex((candidate) => candidate.agent_id === node.parent_agent_id);
+        const parentIndex = normalizedNodes.findIndex((candidate) => candidate.agent_id === node.parent_agent_id);
         if (
           node.depth > this.config.maxDepth
           || parentIndex < 0
           || parentIndex >= index
-          || node.depth !== nodes[parentIndex]!.depth + 1
+          || node.depth !== normalizedNodes[parentIndex]!.depth + 1
         ) {
           return controlFailure("invalid_argument");
         }
       }
     }
-    return controlSuccess(Object.freeze(nodes.map((node) => Object.freeze({
+    return controlSuccess(Object.freeze(normalizedNodes.map((node) => Object.freeze({
       ...node,
       ...(node.error === undefined ? {} : { error: cloneAgentFault(node.error)! }),
     }))));
@@ -1285,7 +1292,7 @@ export class TreeController {
     record.state = node.state;
     record.revision = node.revision;
     record.createdAt = node.created_at;
-    record.activity = node.activity;
+    record.activity = activityForState(node.state, node.activity);
     record.error = cloneAgentFault(node.error);
     record.terminationHadFailure ||= snapshotHadTerminationFailure(node);
     record.terminationHadIncompleteCleanup ||= snapshotHadIncompleteCleanup(node);
@@ -1571,7 +1578,7 @@ export class TreeController {
     const nextErrorCode = mutation.errorCode === undefined
       ? (mutation.clearError === true ? undefined : record.error?.code)
       : mutation.errorCode;
-    const nextActivity = mutation.activity === undefined
+    const requestedActivity = mutation.activity === undefined
       ? record.activity
       : mutation.activity === null
         ? undefined
@@ -1579,6 +1586,7 @@ export class TreeController {
     const stateChanged = nextState !== record.state;
     const wasWorking = isWorkingTimeState(record.state);
     const willBeWorking = isWorkingTimeState(nextState);
+    const nextActivity = activityForState(nextState, requestedActivity);
     const contextChanged = nextContextWindowTokens !== record.contextWindowTokens
       || nextContextUsagePercent !== record.contextUsagePercent;
     const errorChanged = nextErrorCode !== record.error?.code;
@@ -1592,7 +1600,7 @@ export class TreeController {
     record.state = nextState;
     record.contextWindowTokens = nextContextWindowTokens;
     record.contextUsagePercent = nextContextUsagePercent;
-    record.activity = willBeWorking ? nextActivity : undefined;
+    record.activity = nextActivity;
     record.error = nextError;
     if (wasWorking && !willBeWorking) {
       record.accumulatedWorkingElapsedMs = workingElapsedAtMutation;

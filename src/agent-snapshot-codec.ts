@@ -20,6 +20,9 @@ export interface AgentActivitySummary {
   readonly phase: AgentActivityPhase;
 }
 
+/** 旧快照缺少 activity 时使用的兼容阶段。 */
+export const DEFAULT_AGENT_ACTIVITY: AgentActivitySummary = Object.freeze({ phase: "processing" });
+
 export const AGENT_FAULT_CODES = Object.freeze([
   "spawn_failed",
   "spawn_timeout",
@@ -119,15 +122,16 @@ export function parseAgentSnapshot(
       || (record.context_window_tokens !== undefined && !positiveSafeInteger(record.context_window_tokens))
       || (record.context_usage_percent !== undefined && !validContextUsagePercent(record.context_usage_percent))
     ) return undefined;
+    const state = record.state as AgentLifecycleState;
+    // 兼容旧版本快照：工作态缺少 activity 时按安全的默认阶段归一化。
     const activity = record.activity === undefined
-      ? undefined
+      ? isWorkingTimeState(state) ? DEFAULT_AGENT_ACTIVITY : undefined
       : parseAgentActivitySummary(record.activity);
     if (record.activity !== undefined && activity === undefined) return undefined;
     const fault = record.error === undefined ? undefined : parseAgentFault(record.error, options.maxStringBytes);
     if (record.error !== undefined && fault === undefined) return undefined;
     const termination = record.termination_result;
     if (termination !== undefined && !(AGENT_TERMINATION_RESULTS as readonly unknown[]).includes(termination)) return undefined;
-    const state = record.state as AgentLifecycleState;
     if (state === "failed" && fault === undefined) return undefined;
     if (state !== "failed" && fault !== undefined) return undefined;
     if (state === "terminated" && termination === undefined) return undefined;
@@ -196,6 +200,10 @@ function plainDataRecord(value: unknown, allowedKeys: ReadonlySet<string>): Reco
     if (descriptor === undefined || !("value" in descriptor) || descriptor.enumerable !== true) return undefined;
   }
   return record;
+}
+
+function isWorkingTimeState(state: AgentLifecycleState): boolean {
+  return state === "working" || state === "interrupting";
 }
 
 function boundedString(value: unknown, maxBytes: number | undefined): value is string {

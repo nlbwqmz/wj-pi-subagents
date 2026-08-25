@@ -37,12 +37,10 @@ function snapshot(
   });
 }
 
-function scoped(node: AgentSnapshot): ScopedAgentTreeSnapshot {
-  return Object.freeze({
-    tree_revision: node.revision,
-    scope: Object.freeze({ kind: "root" as const }),
-    nodes: Object.freeze([node]),
-  });
+function withoutActivity(node: AgentSnapshot): AgentSnapshot {
+  const copy = { ...node } as { activity?: AgentSnapshot["activity"] };
+  delete copy.activity;
+  return copy as AgentSnapshot;
 }
 
 test("活动阶段快照只接受三个公开值，并限制在 working/interrupting", () => {
@@ -54,10 +52,14 @@ test("活动阶段快照只接受三个公开值，并限制在 working/interrup
 
   const working = snapshot("processing");
   assert.deepEqual(parseAgentSnapshot(working), working);
+  const legacyWorking = withoutActivity(working);
+  const normalizedLegacyWorking = parseAgentSnapshot(legacyWorking);
+  assert.ok(normalizedLegacyWorking);
+  assert.deepEqual(normalizedLegacyWorking.activity, { phase: "processing" });
   assert.equal(parseAgentSnapshot({ ...working, state: "idle" }), undefined);
 });
 
-test("子树快照可以传播活动阶段清除，父端不会保留过期值", () => {
+test("作用域根快照不会清除父端活动阶段，settled 才会清除", () => {
   const tree = new TreeController({
     config: {
       maxDepth: 3,
@@ -79,30 +81,53 @@ test("子树快照可以传播活动阶段清除，父端不会保留过期值",
   const current = tree.getStatus(AGENT_ID);
   assert.equal(current.ok, true, JSON.stringify(current));
   if (!current.ok) return;
+  assert.equal(current.data.state, "working");
+  assert.deepEqual(current.data.activity, { phase: "processing" });
 
-  const withActivity = { ...current.data, activity: { phase: "executing_tools" as const } };
-  const first: SubtreeSnapshotInput = {
+  const activityUpdated = tree.updateActivity(AGENT_ID, { phase: "executing_tools" });
+  assert.equal(activityUpdated.ok, true, JSON.stringify(activityUpdated));
+  const withActivity = tree.getStatus(AGENT_ID);
+  assert.equal(withActivity.ok, true, JSON.stringify(withActivity));
+  if (!withActivity.ok) return;
+  assert.deepEqual(withActivity.data.activity, { phase: "executing_tools" });
+
+  const legacyScopeSnapshot: SubtreeSnapshotInput = {
     scope_agent_id: AGENT_ID,
     subtree_revision: 1,
-    nodes: [withActivity],
+    nodes: [withoutActivity(current.data)],
   };
-  const applied = tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, first);
+  const applied = tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, legacyScopeSnapshot);
   assert.equal(applied.ok, true, JSON.stringify(applied));
   let status = tree.getStatus(AGENT_ID);
   assert.equal(status.ok, true);
-  if (status.ok) assert.deepEqual(status.data.activity, { phase: "executing_tools" });
+  if (status.ok) {
+    assert.equal(status.data.state, "working");
+    assert.deepEqual(status.data.activity, { phase: "executing_tools" });
+  }
 
-  const cleared: SubtreeSnapshotInput = {
-    scope_agent_id: AGENT_ID,
-    subtree_revision: 2,
-    nodes: [current.data],
-  };
-  const clearedResult = tree.applySubtreeSnapshot(ROOT_TREE_ACTOR, cleared);
-  assert.equal(clearedResult.ok, true, JSON.stringify(clearedResult));
+  const generation = tree.getLifecycleGeneration(AGENT_ID);
+  assert.equal(generation.ok, true, JSON.stringify(generation));
+  if (!generation.ok) return;
+  const settled = tree.applyLifecycleEvent(AGENT_ID, {
+    type: "agent_settled",
+    expected_generation: generation.data,
+  });
+  assert.equal(settled.ok, true, JSON.stringify(settled));
   status = tree.getStatus(AGENT_ID);
   assert.equal(status.ok, true);
-  if (status.ok) assert.equal(status.data.activity, undefined);
+  if (status.ok) {
+    assert.equal(status.data.state, "idle");
+    assert.equal(status.data.activity, undefined);
+  }
 });
+
+function scoped(node: AgentSnapshot): ScopedAgentTreeSnapshot {
+  return Object.freeze({
+    tree_revision: node.revision,
+    scope: Object.freeze({ kind: "root" as const }),
+    nodes: Object.freeze([node]),
+  });
+}
 
 test("输入框 widget 和子代理面板显示活动阶段但不显示工具类别", () => {
   const current = scoped(snapshot("executing_tools"));
