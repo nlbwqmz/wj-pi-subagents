@@ -1,3 +1,9 @@
+import {
+  hasStartupDiagnosticDetails,
+  isCanonicalStartupDiagnosticDetails,
+  normalizeStartupDiagnosticDetails,
+  type StartupDiagnosticDetails,
+} from "./startup-diagnostic.ts";
 import { displayWidth, truncateToDisplayWidth } from "./agent-tree-ui.ts";
 import {
   WAIT_AGENT_DEFAULT_TIMEOUT_MS,
@@ -298,7 +304,7 @@ export function renderAgentToolResult(
   if (error !== undefined || context.isError === true) {
     const failure = error ?? { code: "internal_error", reason: INTERNAL_ERROR_REASON };
     return createSafeTextComponent([{
-      text: `${failure.code}: ${failure.reason}`,
+      text: `${failure.code}: ${failure.reason}${formatStableErrorDetails(error?.details)}`,
       color: "error",
     }], theme, context);
   }
@@ -568,7 +574,12 @@ function collapsedStatusLines(snapshot: AgentSnapshot): readonly SafeRenderLine[
   if (snapshot.activity !== undefined) {
     lines.push({ text: `activity.phase: ${snapshot.activity.phase}`, color: "dim" });
   }
-  if (snapshot.error !== undefined) lines.push({ text: `error.code: ${snapshot.error.code}`, color: "warning" });
+  if (snapshot.error !== undefined) {
+    lines.push({ text: `error.code: ${snapshot.error.code}`, color: "warning" });
+    for (const [key, value] of Object.entries(snapshot.error.details ?? {})) {
+      lines.push({ text: `error.${key}: ${value}`, color: "warning" });
+    }
+  }
   if (snapshot.termination_result !== undefined) {
     lines.push({ text: `termination_result: ${snapshot.termination_result}`, color: "dim" });
   }
@@ -602,6 +613,9 @@ function expandedStatusLines(snapshot: AgentSnapshot): readonly SafeRenderLine[]
     lines.push({ text: `error.code: ${snapshot.error.code}`, color: "warning" });
     lines.push({ text: `error.message: ${snapshot.error.message}`, color: "warning" });
     lines.push({ text: `error.retryable: ${snapshot.error.retryable}`, color: "warning" });
+    for (const [key, value] of Object.entries(snapshot.error.details ?? {})) {
+      lines.push({ text: `error.${key}: ${value}`, color: "warning" });
+    }
   }
   if (snapshot.termination_result !== undefined) {
     lines.push({ text: `termination_result: ${snapshot.termination_result}`, color: "dim" });
@@ -708,7 +722,10 @@ function formatTreeNode(node: AgentSnapshot): string {
     ? ""
     : ` · ${node.context_usage_percent === undefined ? "?" : `${node.context_usage_percent.toFixed(1)}%`}/${formatTokens(node.context_window_tokens)}`;
   const activity = node.activity === undefined ? "" : ` · ${node.activity.phase}`;
-  return `${node.template_id} · ${node.name} · ${node.state}${activity} · ${node.agent_id}${context}`;
+  const fault = node.error === undefined
+    ? ""
+    : ` · ${node.error.code}${formatStableErrorDetails(node.error.details)}`;
+  return `${node.template_id} · ${node.name} · ${node.state}${activity} · ${node.agent_id}${context}${fault}`;
 }
 
 function formatTokens(count: number): string {
@@ -755,7 +772,11 @@ function readTemplates(value: unknown): readonly {
   return templates;
 }
 
-function readStableError(result: AgentToolResultView): { readonly code: string; readonly reason: string } | undefined {
+function readStableError(result: AgentToolResultView): {
+  readonly code: string;
+  readonly reason: string;
+  readonly details?: StartupDiagnosticDetails;
+} | undefined {
   const content = readProperty(result, "content");
   if (!Array.isArray(content)) return undefined;
   for (const item of content) {
@@ -772,7 +793,12 @@ function readStableError(result: AgentToolResultView): { readonly code: string; 
     const error = readRecord(readProperty(record, "error"));
     const code = readProperty(error, "code");
     if (typeof code === "string" && isPublicErrorCode(code)) {
-      return { code, reason: stableErrorReason(code) };
+      const details = readSafeErrorDetails(code, readProperty(error, "details"));
+      return {
+        code,
+        reason: stableErrorReason(code),
+        ...(details === undefined ? {} : { details }),
+      };
     }
   }
   return undefined;
@@ -788,6 +814,21 @@ function stableErrorReason(code: PublicErrorCode): string {
   } catch {
     return INTERNAL_ERROR_REASON;
   }
+}
+
+function formatStableErrorDetails(details: StartupDiagnosticDetails | undefined): string {
+  if (details === undefined) return "";
+  const entries = Object.entries(details);
+  return entries.length === 0 ? "" : ` (${entries.map(([key, value]) => `${key}: ${value}`).join(", ")})`;
+}
+
+function readSafeErrorDetails(
+  code: PublicErrorCode,
+  value: unknown,
+): StartupDiagnosticDetails | undefined {
+  if (!isCanonicalStartupDiagnosticDetails(code, value)) return undefined;
+  const details = normalizeStartupDiagnosticDetails(code, value);
+  return hasStartupDiagnosticDetails(details) ? details : undefined;
 }
 
 function readFaultCode(value: unknown): AgentFaultCode | undefined {

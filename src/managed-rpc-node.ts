@@ -15,12 +15,22 @@ import {
   type ProcessTreeHandle,
   type ResourceObservation,
 } from "./process-tree-capability.ts";
+import {
+  ManagedRpcStartupError,
+  parseManagedRpcStartupDiagnostic,
+  type ManagedRpcStartupDiagnostic,
+} from "./startup-diagnostic.ts";
+
+export {
+  ManagedRpcStartupError,
+  type ManagedRpcStartupDiagnostic,
+} from "./startup-diagnostic.ts";
 
 export type ManagedRpcReply = ChildReplyEnvelope;
 
 export type ManagedRpcTransportFault = "eof" | "protocol_fault" | "process_exit";
 
-export const MANAGED_RPC_BRIDGE_PROTOCOL = "wj-pi-subagents/managed-rpc/6" as const;
+export const MANAGED_RPC_BRIDGE_PROTOCOL = "wj-pi-subagents/managed-rpc/7" as const;
 /** 只用于节点启动事务的一次性本地认证，不进入公开控制面。 */
 export const MANAGED_RPC_BRIDGE_CREDENTIAL_ENV = "WJ_PI_SUBAGENTS_MANAGED_RPC_CREDENTIAL" as const;
 /** 外层桥接 JSON 正文的硬边界。 */
@@ -549,6 +559,7 @@ interface BridgeResponse {
   readonly data?: unknown;
   readonly rejected?: true;
   readonly rejection_reason?: ManagedRpcCommandRejectionReason;
+  readonly startup_error?: ManagedRpcStartupDiagnostic;
 }
 
 interface BridgeEventFrame {
@@ -572,6 +583,7 @@ interface BridgeSupervisorFrame {
 type BridgeFrame = BridgeResponse | BridgeEventFrame | BridgeFaultFrame | BridgeSupervisorFrame;
 
 interface PendingBridgeRequest {
+  readonly command: string;
   readonly resolve: (value: unknown) => void;
   readonly reject: (reason: Error) => void;
 }
@@ -746,6 +758,7 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
       }
       signal?.addEventListener("abort", onAbort, { once: true });
       this.pending.set(id, {
+        command,
         resolve: (value) => {
           signal?.removeEventListener("abort", onAbort);
           resolve(value);
@@ -787,8 +800,21 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
       return;
     }
     if (value.kind === "response") {
+      const hasStartupError = Object.hasOwn(value, "startup_error");
+      const startupError = hasStartupError
+        ? parseManagedRpcStartupDiagnostic(value.startup_error)
+        : undefined;
       if (
-        !hasOnlyKeys(value, ["protocol", "kind", "id", "ok", "data", "rejected", "rejection_reason"])
+        !hasOnlyKeys(value, [
+          "protocol",
+          "kind",
+          "id",
+          "ok",
+          "data",
+          "rejected",
+          "rejection_reason",
+          "startup_error",
+        ])
         || !Number.isSafeInteger(value.id)
         || (value.id as number) <= 0
         || typeof value.ok !== "boolean"
@@ -800,7 +826,13 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
           && value.rejection_reason !== "host_busy"
         )
         || (Object.hasOwn(value, "rejection_reason") && value.rejected !== true)
-        || (value.ok === true && (Object.hasOwn(value, "rejected") || Object.hasOwn(value, "rejection_reason")))
+        || (hasStartupError && startupError === undefined)
+        || (hasStartupError && (value.ok === true || value.rejected === true))
+        || (value.ok === true && (
+          Object.hasOwn(value, "rejected")
+          || Object.hasOwn(value, "rejection_reason")
+          || hasStartupError
+        ))
       ) {
         this.failTransport("protocol_fault");
         return;
@@ -808,14 +840,21 @@ export class ManagedRpcBridgeClient implements ManagedRpcBridge {
       const responseId = value.id as number;
       const pending = this.pending.get(responseId);
       if (pending === undefined) return;
+      if (startupError !== undefined && pending.command !== "start") {
+        this.failTransport("protocol_fault");
+        return;
+      }
       this.pending.delete(responseId);
       if (value.ok) pending.resolve(value.data);
       else if (value.rejected === true) {
         pending.reject(new ManagedRpcCommandRejectedError(
           value.rejection_reason as ManagedRpcCommandRejectionReason | undefined,
         ));
+      } else if (startupError !== undefined) {
+        pending.reject(new ManagedRpcStartupError(startupError));
+      } else {
+        pending.reject(new Error("桥接命令失败"));
       }
-      else pending.reject(new Error("桥接命令失败"));
       return;
     }
     if (value.kind === "event") {

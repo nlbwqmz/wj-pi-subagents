@@ -323,11 +323,11 @@ export class AgentController {
         // 只有资源未确认时才保留活动监督器，供后续 terminate_agent 重试。
         this.retainSupervisor(started.agent_id, supervisor, input, unsubscribe, earlyEvents);
       }
-      return controlFailure(started.code);
+      return controlFailure(started.code, started.details);
     }
     if (!started.ok) {
       unsubscribe();
-      return controlFailure(started.code);
+      return controlFailure(started.code, started.details);
     }
     const status = this.tree.getStatus(started.agent_id);
     if (!status.ok || status.data.state !== "idle") {

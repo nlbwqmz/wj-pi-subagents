@@ -13,6 +13,7 @@ import {
 } from "../src/rpc-supervisor.ts";
 import { normalizeRpcBridgeEvent } from "../src/rpc-bridge-event.ts";
 import {
+  controlFailure,
   ROOT_TREE_ACTOR,
   TreeController,
 } from "../src/tree-controller.ts";
@@ -427,6 +428,45 @@ test("回复等待器有界超时并在失败后清理，后续独立消息仍�
   await channels.child.release();
 });
 
+test("控制响应在监督 wire 上保留规范启动错误 details", () => {
+  const requestIdRegistry = new SupervisorRequestIdRegistry();
+  const parent = new SupervisorChannel({
+    role: "parent",
+    rootId: ROOT_ID,
+    localAgentId: null,
+    peerAgentId: CHILD_ID,
+    parentAgentId: null,
+    depth: 1,
+    credential: CREDENTIAL,
+    requestIdRegistry,
+  });
+  const child = new SupervisorChannel({
+    role: "child",
+    rootId: ROOT_ID,
+    localAgentId: CHILD_ID,
+    peerAgentId: "",
+    parentAgentId: null,
+    depth: 1,
+    credential: CREDENTIAL,
+    requestIdRegistry,
+  });
+  const helloResult = parent.receive(child.startHandshake());
+  assert.equal(helloResult.kind, "accepted");
+  if (helloResult.kind !== "accepted") return;
+  for (const outbound of helloResult.outbound) child.receive(outbound);
+  const snapshotResult = parent.receive(child.publishSnapshot([snapshot()], 1));
+  assert.equal(snapshotResult.kind, "accepted");
+
+  const response = {
+    operation_id: "startup-error-operation",
+    ok: false as const,
+    error: controlFailure("provider_unavailable", { provider: "wj-provider" }).error,
+  };
+  const received = child.receive(parent.publishControlResponse(response));
+  assert.equal(received.kind, "accepted");
+  if (received.kind === "accepted") assert.deepEqual(received.control_response, response);
+});
+
 test("旧协议和旧任务字段在新监督 wire 上稳定拒绝为 protocol_mismatch", () => {
   const requestIdRegistry = new SupervisorRequestIdRegistry();
   const parent = new SupervisorChannel({
@@ -480,4 +520,64 @@ test("旧协议和旧任务字段在新监督 wire 上稳定拒绝为 protocol_m
   };
   const result = parent.receive(legacyFrame);
   assert.deepEqual(result, { kind: "protocol_fault", error: "protocol_mismatch" });
+});
+
+test("监督 wire 仅传输规范且独立复制的启动失败详情", () => {
+  const requestIdRegistry = new SupervisorRequestIdRegistry();
+  const parent = new SupervisorChannel({
+    role: "parent",
+    rootId: ROOT_ID,
+    localAgentId: null,
+    peerAgentId: CHILD_ID,
+    parentAgentId: null,
+    depth: 1,
+    credential: CREDENTIAL,
+    requestIdRegistry,
+  });
+  const child = new SupervisorChannel({
+    role: "child",
+    rootId: ROOT_ID,
+    localAgentId: CHILD_ID,
+    peerAgentId: "",
+    parentAgentId: null,
+    depth: 1,
+    credential: CREDENTIAL,
+    requestIdRegistry,
+  });
+  const helloResult = parent.receive(child.startHandshake());
+  assert.equal(helloResult.kind, "accepted");
+  if (helloResult.kind !== "accepted") return;
+  for (const outbound of helloResult.outbound) child.receive(outbound);
+  assert.equal(parent.receive(child.publishSnapshot([snapshot()], 1)).kind, "accepted");
+
+  const details = { provider: "wj-provider", model: "gpt-5.6-terra" };
+  const frame = child.publishEvent({
+    type: "startup_failed",
+    expected_generation: 0,
+    error_code: "model_unavailable",
+    error_details: details,
+  });
+  details.model = "forged-model";
+  const accepted = parent.receive(frame);
+  assert.equal(accepted.kind, "accepted");
+  if (accepted.kind !== "accepted") return;
+  assert.deepEqual(accepted.event, {
+    root_id: ROOT_ID,
+    agent_id: CHILD_ID,
+    type: "startup_failed",
+    expected_generation: 0,
+    error_code: "model_unavailable",
+    error_details: { provider: "wj-provider", model: "gpt-5.6-terra" },
+  });
+  assert.equal(Object.isFrozen(accepted.event?.error_details), true);
+
+  assert.throws(() => child.publishEvent({
+    type: "startup_failed",
+    expected_generation: 0,
+    error_code: "provider_unavailable",
+    error_details: {
+      provider: "wj-provider",
+      source: "https://user:TOP_SECRET@example.test/private?token=TOP_SECRET",
+    },
+  } as unknown as Parameters<typeof child.publishEvent>[0]));
 });

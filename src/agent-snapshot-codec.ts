@@ -1,4 +1,10 @@
 import {
+  hasStartupDiagnosticDetails,
+  isCanonicalStartupDiagnosticDetails,
+  normalizeStartupDiagnosticDetails,
+  type StartupDiagnosticDetails,
+} from "./startup-diagnostic.ts";
+import {
   LIFECYCLE_STATES,
   type LifecycleState,
 } from "./conversation-lifecycle.ts";
@@ -26,6 +32,9 @@ export const DEFAULT_AGENT_ACTIVITY: AgentActivitySummary = Object.freeze({ phas
 export const AGENT_FAULT_CODES = Object.freeze([
   "spawn_failed",
   "spawn_timeout",
+  "provider_unavailable",
+  "model_unavailable",
+  "extension_load_failed",
   "capability_mismatch",
   "message_delivery_failed",
   "termination_incomplete",
@@ -38,6 +47,8 @@ export interface AgentFault {
   readonly code: AgentFaultCode;
   readonly message: string;
   readonly retryable: boolean;
+  /** 仅启动诊断错误可携带的规范、冻结详情。 */
+  readonly details?: StartupDiagnosticDetails;
 }
 
 export const AGENT_TERMINATION_RESULTS = Object.freeze(["completed", "failed", "incomplete"] as const);
@@ -70,6 +81,9 @@ export const AGENT_FAULT_METADATA: Readonly<Record<AgentFaultCode, Readonly<{
 }>>> = Object.freeze({
   spawn_failed: Object.freeze({ message: "Subagent startup failed", retryable: false }),
   spawn_timeout: Object.freeze({ message: "Subagent startup timed out", retryable: true }),
+  provider_unavailable: Object.freeze({ message: "Subagent model provider is unavailable", retryable: false }),
+  model_unavailable: Object.freeze({ message: "Subagent model is unavailable", retryable: false }),
+  extension_load_failed: Object.freeze({ message: "Subagent extension failed to load", retryable: false }),
   capability_mismatch: Object.freeze({ message: "Subagent capability mismatch", retryable: false }),
   message_delivery_failed: Object.freeze({ message: "Message delivery failed", retryable: false }),
   termination_incomplete: Object.freeze({ message: "Subagent resources not fully reclaimed", retryable: true }),
@@ -88,7 +102,7 @@ const SNAPSHOT_KEYS = new Set([
   "activity", "error", "termination_result",
 ]);
 const ACTIVITY_KEYS = new Set(["phase"]);
-const FAULT_KEYS = new Set(["code", "message", "retryable"]);
+const FAULT_KEYS = new Set(["code", "message", "retryable", "details"]);
 const UTF8_ENCODER = new TextEncoder();
 const RFC3339_MILLIS_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -181,7 +195,25 @@ export function parseAgentFault(value: unknown, maxStringBytes?: number): AgentF
   const code = record.code as AgentFaultCode;
   const metadata = AGENT_FAULT_METADATA[code];
   if (record.message !== metadata.message || record.retryable !== metadata.retryable) return undefined;
-  return Object.freeze({ code, message: metadata.message, retryable: metadata.retryable });
+  if (!Object.hasOwn(record, "details")) return createAgentFault(code);
+  if (!isCanonicalStartupDiagnosticDetails(code, record.details)) return undefined;
+  const details = normalizeStartupDiagnosticDetails(code, record.details);
+  if (!hasStartupDiagnosticDetails(details) || !diagnosticDetailsWithinBounds(details, maxStringBytes)) {
+    return undefined;
+  }
+  return createAgentFault(code, details);
+}
+
+/** 从稳定错误码和受限诊断重新生成公开 fault，绝不保留调用方对象。 */
+export function createAgentFault(code: AgentFaultCode, details?: unknown): AgentFault {
+  const metadata = AGENT_FAULT_METADATA[code];
+  const canonicalDetails = normalizeStartupDiagnosticDetails(code, details);
+  return Object.freeze({
+    code,
+    message: metadata.message,
+    retryable: metadata.retryable,
+    ...(hasStartupDiagnosticDetails(canonicalDetails) ? { details: canonicalDetails } : {}),
+  });
 }
 
 export interface AgentContextUsageInput {
@@ -208,6 +240,13 @@ function isWorkingTimeState(state: AgentLifecycleState): boolean {
 
 function boundedString(value: unknown, maxBytes: number | undefined): value is string {
   return typeof value === "string" && (maxBytes === undefined || UTF8_ENCODER.encode(value).byteLength <= maxBytes);
+}
+
+function diagnosticDetailsWithinBounds(
+  details: StartupDiagnosticDetails,
+  maxStringBytes: number | undefined,
+): boolean {
+  return Object.values(details).every((value) => boundedString(value, maxStringBytes));
 }
 
 function positiveSafeInteger(value: unknown): boolean {

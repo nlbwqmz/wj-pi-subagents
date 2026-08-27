@@ -6,6 +6,7 @@ import {
   AGENT_FAULT_CODES,
   AGENT_FAULT_METADATA,
   DEFAULT_AGENT_ACTIVITY,
+  createAgentFault,
   isCanonicalAgentUuid,
   parseAgentActivitySummary,
   parseAgentSnapshot,
@@ -17,6 +18,13 @@ import {
   type AgentSnapshot,
   type AgentTerminationResult,
 } from "./agent-snapshot-codec.ts";
+import {
+  EMPTY_STARTUP_DIAGNOSTIC_DETAILS,
+  hasStartupDiagnosticDetails,
+  isCanonicalStartupDiagnosticDetails,
+  normalizeStartupDiagnosticDetails,
+  type StartupDiagnosticDetails,
+} from "./startup-diagnostic.ts";
 
 type InternalAgentLifecycleState = AgentLifecycleState;
 
@@ -49,6 +57,9 @@ export const PUBLIC_ERROR_CODES = Object.freeze([
   "max_tree_agents_reached",
   "spawn_failed",
   "spawn_timeout",
+  "provider_unavailable",
+  "model_unavailable",
+  "extension_load_failed",
   "agent_unavailable",
   "message_delivery_failed",
   "compaction_active",
@@ -59,11 +70,13 @@ export const PUBLIC_ERROR_CODES = Object.freeze([
 
 export type PublicErrorCode = (typeof PUBLIC_ERROR_CODES)[number];
 
+export type PublicErrorDetails = StartupDiagnosticDetails;
+
 export interface PublicControlError {
   readonly code: PublicErrorCode;
   readonly message: string;
   readonly retryable: boolean;
-  readonly details: Readonly<Record<string, never>>;
+  readonly details: PublicErrorDetails;
 }
 
 export interface ControlSuccess<T> {
@@ -78,7 +91,7 @@ export interface ControlFailure {
 
 export type ControlResult<T> = ControlSuccess<T> | ControlFailure;
 
-const EMPTY_DETAILS: Readonly<Record<string, never>> = Object.freeze({});
+const EMPTY_DETAILS: PublicErrorDetails = EMPTY_STARTUP_DIAGNOSTIC_DETAILS;
 
 const ERROR_METADATA: Readonly<Record<PublicErrorCode, Readonly<{
   message: string;
@@ -97,6 +110,9 @@ const ERROR_METADATA: Readonly<Record<PublicErrorCode, Readonly<{
   max_tree_agents_reached: Object.freeze({ message: "Agent tree limit reached", retryable: true }),
   spawn_failed: AGENT_FAULT_METADATA.spawn_failed,
   spawn_timeout: AGENT_FAULT_METADATA.spawn_timeout,
+  provider_unavailable: AGENT_FAULT_METADATA.provider_unavailable,
+  model_unavailable: AGENT_FAULT_METADATA.model_unavailable,
+  extension_load_failed: AGENT_FAULT_METADATA.extension_load_failed,
   agent_unavailable: Object.freeze({ message: "Subagent currently unavailable", retryable: false }),
   message_delivery_failed: AGENT_FAULT_METADATA.message_delivery_failed,
   compaction_active: Object.freeze({
@@ -109,7 +125,7 @@ const ERROR_METADATA: Readonly<Record<PublicErrorCode, Readonly<{
 });
 
 /** 所有公开失败均从此处创建，避免把路径、异常或句柄带出控制器。 */
-export function controlFailure(code: PublicErrorCode): ControlFailure {
+export function controlFailure(code: PublicErrorCode, details: unknown = EMPTY_DETAILS): ControlFailure {
   const metadata = ERROR_METADATA[code];
   return Object.freeze({
     ok: false,
@@ -117,7 +133,7 @@ export function controlFailure(code: PublicErrorCode): ControlFailure {
       code,
       message: metadata.message,
       retryable: metadata.retryable,
-      details: EMPTY_DETAILS,
+      details: normalizeStartupDiagnosticDetails(code, details),
     }),
   });
 }
@@ -244,6 +260,8 @@ interface EventGeneration {
 
 interface FailureEvent extends EventGeneration {
   readonly error_code?: AgentFaultCode;
+  /** 仅可与对应启动错误码组合的规范、冻结诊断。 */
+  readonly error_details?: StartupDiagnosticDetails;
 }
 
 /** 来自 Pi ExtensionContext 的安全上下文用量投影。 */
@@ -339,6 +357,8 @@ interface ResolvedActor {
 interface PublicMutation {
   readonly state?: InternalAgentLifecycleState;
   readonly errorCode?: AgentFaultCode;
+  /** errorCode 指定时重新规范化；未指定时不得改变既有故障详情。 */
+  readonly errorDetails?: StartupDiagnosticDetails;
   readonly clearError?: boolean;
   /** undefined 表示保持，null 表示清除。 */
   readonly activity?: AgentActivitySummary | null;
@@ -372,42 +392,55 @@ function isAgentFaultCode(value: unknown): value is AgentFaultCode {
   return typeof value === "string" && (AGENT_FAULT_CODES as readonly string[]).includes(value);
 }
 
+/** 生命周期入口不接受原型字段、访问器或符号字段，避免绕过 details 闭集。 */
+function plainLifecycleEventRecord(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return undefined;
+  const record = value as Record<string, unknown>;
+  for (const key of Reflect.ownKeys(record)) {
+    if (typeof key !== "string") return undefined;
+    const descriptor = Object.getOwnPropertyDescriptor(record, key);
+    if (descriptor === undefined || descriptor.enumerable !== true || !("value" in descriptor)) return undefined;
+  }
+  return record;
+}
+
 function isLifecycleEvent(value: unknown): value is AgentLifecycleEvent {
-  if (typeof value !== "object" || value === null) return false;
-  const candidate = value as Record<string, unknown>;
-  const type = candidate.type;
-  if (typeof type !== "string") return false;
-  const supported = [
-    "startup_ready",
-    "startup_failed",
-    "agent_start",
-    "agent_settled",
-    "interrupt_accepted",
-    "terminate_accepted",
-    "runtime_failed",
-    "resources_confirmed",
-  ];
-  if (!supported.includes(type)) return false;
-  const allowsErrorCode = type === "startup_failed" || type === "runtime_failed";
-  if (Object.keys(candidate).some((key) =>
-    !["type", "expected_generation", ...(allowsErrorCode ? ["error_code"] : [])].includes(key)
-  )) return false;
-  if (
-    !("expected_generation" in candidate) ||
-    !Number.isSafeInteger(candidate.expected_generation) ||
-    (candidate.expected_generation as number) < 0
-  ) {
+  try {
+    const candidate = plainLifecycleEventRecord(value);
+    if (candidate === undefined || !Object.hasOwn(candidate, "type")) return false;
+    const type = candidate.type;
+    if (typeof type !== "string" || !(AGENT_LIFECYCLE_EVENT_TYPES as readonly string[]).includes(type)) {
+      return false;
+    }
+    const failureEvent = type === "startup_failed" || type === "runtime_failed";
+    const allowedKeys = [
+      "type",
+      "expected_generation",
+      ...(failureEvent ? ["error_code", "error_details"] : []),
+    ];
+    if (Object.keys(candidate).some((key) => !allowedKeys.includes(key))) return false;
+    if (
+      !Object.hasOwn(candidate, "expected_generation")
+      || !Number.isSafeInteger(candidate.expected_generation)
+      || (candidate.expected_generation as number) < 0
+    ) return false;
+    if (!failureEvent) return true;
+    if (
+      Object.hasOwn(candidate, "error_code")
+      && candidate.error_code !== undefined
+      && !isAgentFaultCode(candidate.error_code)
+    ) return false;
+    if (!Object.hasOwn(candidate, "error_details")) return true;
+    if (!isAgentFaultCode(candidate.error_code)) return false;
+    if (!isCanonicalStartupDiagnosticDetails(candidate.error_code, candidate.error_details)) return false;
+    return hasStartupDiagnosticDetails(
+      normalizeStartupDiagnosticDetails(candidate.error_code, candidate.error_details),
+    );
+  } catch {
     return false;
   }
-  if (
-    "error_code" in candidate &&
-    candidate.error_code !== undefined &&
-    !isAgentFaultCode(candidate.error_code)
-  ) {
-    return false;
-  }
-  if (!allowsErrorCode && candidate.error_code !== undefined) return false;
-  return true;
 }
 
 function validReserveInput(value: unknown): value is ReserveStartingChildInput {
@@ -451,7 +484,7 @@ function isAdoptSpawnGrantInput(value: unknown): value is AdoptSpawnGrantInput {
 }
 
 function cloneAgentFault(fault: AgentFault | undefined): AgentFault | undefined {
-  return fault === undefined ? undefined : Object.freeze({ ...fault });
+  return fault === undefined ? undefined : createAgentFault(fault.code, fault.details);
 }
 
 function snapshotHadTerminationFailure(node: AgentSnapshot): boolean {
@@ -895,18 +928,30 @@ export class TreeController {
         break;
       case "startup_failed":
         if (record.state === "starting") {
-          applied = this.failStartingNode(record, eventFaultCode(event, "spawn_failed"));
+          applied = this.failStartingNode(
+            record,
+            eventFaultCode(event, "spawn_failed"),
+            event.error_details,
+          );
         }
         break;
       case "runtime_failed":
         if (record.state === "starting") {
-          applied = this.failStartingNode(record, eventFaultCode(event, "spawn_failed"));
+          applied = this.failStartingNode(
+            record,
+            eventFaultCode(event, "spawn_failed"),
+            event.error_details,
+          );
         } else if (
           record.state === "idle"
           || record.state === "working"
           || record.state === "interrupting"
         ) {
-          applied = this.failRuntimeAndOrphans(record, eventFaultCode(event, "spawn_failed"));
+          applied = this.failRuntimeAndOrphans(
+            record,
+            eventFaultCode(event, "spawn_failed"),
+            event.error_details,
+          );
         }
         break;
       case "resources_confirmed":
@@ -1171,7 +1216,7 @@ export class TreeController {
           contextWindowTokens: node.context_window_tokens,
           contextUsagePercent: node.context_usage_percent,
           activity: activityForState(node.state, node.activity),
-          error: node.error,
+          error: cloneAgentFault(node.error),
           terminationResult: node.termination_result,
           terminationHadFailure: snapshotHadTerminationFailure(node),
           terminationHadIncompleteCleanup: snapshotHadIncompleteCleanup(node),
@@ -1496,7 +1541,11 @@ export class TreeController {
     });
   }
 
-  private failRuntimeAndOrphans(record: AgentRecord, errorCode: AgentFaultCode): boolean {
+  private failRuntimeAndOrphans(
+    record: AgentRecord,
+    errorCode: AgentFaultCode,
+    errorDetails?: StartupDiagnosticDetails,
+  ): boolean {
     const descendants = this.collectSubtree(record.agentId)
       .filter((candidate) => candidate.agentId !== record.agentId && candidate.state !== "terminated");
     const members = [record, ...this.orderDescendantsFirst(descendants)];
@@ -1504,6 +1553,7 @@ export class TreeController {
       ? {
           state: "failed",
           errorCode,
+          ...(errorDetails === undefined ? {} : { errorDetails }),
         }
       : {
           state: "terminating",
@@ -1520,10 +1570,15 @@ export class TreeController {
   }
 
   /** 启动残骸先留存失败事实，再在同一顺序域建立不可逆清理屏障。 */
-  private failStartingNode(record: AgentRecord, errorCode: AgentFaultCode): boolean {
+  private failStartingNode(
+    record: AgentRecord,
+    errorCode: AgentFaultCode,
+    errorDetails?: StartupDiagnosticDetails,
+  ): boolean {
     const failedApplied = this.mutate(record, {
       state: "failed",
       errorCode,
+      ...(errorDetails === undefined ? {} : { errorDetails }),
     });
     if (!this.terminationBarriers.has(record.agentId)) {
       const members = this.orderDescendantsFirst(this.collectSubtree(record.agentId));
@@ -1575,9 +1630,10 @@ export class TreeController {
       : mutation.contextUsagePercent === undefined
         ? record.contextUsagePercent
         : mutation.contextUsagePercent === null ? undefined : mutation.contextUsagePercent;
-    const nextErrorCode = mutation.errorCode === undefined
-      ? (mutation.clearError === true ? undefined : record.error?.code)
-      : mutation.errorCode;
+    const nextError = mutation.errorCode === undefined
+      ? (mutation.clearError === true ? undefined : record.error)
+      : this.createFault(mutation.errorCode, mutation.errorDetails);
+    const nextErrorCode = nextError?.code;
     const requestedActivity = mutation.activity === undefined
       ? record.activity
       : mutation.activity === null
@@ -1589,14 +1645,11 @@ export class TreeController {
     const nextActivity = activityForState(nextState, requestedActivity);
     const contextChanged = nextContextWindowTokens !== record.contextWindowTokens
       || nextContextUsagePercent !== record.contextUsagePercent;
-    const errorChanged = nextErrorCode !== record.error?.code;
+    const errorChanged = JSON.stringify(nextError) !== JSON.stringify(record.error);
     const activityChanged = JSON.stringify(nextActivity) !== JSON.stringify(record.activity);
     if (!stateChanged && !contextChanged && !errorChanged && !activityChanged) return false;
 
     const workingElapsedAtMutation = this.workingElapsedValue(record, monotonicAt);
-    const nextError = mutation.errorCode === undefined
-      ? (mutation.clearError === true ? undefined : record.error)
-      : this.createFault(mutation.errorCode);
     record.state = nextState;
     record.contextWindowTokens = nextContextWindowTokens;
     record.contextUsagePercent = nextContextUsagePercent;
@@ -1655,13 +1708,8 @@ export class TreeController {
     }
   }
 
-  private createFault(code: AgentFaultCode): AgentFault {
-    const metadata = ERROR_METADATA[code];
-    return Object.freeze({
-      code,
-      message: metadata.message,
-      retryable: metadata.retryable,
-    });
+  private createFault(code: AgentFaultCode, details?: StartupDiagnosticDetails): AgentFault {
+    return createAgentFault(code, details);
   }
 
   private safeMonotonicNow(): number {
@@ -1718,7 +1766,7 @@ export class TreeController {
       ? withActivity
       : { ...withActivity, termination_result: record.terminationResult };
     if (record.error === undefined) return Object.freeze(withTerminationResult);
-    return Object.freeze({ ...withTerminationResult, error: record.error });
+    return Object.freeze({ ...withTerminationResult, error: cloneAgentFault(record.error)! });
   }
 
   private outcome(

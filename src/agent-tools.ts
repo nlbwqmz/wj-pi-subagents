@@ -56,14 +56,15 @@ export class SubagentToolError extends Error {
     readonly code: string;
     readonly message: string;
     readonly retryable: boolean;
-    readonly details?: Readonly<Record<string, never>>;
+    readonly details?: unknown;
   }) {
-    // 工具边界只信任 code；message、retryable 和 details 始终重新生成。
+    // 工具边界只信任 code 与对应白名单 details；其余字段始终重新生成。
     const code = (PUBLIC_ERROR_CODES as readonly string[]).includes(error.code)
       ? error.code
       : "internal_error";
     const canonical = controlFailure(
       code as PublicErrorCode,
+      error.details,
     ).error;
     super(JSON.stringify({
       ok: false,

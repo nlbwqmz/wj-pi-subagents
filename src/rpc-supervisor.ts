@@ -7,6 +7,7 @@ import {
 import type { ChildReplyEnvelope } from "./child-reply-envelope.ts";
 import {
   ManagedRpcCommandRejectedError,
+  ManagedRpcStartupError,
   type ManagedRpcNodeLike,
   type ManagedRpcNodeStartContext,
 } from "./managed-rpc-node.ts";
@@ -23,6 +24,7 @@ import type {
   SupervisorSnapshot,
 } from "./supervisor-channel.ts";
 import type {
+  AgentFaultCode,
   AgentLifecycleEvent,
   AgentLifecycleState,
   AgentActivityPhase,
@@ -30,10 +32,15 @@ import type {
   ControlResult,
   LifecycleEventOutcome,
   PublicErrorCode,
+  PublicErrorDetails,
   ReserveStartingChildInput,
   ReservedAgentOutcome,
   TreeActor,
 } from "./tree-controller.ts";
+import {
+  hasStartupDiagnosticDetails,
+  normalizeStartupDiagnosticDetails,
+} from "./startup-diagnostic.ts";
 import type { SpawnGrant } from "./tree-authority.ts";
 
 export type RpcSupervisorTransportFault = "eof" | "protocol_fault" | "process_exit";
@@ -407,6 +414,7 @@ export type RpcSupervisorStartupResult =
   | {
       readonly ok: false;
       readonly code: PublicErrorCode;
+      readonly details?: PublicErrorDetails;
       readonly agent_id?: string;
       readonly cleanup?: "confirmed" | "incomplete";
     };
@@ -477,9 +485,12 @@ class CapabilityMismatchError extends Error {
 }
 
 class StartupTransportFaultError extends Error {
-  constructor() {
+  readonly fault: RpcSupervisorTransportFault | RpcSupervisorChannelFault;
+
+  constructor(fault: RpcSupervisorTransportFault | RpcSupervisorChannelFault) {
     super("启动期间监督传输故障");
     this.name = "StartupTransportFaultError";
+    this.fault = fault;
   }
 }
 
@@ -553,6 +564,7 @@ export class RpcSupervisor {
   private lifecycleGeneration = 0;
   private lifecycleState: AgentLifecycleState | undefined;
   private startupFault: RpcSupervisorTransportFault | RpcSupervisorChannelFault | undefined;
+  private startupAbortController: AbortController | undefined;
   private readonly startupFaultListeners = new Set<() => void>();
   private startPromise: Promise<RpcSupervisorStartupResult> | undefined;
   private unsubscribeRpcEvent: (() => void) | undefined;
@@ -788,6 +800,7 @@ export class RpcSupervisor {
     this.lifecycleState = reserved.data.node.state;
 
     const abortController = new AbortController();
+    this.startupAbortController = abortController;
     try {
       if (this.channel === undefined) {
         const factory = this.options.channelFactory;
@@ -818,12 +831,25 @@ export class RpcSupervisor {
         state: "idle",
       });
     } catch (error: unknown) {
-      const failureCode = error instanceof StartupTimeoutError
-        ? "spawn_timeout"
-        : error instanceof CapabilityMismatchError
-          ? "capability_mismatch"
-          : "spawn_failed";
-      return this.rollbackStartup(failureCode);
+      const failureCode: AgentFaultCode = this.startupFault !== undefined
+        ? this.startupFault === "protocol_fault"
+          ? "protocol_mismatch"
+          : "spawn_failed"
+        : error instanceof StartupTimeoutError
+          ? "spawn_timeout"
+          : error instanceof CapabilityMismatchError
+            ? "capability_mismatch"
+            : error instanceof ManagedRpcStartupError
+              ? error.code
+              : error instanceof StartupTransportFaultError && error.fault === "protocol_fault"
+                ? "protocol_mismatch"
+                : "spawn_failed";
+      return this.rollbackStartup(
+        failureCode,
+        error instanceof ManagedRpcStartupError ? error.details : undefined,
+      );
+    } finally {
+      if (this.startupAbortController === abortController) this.startupAbortController = undefined;
     }
   }
 
@@ -896,9 +922,11 @@ export class RpcSupervisor {
         cleanup();
         return;
       }
-      unsubscribeStartupFault = this.onStartupFault(() => fail(new StartupTransportFaultError()));
+      unsubscribeStartupFault = this.onStartupFault(() => {
+        fail(new StartupTransportFaultError(this.startupFault ?? "protocol_fault"));
+      });
       if (this.startupFault !== undefined) {
-        fail(new StartupTransportFaultError());
+        fail(new StartupTransportFaultError(this.startupFault));
         return;
       }
       signal.addEventListener("abort", abort, { once: true });
@@ -1264,7 +1292,9 @@ export class RpcSupervisor {
     source: "rpc" | "supervisor",
   ): void {
     if (this.phase === "starting") {
-      this.recordStartupFault(fault);
+      this.recordStartupFault(source === "supervisor" && fault === "protocol_fault"
+        ? "protocol_fault"
+        : fault);
       return;
     }
     if (this.phase !== "ready") return;
@@ -1287,10 +1317,16 @@ export class RpcSupervisor {
       return;
     }
     try {
+      const details = event.error_details === undefined
+        ? undefined
+        : normalizeStartupDiagnosticDetails(event.error_code, event.error_details);
       const lifecycleEvent = Object.freeze({
         type: event.type,
         expected_generation: expectedGeneration,
         ...(event.error_code === undefined ? {} : { error_code: event.error_code }),
+        ...(details === undefined || !hasStartupDiagnosticDetails(details)
+          ? {}
+          : { error_details: details }),
       }) as AgentLifecycleEvent;
       if (event.agent_id === this.agentId && lifecycleEvent.type === "agent_settled") {
         const settlementVersion = this.markLifecycleObservation();
@@ -1345,7 +1381,7 @@ export class RpcSupervisor {
   }
 
   private throwIfStartupFaulted(): void {
-    if (this.startupFault !== undefined) throw new StartupTransportFaultError();
+    if (this.startupFault !== undefined) throw new StartupTransportFaultError(this.startupFault);
   }
 
   private receiveToolStart(event: Record<string, unknown>): void {
@@ -1410,6 +1446,7 @@ export class RpcSupervisor {
 
   private recordStartupFault(fault: RpcSupervisorTransportFault | RpcSupervisorChannelFault): void {
     this.startupFault ??= fault;
+    this.startupAbortController?.abort();
     for (const listener of [...this.startupFaultListeners]) listener();
   }
 
@@ -1596,10 +1633,19 @@ export class RpcSupervisor {
   }
 
   private async rollbackStartup(
-    code: "spawn_failed" | "spawn_timeout" | "capability_mismatch",
+    code: AgentFaultCode,
+    details?: PublicErrorDetails,
   ): Promise<RpcSupervisorStartupResult> {
+    const canonicalDetails = normalizeStartupDiagnosticDetails(code, details);
+    const lifecycleDetails = hasStartupDiagnosticDetails(canonicalDetails)
+      ? canonicalDetails
+      : undefined;
     if (this.agentId !== undefined) {
-      this.applyLifecycle({ type: "startup_failed", error_code: code });
+      this.applyLifecycle({
+        type: "startup_failed",
+        error_code: code,
+        ...(lifecycleDetails === undefined ? {} : { error_details: lifecycleDetails }),
+      });
     }
     this.phase = "terminating";
     const cleanup = await this.cleanupResources(false, true);
@@ -1607,6 +1653,7 @@ export class RpcSupervisor {
       ok: false,
       ...(this.agentId === undefined ? {} : { agent_id: this.agentId }),
       code: cleanup === "confirmed" ? code : "termination_incomplete",
+      ...(cleanup === "confirmed" && lifecycleDetails !== undefined ? { details: lifecycleDetails } : {}),
       cleanup,
     });
   }
@@ -1853,9 +1900,20 @@ export class RpcSupervisor {
     event: LifecycleEventWithoutGeneration,
   ): LifecycleEventOutcome {
     if (this.agentId === undefined) throw new Error("代理尚未预留");
+    const failure = event.type === "startup_failed" || event.type === "runtime_failed"
+      ? event
+      : undefined;
+    const errorCode = failure?.error_code;
+    const details = failure?.error_details === undefined
+      ? undefined
+      : normalizeStartupDiagnosticDetails(errorCode, failure.error_details);
     const normalized = Object.freeze({
-      ...event,
+      type: event.type,
       expected_generation: this.lifecycleGeneration,
+      ...(errorCode === undefined ? {} : { error_code: errorCode }),
+      ...(details === undefined || !hasStartupDiagnosticDetails(details)
+        ? {}
+        : { error_details: details }),
     }) as AgentLifecycleEvent;
     const outcome = this.options.controller.applyLifecycleEvent(this.agentId, normalized);
     if (!outcome.ok) throw new Error("控制器拒绝监督器生命周期事实");

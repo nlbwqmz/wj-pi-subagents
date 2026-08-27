@@ -28,6 +28,10 @@ import {
 import { normalizeRpcBridgeEvent } from "./rpc-bridge-event.ts";
 import { RUNTIME_EPHEMERAL_ENV_KEYS } from "./root-runtime-context.ts";
 import type { SupervisorByteTransport } from "./stream-supervisor-channel.ts";
+import {
+  classifyPiStartupError,
+  type ManagedRpcStartupDiagnostic,
+} from "./startup-diagnostic.ts";
 
 const MAX_FRAME_BYTES = MANAGED_RPC_BRIDGE_MAX_FRAME_BYTES;
 const PROTOCOL = MANAGED_RPC_BRIDGE_PROTOCOL;
@@ -236,6 +240,17 @@ function rejectedResponse(id: number, reason?: ManagedRpcCommandRejectionReason)
     ok: false,
     rejected: true,
     ...(reason === undefined ? {} : { rejection_reason: reason }),
+  });
+}
+
+function startupFailureResponse(id: number, diagnostic: ManagedRpcStartupDiagnostic): void {
+  if (protocolFailed) return;
+  writeFrame({
+    protocol: PROTOCOL,
+    kind: "response",
+    id,
+    ok: false,
+    startup_error: diagnostic,
   });
 }
 
@@ -654,10 +669,15 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
       const connection = supervisorListener?.waitForConnection();
       try {
         await current.start();
-        if (connection !== undefined) bindSupervisorTransport(await connection);
-        // RpcClient.start() 仅确认子进程已经存活；等待一次只读 RPC 响应，
-        // 确保 Pi 已完成资源读取后再删除短生命周期的模板提示文件。
-        if (templatePromptDirectory !== undefined) await current.getState();
+        // RpcClient.start() 只等待一个很短的存活窗口。立即发起只读探针并与
+        // 监督连接并行等待，使 Pi 的确定性早退能够先于外层启动超时结算。
+        const stateProbe = current.getState();
+        if (connection !== undefined) {
+          const [, transport] = await Promise.all([stateProbe, connection]);
+          bindSupervisorTransport(transport);
+        } else {
+          await stateProbe;
+        }
       } finally {
         cleanupTemplatePromptFile();
         clearBridgeSupervisorEnvironment();
@@ -721,17 +741,25 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
       return;
     }
     response(command.id, false);
-  } catch {
+  } catch (error: unknown) {
+    let startupDiagnostic: ManagedRpcStartupDiagnostic | undefined;
     if (command.command === "start") {
+      const rpcOptions = isRecord(config.rpc) ? config.rpc : {};
+      startupDiagnostic = classifyPiStartupError(error, {
+        provider: rpcOptions.provider,
+        model: rpcOptions.model,
+        args: rpcOptions.args,
+      });
       settleStart(false);
       cleanupTemplatePromptFile();
       try {
         await closeLocalSupervisor();
       } catch {
-        // 启动失败仍只返回固定桥接失败，不泄露本地端点。
+        // 启动失败只返回脱敏诊断，不泄露本地端点或底层异常。
       }
     }
-    response(command.id, false);
+    if (startupDiagnostic === undefined) response(command.id, false);
+    else startupFailureResponse(command.id, startupDiagnostic);
   }
 }
 

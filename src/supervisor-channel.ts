@@ -11,6 +11,12 @@ import {
 } from "./reply-acceptance.ts";
 import { REPLY_MAX_TEXT_BYTES } from "./child-reply-limits.ts";
 import {
+  hasStartupDiagnosticDetails,
+  isCanonicalStartupDiagnosticDetails,
+  normalizeStartupDiagnosticDetails,
+  type StartupDiagnosticDetails,
+} from "./startup-diagnostic.ts";
+import {
   AGENT_FAULT_CODES,
   AGENT_LIFECYCLE_EVENT_TYPES,
   AGENT_LIFECYCLE_STATES,
@@ -25,7 +31,7 @@ import {
 } from "./tree-controller.ts";
 
 /** 父子监督通道与 Pi 任务 RPC 完全隔离的固定协议版本。 */
-export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/15";
+export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/17";
 
 export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "hello",
@@ -212,6 +218,8 @@ export interface SupervisorEvent {
   readonly type: AgentLifecycleEventType;
   readonly expected_generation?: number;
   readonly error_code?: AgentFault["code"];
+  /** 失败生命周期事件的严格、可复制诊断闭集。 */
+  readonly error_details?: StartupDiagnosticDetails;
 }
 
 export type SupervisorChannelState =
@@ -705,17 +713,18 @@ function parsePublicControlError(value: unknown, limits: SupervisorChannelLimits
     typeof error.retryable !== "boolean"
   ) frameError("invalid_frame");
   const details = asPlainJsonRecord(error.details);
-  if (Object.keys(details).length !== 0) frameError("invalid_frame");
   const code = error.code as PublicErrorCode;
-  const canonical = controlFailure(code).error;
-  // 只接受当前协议的规范字段；不兼容旧描述或伪造 retryable，语义仍由 code 识别。
+  const canonical = controlFailure(code, details).error;
+  const canonicalDetails = canonical.details as Readonly<Record<string, unknown>>;
+  const detailKeys = Object.keys(details);
+  const canonicalDetailKeys = Object.keys(canonicalDetails);
+  if (
+    detailKeys.length !== canonicalDetailKeys.length
+    || detailKeys.some((key) => details[key] !== canonicalDetails[key])
+  ) frameError("invalid_frame");
+  // 只接受当前协议的规范字段；不兼容旧描述、伪造 retryable 或越界诊断字段。
   if (error.message !== canonical.message || error.retryable !== canonical.retryable) frameError("invalid_frame");
-  return Object.freeze({
-    code,
-    message: canonical.message,
-    retryable: canonical.retryable,
-    details: Object.freeze({}),
-  });
+  return canonical;
 }
 
 function parseControlResponse(value: unknown, limits: SupervisorChannelLimits): SupervisorControlResponse {
@@ -1428,6 +1437,7 @@ export class SupervisorChannel {
       type: candidate.type,
       ...(candidate.expected_generation === undefined ? {} : { expected_generation: candidate.expected_generation }),
       ...(candidate.error_code === undefined ? {} : { error_code: candidate.error_code }),
+      ...(candidate.error_details === undefined ? {} : { error_details: candidate.error_details }),
     };
     this.parseEventPayload(payload);
     return this.createFrame("event", payload);
@@ -1863,20 +1873,41 @@ export class SupervisorChannel {
       || (payload.expected_generation as number) < 0
     ) frameError("invalid_frame");
     if (!this.eventAgentIsInScope(payload.agent_id as string)) frameError("identity_mismatch");
-    if (Object.keys(payload).some((key) => !["root_id", "agent_id", "type", "expected_generation", "error_code"].includes(key))) {
-      frameError("invalid_frame");
+    const type = payload.type as AgentLifecycleEventType;
+    const failureEvent = type === "startup_failed" || type === "runtime_failed";
+    const allowedKeys = [
+      "root_id",
+      "agent_id",
+      "type",
+      "expected_generation",
+      ...(failureEvent ? ["error_code", "error_details"] : []),
+    ];
+    if (Object.keys(payload).some((key) => !allowedKeys.includes(key))) frameError("invalid_frame");
+    if (
+      hasOwn(payload, "error_code")
+      && (payload.error_code === undefined || !(AGENT_FAULT_CODES as readonly string[]).includes(payload.error_code as string))
+    ) frameError("invalid_frame");
+    const hasDetails = hasOwn(payload, "error_details");
+    if (hasDetails) {
+      if (
+        !isCanonicalStartupDiagnosticDetails(payload.error_code, payload.error_details)
+        || !hasStartupDiagnosticDetails(
+          normalizeStartupDiagnosticDetails(payload.error_code, payload.error_details),
+        )
+      ) frameError("invalid_frame");
     }
-    if (payload.error_code !== undefined && !(AGENT_FAULT_CODES as readonly string[]).includes(payload.error_code as string)) {
-      frameError("invalid_frame");
-    }
+    const details = hasDetails
+      ? normalizeStartupDiagnosticDetails(payload.error_code, payload.error_details)
+      : undefined;
     return Object.freeze({
       root_id: this.rootId,
       agent_id: payload.agent_id as string,
-      type: payload.type as AgentLifecycleEventType,
+      type,
       expected_generation: payload.expected_generation as number,
       ...(payload.error_code === undefined
         ? {}
         : { error_code: payload.error_code as AgentFault["code"] }),
+      ...(details === undefined ? {} : { error_details: details }),
     });
   }
 
