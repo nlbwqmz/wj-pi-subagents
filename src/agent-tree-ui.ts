@@ -37,6 +37,13 @@ interface AgentTreePanelTheme {
 interface PanelRow {
   readonly key: string;
   readonly text: string;
+  readonly terminal: boolean;
+}
+
+interface PanelRenderedLine {
+  readonly text: string;
+  readonly terminal: boolean;
+  readonly selected: boolean;
 }
 
 interface BranchAggregate {
@@ -110,10 +117,11 @@ const WORKING_SPINNER_INTERVAL_MS = 80;
 const INITIAL_WORKING_SPINNER_FRAME = WORKING_SPINNER_FRAMES[0] ?? "⠋";
 const DEFAULT_PANEL_VIEWPORT_HEIGHT = 12;
 const AGENT_TREE_OVERLAY_OPTIONS = Object.freeze({
-  width: 120,
+  width: 160,
   anchor: "center" as const,
   margin: 1,
 });
+const RENDER_PANEL_LINES = Symbol("renderPanelLines");
 
 export type AgentTreePanelInputOutcome = "changed" | "ignored" | "close";
 export type AgentTreePanelUpdateOutcome = "changed" | "ignored" | "close" | "error";
@@ -465,21 +473,29 @@ export class AgentTreePanelModel {
   }
 
   render(width: number): readonly string[] {
-    if (this.status === "error") return Object.freeze([
-      truncateToDisplayWidth("Agent tree", width),
-      truncateToDisplayWidth("Agent tree temporarily unavailable", width),
-      truncateToDisplayWidth("Esc close", width),
-    ]);
+    return Object.freeze(this[RENDER_PANEL_LINES](width).map((line) => line.text));
+  }
+
+  [RENDER_PANEL_LINES](width: number): readonly PanelRenderedLine[] {
+    if (this.status === "error") {
+      return Object.freeze(errorPanelLines(width).map(neutralPanelLine));
+    }
     const rows = this.buildRows();
     this.clampSelection(rows.length);
     const visible = rows.slice(this.scrollOffset, this.scrollOffset + this.viewportHeight);
     return Object.freeze([
-      truncateToDisplayWidth(`Agent tree · revision ${this.snapshot.tree_revision}`, width),
-      ...visible.map((row, index) => truncateToDisplayWidth(
-        `${this.scrollOffset + index === this.selectedIndex ? "› " : "  "}${row.text}`,
-        width,
-      )),
-      truncateToDisplayWidth("↑↓ scroll · ←→ fold · Esc close", width),
+      neutralPanelLine(
+        truncateToDisplayWidth(`Agent tree · revision ${this.snapshot.tree_revision}`, width),
+      ),
+      ...visible.map((row, index) => Object.freeze({
+        text: truncateToDisplayWidth(
+          `${this.scrollOffset + index === this.selectedIndex ? "› " : "  "}${row.text}`,
+          width,
+        ),
+        terminal: row.terminal,
+        selected: this.scrollOffset + index === this.selectedIndex,
+      })),
+      neutralPanelLine(truncateToDisplayWidth("↑↓ scroll · ←→ fold · Esc close", width)),
     ]);
   }
 
@@ -586,6 +602,7 @@ export class AgentTreePanelModel {
       rows.push(Object.freeze({
         key: node.agent_id,
         text: `${"  ".repeat(level)}${marker} ${formatAgentFacts(node, true)}${aggregate}`,
+        terminal: node.state === "terminated" || node.state === "failed",
       }));
       if (expanded) for (const child of children) append(child, level + 1);
     };
@@ -696,7 +713,7 @@ export class AgentTreePanelModel {
   }
 }
 
-type AgentTreePanelLineStyle = "header" | "body" | "selected" | "error" | "footer";
+type AgentTreePanelLineStyle = "header" | "body" | "terminal" | "selected" | "error" | "footer";
 
 /** 将纯树投影包装成完整主题表面，避免 overlay 内部继续透出底层会话内容。 */
 export function renderAgentTreePanelSurface(
@@ -709,23 +726,31 @@ export function renderAgentTreePanelSurface(
   const framed = panelWidth >= 6;
   const contentWidth = framed ? panelWidth - 4 : panelWidth;
   const semanticLines = model === undefined
-    ? errorPanelLines(contentWidth)
-    : [...model.render(contentWidth)];
+    ? errorPanelLines(contentWidth).map(neutralPanelLine)
+    : model[RENDER_PANEL_LINES](contentWidth);
   const state = model?.getPublicState();
   const isError = model === undefined || state?.status === "error";
   const bodyHeight = model?.getViewportHeight() ?? DEFAULT_PANEL_VIEWPORT_HEIGHT;
   const body = semanticLines.slice(1, -1).slice(0, bodyHeight);
-  while (body.length < bodyHeight) body.push("");
+  while (body.length < bodyHeight) body.push(neutralPanelLine(""));
   const header = formatPanelHeader(isError ? undefined : state?.tree_revision, contentWidth);
-  const footer = semanticLines.at(-1) ?? "";
+  const footer = semanticLines.at(-1)?.text ?? "";
+  const bodyStyle = (line: PanelRenderedLine): AgentTreePanelLineStyle =>
+    isError && line.text.length > 0
+      ? "error"
+      : line.selected
+        ? "selected"
+        : line.terminal
+          ? "terminal"
+          : "body";
 
   if (!framed) {
     return Object.freeze([
       renderNarrowPanelLine(header, panelWidth, "header", theme),
       ...body.map((line) => renderNarrowPanelLine(
-        line,
+        line.text,
         panelWidth,
-        isError && line.length > 0 ? "error" : line.startsWith("› ") ? "selected" : "body",
+        bodyStyle(line),
         theme,
       )),
       renderNarrowPanelLine(footer, panelWidth, "footer", theme),
@@ -737,15 +762,19 @@ export function renderAgentTreePanelSurface(
     renderFramedPanelLine(header, contentWidth, "header", theme),
     renderPanelRule(panelWidth, "divider", theme),
     ...body.map((line) => renderFramedPanelLine(
-      line,
+      line.text,
       contentWidth,
-      isError && line.length > 0 ? "error" : line.startsWith("› ") ? "selected" : "body",
+      bodyStyle(line),
       theme,
     )),
     renderPanelRule(panelWidth, "divider", theme),
     renderFramedPanelLine(footer, contentWidth, "footer", theme),
     renderPanelRule(panelWidth, "bottom", theme),
   ]);
+}
+
+function neutralPanelLine(text: string): PanelRenderedLine {
+  return Object.freeze({ text, terminal: false, selected: false });
 }
 
 function formatPanelHeader(revision: number | undefined, width: number): string {
@@ -807,6 +836,7 @@ function stylePanelText(value: string, style: AgentTreePanelLineStyle, theme: un
     case "error":
       return themeFg(theme, "error", value);
     case "footer":
+    case "terminal":
       return themeFg(theme, "dim", value);
     case "body":
       return themeFg(theme, "customMessageText", value);
