@@ -337,6 +337,44 @@ test("interrupting 必须等待真实 agent_settled，idle 不会误报 starting
   }
 });
 
+test("压缩阻塞不建立中断屏障，后续重试成功才进入 interrupting", async () => {
+  const fake = new FakeSupervisor();
+  const { controller, tree } = makeController(fake);
+  const spawned = await controller.spawnAgent({ template_id: "demo", name: "压缩中断测试" });
+  assert.equal(spawned.ok, true, JSON.stringify(spawned));
+
+  fake.emitLifecycle({ type: "agent_start", expected_generation: generation(tree) });
+  fake.interruptResult = {
+    ok: true,
+    accepted: true,
+    changed: false,
+    blocked_reason: "compaction_active",
+  };
+  const blocked = await controller.interruptAgent(AGENT_ID);
+  assert.deepEqual(blocked, {
+    ok: true,
+    data: {
+      agent_id: AGENT_ID,
+      accepted: true,
+      changed: false,
+      state: "working",
+      blocked_reason: "compaction_active",
+    },
+  });
+  const working = controller.getAgentStatus(AGENT_ID);
+  assert.equal(working.ok, true);
+  if (working.ok) assert.equal(working.data.state, "working");
+
+  fake.interruptResult = { ok: true, accepted: true, changed: true };
+  const interrupted = await controller.interruptAgent(AGENT_ID);
+  assert.equal(interrupted.ok, true);
+  if (interrupted.ok) {
+    assert.equal(interrupted.data.changed, true);
+    assert.equal(interrupted.data.state, "interrupting");
+    assert.equal(interrupted.data.blocked_reason, undefined);
+  }
+});
+
 test("父端接纳事件可以在 settled 后登记，terminate 建立不可逆屏障并产生 terminal", async () => {
   const fake = new FakeSupervisor();
   const { controller, tree } = makeController(fake);

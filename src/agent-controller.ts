@@ -559,13 +559,16 @@ export class AgentController {
       return controlFailure("agent_unavailable");
     }
     if (!result.ok) return controlFailure(result.code);
-    // 控制接纳先建立 interrupting 屏障；回到 idle 只能由后续真实 agent_settled 事实触发。
-    const generation = this.tree.getLifecycleGeneration(target.data.agent_id);
-    if (generation.ok && current.data.state === "working") {
-      this.tree.applyLifecycleEvent(target.data.agent_id, {
-        type: "interrupt_accepted",
-        expected_generation: generation.data,
-      });
+    // 只有实际改变监督器状态的接纳才建立 interrupting 屏障；回到 idle
+    // 只能由后续真实 agent_settled 事实触发。
+    if (result.changed && result.blocked_reason === undefined) {
+      const generation = this.tree.getLifecycleGeneration(target.data.agent_id);
+      if (generation.ok && current.data.state === "working") {
+        this.tree.applyLifecycleEvent(target.data.agent_id, {
+          type: "interrupt_accepted",
+          expected_generation: generation.data,
+        });
+      }
     }
     const latest = this.tree.getStatus(target.data.agent_id);
     if (!latest.ok) return controlFailure("agent_not_found");
