@@ -669,12 +669,21 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
       const connection = supervisorListener?.waitForConnection();
       try {
         await current.start();
-        // RpcClient.start() 只等待一个很短的存活窗口。立即发起只读探针并与
-        // 监督连接并行等待，使 Pi 的确定性早退能够先于外层启动超时结算。
+        // RpcClient.start() 只等待一个很短的存活窗口。状态探针与监督连接
+        // 竞速：探针若先失败可立即分类；连接若先建立必须立即绑定 transport，
+        // 否则正常子端的 getState() 会等待监督 ready，形成循环等待。
         const stateProbe = current.getState();
         if (connection !== undefined) {
-          const [, transport] = await Promise.all([stateProbe, connection]);
-          bindSupervisorTransport(transport);
+          const first = await Promise.race([
+            connection.then((transport) => Object.freeze({ kind: "connection" as const, transport })),
+            stateProbe.then(() => Object.freeze({ kind: "state" as const })),
+          ]);
+          if (first.kind === "connection") {
+            bindSupervisorTransport(first.transport);
+            await stateProbe;
+          } else {
+            bindSupervisorTransport(await connection);
+          }
         } else {
           await stateProbe;
         }

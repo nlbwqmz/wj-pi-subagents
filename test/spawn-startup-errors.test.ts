@@ -7,8 +7,11 @@ import {
   MANAGED_RPC_BRIDGE_CREDENTIAL_ENV,
   ManagedRpcBridgeClient,
   ManagedRpcStartupError,
+  type ManagedRpcNodeLike,
+  type ManagedRpcNodeStartContext,
   type ManagedRpcStartupDiagnostic,
 } from "../src/managed-rpc-node.ts";
+import { ManagedRpcSupervisorChannel } from "../src/managed-rpc-supervisor-channel.ts";
 import {
   RpcSupervisor,
   type RpcSupervisorChannel,
@@ -20,7 +23,11 @@ import {
   ROOT_TREE_ACTOR,
   TreeController,
 } from "../src/tree-controller.ts";
-import type { SupervisorReply } from "../src/supervisor-channel.ts";
+import {
+  SupervisorRequestIdRegistry,
+  type SupervisorReply,
+} from "../src/supervisor-channel.ts";
+import { RUNTIME_INTERNAL_ENV_KEYS } from "../src/root-runtime-context.ts";
 import {
   classifyPiStartupError,
   extensionDiagnosticLabelFromSource,
@@ -29,7 +36,9 @@ import { parseAgentSnapshot } from "../src/agent-snapshot-codec.ts";
 import { SubagentToolError } from "../src/agent-tools.ts";
 
 const BRIDGE_CREDENTIAL = "startup-diagnostic-test-credential-0001";
+const SUPERVISOR_CREDENTIAL = "startup-supervisor-test-credential-0001";
 const AGENT_ID = "550e8400-e29b-41d4-a716-446655440000";
+const ROOT_ID = "startup-diagnostic-root";
 
 class StartupFailureNode extends FakeManagedRpcNode {
   override async start(): Promise<void> {
@@ -105,6 +114,59 @@ function startBridge(model: string, args: readonly string[] = []): {
   return { process: bridge, client };
 }
 
+function startSupervisedBridge(): {
+  readonly process: ChildProcessWithoutNullStreams;
+  readonly client: ManagedRpcBridgeClient;
+  readonly context: ManagedRpcNodeStartContext;
+} {
+  const bridge = spawn(process.execPath, [
+    "--experimental-strip-types",
+    fileURLToPath(new URL("../src/rpc-bridge-process.ts", import.meta.url)),
+  ], {
+    cwd: fileURLToPath(new URL("..", import.meta.url)),
+    env: {
+      ...process.env,
+      [MANAGED_RPC_BRIDGE_CREDENTIAL_ENV]: BRIDGE_CREDENTIAL,
+      [RUNTIME_INTERNAL_ENV_KEYS.rootId]: ROOT_ID,
+      [RUNTIME_INTERNAL_ENV_KEYS.parentAgentId]: "",
+      [RUNTIME_INTERNAL_ENV_KEYS.agentId]: AGENT_ID,
+      [RUNTIME_INTERNAL_ENV_KEYS.depth]: "1",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const client = new ManagedRpcBridgeClient({
+    stdin: bridge.stdin,
+    stdout: bridge.stdout,
+    stderr: bridge.stderr,
+  }, {
+    credential: BRIDGE_CREDENTIAL,
+    rpcOptions: {
+      piModulePath: new URL("./helpers/fake-pi-rpc-client.mjs", import.meta.url).href,
+    },
+  });
+  const context: ManagedRpcNodeStartContext = Object.freeze({
+    supervisor: Object.freeze({
+      root_id: ROOT_ID,
+      local_agent_id: AGENT_ID,
+      peer_agent_id: "",
+      parent_agent_id: null,
+      depth: 1,
+      credential: SUPERVISOR_CREDENTIAL,
+      initial_snapshot: Object.freeze([Object.freeze({
+        agent_id: AGENT_ID,
+        parent_agent_id: null,
+        template_id: "researcher",
+        name: "生产桥接 fake 子端点",
+        depth: 1,
+        state: "starting" as const,
+        revision: 1,
+      })]),
+      initial_subtree_revision: 1,
+    }),
+  });
+  return { process: bridge, client, context };
+}
+
 async function closeBridge(
   bridge: ChildProcessWithoutNullStreams,
   client: ManagedRpcBridgeClient,
@@ -119,6 +181,36 @@ async function closeBridge(
     if (bridge.exitCode === null) bridge.kill();
   }
 }
+
+test("正常子端的状态探针不会与监督握手互相等待", async () => {
+  const { process: bridge, client, context } = startSupervisedBridge();
+  const channel = new ManagedRpcSupervisorChannel({
+    node: client as unknown as ManagedRpcNodeLike,
+    rootId: ROOT_ID,
+    localAgentId: null,
+    peerAgentId: AGENT_ID,
+    parentAgentId: null,
+    depth: 1,
+    credential: SUPERVISOR_CREDENTIAL,
+    requestIdRegistry: new SupervisorRequestIdRegistry(),
+  });
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), 1_000);
+  try {
+    await channel.bind(abort.signal);
+    await Promise.all([
+      client.start(abort.signal, context),
+      channel.waitForReady(abort.signal),
+    ]);
+    assert.equal(channel.isReady(), true);
+    const state = await client.getState() as { readonly supervisor?: { readonly state?: string } };
+    assert.equal(state.supervisor?.state, "ready");
+  } finally {
+    clearTimeout(timer);
+    await channel.release().catch(() => {});
+    await closeBridge(bridge, client);
+  }
+});
 
 test("未知 provider 在 bridge 启动阶段立即返回安全诊断", async () => {
   const { process: bridge, client } = startBridge("provider-failure");
