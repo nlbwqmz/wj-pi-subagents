@@ -194,8 +194,16 @@ test("所有非终态节点继续使用普通正文主题", () => {
   }
 });
 
-test("选中的终态节点保持高对比，移开后整行恢复弱化主题", () => {
+test("选中只叠加背景并保留节点原有文字颜色", () => {
   const panel = new AgentTreePanelModel(treeSnapshot(), { viewport_height: 8 });
+  const initiallySelectedSurface = renderAgentTreePanelSurface(panel, 120, MARKER_THEME);
+  const initiallySelectedLine = initiallySelectedSurface.find((line) => line.includes("parent"));
+
+  assert.match(
+    initiallySelectedLine ?? "",
+    /<bg:selectedBg>.*<fg:customMessageText>.*parent.*<\/fg:customMessageText>/,
+  );
+  assert.doesNotMatch(initiallySelectedLine ?? "", /<bold>|<fg:text>|<fg:dim>/);
 
   assert.equal(panel.handleInput("\x1b[B"), "changed");
   assert.equal(panel.handleInput("\x1b[B"), "changed");
@@ -204,9 +212,12 @@ test("选中的终态节点保持高对比，移开后整行恢复弱化主题",
   const selectedSurface = renderAgentTreePanelSurface(panel, 120, MARKER_THEME);
   const selectedLine = selectedSurface.find((line) => line.includes("terminated-parent"));
 
-  assert.match(selectedLine ?? "", /<bg:selectedBg>.*<fg:text><bold>.*terminated-parent/);
+  assert.match(
+    selectedLine ?? "",
+    /<bg:selectedBg>.*<fg:dim>.*terminated-parent.*<\/fg:dim>/,
+  );
   assert.match(selectedLine ?? "", /descendants 1 · working 0 · failed 0 · terminated 1/);
-  assert.doesNotMatch(selectedLine ?? "", /<fg:dim>/);
+  assert.doesNotMatch(selectedLine ?? "", /<bold>|<fg:text>|<fg:customMessageText>/);
 
   assert.equal(panel.handleInput("\x1b[A"), "changed");
   const restoredSurface = renderAgentTreePanelSurface(panel, 120, MARKER_THEME);
@@ -219,7 +230,7 @@ test("选中的终态节点保持高对比，移开后整行恢复弱化主题",
   assert.doesNotMatch(restoredLine ?? "", /<bg:selectedBg>/);
 });
 
-test("极窄宽度下选中的终态节点仍保持高对比主题", () => {
+test("极窄宽度下选中的终态节点仍保留弱化文字", () => {
   const snapshot: ScopedAgentTreeSnapshot = Object.freeze({
     tree_revision: 9,
     scope: Object.freeze({ kind: "root" as const }),
@@ -231,8 +242,8 @@ test("极窄宽度下选中的终态节点仍保持高对比主题", () => {
 
   for (const width of [1, 2]) {
     const selectedLine = renderAgentTreePanelSurface(panel, width, MARKER_THEME)[1];
-    assert.match(selectedLine ?? "", /<bg:selectedBg><fg:text><bold>/);
-    assert.doesNotMatch(selectedLine ?? "", /<fg:dim>/);
+    assert.match(selectedLine ?? "", /<bg:selectedBg><fg:dim>/);
+    assert.doesNotMatch(selectedLine ?? "", /<bold>|<fg:text>|<fg:customMessageText>/);
   }
 });
 

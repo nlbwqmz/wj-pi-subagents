@@ -713,7 +713,7 @@ export class AgentTreePanelModel {
   }
 }
 
-type AgentTreePanelLineStyle = "header" | "body" | "terminal" | "selected" | "error" | "footer";
+type AgentTreePanelLineStyle = "header" | "body" | "terminal" | "error" | "footer";
 
 /** 将纯树投影包装成完整主题表面，避免 overlay 内部继续透出底层会话内容。 */
 export function renderAgentTreePanelSurface(
@@ -738,37 +738,37 @@ export function renderAgentTreePanelSurface(
   const bodyStyle = (line: PanelRenderedLine): AgentTreePanelLineStyle =>
     isError && line.text.length > 0
       ? "error"
-      : line.selected
-        ? "selected"
-        : line.terminal
-          ? "terminal"
-          : "body";
+      : line.terminal
+        ? "terminal"
+        : "body";
 
   if (!framed) {
     return Object.freeze([
-      renderNarrowPanelLine(header, panelWidth, "header", theme),
+      renderNarrowPanelLine(header, panelWidth, "header", false, theme),
       ...body.map((line) => renderNarrowPanelLine(
         line.text,
         panelWidth,
         bodyStyle(line),
+        line.selected,
         theme,
       )),
-      renderNarrowPanelLine(footer, panelWidth, "footer", theme),
+      renderNarrowPanelLine(footer, panelWidth, "footer", false, theme),
     ]);
   }
 
   return Object.freeze([
     renderPanelRule(panelWidth, "top", theme),
-    renderFramedPanelLine(header, contentWidth, "header", theme),
+    renderFramedPanelLine(header, contentWidth, "header", false, theme),
     renderPanelRule(panelWidth, "divider", theme),
     ...body.map((line) => renderFramedPanelLine(
       line.text,
       contentWidth,
       bodyStyle(line),
+      line.selected,
       theme,
     )),
     renderPanelRule(panelWidth, "divider", theme),
-    renderFramedPanelLine(footer, contentWidth, "footer", theme),
+    renderFramedPanelLine(footer, contentWidth, "footer", false, theme),
     renderPanelRule(panelWidth, "bottom", theme),
   ]);
 }
@@ -805,24 +805,26 @@ function renderFramedPanelLine(
   value: string,
   contentWidth: number,
   style: AgentTreePanelLineStyle,
+  selected: boolean,
   theme: unknown,
 ): string {
   const padded = padToDisplayWidth(value, contentWidth);
-  const borderColor = style === "header" || style === "selected" ? "borderAccent" : "border";
+  const borderColor = style === "header" || selected ? "borderAccent" : "border";
   const line = `${themeFg(theme, borderColor, "┃")} ${stylePanelText(padded, style, theme)} ${themeFg(theme, borderColor, "┃")}`;
-  return themeBg(theme, style === "selected" ? "selectedBg" : "customMessageBg", line);
+  return themeBg(theme, selected ? "selectedBg" : "customMessageBg", line);
 }
 
 function renderNarrowPanelLine(
   value: string,
   width: number,
   style: AgentTreePanelLineStyle,
+  selected: boolean,
   theme: unknown,
 ): string {
   const padded = padToDisplayWidth(value, width);
   return themeBg(
     theme,
-    style === "selected" ? "selectedBg" : "customMessageBg",
+    selected ? "selectedBg" : "customMessageBg",
     stylePanelText(padded, style, theme),
   );
 }
@@ -831,15 +833,13 @@ function stylePanelText(value: string, style: AgentTreePanelLineStyle, theme: un
   switch (style) {
     case "header":
       return themeFg(theme, "accent", themeBold(theme, value));
-    case "selected":
-      return themeFg(theme, "text", themeBold(theme, value));
+    case "body":
+      return themeFg(theme, "customMessageText", value);
     case "error":
       return themeFg(theme, "error", value);
     case "footer":
     case "terminal":
       return themeFg(theme, "dim", value);
-    case "body":
-      return themeFg(theme, "customMessageText", value);
   }
 }
 
