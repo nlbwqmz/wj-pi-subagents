@@ -81,6 +81,7 @@ import {
   ROOT_TREE_ACTOR,
   TreeController,
   isCanonicalUuid,
+  type AppliedLifecycleFact,
   type AgentSnapshot,
   type ControlResult,
   type TreeActor,
@@ -212,7 +213,7 @@ interface ActiveRuntime {
 interface ChildUpstreamControl {
   readonly channel: StreamSupervisorChannel;
   readonly client: SupervisorControlClient;
-  readonly publisher: SubtreePublisher<AgentSnapshot>;
+  readonly publisher: SubtreePublisher<AgentSnapshot, AppliedLifecycleFact>;
 }
 
 interface RuntimeBindings {
@@ -1218,7 +1219,7 @@ export function createWjPiSubagentsRuntimeActivator(
         }
         const client = new SupervisorControlClient(channel);
         authority = new RemoteTreeAuthorityPort(bootstrap.agentId, client);
-        const publisher = new SubtreePublisher<AgentSnapshot>({
+        const publisher = new SubtreePublisher<AgentSnapshot, AppliedLifecycleFact>({
           read: () => {
             const current = tree.getSupervisionSubtreeSnapshot(actor);
             if (!current.ok) throw new Error("子树投影不可用");
@@ -1228,6 +1229,7 @@ export function createWjPiSubagentsRuntimeActivator(
             });
           },
           onChange: (listener) => tree.onChange(listener),
+          onLifecycleEvent: (listener) => tree.onLifecycleEvent(listener),
         }, channel);
         upstream = Object.freeze({ channel, client, publisher });
       }
@@ -1308,6 +1310,7 @@ export function createWjPiSubagentsRuntimeActivator(
         onTerminal: (agentId) => state.replyInbox.acceptTerminal(agentId),
         replyNotificationsHandledByInbox: true,
         authority,
+        ...(upstream === undefined ? {} : { flushUpstreamLifecycle: () => upstream.publisher.flush() }),
       });
       state.controller = controller;
       state.createSupervisor = createSupervisor;

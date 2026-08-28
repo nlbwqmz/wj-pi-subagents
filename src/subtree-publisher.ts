@@ -7,14 +7,18 @@ export interface SubtreeSnapshot<TNode> {
 }
 
 /** 完整子树发布器所需的最小只读数据源。 */
-export interface SubtreeSnapshotSource<TNode> {
+export interface SubtreeSnapshotSource<TNode, TEvent = never> {
   read(): SubtreeSnapshot<TNode>;
   onChange(listener: () => void): () => void;
+  /** 可选的已应用生命周期事实观察；只读、按产生顺序交付。 */
+  onLifecycleEvent?(listener: (event: TEvent) => void): () => void;
 }
 
 /** 完整子树发布器所需的最小异步写入端。 */
-export interface SubtreeSnapshotSink<TNode> {
+export interface SubtreeSnapshotSink<TNode, TEvent = never> {
   publishSnapshot(nodes: readonly TNode[], revision: number): Promise<void>;
+  /** 与快照共用同一写入流的生命周期事实写入。 */
+  publishEvent?(event: TEvent): Promise<void>;
 }
 
 type PublisherState = "idle" | "running" | "closing" | "closed";
@@ -85,24 +89,29 @@ function assertRevision(revision: number, acceptedRevision: number | undefined):
 }
 
 /**
- * 把易变的完整子树事实合并到单写入流。
+ * 把易变的完整子树事实合并到单写入流，并保留生命周期事实的 FIFO。
  *
- * 发布器不保存事件队列：写入期间的任意数量变化都只设置一个 dirty 位，
- * 当前写入结束后重新读取一次最新完整快照。
+ * 快照可以合并为最新值；生命周期事实处于运行态时按 FIFO 发布。每次事实
+ * 成功写入后才从队首移除，失败会保留原事实供下一次 flush 重试。
  */
-export class SubtreePublisher<TNode> {
-  private readonly source: SubtreeSnapshotSource<TNode>;
-  private readonly sink: SubtreeSnapshotSink<TNode>;
+export class SubtreePublisher<TNode, TEvent = never> {
+  private readonly source: SubtreeSnapshotSource<TNode, TEvent>;
+  private readonly sink: SubtreeSnapshotSink<TNode, TEvent>;
   private state: PublisherState = "idle";
   private unsubscribe: (() => void) | undefined;
+  private unsubscribeLifecycle: (() => void) | undefined;
   private inFlight: Promise<void> | undefined;
   private closeOperation: Promise<void> | undefined;
   private dirty = false;
+  private readonly pendingLifecycleEvents: TEvent[] = [];
   private acceptedRevision: number | undefined;
   private lastPublishedNodes: readonly TNode[] | undefined;
   private pendingFailure: PendingFailure | undefined;
 
-  constructor(source: SubtreeSnapshotSource<TNode>, sink: SubtreeSnapshotSink<TNode>) {
+  constructor(
+    source: SubtreeSnapshotSource<TNode, TEvent>,
+    sink: SubtreeSnapshotSink<TNode, TEvent>,
+  ) {
     this.source = source;
     this.sink = sink;
   }
@@ -124,13 +133,28 @@ export class SubtreePublisher<TNode> {
     }
     this.state = "running";
     this.dirty = true;
+    let unsubscribe: (() => void) | undefined;
+    let unsubscribeLifecycle: (() => void) | undefined;
     try {
-      const unsubscribe = this.source.onChange(this.handleSourceChange);
+      unsubscribe = this.source.onChange(this.handleSourceChange);
       if (typeof unsubscribe !== "function") {
         throw new TypeError("子树数据源必须返回退订函数");
       }
+      const onLifecycleEvent = this.source.onLifecycleEvent;
+      if (onLifecycleEvent !== undefined) {
+        if (typeof this.sink.publishEvent !== "function") {
+          throw new TypeError("生命周期事实写入端不可用");
+        }
+        unsubscribeLifecycle = onLifecycleEvent.call(this.source, this.handleLifecycleEvent);
+        if (typeof unsubscribeLifecycle !== "function") {
+          throw new TypeError("生命周期事实数据源必须返回退订函数");
+        }
+      }
       this.unsubscribe = unsubscribe;
+      this.unsubscribeLifecycle = unsubscribeLifecycle;
     } catch (error) {
+      try { unsubscribeLifecycle?.(); } catch { /* 保持原始启动错误。 */ }
+      try { unsubscribe?.(); } catch { /* 保持原始启动错误。 */ }
       this.state = "idle";
       this.dirty = false;
       return Promise.reject(error);
@@ -169,14 +193,25 @@ export class SubtreePublisher<TNode> {
     if (this.state === "closed") return Promise.resolve();
 
     this.state = "closing";
-    let unsubscribeFailure: PendingFailure | undefined;
     const unsubscribe = this.unsubscribe;
+    const unsubscribeLifecycle = this.unsubscribeLifecycle;
     this.unsubscribe = undefined;
+    this.unsubscribeLifecycle = undefined;
+    let unsubscribeFailure: PendingFailure | undefined;
     if (unsubscribe !== undefined) {
       try {
         unsubscribe();
       } catch (error) {
         unsubscribeFailure = { error };
+      }
+    }
+    if (unsubscribeLifecycle !== undefined) {
+      try {
+        unsubscribeLifecycle();
+      } catch (error) {
+        unsubscribeFailure = unsubscribeFailure === undefined
+          ? { error }
+          : { error: new AggregateError([unsubscribeFailure.error, error], "子树发布器退订失败") };
       }
     }
 
@@ -191,6 +226,12 @@ export class SubtreePublisher<TNode> {
     this.launchBackgroundDrain();
   };
 
+  private readonly handleLifecycleEvent = (event: TEvent): void => {
+    if (this.state !== "running") return;
+    this.pendingLifecycleEvents.push(event);
+    this.launchBackgroundDrain();
+  };
+
   private launchBackgroundDrain(): void {
     const operation = this.ensureDrain();
     void operation.catch(() => {
@@ -200,7 +241,9 @@ export class SubtreePublisher<TNode> {
 
   private ensureDrain(): Promise<void> {
     if (this.inFlight !== undefined) return this.inFlight;
-    if (this.state !== "running" || !this.dirty) return Promise.resolve();
+    if (this.state !== "running" || (!this.dirty && this.pendingLifecycleEvents.length === 0)) {
+      return Promise.resolve();
+    }
 
     this.pendingFailure = undefined;
     let succeeded = false;
@@ -212,20 +255,41 @@ export class SubtreePublisher<TNode> {
     tracked = running.finally(() => {
       if (this.inFlight !== tracked) return;
       this.inFlight = undefined;
-      // 覆盖 drain 结束与 Promise 清理之间到达的变化，不为失败做无界自动重试。
-      if (succeeded && this.state === "running" && this.dirty) this.launchBackgroundDrain();
+      // 覆盖 drain 结束与 Promise 清理之间到达的事实或变化，不为失败做无界自动重试。
+      if (
+        succeeded
+        && this.state === "running"
+        && (this.dirty || this.pendingLifecycleEvents.length > 0)
+      ) this.launchBackgroundDrain();
     });
     this.inFlight = tracked;
     return tracked;
   }
 
   private async drain(): Promise<void> {
-    while (this.state === "running" && this.dirty) {
-      this.dirty = false;
+    while (
+      this.state === "running"
+      && (this.pendingLifecycleEvents.length > 0 || this.dirty)
+    ) {
+      let snapshotAttempted = false;
       try {
-        await this.publishLatest();
+        while (this.pendingLifecycleEvents.length > 0) {
+          const publishEvent = this.sink.publishEvent;
+          if (typeof publishEvent !== "function") {
+            throw new TypeError("生命周期事实写入端不可用");
+          }
+          const event = this.pendingLifecycleEvents[0]!;
+          await publishEvent.call(this.sink, event);
+          this.pendingLifecycleEvents.shift();
+        }
+        if (this.dirty) {
+          this.dirty = false;
+          snapshotAttempted = true;
+          await this.publishLatest();
+        }
       } catch (error) {
-        this.dirty = true;
+        // 事件只在成功后出队；快照失败则保留 dirty 供显式重试。
+        if (snapshotAttempted) this.dirty = true;
         this.pendingFailure = { error };
         throw error;
       }
@@ -270,6 +334,7 @@ export class SubtreePublisher<TNode> {
     }
 
     this.dirty = false;
+    this.pendingLifecycleEvents.length = 0;
     this.pendingFailure = undefined;
     this.state = "closed";
 

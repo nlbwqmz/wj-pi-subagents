@@ -298,6 +298,8 @@ export type RpcSupervisorFaultCode =
 export type RpcSupervisorEvent =
   | {
       readonly kind: "lifecycle";
+      /** 真实生命周期事实所属节点；旧测试替身可省略，运行时事件始终携带。 */
+      readonly agent_id?: string;
       readonly event: AgentLifecycleEvent;
     }
   | {
@@ -1356,7 +1358,11 @@ export class RpcSupervisor {
           }
         }
       }
-      this.emitEvent(Object.freeze({ kind: "lifecycle", event: lifecycleEvent }));
+      this.emitEvent(Object.freeze({
+        kind: "lifecycle",
+        agent_id: event.agent_id,
+        event: lifecycleEvent,
+      }));
     } catch {
       this.receiveTransportFault("protocol_fault", "supervisor");
     }
@@ -1921,7 +1927,11 @@ export class RpcSupervisor {
     this.lifecycleState = outcome.data.node.state;
     if (outcome.data.applied) {
       this.markLifecycleObservation(event.type === "agent_start" ? "agent_start" : undefined);
-      this.emitEvent(Object.freeze({ kind: "lifecycle", event: normalized }));
+      this.emitEvent(Object.freeze({
+        kind: "lifecycle",
+        agent_id: this.agentId,
+        event: normalized,
+      }));
     }
     return outcome.data;
   }

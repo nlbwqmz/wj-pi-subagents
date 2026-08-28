@@ -297,6 +297,11 @@ export type AgentLifecycleEvent = {
   readonly [Type in AgentLifecycleEventType]: LifecycleEventShape<Type> & { readonly type: Type };
 }[AgentLifecycleEventType];
 
+/** 树控制器已经实际应用的一条生命周期事实；观察者只能读取该冻结投影。 */
+export type AppliedLifecycleFact = AgentLifecycleEvent & {
+  readonly agent_id: string;
+};
+
 export interface TreeControllerOptions {
   readonly config: Pick<
     RuntimeConfig,
@@ -509,9 +514,6 @@ function sameSnapshot(
 ): boolean {
   const currentFault = record.error;
   const nextFault = node.error;
-  const workingMatches = node.working_elapsed_ms === undefined
-    || Math.max(0, Math.round(record.accumulatedWorkingElapsedMs)) === node.working_elapsed_ms
-    || isWorkingTimeState(record.state);
   const contextMatches = node.context_window_tokens === undefined
     || (
       record.contextWindowTokens === node.context_window_tokens
@@ -524,8 +526,8 @@ function sameSnapshot(
     && record.depth === node.depth
     && record.state === node.state
     && record.revision === node.revision
-    && record.createdAt === node.created_at
-    && workingMatches
+    // created_at 与 working_elapsed_ms 由各运行时本地时钟派生；同一事实
+    // 在根和子运行时独立应用时可以不同，不能据此否定同修订投影。
     && contextMatches
     && JSON.stringify(record.activity) === JSON.stringify(node.activity)
     && JSON.stringify(currentFault) === JSON.stringify(nextFault)
@@ -593,6 +595,7 @@ export class TreeController {
   private readonly terminationBarriers = new Map<string, TerminationBarrierRecord>();
   private readonly subtreeRevisions = new Map<string, number>();
   private readonly changeListeners = new Set<() => void>();
+  private readonly lifecycleListeners = new Set<(fact: AppliedLifecycleFact) => void>();
   private treeRevision = 0;
 
   constructor(options: TreeControllerOptions) {
@@ -649,6 +652,12 @@ export class TreeController {
   onChange(listener: () => void): () => void {
     this.changeListeners.add(listener);
     return () => this.changeListeners.delete(listener);
+  }
+
+  /** 只观察真正应用的生命周期事实；迟到、重复和非法事实不会回调。 */
+  onLifecycleEvent(listener: (fact: AppliedLifecycleFact) => void): () => void {
+    this.lifecycleListeners.add(listener);
+    return () => this.lifecycleListeners.delete(listener);
   }
 
   /** 返回节点当前生命周期代际，供受管监督事件构造安全事件。 */
@@ -963,11 +972,13 @@ export class TreeController {
         }
         break;
     }
-    return controlSuccess(this.outcome(
+    const outcome = this.outcome(
       record,
       applied,
       applied ? undefined : "invalid_transition",
-    ));
+    );
+    if (applied) this.notifyLifecycleFact(record.agentId, event);
+    return controlSuccess(outcome);
   }
 
   /** 更新当前子代理的 Pi 上下文窗口事实；undefined 清除当前可用度量。 */
@@ -1696,6 +1707,33 @@ export class TreeController {
 
   private isTerminationBarrierMember(agentId: string): boolean {
     return [...this.terminationBarriers.values()].some((barrier) => barrier.memberIds.includes(agentId));
+  }
+
+  private notifyLifecycleFact(
+    agentId: string,
+    event: AgentLifecycleEvent,
+  ): void {
+    const errorCode = "error_code" in event ? event.error_code : undefined;
+    const errorDetails = "error_details" in event ? event.error_details : undefined;
+    const details = errorDetails === undefined
+      ? undefined
+      : normalizeStartupDiagnosticDetails(errorCode, errorDetails);
+    const fact = Object.freeze({
+      agent_id: agentId,
+      type: event.type,
+      expected_generation: event.expected_generation,
+      ...(errorCode === undefined ? {} : { error_code: errorCode }),
+      ...(details === undefined || !hasStartupDiagnosticDetails(details)
+        ? {}
+        : { error_details: details }),
+    }) as AppliedLifecycleFact;
+    for (const listener of this.lifecycleListeners) {
+      try {
+        listener(fact);
+      } catch {
+        // 事实观察者异常不能改变已经完成的生命周期裁决。
+      }
+    }
   }
 
   private notifyChange(): void {

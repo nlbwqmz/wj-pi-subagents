@@ -96,6 +96,8 @@ export interface AgentControllerOptions {
   ) => void;
   /** 节点故障通知必须在 terminal waiter 解除前同步进入父会话；false 表示稍后重试。 */
   readonly onTerminal?: (agentId: string) => boolean | void;
+  /** 故障后代已由受管监督器回收、根权威 confirm 前刷新本地上行生命周期事实。 */
+  readonly flushUpstreamLifecycle?: () => Promise<void>;
   /** 生产 inbox 已在消息接纳点登记 reply；避免监督事件再次登记同一通知。 */
   readonly replyNotificationsHandledByInbox?: boolean;
   /** 生产运行时必须提供根权威端口；省略仅保留旧单节点测试 seam。 */
@@ -191,6 +193,7 @@ export class AgentController {
   private readonly waitTimeoutMs: number;
   private readonly onReply: AgentControllerOptions["onReply"];
   private readonly onTerminal: AgentControllerOptions["onTerminal"];
+  private readonly flushUpstreamLifecycle: AgentControllerOptions["flushUpstreamLifecycle"];
   private readonly replyNotificationsHandledByInbox: boolean;
   private readonly authority: TreeAuthorityPort | undefined;
   private readonly agents = new Map<string, ManagedAgentEntry>();
@@ -226,6 +229,7 @@ export class AgentController {
     this.waitTimeoutMs = options.waitTimeoutMs ?? WAIT_AGENT_DEFAULT_TIMEOUT_MS;
     this.onReply = options.onReply;
     this.onTerminal = options.onTerminal;
+    this.flushUpstreamLifecycle = options.flushUpstreamLifecycle;
     this.replyNotificationsHandledByInbox = options.replyNotificationsHandledByInbox === true;
     this.authority = options.authority;
     if (!validWaitTimeout(this.waitTimeoutMs)) throw new TypeError("默认等待期限无效");
@@ -925,6 +929,16 @@ export class AgentController {
   }
 
   private handleSupervisorEvent(agentId: string | undefined, event: RpcSupervisorEvent): void {
+    // 生命周期事实的真实 agent_id 优先于“该监督器所属的直接子”；后代事实
+    // 可以更新共享树，但不能被错误投影成直接子的会话通知或清理动作。
+    const lifecycleAgentId = event.kind === "lifecycle"
+      ? event.agent_id ?? agentId
+      : agentId;
+    const directLifecycleAgentId = lifecycleAgentId !== undefined
+      && this.directChild(lifecycleAgentId).ok
+      ? lifecycleAgentId
+      : undefined;
+
     if (event.kind === "reply" && this.onReply !== undefined && agentId !== undefined) {
       try {
         this.onReply(agentId, event.reply);
@@ -953,19 +967,19 @@ export class AgentController {
       this.tree.updateActivity(agentId, event.activity);
     }
     // activity 阶段属于安全树快照；工具正文、名称和参数仍只留在监督器本地。
-    const lifecycleApplied = agentId !== undefined
+    const lifecycleApplied = directLifecycleAgentId !== undefined
       && event.kind === "lifecycle"
-      && this.wasLifecycleEventApplied(agentId, event.event);
+      && this.wasLifecycleEventApplied(directLifecycleAgentId, event.event);
     let runtimeFailedAgentId: string | undefined;
     if (
-      agentId !== undefined
+      directLifecycleAgentId !== undefined
       && (
         event.kind === "fault"
         || (lifecycleApplied && event.kind === "lifecycle" && event.event.type === "runtime_failed")
       )
     ) {
-      const status = this.tree.getStatus(agentId);
-      if (status.ok && status.data.state === "failed") runtimeFailedAgentId = agentId;
+      const status = this.tree.getStatus(directLifecycleAgentId);
+      if (status.ok && status.data.state === "failed") runtimeFailedAgentId = directLifecycleAgentId;
     }
     if (
       runtimeFailedAgentId !== undefined
@@ -977,25 +991,25 @@ export class AgentController {
     }
     if (runtimeFailedAgentId !== undefined) this.startOrphanTermination(runtimeFailedAgentId);
     if (
-      agentId !== undefined
+      directLifecycleAgentId !== undefined
       && lifecycleApplied
       && event.kind === "lifecycle"
       && event.event.type === "resources_confirmed"
     ) {
-      this.notifySessionEvent(agentId, "terminal");
-      this.releaseTerminatedSupervisor(agentId);
+      this.notifySessionEvent(directLifecycleAgentId, "terminal");
+      this.releaseTerminatedSupervisor(directLifecycleAgentId);
     }
     if (
-      agentId !== undefined
+      directLifecycleAgentId !== undefined
       && lifecycleApplied
       && event.kind === "lifecycle"
       && event.event.type === "agent_settled"
     ) {
-      this.notifySessionEvent(agentId, "idle");
+      this.notifySessionEvent(directLifecycleAgentId, "idle");
     }
     // 先登记真实生命周期事件，再用稳定状态兜底；否则 tree.onChange 可能
     // 在事件登记前把同一事实当成 idle/terminal 快照并留下重复通知。
-    if (agentId !== undefined) this.resolveWaiters(agentId);
+    if (directLifecycleAgentId !== undefined) this.resolveWaiters(directLifecycleAgentId);
     this.resolveAllReadyWaiters();
   }
 
@@ -1043,6 +1057,15 @@ export class AgentController {
       return;
     }
     if (this.authority !== undefined) {
+      if (this.flushUpstreamLifecycle !== undefined) {
+        try {
+          await this.flushUpstreamLifecycle();
+        } catch {
+          // 上行事实未确认前不能提交根资源确认；后续终止可重试该边界。
+          this.tree.markTerminationBarrierIncomplete(agentId, true);
+          return;
+        }
+      }
       const rootConfirmation = await this.authority.confirmResources(this.actor, agentId);
       if (!rootConfirmation.ok) {
         this.tree.markTerminationBarrierIncomplete(agentId, true);

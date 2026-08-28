@@ -170,6 +170,58 @@ test("发布失败由 flush 返回并保留 dirty，下一次 flush 重试同一
   await publisher.close();
 });
 
+test("生命周期事实按 FIFO 先于快照写入，失败保留队首并可重试", async () => {
+  const changeListeners = new Set<() => void>();
+  const lifecycleListeners = new Set<(event: string) => void>();
+  let currentRevision = 1;
+  const source: SubtreeSnapshotSource<TestNode, string> = {
+    read: () => ({ nodes: [node("a", currentRevision === 1 ? "一" : "二")], subtreeRevision: currentRevision }),
+    onChange: (listener) => {
+      changeListeners.add(listener);
+      return () => changeListeners.delete(listener);
+    },
+    onLifecycleEvent: (listener) => {
+      lifecycleListeners.add(listener);
+      return () => lifecycleListeners.delete(listener);
+    },
+  };
+  const writes: string[] = [];
+  let failFirstEvent = true;
+  const sink: SubtreeSnapshotSink<TestNode, string> = {
+    async publishEvent(event) {
+      writes.push(`event:${event}`);
+      if (event === "first" && failFirstEvent) {
+        failFirstEvent = false;
+        throw new Error("模拟事实写入失败");
+      }
+    },
+    async publishSnapshot(_nodes, revision) {
+      writes.push(`snapshot:${revision}`);
+    },
+  };
+  const publisher = new SubtreePublisher(source, sink);
+  await publisher.start();
+
+  currentRevision = 2;
+  for (const listener of [...changeListeners]) listener();
+  for (const event of ["first", "second"] as const) {
+    for (const listener of [...lifecycleListeners]) listener(event);
+  }
+  await settle();
+  await assert.rejects(publisher.flush(), /模拟事实写入失败/);
+  assert.deepEqual(writes, ["snapshot:1", "event:first"]);
+
+  await publisher.flush();
+  assert.deepEqual(writes, [
+    "snapshot:1",
+    "event:first",
+    "event:first",
+    "event:second",
+    "snapshot:2",
+  ]);
+  await publisher.close();
+});
+
 test("close 立即退订并等待在途写入，随后不再启动 dirty 发布", async () => {
   const source = new FakeSource([node("a", "一")], 1);
   const secondWrite = deferred<void>();
