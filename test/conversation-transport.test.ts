@@ -143,6 +143,9 @@ function pair(
   onReply: (reply: SupervisorReply) => ReplyDeliveryDecision,
   replyAcceptanceTimeoutMs = 200,
   initialState: "starting" | "idle" = "idle",
+  createParent?: (
+    options: ConstructorParameters<typeof StreamSupervisorChannel>[0],
+  ) => StreamSupervisorChannel,
 ): {
   readonly parent: StreamSupervisorChannel;
   readonly child: StreamSupervisorChannel;
@@ -158,7 +161,7 @@ function pair(
     stdout: parentToChild,
   };
   const requestIdRegistry = new SupervisorRequestIdRegistry();
-  const parent = new StreamSupervisorChannel({
+  const parentOptions: ConstructorParameters<typeof StreamSupervisorChannel>[0] = {
     role: "parent",
     rootId: ROOT_ID,
     localAgentId: null,
@@ -169,7 +172,8 @@ function pair(
     requestIdRegistry,
     transport: transportForParent,
     onReply,
-  });
+  };
+  const parent = createParent?.(parentOptions) ?? new StreamSupervisorChannel(parentOptions);
   const child = new StreamSupervisorChannel({
     role: "child",
     rootId: ROOT_ID,
@@ -195,6 +199,39 @@ async function readyChannels(channels: ReturnType<typeof pair>): Promise<void> {
     channels.parent.waitForReady(signal),
     channels.child.waitForReady(signal),
   ]);
+}
+
+interface TestSignal {
+  readonly promise: Promise<void>;
+  resolve(): void;
+}
+
+function testSignal(): TestSignal {
+  let resolve!: () => void;
+  const promise = new Promise<void>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+class FirstCompactionAckBlockingChannel extends StreamSupervisorChannel {
+  readonly firstResponseStarted = testSignal();
+  readonly firstResponseFinished = testSignal();
+  readonly allowFirstResponse = testSignal();
+  private responseCount = 0;
+
+  override async respondCompactionCompleted(
+    response: Parameters<StreamSupervisorChannel["respondCompactionCompleted"]>[0],
+  ): Promise<void> {
+    this.responseCount += 1;
+    const first = this.responseCount === 1;
+    if (first) {
+      this.firstResponseStarted.resolve();
+      await this.allowFirstResponse.promise;
+    }
+    await super.respondCompactionCompleted(response);
+    if (first) this.firstResponseFinished.resolve();
+  }
 }
 
 test("真实 Pi 手动压缩事件与监督 ACK 并发时保留协调授权", async () => {
@@ -580,4 +617,417 @@ test("监督 wire 仅传输规范且独立复制的启动失败详情", () => {
       source: "https://user:TOP_SECRET@example.test/private?token=TOP_SECRET",
     },
   } as unknown as Parameters<typeof child.publishEvent>[0]));
+});
+
+test("自动压缩声明续跑时不把后继 agent_start 前的间隙结算为 idle", async () => {
+  const channels = pair(() => true, 200, "idle");
+  const rpc = new FakeRpcClient({
+    state: { isStreaming: false, isCompacting: false, pendingMessageCount: 0 },
+  });
+  const node = new TestManagedRpcNode(rpc);
+  const tree = new TreeController({
+    config: {
+      maxDepth: 2,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 8,
+      waitTimeoutMs: 1_000,
+    },
+    idFactory: () => CHILD_ID,
+  });
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "流式子代理" },
+    managedNode: node,
+    channel: channels.parent,
+    startupTimeoutMs: 1_000,
+    gracefulShutdownMs: 1_000,
+  });
+  const signal = new AbortController().signal;
+  try {
+    const startup = supervisor.start();
+    await channels.child.bind(signal);
+    assert.equal((await startup).ok, true);
+    await channels.child.waitForReady(signal);
+
+    rpc.setState({ isStreaming: true, isCompacting: false, pendingMessageCount: 0 });
+    emitPiEvent(rpc, { type: "agent_start" });
+    emitPiEvent(rpc, { type: "compaction_start", reason: "threshold" });
+
+    // Pi 在 compaction_end 后才开始 continue()；此时 get_state 可能短暂静止。
+    rpc.setState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+    emitPiEvent(rpc, {
+      type: "compaction_end",
+      reason: "threshold",
+      aborted: false,
+      willRetry: true,
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const status = tree.getStatus(CHILD_ID);
+    assert.equal(status.ok, true);
+    if (status.ok) assert.equal(status.data.state, "working");
+  } finally {
+    await channels.parent.release();
+    await channels.child.release();
+  }
+});
+
+test("协调压缩声明后继回合时不在完成 ACK 间隙结算 idle", async () => {
+  const channels = pair(() => true, 200, "idle");
+  const rpc = new FakeRpcClient({
+    state: { isStreaming: false, isCompacting: false, pendingMessageCount: 0 },
+  });
+  const tree = new TreeController({
+    config: {
+      maxDepth: 2,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 8,
+      waitTimeoutMs: 1_000,
+    },
+    idFactory: () => CHILD_ID,
+  });
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "流式子代理" },
+    managedNode: new TestManagedRpcNode(rpc),
+    channel: channels.parent,
+    startupTimeoutMs: 1_000,
+    gracefulShutdownMs: 1_000,
+    onCompactionPrepare: () => true,
+    onCompactionComplete: () => true,
+  });
+  const signal = new AbortController().signal;
+  try {
+    const startup = supervisor.start();
+    await channels.child.bind(signal);
+    assert.equal((await startup).ok, true);
+    await channels.child.waitForReady(signal);
+
+    const transactionId = "continuation-compaction";
+    assert.equal(await channels.child.requestCompactionPrepare(transactionId), true);
+    rpc.setState({ isStreaming: true, isCompacting: false, pendingMessageCount: 0 });
+    emitPiEvent(rpc, { type: "agent_start" });
+    emitPiEvent(rpc, { type: "compaction_start", reason: "manual" });
+    rpc.setState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+    emitPiEvent(rpc, {
+      type: "compaction_end",
+      reason: "manual",
+      aborted: false,
+      willRetry: false,
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(
+      await channels.child.requestCompactionComplete(
+        transactionId,
+        "succeeded",
+        undefined,
+        true,
+      ),
+      true,
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const status = tree.getStatus(CHILD_ID);
+    assert.equal(status.ok, true);
+    if (status.ok) assert.equal(status.data.state, "working");
+  } finally {
+    await channels.parent.release();
+    await channels.child.release();
+  }
+});
+
+test("协调完成先于 compaction_end 时续跑意图不被旧事件覆盖", async () => {
+  const channels = pair(() => true, 200, "idle");
+  const rpc = new FakeRpcClient({
+    state: { isStreaming: false, isCompacting: false, pendingMessageCount: 0 },
+  });
+  const tree = new TreeController({
+    config: {
+      maxDepth: 2,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 8,
+      waitTimeoutMs: 1_000,
+    },
+    idFactory: () => CHILD_ID,
+  });
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "流式子代理" },
+    managedNode: new TestManagedRpcNode(rpc),
+    channel: channels.parent,
+    startupTimeoutMs: 1_000,
+    gracefulShutdownMs: 1_000,
+    onCompactionPrepare: () => true,
+    onCompactionComplete: () => true,
+  });
+  const signal = new AbortController().signal;
+  try {
+    const startup = supervisor.start();
+    await channels.child.bind(signal);
+    assert.equal((await startup).ok, true);
+    await channels.child.waitForReady(signal);
+
+    const transactionId = "completion-before-end";
+    assert.equal(await channels.child.requestCompactionPrepare(transactionId), true);
+    rpc.setState({ isStreaming: true, isCompacting: false, pendingMessageCount: 0 });
+    emitPiEvent(rpc, { type: "agent_start" });
+    emitPiEvent(rpc, { type: "compaction_start", reason: "manual" });
+    rpc.setState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+
+    // 监督帧和 Pi 事件来自不同传输；complete 可能先于 bridge 的 end 事件抵达。
+    assert.equal(
+      await channels.child.requestCompactionComplete(
+        transactionId,
+        "succeeded",
+        undefined,
+        true,
+      ),
+      true,
+    );
+    emitPiEvent(rpc, {
+      type: "compaction_end",
+      reason: "manual",
+      aborted: false,
+      willRetry: false,
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const status = tree.getStatus(CHILD_ID);
+    assert.equal(status.ok, true);
+    if (status.ok) assert.equal(status.data.state, "working");
+  } finally {
+    await channels.parent.release();
+    await channels.child.release();
+  }
+});
+test("协调完成先于后继 agent_start 到达时最终 settled 仍能收束 idle", async () => {
+  const channels = pair(() => true, 200, "idle");
+  const rpc = new FakeRpcClient({
+    state: { isStreaming: false, isCompacting: false, pendingMessageCount: 0 },
+  });
+  const tree = new TreeController({
+    config: {
+      maxDepth: 2,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 8,
+      waitTimeoutMs: 1_000,
+    },
+    idFactory: () => CHILD_ID,
+  });
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "流式子代理" },
+    managedNode: new TestManagedRpcNode(rpc),
+    channel: channels.parent,
+    startupTimeoutMs: 1_000,
+    gracefulShutdownMs: 1_000,
+    onCompactionPrepare: () => true,
+    onCompactionComplete: () => true,
+  });
+  const signal = new AbortController().signal;
+  try {
+    const startup = supervisor.start();
+    await channels.child.bind(signal);
+    assert.equal((await startup).ok, true);
+    await channels.child.waitForReady(signal);
+
+    const transactionId = "completion-after-continuation-start";
+    assert.equal(await channels.child.requestCompactionPrepare(transactionId), true);
+    rpc.setState({ isStreaming: true, isCompacting: false, pendingMessageCount: 0 });
+    emitPiEvent(rpc, { type: "agent_start" });
+    emitPiEvent(rpc, { type: "compaction_start", reason: "manual" });
+    rpc.setState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+    emitPiEvent(rpc, {
+      type: "compaction_end",
+      reason: "manual",
+      aborted: false,
+      willRetry: false,
+    });
+
+    // 上游监督帧延迟到后继回合已经开始之后才抵达。
+    rpc.setState({ isStreaming: true, isCompacting: false, pendingMessageCount: 0 });
+    emitPiEvent(rpc, { type: "agent_start" });
+    rpc.setState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+    assert.equal(
+      await channels.child.requestCompactionComplete(
+        transactionId,
+        "succeeded",
+        undefined,
+        true,
+      ),
+      true,
+    );
+    emitPiEvent(rpc, { type: "agent_settled" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await supervisor.synchronizeState();
+
+    const status = tree.getStatus(CHILD_ID);
+    assert.equal(status.ok, true);
+    if (status.ok) assert.equal(status.data.state, "idle");
+  } finally {
+    await channels.parent.release();
+    await channels.child.release();
+  }
+});
+test("协调压缩完成 ACK 超时后的补偿撤销续跑保护", async () => {
+  let blockingParent!: FirstCompactionAckBlockingChannel;
+  const channels = pair(
+    () => true,
+    200,
+    "idle",
+    (options) => {
+      blockingParent = new FirstCompactionAckBlockingChannel(options);
+      return blockingParent;
+    },
+  );
+  const rpc = new FakeRpcClient({
+    state: { isStreaming: false, isCompacting: false, pendingMessageCount: 0 },
+  });
+  const tree = new TreeController({
+    config: {
+      maxDepth: 2,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 8,
+      waitTimeoutMs: 1_000,
+    },
+    idFactory: () => CHILD_ID,
+  });
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "流式子代理" },
+    managedNode: new TestManagedRpcNode(rpc),
+    channel: channels.parent,
+    startupTimeoutMs: 1_000,
+    gracefulShutdownMs: 1_000,
+    onCompactionPrepare: () => true,
+    onCompactionComplete: () => true,
+  });
+  const signal = new AbortController().signal;
+  const completionAbort = new AbortController();
+  let firstCompletion: Promise<boolean> | undefined;
+  try {
+    const startup = supervisor.start();
+    await channels.child.bind(signal);
+    assert.equal((await startup).ok, true);
+    await channels.child.waitForReady(signal);
+
+    const transactionId = "delayed-continuation-ack";
+    assert.equal(await channels.child.requestCompactionPrepare(transactionId), true);
+    rpc.setState({ isStreaming: true, isCompacting: false, pendingMessageCount: 0 });
+    emitPiEvent(rpc, { type: "agent_start" });
+    emitPiEvent(rpc, { type: "compaction_start", reason: "manual" });
+    rpc.setState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+    emitPiEvent(rpc, {
+      type: "compaction_end",
+      reason: "manual",
+      aborted: false,
+      willRetry: false,
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    firstCompletion = channels.child.requestCompactionComplete(
+      transactionId,
+      "succeeded",
+      completionAbort.signal,
+      true,
+    );
+    await blockingParent.firstResponseStarted.promise;
+
+    // 业务裁决已经释放协调屏障，但 ACK 尚未写回；续跑意图必须先于 ACK 生效。
+    await supervisor.synchronizeState();
+    let status = tree.getStatus(CHILD_ID);
+    assert.equal(status.ok, true);
+    if (status.ok) assert.equal(status.data.state, "working");
+
+    // 调用方未观察到首个 ACK 时会以同一事务发送 not_started 补偿。
+    completionAbort.abort();
+    await assert.rejects(firstCompletion);
+    blockingParent.allowFirstResponse.resolve();
+    await blockingParent.firstResponseFinished.promise;
+    assert.equal(
+      await channels.child.requestCompactionComplete(transactionId, "not_started"),
+      true,
+    );
+    await supervisor.synchronizeState();
+
+    status = tree.getStatus(CHILD_ID);
+    assert.equal(status.ok, true);
+    if (status.ok) assert.equal(status.data.state, "idle");
+  } finally {
+    completionAbort.abort();
+    blockingParent.allowFirstResponse.resolve();
+    await firstCompletion?.catch(() => undefined);
+    await channels.parent.release();
+    await channels.child.release();
+  }
+});
+
+test("手动压缩在 settled 探针前开始仍能结算 idle", async () => {
+  const channels = pair(() => true, 200, "idle");
+  const rpc = new FakeRpcClient({
+    state: { isStreaming: false, isCompacting: false, pendingMessageCount: 0 },
+  });
+  const node = new TestManagedRpcNode(rpc);
+  const tree = new TreeController({
+    config: {
+      maxDepth: 2,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 8,
+      waitTimeoutMs: 1_000,
+    },
+    idFactory: () => CHILD_ID,
+  });
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "流式子代理" },
+    managedNode: node,
+    channel: channels.parent,
+    startupTimeoutMs: 1_000,
+    gracefulShutdownMs: 1_000,
+  });
+  const signal = new AbortController().signal;
+  try {
+    const startup = supervisor.start();
+    await channels.child.bind(signal);
+    assert.deepEqual(await startup, {
+      ok: true,
+      agent_id: CHILD_ID,
+      state: "idle",
+    });
+    await channels.child.waitForReady(signal);
+
+    rpc.setState({ isStreaming: true, isCompacting: false, pendingMessageCount: 0 });
+    emitPiEvent(rpc, { type: "agent_start" });
+    const settledProbe = rpc.deferNext("get_state");
+    emitPiEvent(rpc, { type: "agent_settled" });
+    await settledProbe.started;
+
+    rpc.setState({ isStreaming: false, isCompacting: true, pendingMessageCount: 0 });
+    emitPiEvent(rpc, { type: "compaction_start", reason: "manual" });
+    settledProbe.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    rpc.setState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+    emitPiEvent(rpc, {
+      type: "compaction_end",
+      reason: "manual",
+      aborted: false,
+      willRetry: false,
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const status = tree.getStatus(CHILD_ID);
+    assert.equal(status.ok, true);
+    if (status.ok) assert.equal(status.data.state, "idle");
+  } finally {
+    await channels.parent.release();
+    await channels.child.release();
+  }
 });

@@ -589,6 +589,11 @@ export class RpcSupervisor {
   private lifecycleObservationVersion = 0;
   private latestAgentStartVersion = 0;
   private compactionObservationVersion = 0;
+  private compactionContinuationExpected = false;
+  /** 续跑保护的协调事务；迟到旧补偿不得清除新事务的保护。 */
+  private compactionContinuationTransactionId: string | undefined;
+  /** 当前压缩开始前最近一次 agent_start 的观察版本。 */
+  private compactionStartAgentStartVersion: number | undefined;
   private queueObservationVersion = 0;
   private stateReconciliationQueue: Promise<boolean> = Promise.resolve(false);
   private terminationPromise: Promise<RpcSupervisorTerminationResult> | undefined;
@@ -1063,6 +1068,18 @@ export class RpcSupervisor {
         );
       } else {
         accepted = remembered.accepted;
+        if (
+          request.outcome === "not_started"
+          && remembered.accepted
+          && remembered.continuationExpected
+        ) {
+          remembered.compensationAccepted ??= true;
+          if (remembered.compensationAccepted
+            && this.compactionContinuationTransactionId === request.transaction_id) {
+            this.compactionContinuationExpected = false;
+            this.compactionContinuationTransactionId = undefined;
+          }
+        }
       }
     } else if (state.terminalAccepted !== undefined) {
       accepted = state.terminalAccepted;
@@ -1076,6 +1093,18 @@ export class RpcSupervisor {
         state.terminalAccepted = false;
       }
     }
+    if (accepted) {
+      // 事务释放事实在 ACK 写入前就已被父端接纳；续跑保护必须从这一刻起
+      // 生效，避免并发状态探针把 ACK 间隙误结算为 idle。
+      if (request.continuation_expected
+        && state !== undefined
+        && state.phase === "closed"
+        && (this.compactionStartAgentStartVersion === undefined
+          || this.latestAgentStartVersion <= this.compactionStartAgentStartVersion)) {
+        this.compactionContinuationExpected = true;
+        this.compactionContinuationTransactionId = request.transaction_id;
+      }
+    }
     try {
       await respond.call(channel, {
         transaction_id: request.transaction_id,
@@ -1083,6 +1112,13 @@ export class RpcSupervisor {
       });
     } catch {
       this.receiveTransportFault("protocol_fault", "supervisor");
+    }
+    if (accepted) {
+      // 协调屏障可能晚于 Pi 的 compaction_end 事件释放；释放后再校准一次，
+      // 让真实 get_state 决定是否可以从 working 收束到 idle。
+      void this.enqueueStateReconciliation().catch(() => {
+        // 状态探针失败不能伪造 idle；后续状态查询或消息发送仍可重试校准。
+      });
     }
   }
 
@@ -1197,6 +1233,8 @@ export class RpcSupervisor {
     switch (event.type) {
       case "agent_start":
         this.hostPendingInputCount = 0;
+        this.compactionContinuationExpected = false;
+        this.compactionContinuationTransactionId = undefined;
         this.markLifecycleObservation("agent_start");
         this.resetToolActivity();
         if (this.lifecycleState === "idle") this.applyLifecycle({ type: "agent_start" });
@@ -1231,6 +1269,7 @@ export class RpcSupervisor {
         }
         if (event.reason !== "manual") this.revokePendingManualCompactionAuthorizations();
         this.runtimeCompactionActive = true;
+        this.compactionStartAgentStartVersion = this.latestAgentStartVersion;
         this.compactionObservationVersion += 1;
         this.markLifecycleObservation();
         this.emitActivity("compacting");
@@ -1255,9 +1294,17 @@ export class RpcSupervisor {
           return;
         }
         this.runtimeCompactionActive = false;
+        // 已接纳的协调 complete 可能先于 Pi 的 compaction_end 到达；
+        // 同周期的 end 事实不能覆盖明确声明的 continuation_expected。
+        if (this.compactionContinuationTransactionId === undefined) {
+          this.compactionContinuationExpected = event.willRetry;
+        }
         this.compactionObservationVersion += 1;
-        this.markLifecycleObservation();
+        const completionVersion = this.markLifecycleObservation();
         this.emitActivity(this.activeTools.size > 0 ? "executing_tools" : "processing");
+        void this.enqueueStateReconciliation(completionVersion).catch(() => {
+          // 状态探针失败不能伪造 idle；后续状态查询或消息发送仍可重试校准。
+        });
         void coordinatedManual;
         return;
       case "queue_update": {
@@ -1488,6 +1535,8 @@ export class RpcSupervisor {
     this.activeManualCompactionTransactionId = undefined;
     this.uncoordinatedManualCompactionActive = false;
     this.runtimeCompactionActive = false;
+    this.compactionContinuationExpected = false;
+    this.compactionContinuationTransactionId = undefined;
   }
 
   private compactionBarrierActive(): boolean {
@@ -1597,6 +1646,7 @@ export class RpcSupervisor {
       (expectedSettlementVersion !== undefined
         && this.latestAgentStartVersion > expectedSettlementVersion)
       || this.latestAgentStartVersion > latestAgentStartAtProbe
+      || this.compactionContinuationExpected
     ) return true;
     if (isCompacting || this.compactionBarrierActive() || pendingMessageCount !== 0) {
       this.emitActivity("compacting");
