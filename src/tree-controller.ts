@@ -507,18 +507,13 @@ function terminationResultFromHistory(
   return hadIncompleteCleanup ? "incomplete" : hadFailure ? "failed" : "completed";
 }
 
-function sameSnapshot(
+function sameSnapshotExceptContext(
   record: AgentRecord,
   node: AgentSnapshot,
   hiddenParent: boolean,
 ): boolean {
   const currentFault = record.error;
   const nextFault = node.error;
-  const contextMatches = node.context_window_tokens === undefined
-    || (
-      record.contextWindowTokens === node.context_window_tokens
-      && record.contextUsagePercent === node.context_usage_percent
-    );
   return (
     record.parentAgentId === (hiddenParent ? record.parentAgentId : node.parent_agent_id)
     && record.templateId === node.template_id
@@ -528,11 +523,23 @@ function sameSnapshot(
     && record.revision === node.revision
     // created_at 与 working_elapsed_ms 由各运行时本地时钟派生；同一事实
     // 在根和子运行时独立应用时可以不同，不能据此否定同修订投影。
-    && contextMatches
     && JSON.stringify(record.activity) === JSON.stringify(node.activity)
     && JSON.stringify(currentFault) === JSON.stringify(nextFault)
     && record.terminationResult === node.termination_result
   );
+}
+
+function sameSnapshot(
+  record: AgentRecord,
+  node: AgentSnapshot,
+  hiddenParent: boolean,
+): boolean {
+  const contextMatches = node.context_window_tokens === undefined
+    || (
+      record.contextWindowTokens === node.context_window_tokens
+      && record.contextUsagePercent === node.context_usage_percent
+    );
+  return sameSnapshotExceptContext(record, node, hiddenParent) && contextMatches;
 }
 
 function safeWallClockNow(now: () => Date): string {
@@ -594,6 +601,8 @@ export class TreeController {
   private readonly issuedAgentIds = new Set<string>();
   private readonly terminationBarriers = new Map<string, TerminationBarrierRecord>();
   private readonly subtreeRevisions = new Map<string, number>();
+  /** 根权威已预留、但尚未在任何已接受子树快照中出现的后代身份。 */
+  private readonly pendingSubtreeProjectionAgentIds = new Set<string>();
   private readonly changeListeners = new Set<() => void>();
   private readonly lifecycleListeners = new Set<(fact: AppliedLifecycleFact) => void>();
   private treeRevision = 0;
@@ -823,6 +832,9 @@ export class TreeController {
     // 写入注册表即完成配额预留，之后任何同步竞争者都会看到该节点。
     this.agents.set(agentId, record);
     this.issuedAgentIds.add(agentId);
+    if (this.authoritative && record.parentAgentId !== null) {
+      this.pendingSubtreeProjectionAgentIds.add(agentId);
+    }
     this.treeRevision += 1;
     this.notifyChange();
     return controlSuccess(this.outcome(record, true));
@@ -1101,6 +1113,7 @@ export class TreeController {
     this.agents.clear();
     this.terminationBarriers.clear();
     this.subtreeRevisions.clear();
+    this.pendingSubtreeProjectionAgentIds.clear();
     this.notifyChange();
     return true;
   }
@@ -1131,6 +1144,9 @@ export class TreeController {
 
     const parsed = this.validateSubtreeSnapshot(scope, input.nodes);
     if (!parsed.ok) return parsed;
+    // begin_termination 的根权威响应与 child 本地屏障分属两个传输方向；
+    // 响应前已读取的旧投影可以在根屏障之后抵达，但不能逆转该屏障。
+    const barrierSupersededNodeIds = new Set<string>();
     const addedActiveChildren = new Map<string, number>();
     let addedActiveNodes = 0;
     for (const node of parsed.data) {
@@ -1143,7 +1159,19 @@ export class TreeController {
           || current.templateId !== node.template_id
           || current.name !== node.name
           || current.depth !== node.depth
-          || (!isScopeNode && current.state === "terminated" && node.state !== "terminated")
+        ) return controlFailure("invalid_argument");
+        if (
+          !isScopeNode
+          && current.state === "terminating"
+          && this.isTerminationBarrierMember(current.agentId)
+          && node.state !== "terminating"
+          && node.state !== "terminated"
+        ) {
+          barrierSupersededNodeIds.add(current.agentId);
+          continue;
+        }
+        if (
+          (!isScopeNode && current.state === "terminated" && node.state !== "terminated")
           || (!isScopeNode
             && this.isTerminationBarrierMember(current.agentId)
             && node.state !== "terminating"
@@ -1186,15 +1214,26 @@ export class TreeController {
     const existingIds = new Set(parsed.data.map((node) => node.agent_id));
     for (const record of this.agents.values()) {
       if (
-        record.agentId !== scope.agentId
-        && this.isDescendantOf(record, scope.agentId)
-        && record.state !== "terminated"
-        && !existingIds.has(record.agentId)
-      ) return controlFailure("invalid_argument");
+        record.agentId === scope.agentId
+        || !this.isDescendantOf(record, scope.agentId)
+        || record.state === "terminated"
+        || existingIds.has(record.agentId)
+      ) continue;
+      // reserve_child 先由根权威登记身份，再把 grant 返回 child。该响应前
+      // 已读取的完整快照可以合法地暂时缺少尚未投影、甚至正回滚的身份。
+      if (
+        this.authoritative
+        && this.pendingSubtreeProjectionAgentIds.has(record.agentId)
+      ) continue;
+      return controlFailure("invalid_argument");
     }
 
     const monotonicAt = this.safeMonotonicNow();
-    const changes: Array<{ readonly record: AgentRecord; readonly node: AgentSnapshot }> = [];
+    const changes: Array<{
+      readonly record: AgentRecord;
+      readonly node: AgentSnapshot;
+      readonly contextOnly: boolean;
+    }> = [];
     const additions: AgentRecord[] = [];
     const additionById = new Map<string, AgentRecord>();
     let scopeContextUsage: AgentContextUsageInput | undefined;
@@ -1250,6 +1289,7 @@ export class TreeController {
         }
         continue;
       }
+      if (barrierSupersededNodeIds.has(current.agentId)) continue;
       if (current.state === "terminated" && node.revision !== current.revision) {
         // terminated 是吸收态；终止后的远端修订不能重写资源事实。
         return controlFailure("invalid_argument");
@@ -1260,20 +1300,34 @@ export class TreeController {
         return controlFailure("invalid_argument");
       }
       if (node.revision < current.revision) return controlFailure("invalid_argument");
-      if (node.revision === current.revision && !sameSnapshot(
-        current,
-        node,
-        current.parentAgentId === scope.parentAgentId && current.agentId === scope.agentId,
-      )) return controlFailure("invalid_argument");
-      if (!sameSnapshot(current, node, current.parentAgentId === scope.parentAgentId && current.agentId === scope.agentId)) {
-        changes.push({ record: current, node });
+      const hiddenParent = current.parentAgentId === scope.parentAgentId
+        && current.agentId === scope.agentId;
+      if (
+        node.revision === current.revision
+        && !sameSnapshotExceptContext(current, node, hiddenParent)
+      ) return controlFailure("invalid_argument");
+      if (!sameSnapshot(current, node, hiddenParent)) {
+        // 上下文窗口由各层 Pi 会话独立观测，不属于生命周期修订的事实域。
+        // 同修订差异只合并该观测，不能借此重写生命周期派生字段。
+        changes.push({
+          record: current,
+          node,
+          contextOnly: node.revision === current.revision,
+        });
       }
     }
     for (const record of additions) {
       this.agents.set(record.agentId, record);
       this.issuedAgentIds.add(record.agentId);
     }
-    for (const change of changes) this.applySnapshotToRecord(change.record, change.node, monotonicAt);
+    for (const change of changes) {
+      if (change.contextOnly) {
+        change.record.contextWindowTokens = change.node.context_window_tokens;
+        change.record.contextUsagePercent = change.node.context_usage_percent;
+      } else {
+        this.applySnapshotToRecord(change.record, change.node, monotonicAt);
+      }
+    }
     const scopeContextChanged = scopeContextUsage === undefined
       || scope.state === "failed"
       || scope.state === "terminating"
@@ -1284,6 +1338,9 @@ export class TreeController {
           contextUsagePercent: scopeContextUsage.context_usage_percent ?? null,
         }, safeWallClockNow(this.now), monotonicAt);
     this.subtreeRevisions.set(scope.agentId, input.subtree_revision);
+    if (this.authoritative) {
+      for (const node of parsed.data) this.pendingSubtreeProjectionAgentIds.delete(node.agent_id);
+    }
     if (additions.length > 0 || changes.length > 0 || scopeContextChanged) {
       this.treeRevision += 1;
       this.notifyChange();
