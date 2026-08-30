@@ -322,14 +322,6 @@ export class AutoCompactCoordinationParticipant {
     if (this.closed) return;
     const request = parseComplete(value, this.participantId);
     if (request === undefined) return;
-    if (
-      this.completedLocalSuccess !== undefined
-      && !this.completedLocalSuccess.runtime.replyCoordinator?.awaitsCoordinationContinuation(
-        this.completedLocalSuccess.requestId,
-      )
-    ) {
-      this.completedLocalSuccess = undefined;
-    }
     const record = this.transactions.get(request.requestId) ?? {};
     if (!this.transactions.has(request.requestId)) this.transactions.set(request.requestId, record);
     const terminal = record.terminal;
@@ -369,16 +361,12 @@ export class AutoCompactCoordinationParticipant {
     }
 
     this.barriers.delete(request.requestId);
-    const continuationExpected = barrier.runtime.replyCoordinator?.expectsCoordinationContinuation(
-      request.requestId,
-      request.outcome,
-    ) ?? false;
     const accepted = await this.releaseBarrier(
       request.requestId,
       barrier,
       request.outcome,
       false,
-      continuationExpected,
+      request.continuationExpected,
     );
     if (
       request.outcome !== "succeeded"
@@ -395,7 +383,7 @@ export class AutoCompactCoordinationParticipant {
     if (
       accepted
       && request.outcome === "succeeded"
-      && barrier.runtime.replyCoordinator?.awaitsCoordinationContinuation(request.requestId) === true
+      && request.continuationExpected
     ) {
       this.completedLocalSuccess = Object.freeze({ requestId: request.requestId, runtime: barrier.runtime });
     }
@@ -542,8 +530,18 @@ function parseTargeted(
 function parseComplete(
   value: unknown,
   participantId: string,
-): { readonly requestId: string; readonly outcome: SupervisorCompactionOutcome } | undefined {
-  if (!isRecord(value) || !hasOnlyKeys(value, ["protocolVersion", "requestId", "participantId", "outcome"])) {
+): {
+  readonly requestId: string;
+  readonly outcome: SupervisorCompactionOutcome;
+  readonly continuationExpected: boolean;
+} | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, [
+    "protocolVersion",
+    "requestId",
+    "participantId",
+    "outcome",
+    "continuationExpected",
+  ])) {
     return undefined;
   }
   if (
@@ -553,9 +551,17 @@ function parseComplete(
     || typeof value.outcome !== "string"
     || !OUTCOMES.has(value.outcome)
   ) return undefined;
+  const continuationExpected = Object.prototype.hasOwnProperty.call(value, "continuationExpected")
+    ? value.continuationExpected
+    : false;
+  if (
+    typeof continuationExpected !== "boolean"
+    || (continuationExpected && value.outcome !== "succeeded")
+  ) return undefined;
   return Object.freeze({
     requestId: value.requestId,
     outcome: value.outcome as SupervisorCompactionOutcome,
+    continuationExpected,
   });
 }
 
