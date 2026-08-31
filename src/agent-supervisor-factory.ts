@@ -14,16 +14,12 @@ import {
 } from "./managed-rpc-node.ts";
 import { ManagedRpcSupervisorChannel } from "./managed-rpc-supervisor-channel.ts";
 import type { ProcessTreeAdapter } from "./process-tree-capability.ts";
-import type {
-  ReplyDeliveryDecision,
-} from "./reply-acceptance.ts";
 import {
   RpcSupervisor,
   type RpcSupervisorChannelBinding,
 } from "./rpc-supervisor.ts";
 import type {
   SupervisorCapabilityManifest,
-  SupervisorCompactionComplete,
 } from "./supervisor-channel.ts";
 import type { RootRuntimeContext } from "./root-runtime-context.ts";
 import type {
@@ -54,15 +50,10 @@ export interface AgentSupervisorFactoryOptions {
   readonly currentThinking?: string | (() => string | undefined);
   readonly managementToolNames?: readonly string[];
   readonly childReplyToolNames?: readonly string[];
-  /** 只有宿主消息已同步进入父会话上下文时才返回接纳裁决；可携带压缩拒绝原因。 */
-  readonly deliverReply?: (agentId: string, reply: ManagedRpcReply) => ReplyDeliveryDecision;
-  /** 为当前父会话内的直接子同步建立/释放协调压缩 reply 屏障。 */
-  readonly onCompactionPrepare?: (agentId: string, transactionId: string) => boolean;
-  readonly onCompactionComplete?: (
-    agentId: string,
-    transactionId: string,
-    outcome: SupervisorCompactionComplete["outcome"],
-  ) => boolean;
+  /**
+   * 调用宿主 Pi 的 fire-and-forget 扩展消息 API；true 只表示同步提交成功。
+   */
+  readonly deliverReply?: (agentId: string, reply: ManagedRpcReply) => boolean;
   /** 为每条直接子监督通道绑定根裁决或逐跳转发服务。 */
   readonly bindControlServer?: (
     agentId: string,
@@ -122,7 +113,6 @@ export function createAgentSupervisorFactory(
     });
 
     let rpcSupervisor: RpcSupervisor | undefined;
-    let directAgentId: string | undefined;
     rpcSupervisor = new RpcSupervisor({
       controller: options.tree,
       actor: input.actor,
@@ -143,7 +133,6 @@ export function createAgentSupervisorFactory(
         }
         : {}),
       channelFactory: (context): RpcSupervisorChannelBinding => {
-        directAgentId = context.agent_id;
         const credential = randomBytes(32).toString("base64url");
         const channel = new ManagedRpcSupervisorChannel({
           node,
@@ -156,7 +145,7 @@ export function createAgentSupervisorFactory(
           requestIdRegistry,
           onReply: (reply) => {
             if (rpcSupervisor === undefined || options.deliverReply === undefined) return false;
-            return rpcSupervisor.acceptChildReplyResult(reply, () => {
+            return rpcSupervisor.acceptChildReply(reply, () => {
               try {
                 return options.deliverReply!(context.agent_id, reply);
               } catch {
@@ -205,12 +194,6 @@ export function createAgentSupervisorFactory(
       },
       startupTimeoutMs,
       gracefulShutdownMs,
-      onCompactionPrepare: (transactionId) => directAgentId === undefined
-        ? false
-        : options.onCompactionPrepare?.(directAgentId, transactionId) ?? false,
-      onCompactionComplete: (transactionId, outcome) => directAgentId === undefined
-        ? false
-        : options.onCompactionComplete?.(directAgentId, transactionId, outcome) ?? false,
     });
     return rpcSupervisor;
   }) as AgentSupervisorFactory;

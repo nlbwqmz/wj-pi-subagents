@@ -16,8 +16,10 @@ export class RpcClient {
       type: "response",
       command: command?.type,
       success: false,
-      error: command?.type === "prompt" && command?.message === "压缩期间 prompt"
+      error: command?.type === "abort"
         ? "Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry."
+        : command?.type === "prompt" && command?.message === "压缩期间 prompt"
+          ? "Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry."
         : command?.type === "prompt" && command?.message === "宿主忙碌 prompt"
           ? "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."
           : "explicit rejection",

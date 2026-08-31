@@ -4,11 +4,6 @@ import {
   parseChildReplyEnvelope,
   type ChildReplyEnvelope,
 } from "./child-reply-envelope.ts";
-import {
-  normalizeReplyAcceptance,
-  type ReplyAcceptance,
-  type ReplyDeliveryDecision,
-} from "./reply-acceptance.ts";
 import { REPLY_MAX_TEXT_BYTES } from "./child-reply-limits.ts";
 import {
   hasStartupDiagnosticDetails,
@@ -31,7 +26,7 @@ import {
 } from "./tree-controller.ts";
 
 /** 父子监督通道与 Pi 任务 RPC 完全隔离的固定协议版本。 */
-export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/17";
+export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/18";
 
 export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "hello",
@@ -43,10 +38,6 @@ export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "reply",
   "control_request",
   "control_response",
-  "compaction_prepare",
-  "compaction_prepared",
-  "compaction_complete",
-  "compaction_completed",
   "close",
 ] as const);
 
@@ -146,28 +137,6 @@ export type SupervisorReplyKind = ChildReplyEnvelope["kind"];
 
 /** 新 wire reply 只携带一个会话信封；底层帧 `seq` 不属于消息语义。 */
 export type SupervisorReply = ChildReplyEnvelope;
-
-export type SupervisorCompactionOutcome = "succeeded" | "failed" | "cancelled" | "not_started";
-
-/** child 在执行协调压缩前要求直接父端建立接纳屏障。 */
-export interface SupervisorCompactionPrepare {
-  readonly transaction_id: string;
-}
-
-export interface SupervisorCompactionPrepared extends SupervisorCompactionPrepare {
-  readonly accepted: boolean;
-}
-
-/** child 在压缩事务结束后要求直接父端释放同一屏障。 */
-export interface SupervisorCompactionComplete extends SupervisorCompactionPrepare {
-  readonly outcome: SupervisorCompactionOutcome;
-  /** true 时请求方会在 complete ACK 后启动 successor run。 */
-  readonly continuation_expected: boolean;
-}
-
-export interface SupervisorCompactionCompleted extends SupervisorCompactionPrepare {
-  readonly accepted: boolean;
-}
 
 /** 监督控制正文只允许可复制、可深冻结的纯 JSON 值。 */
 export type SupervisorJsonValue =
@@ -280,14 +249,6 @@ export interface SupervisorReceiveAccepted {
   readonly replies: readonly SupervisorReply[];
   /** parent 端原子缓存的 child capability manifest；不进入公开状态。 */
   readonly capability?: SupervisorCapabilityManifest;
-  /** parent 端收到的协调压缩屏障请求。 */
-  readonly compaction_prepare?: SupervisorCompactionPrepare;
-  /** child 端收到的协调压缩准备结果。 */
-  readonly compaction_prepared?: SupervisorCompactionPrepared;
-  /** parent 端收到的协调压缩完成请求。 */
-  readonly compaction_complete?: SupervisorCompactionComplete;
-  /** child 端收到的协调压缩完成确认。 */
-  readonly compaction_completed?: SupervisorCompactionCompleted;
   /** 仅供本地监督器递交给 TreeController 的脱敏生命周期事实。 */
   readonly event?: SupervisorEvent;
   /** 本次接收原子替换的完整快照；调用方可直接交给树控制器。 */
@@ -353,8 +314,8 @@ export interface SupervisorChannelOptions {
   readonly streamIdFactory?: () => string;
   /** 同一活动根会话的全部监督通道必须共享这一分配器。 */
   readonly requestIdRegistry: SupervisorRequestIdRegistry;
-  /** 父端在普通回复可安全注入会话后返回同步接纳裁决，可携带压缩拒绝原因。 */
-  readonly onReply?: (reply: SupervisorReply) => ReplyDeliveryDecision;
+  /** 父端把普通回复同步提交给 Pi 扩展消息 API 后返回结果。 */
+  readonly onReply?: (reply: SupervisorReply) => boolean;
   /** EOF/断序后允许对端完成完整快照重同步的内部期限。 */
   readonly resyncTimeoutMs?: number;
   /** 重同步期限耗尽时的本地通知；不携带帧或底层错误。 */
@@ -456,10 +417,6 @@ function validBoundedString(value: unknown, limits: SupervisorChannelLimits): va
 
 function validOpaqueId(value: unknown, limits: SupervisorChannelLimits): value is string {
   return validBoundedString(value, limits) && SAFE_ID_PATTERN.test(value);
-}
-
-function validCompactionTransactionId(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && value.length <= 256;
 }
 
 function validStreamId(value: unknown, limits: SupervisorChannelLimits): value is string {
@@ -1130,54 +1087,6 @@ function parseCapabilityManifest(
   }) as SupervisorCapabilityManifest;
 }
 
-const SUPERVISOR_COMPACTION_OUTCOMES: ReadonlySet<string> = new Set([
-  "succeeded",
-  "failed",
-  "cancelled",
-  "not_started",
-]);
-
-function parseCompactionPrepare(payload: Record<string, unknown>): SupervisorCompactionPrepare {
-  if (!hasExactObjectKeys(payload, ["transaction_id"]) || !validCompactionTransactionId(payload.transaction_id)) {
-    frameError("invalid_frame");
-  }
-  return Object.freeze({ transaction_id: payload.transaction_id });
-}
-
-function parseCompactionPrepared(payload: Record<string, unknown>): SupervisorCompactionPrepared {
-  if (
-    !hasExactObjectKeys(payload, ["transaction_id", "accepted"])
-    || !validCompactionTransactionId(payload.transaction_id)
-    || typeof payload.accepted !== "boolean"
-  ) frameError("invalid_frame");
-  return Object.freeze({ transaction_id: payload.transaction_id, accepted: payload.accepted });
-}
-
-function parseCompactionComplete(payload: Record<string, unknown>): SupervisorCompactionComplete {
-  if (
-    !hasExactObjectKeys(payload, ["transaction_id", "outcome", "continuation_expected"])
-    || !validCompactionTransactionId(payload.transaction_id)
-    || typeof payload.outcome !== "string"
-    || !SUPERVISOR_COMPACTION_OUTCOMES.has(payload.outcome)
-    || typeof payload.continuation_expected !== "boolean"
-    || (payload.continuation_expected && payload.outcome !== "succeeded")
-  ) frameError("invalid_frame");
-  return Object.freeze({
-    transaction_id: payload.transaction_id,
-    outcome: payload.outcome as SupervisorCompactionOutcome,
-    continuation_expected: payload.continuation_expected,
-  });
-}
-
-function parseCompactionCompleted(payload: Record<string, unknown>): SupervisorCompactionCompleted {
-  if (
-    !hasExactObjectKeys(payload, ["transaction_id", "accepted"])
-    || !validCompactionTransactionId(payload.transaction_id)
-    || typeof payload.accepted !== "boolean"
-  ) frameError("invalid_frame");
-  return Object.freeze({ transaction_id: payload.transaction_id, accepted: payload.accepted });
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -1218,7 +1127,7 @@ export class SupervisorChannel {
   private readonly credential: Uint8Array;
   private readonly streamIdFactory: () => string;
   private readonly requestIdRegistry: SupervisorRequestIdRegistry;
-  private readonly onReply: ((reply: SupervisorReply) => ReplyDeliveryDecision) | undefined;
+  private readonly onReply: ((reply: SupervisorReply) => boolean) | undefined;
   private readonly resyncTimeoutMs: number;
   private readonly onProtocolFault: (() => void) | undefined;
   private resyncTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1226,7 +1135,7 @@ export class SupervisorChannel {
   private readonly retiredIncomingStreams = new Set<string>();
   private readonly retiredIncomingOrder: string[] = [];
   // 新协议不保存应用消息正文、序号、窗口或去重集合；每帧在接收临界区
-  // 同步交给 onReply，返回即表示该层已接纳。
+  // 同步交给 onReply，返回即表示该层已完成提交裁决。
 
   private state: SupervisorChannelState = "new";
   private sendSeq = 0;
@@ -1343,7 +1252,7 @@ export class SupervisorChannel {
     if (envelope.agent_id !== this.localAgentId) {
       throw new SupervisorProtocolError("identity_mismatch");
     }
-    // request_id 只用于父端同步返回 Pi 接纳裁决，不进入消息信封，也不承担
+    // request_id 只用于父端同步返回扩展消息提交结果，不进入消息信封，也不承担
     // 应用去重、排序、窗口或重放语义。
     return this.createFrame(
       "reply",
@@ -1363,38 +1272,6 @@ export class SupervisorChannel {
     const parsed = parseCapabilityManifest(manifest, this.limits);
     this.capabilityPublished = true;
     return this.createFrame("capability", parsed as unknown as Record<string, unknown>);
-  }
-
-  publishCompactionPrepare(request: SupervisorCompactionPrepare): SupervisorFrame {
-    if (this.role !== "child" || this.terminationBarrier || this.state !== "ready") {
-      throw new SupervisorProtocolError("closed");
-    }
-    const parsed = parseCompactionPrepare(request as unknown as Record<string, unknown>);
-    return this.createFrame("compaction_prepare", parsed as unknown as Record<string, unknown>);
-  }
-
-  publishCompactionPrepared(response: SupervisorCompactionPrepared): SupervisorFrame {
-    if (this.role !== "parent" || this.terminationBarrier || this.state !== "ready") {
-      throw new SupervisorProtocolError("closed");
-    }
-    const parsed = parseCompactionPrepared(response as unknown as Record<string, unknown>);
-    return this.createFrame("compaction_prepared", parsed as unknown as Record<string, unknown>);
-  }
-
-  publishCompactionComplete(request: SupervisorCompactionComplete): SupervisorFrame {
-    if (this.role !== "child" || this.terminationBarrier || this.state !== "ready") {
-      throw new SupervisorProtocolError("closed");
-    }
-    const parsed = parseCompactionComplete(request as unknown as Record<string, unknown>);
-    return this.createFrame("compaction_complete", parsed as unknown as Record<string, unknown>);
-  }
-
-  publishCompactionCompleted(response: SupervisorCompactionCompleted): SupervisorFrame {
-    if (this.role !== "parent" || this.terminationBarrier || this.state !== "ready") {
-      throw new SupervisorProtocolError("closed");
-    }
-    const parsed = parseCompactionCompleted(response as unknown as Record<string, unknown>);
-    return this.createFrame("compaction_completed", parsed as unknown as Record<string, unknown>);
   }
 
   /** child 发布已绑定自身分支的内部控制请求；operation_id 不占用监督 request_id。 */
@@ -1638,10 +1515,6 @@ export class SupervisorChannel {
     let applied = false;
     let replies: readonly SupervisorReply[] = EMPTY_REPLIES;
     let capability: SupervisorCapabilityManifest | undefined;
-    let compactionPrepare: SupervisorCompactionPrepare | undefined;
-    let compactionPrepared: SupervisorCompactionPrepared | undefined;
-    let compactionComplete: SupervisorCompactionComplete | undefined;
-    let compactionCompleted: SupervisorCompactionCompleted | undefined;
     let event: SupervisorEvent | undefined;
     let controlRequest: SupervisorControlRequest | undefined;
     let controlResponse: SupervisorControlResponse | undefined;
@@ -1673,30 +1546,14 @@ export class SupervisorChannel {
         break;
       case "reply": {
         const replyResult = this.applyReplyFrame(frame);
-        replies = replyResult.acceptance.accepted
+        replies = replyResult.accepted
           ? Object.freeze([replyResult.reply])
           : EMPTY_REPLIES;
         if (frame.request_id !== undefined) {
-          outbound.push(this.createReplyAcceptanceResponse(frame.request_id, replyResult.acceptance));
+          outbound.push(this.createReplyDispatchResponse(frame.request_id, replyResult.accepted));
         }
         break;
       }
-      case "compaction_prepare":
-        if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
-        compactionPrepare = parseCompactionPrepare(frame.payload);
-        break;
-      case "compaction_prepared":
-        if (this.role !== "child" || this.state !== "ready") frameError("sequence_violation");
-        compactionPrepared = parseCompactionPrepared(frame.payload);
-        break;
-      case "compaction_complete":
-        if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
-        compactionComplete = parseCompactionComplete(frame.payload);
-        break;
-      case "compaction_completed":
-        if (this.role !== "child" || this.state !== "ready") frameError("sequence_violation");
-        compactionCompleted = parseCompactionCompleted(frame.payload);
-        break;
       case "control_request":
         if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
         controlRequest = parseControlRequest(frame.payload, this.peerAgentId, this.latestSnapshot, this.limits);
@@ -1722,10 +1579,6 @@ export class SupervisorChannel {
       outbound: Object.freeze(outbound),
       replies,
       ...(capability === undefined ? {} : { capability }),
-      ...(compactionPrepare === undefined ? {} : { compaction_prepare: compactionPrepare }),
-      ...(compactionPrepared === undefined ? {} : { compaction_prepared: compactionPrepared }),
-      ...(compactionComplete === undefined ? {} : { compaction_complete: compactionComplete }),
-      ...(compactionCompleted === undefined ? {} : { compaction_completed: compactionCompleted }),
       ...(event === undefined ? {} : { event }),
       ...(acceptedSnapshot === undefined ? {} : { snapshot: acceptedSnapshot }),
       ...(controlRequest === undefined ? {} : { control_request: controlRequest }),
@@ -1816,41 +1669,36 @@ export class SupervisorChannel {
 
   private applyReplyFrame(frame: InternalFrame): {
     readonly reply: SupervisorReply;
-    readonly acceptance: ReplyAcceptance;
+    readonly accepted: boolean;
   } {
     if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
     const reply = parseReply(frame.payload);
     if (reply.agent_id !== this.peerAgentId) frameError("identity_mismatch");
-    let acceptance: ReplyAcceptance = Object.freeze({ accepted: true });
-    // 父端接纳回调是唯一的 Pi 同步裁决点。回调缺失时，协议端点只能把
-    // 该帧视为已通过传输边界，生产装配会始终提供 ParentReplyInbox 回调。
+    let accepted = true;
+    // 生产装配会提供 ParentReplyInbox 回调。回调缺失时，协议端点只能确认
+    // 该帧已通过传输边界；回调存在时则确认 fire-and-forget API 已同步调用。
     try {
-      acceptance = this.onReply === undefined
-        ? Object.freeze({ accepted: true })
-        : normalizeReplyAcceptance(this.onReply(reply));
+      accepted = this.onReply === undefined || this.onReply(reply) === true;
     } catch {
-      acceptance = Object.freeze({ accepted: false });
+      accepted = false;
     }
-    return Object.freeze({ reply, acceptance });
+    return Object.freeze({ reply, accepted });
   }
 
   /**
-   * 用控制响应返回一次同步 Pi 接纳裁决。它不携带正文、消息身份、序号、
+   * 用控制响应返回一次父扩展消息提交结果。它不携带正文、消息身份、序号、
    * ACK 或重放状态；operation_id 只是本次控制调用的传输相关性值。
    */
-  private createReplyAcceptanceResponse(
+  private createReplyDispatchResponse(
     operationId: string,
-    acceptance: ReplyAcceptance,
+    accepted: boolean,
   ): SupervisorFrame {
     return this.createFrame("control_response", {
       operation_id: operationId,
       ok: true,
       data: {
-        kind: "reply_acceptance",
-        accepted: acceptance.accepted,
-        ...(acceptance.accepted || acceptance.blocked_reason === undefined
-          ? {}
-          : { blocked_reason: acceptance.blocked_reason }),
+        kind: "reply_dispatch",
+        accepted,
       },
     });
   }
@@ -2157,7 +2005,7 @@ export interface FakeSupervisorChannelPairOptions {
   readonly credential?: string | Uint8Array;
   readonly limits?: Partial<SupervisorChannelLimits>;
   readonly requestIdRegistry?: SupervisorRequestIdRegistry;
-  readonly onReply?: (reply: SupervisorReply) => ReplyDeliveryDecision;
+  readonly onReply?: (reply: SupervisorReply) => boolean;
   readonly autoDeliver?: boolean;
 }
 

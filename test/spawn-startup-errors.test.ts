@@ -6,6 +6,7 @@ import {
   FakeManagedRpcNode,
   MANAGED_RPC_BRIDGE_CREDENTIAL_ENV,
   ManagedRpcBridgeClient,
+  ManagedRpcCommandRejectedError,
   ManagedRpcStartupError,
   type ManagedRpcNodeLike,
   type ManagedRpcNodeStartContext,
@@ -83,7 +84,11 @@ class StartupTestChannel implements RpcSupervisorChannel {
   }
 }
 
-function startBridge(model: string, args: readonly string[] = []): {
+function startBridge(
+  model: string,
+  args: readonly string[] = [],
+  piModulePath = new URL("./helpers/failing-pi-rpc-client.mjs", import.meta.url).href,
+): {
   readonly process: ChildProcessWithoutNullStreams;
   readonly client: ManagedRpcBridgeClient;
 } {
@@ -105,7 +110,7 @@ function startBridge(model: string, args: readonly string[] = []): {
   }, {
     credential: BRIDGE_CREDENTIAL,
     rpcOptions: {
-      piModulePath: new URL("./helpers/failing-pi-rpc-client.mjs", import.meta.url).href,
+      piModulePath,
       provider: "wj-provider",
       model,
       args,
@@ -181,6 +186,29 @@ async function closeBridge(
     if (bridge.exitCode === null) bridge.kill();
   }
 }
+
+test("bridge 保留 prompt 和 abort 错误响应中的 compaction_active 原因", async () => {
+  const { process: bridge, client } = startBridge(
+    "unused",
+    [],
+    new URL("./helpers/rejecting-pi-rpc-client.mjs", import.meta.url).href,
+  );
+  try {
+    await client.start();
+    await assert.rejects(
+      client.prompt("压缩期间 prompt"),
+      (error: unknown) => error instanceof ManagedRpcCommandRejectedError
+        && error.reason === "compaction_active",
+    );
+    await assert.rejects(
+      client.abort(),
+      (error: unknown) => error instanceof ManagedRpcCommandRejectedError
+        && error.reason === "compaction_active",
+    );
+  } finally {
+    await closeBridge(bridge, client);
+  }
+});
 
 test("正常子端的状态探针不会与监督握手互相等待", async () => {
   const { process: bridge, client, context } = startSupervisedBridge();

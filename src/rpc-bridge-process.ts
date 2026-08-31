@@ -45,15 +45,15 @@ const HOST_BUSY_PROMPT_ERROR =
 interface BridgeClient {
   start(): Promise<void>;
   stop(): Promise<void>;
-  /** 直接取得原始 response，避免 Pi prompt/steer 包装方法吞掉 success:false。 */
-  send(command: {
-    readonly type: "prompt" | "steer";
-    readonly message: string;
-    readonly streamingBehavior?: "steer";
-  }): Promise<unknown>;
-  prompt(message: string): Promise<void>;
-  steer(message: string): Promise<void>;
-  abort(): Promise<void>;
+  /** 直接取得原始 response，避免 Pi 命令包装方法吞掉 success:false。 */
+  send(command:
+    | {
+        readonly type: "prompt";
+        readonly message: string;
+        readonly streamingBehavior?: "steer";
+      }
+    | { readonly type: "abort" }
+  ): Promise<unknown>;
   getState(): Promise<unknown>;
   onEvent(listener: (event: unknown) => void): () => void;
 }
@@ -142,20 +142,18 @@ type PiCommandDisposition =
 
 function piCommandDisposition(
   value: unknown,
-  command: "prompt" | "steer",
+  command: "prompt" | "abort",
 ): PiCommandDisposition {
   if (!isRecord(value) || value.type !== "response" || value.command !== command) {
     return Object.freeze({ kind: "unknown" });
   }
   if (value.success === true) return Object.freeze({ kind: "accepted" });
   if (value.success !== false) return Object.freeze({ kind: "unknown" });
-  const reason = command !== "prompt"
-    ? undefined
-    : value.error === COMPACTION_ACTIVE_PROMPT_ERROR
-      ? "compaction_active" as const
-      : value.error === HOST_BUSY_PROMPT_ERROR
-        ? "host_busy" as const
-        : undefined;
+  const reason = value.error === COMPACTION_ACTIVE_PROMPT_ERROR
+    ? "compaction_active" as const
+    : command === "prompt" && value.error === HOST_BUSY_PROMPT_ERROR
+      ? "host_busy" as const
+      : undefined;
   return Object.freeze({
     kind: "rejected",
     ...(reason === undefined ? {} : { reason }),
@@ -741,8 +739,11 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
       return;
     }
     if (command.command === "abort") {
-      await current.abort();
-      response(command.id, true);
+      const result = await current.send({ type: "abort" });
+      const disposition = piCommandDisposition(result, "abort");
+      if (disposition.kind === "accepted") response(command.id, true);
+      else if (disposition.kind === "rejected") rejectedResponse(command.id, disposition.reason);
+      else response(command.id, false);
       return;
     }
     if (command.command === "get_state") {

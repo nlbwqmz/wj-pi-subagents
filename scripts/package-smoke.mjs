@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -37,6 +37,7 @@ function runNpm(args) {
 }
 
 try {
+  rmSync(smokeRoot, { recursive: true, force: true });
   mkdirSync(smokeRoot, { recursive: true });
   const packageMetadata = readPackageMetadata();
   const archivePath = join(smokeRoot, packageMetadata.archiveName);
@@ -69,12 +70,24 @@ try {
       throw new Error(`Smoke 测试包缺少 ${file}`);
     }
   }
+  for (const forbidden of [
+    join("src", "auto-compact-coordination.ts"),
+    join("src", "reply-acceptance.ts"),
+    join("dist", "src", "auto-compact-coordination.js"),
+    join("dist", "src", "reply-acceptance.js"),
+  ]) {
+    if (existsSync(join(installedPackagePath, forbidden))) {
+      throw new Error(`Smoke 测试包仍包含已删除产物 ${forbidden}`);
+    }
+  }
   if (existsSync(join(installedPackagePath, "extensions", "wj-pi-subagents.ts"))) {
     throw new Error("Smoke 测试包仍包含旧扩展入口");
   }
-  console.log(`Smoke 测试包已安装：${installedPackagePath}`);
+  console.log("Smoke 测试包验证通过");
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   console.error(`Smoke 打包失败：${message}`);
   process.exitCode = 1;
+} finally {
+  rmSync(smokeRoot, { recursive: true, force: true });
 }

@@ -34,21 +34,22 @@
     "node": ">=22.19.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-coding-agent": ">=0.84.4",
+    "@earendil-works/pi-tui": ">=0.84.4"
   },
   "dependencies": {
     "semver": "7.8.0",
     "yaml": "2.9.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-tui": "0.84.2",
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@earendil-works/pi-tui": "0.84.4",
     "@types/node": "24.12.4",
     "@types/semver": "7.7.1",
     "typescript": "5.9.3"
   },
   "scripts": {
-    "build:bridge": "tsc -p tsconfig.bridge.json",
+    "build:bridge": "node scripts/build-bridge.mjs",
     "pack:smoke": "node scripts/package-smoke.mjs",
     "release:validate": "node scripts/validate-release-tag.mjs",
     "prepublishOnly": "npm run check",
@@ -65,6 +66,6 @@
     ]
   },
   "wjPiSubagents": {
-    "requiresPi": ">=0.84.1"
+    "requiresPi": ">=0.84.4"
   }
 }

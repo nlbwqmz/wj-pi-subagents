@@ -9,6 +9,9 @@ const requiredPiVersion = manifest.wjPiSubagents?.requiresPi;
 const extensionEntry = join(repositoryRoot, "index.ts");
 const piCommand = process.env.PI_BIN ?? "pi";
 const timeoutMs = 15_000;
+const standaloneEnvironment = Object.fromEntries(
+  Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith("WJ_PI_SUBAGENTS_")),
+);
 
 function parseVersion(value) {
   const match = /(?:^|\s)v?(\d+)\.(\d+)\.(\d+)(?:[-+][^\s]+)?(?:\s|$)/.exec(value);
@@ -33,6 +36,7 @@ function runProcess(args, input = "") {
   return new Promise((resolve, reject) => {
     const child = spawn(piCommand, args, {
       cwd: repositoryRoot,
+      env: standaloneEnvironment,
       shell: process.platform === "win32",
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,

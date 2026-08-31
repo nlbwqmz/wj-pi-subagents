@@ -22,7 +22,6 @@ import {
   type SafeRenderLine,
 } from "./agent-tool-rendering.ts";
 import type { ManagedRpcReply } from "./managed-rpc-node.ts";
-import type { ReplyAcceptance } from "./reply-acceptance.ts";
 import { isCanonicalUuid } from "./tree-controller.ts";
 
 export const WJ_PI_SUBAGENTS_MESSAGE_TYPE = "wj-pi-subagents-message" as const;
@@ -30,7 +29,8 @@ export const WJ_PI_SUBAGENTS_FINAL_TYPE = "wj-pi-subagents-final-report" as cons
 export const WJ_PI_SUBAGENTS_TERMINAL_TYPE = "wj-pi-subagents-terminal" as const;
 
 export interface ParentConversationApi {
-  sendMessage(message: unknown, options?: unknown): unknown;
+  /** Mirrors Pi 0.84.4 ExtensionAPI.sendMessage, which is fire-and-forget. */
+  sendMessage(message: unknown, options?: unknown): void;
 }
 
 export interface ParentReplyInboxOptions {
@@ -85,8 +85,8 @@ export interface ParentReplyMessageRendererOptions {
 }
 
 /**
- * 父端结构化回复接纳点。只有 Pi 会话已同步接受 custom message 后才返回 true，
- * 监督通道据此返回一次性的 Pi 接纳裁决。
+ * 父端结构化回复提交点。Pi ExtensionAPI.sendMessage 是 fire-and-forget；
+ * 返回 true 只表示调用已同步提交给当前扩展运行时，不声称异步处理已完成。
  */
 export class ParentReplyInbox {
   private readApi!: () => ParentConversationApi;
@@ -94,9 +94,6 @@ export class ParentReplyInbox {
   private readSenderName: ((agentId: string) => string | undefined) | undefined;
   private turnTriggerState: "open" | "blocked" | "failed" = "open";
   private turnTriggerBlockToken = Symbol("turn-trigger-block");
-  private localCompactionActive = false;
-  private readonly sessionCompactionBarriers = new Set<string>();
-  private readonly childCompactionBarriers = new Map<string, Set<string>>();
 
   constructor(options: ParentReplyInboxOptions) {
     this.rebind(options);
@@ -109,7 +106,7 @@ export class ParentReplyInbox {
     this.readSenderName = options.readSenderName;
   }
 
-  /** context/UI 观察只负责展示，不能改变已接纳会话事件。 */
+  /** context/UI 观察只负责展示，不能改变已提交会话事件。 */
   observeContext(_event: unknown): void {}
 
   /** Pi 即将结束当前 loop 时先阻止后代回复重入；重复调用返回同一屏障令牌。 */
@@ -136,64 +133,17 @@ export class ParentReplyInbox {
     this.turnTriggerState = "failed";
   }
 
-  beginSessionCompactionBarrier(transactionId: string): boolean {
-    if (!validCompactionTransactionId(transactionId)) return false;
-    if (this.sessionCompactionBarriers.has(transactionId)) return true;
-    this.sessionCompactionBarriers.add(transactionId);
-    return true;
-  }
-
-  completeSessionCompactionBarrier(transactionId: string): boolean {
-    if (!validCompactionTransactionId(transactionId)) return false;
-    return this.sessionCompactionBarriers.delete(transactionId);
-  }
-
-  beginChildCompactionBarrier(agentId: string, transactionId: string): boolean {
-    if (!isCanonicalUuid(agentId) || !validCompactionTransactionId(transactionId)) return false;
-    const barriers = this.childCompactionBarriers.get(agentId) ?? new Set<string>();
-    barriers.add(transactionId);
-    this.childCompactionBarriers.set(agentId, barriers);
-    return true;
-  }
-
-  completeChildCompactionBarrier(agentId: string, transactionId: string): boolean {
-    if (!isCanonicalUuid(agentId) || !validCompactionTransactionId(transactionId)) return false;
-    const barriers = this.childCompactionBarriers.get(agentId);
-    if (barriers === undefined || !barriers.delete(transactionId)) return false;
-    if (barriers.size === 0) this.childCompactionBarriers.delete(agentId);
-    return true;
-  }
-
-  /** 当前 Pi 会话本身压缩时，拒绝所有新进入父端的 child 消息。 */
-  observeCompactionStart(): void {
-    this.localCompactionActive = true;
-  }
-
-  observeCompactionEnd(): void {
-    this.localCompactionActive = false;
-  }
-
+  /**
+   * 始终把有效回复交给 Pi 扩展 API。该 void API 不暴露异步接纳或
+   * compaction_active 结果，因此这里只裁决同步提交是否成功。
+   */
   accept(agentId: string, reply: ManagedRpcReply): boolean {
-    return this.acceptResult(agentId, reply).accepted;
-  }
-
-  /** 返回父端 Pi 接纳裁决，保留压缩屏障这一可恢复原因。 */
-  acceptResult(agentId: string, reply: ManagedRpcReply): ReplyAcceptance {
     const envelope = parseChildReplyEnvelope(reply);
-    if (envelope === undefined || envelope.agent_id !== agentId) {
-      return Object.freeze({ accepted: false });
-    }
+    if (envelope === undefined || envelope.agent_id !== agentId) return false;
     const content = messageContent(envelope);
-    if (
-      this.localCompactionActive
-      || this.sessionCompactionBarriers.size > 0
-      || (this.childCompactionBarriers.get(agentId)?.size ?? 0) > 0
-    ) {
-      return Object.freeze({ accepted: false, blocked_reason: "compaction_active" });
-    }
     const senderName = this.safeReadSenderName(agentId);
     try {
-      const sendResult = this.readApi().sendMessage({
+      this.readApi().sendMessage({
         customType: envelope.kind === "message" ? WJ_PI_SUBAGENTS_MESSAGE_TYPE : WJ_PI_SUBAGENTS_FINAL_TYPE,
         content,
         display: true,
@@ -206,29 +156,18 @@ export class ParentReplyInbox {
         triggerTurn: true,
         deliverAs: "steer",
       });
-      if (!isSynchronousAcceptance(sendResult)) {
-        return isCompactionActiveResponse(sendResult)
-          ? Object.freeze({ accepted: false, blocked_reason: "compaction_active" })
-          : Object.freeze({ accepted: false });
-      }
-    } catch (error) {
-      return isCompactionActiveResponse(error)
-        ? Object.freeze({ accepted: false, blocked_reason: "compaction_active" })
-        : Object.freeze({ accepted: false });
+    } catch {
+      return false;
     }
     try {
       this.onSessionEvent?.(agentId, envelope.kind === "message" ? "reply" : "final_report");
-    } catch { /* 观察失败不撤销接纳 */ }
-    return Object.freeze({ accepted: true });
+    } catch { /* 观察失败不撤销已提交事实 */ }
+    return true;
   }
 
   /** 节点故障通知由直接父运行时生成，不伪装成 child final。 */
   acceptTerminal(agentId: string): boolean {
-    if (
-      !isCanonicalUuid(agentId)
-      || this.sessionCompactionBarriers.size > 0
-      || (this.childCompactionBarriers.get(agentId)?.size ?? 0) > 0
-    ) return false;
+    if (!isCanonicalUuid(agentId)) return false;
     const notice: TerminalNotice = {
       schema: CHILD_TERMINAL_SCHEMA,
       version: CHILD_REPLY_VERSION,
@@ -239,7 +178,7 @@ export class ParentReplyInbox {
     };
     const senderName = this.safeReadSenderName(agentId);
     try {
-      const sendResult = this.readApi().sendMessage({
+      this.readApi().sendMessage({
         customType: WJ_PI_SUBAGENTS_TERMINAL_TYPE,
         content: [{ type: "text", text: encodeTerminalNotice(notice) }],
         display: true,
@@ -254,11 +193,10 @@ export class ParentReplyInbox {
         triggerTurn: true,
         deliverAs: "steer",
       });
-      if (!isSynchronousAcceptance(sendResult)) return false;
     } catch {
       return false;
     }
-    try { this.onSessionEvent?.(agentId, "terminal"); } catch { /* 观察失败不撤销接纳 */ }
+    try { this.onSessionEvent?.(agentId, "terminal"); } catch { /* 观察失败不撤销已提交事实 */ }
     return true;
   }
 
@@ -531,10 +469,6 @@ function readMessageText(value: unknown): string {
   return texts.join("\n");
 }
 
-function validCompactionTransactionId(value: string): boolean {
-  return typeof value === "string" && value.length > 0 && value.length <= 256;
-}
-
 function readRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -548,40 +482,6 @@ function readProperty(value: unknown, key: string): unknown {
   } catch {
     return undefined;
   }
-}
-
-const COMPACTION_ACTIVE_PROMPT_ERROR =
-  "Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.";
-
-function isCompactionActiveResponse(value: unknown): boolean {
-  const record = readRecord(value);
-  if (record === undefined) return false;
-  if (
-    readProperty(record, "blocked_reason") === "compaction_active"
-    || readProperty(record, "blockedReason") === "compaction_active"
-    || readProperty(record, "code") === "compaction_active"
-  ) return true;
-  if (
-    readProperty(record, "message") === COMPACTION_ACTIVE_PROMPT_ERROR
-    || readProperty(record, "error") === COMPACTION_ACTIVE_PROMPT_ERROR
-  ) return true;
-  const nestedError = readProperty(record, "error");
-  return readProperty(nestedError, "code") === "compaction_active"
-    || readProperty(nestedError, "message") === COMPACTION_ACTIVE_PROMPT_ERROR;
-}
-
-function isSynchronousAcceptance(value: unknown): boolean {
-  if (value === undefined || value === true) return true;
-  if (value === false || value === null || typeof value !== "object") return false;
-  const record = value as Record<string, unknown>;
-  if (
-    (record.accepted === true || record.ok === true)
-    && record.blocked_reason !== undefined
-  ) return false;
-  if (typeof record.then === "function") return false;
-  return (record.ok === true || record.accepted === true)
-    && record.ok !== false
-    && record.accepted !== false;
 }
 
 export function createVisibleEnvelope(envelope: ChildReplyEnvelope | TerminalNotice): string {

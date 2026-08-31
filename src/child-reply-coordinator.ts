@@ -10,11 +10,6 @@ import {
   type ChildReplyEnvelope,
 } from "./child-reply-envelope.ts";
 import { REPLY_MAX_TEXT_BYTES } from "./child-reply-limits.ts";
-import {
-  normalizeReplyAcceptance,
-  ReplyDeliveryRejectedError,
-  type ReplyAcceptance,
-} from "./reply-acceptance.ts";
 
 export interface NormalReplyInput {
   readonly message: string;
@@ -30,14 +25,13 @@ export interface FinalReportInput {
 
 export type FinalReportData = NormalReplyData;
 
-export type ChildCompactionReason = "manual" | "threshold" | "overflow";
-
 /**
- * 子端消息发送端口。每次 publishReply 正常返回即表示接收侧 Pi 已接纳。
+ * 子端消息发送端口。每次 publishReply 正常返回只表示父端扩展运行时已接受
+ * 本次提交；Pi 的 fire-and-forget 扩展 API 不提供异步处理结果。
  * ACK、应用序号和消息重放不属于该接口。
  */
 export interface ChildReplyPort {
-  publishReply(reply: ChildReplyEnvelope, signal?: AbortSignal): Promise<void | ReplyAcceptance>;
+  publishReply(reply: ChildReplyEnvelope, signal?: AbortSignal): Promise<void>;
 }
 
 export interface ChildReplyCoordinatorOptions {
@@ -48,16 +42,14 @@ export interface ChildReplyCoordinatorOptions {
 /**
  * 持续会话的子端消息边界。
  *
- * 该类只记录当前 Pi 是否存在活动回合和上下文屏障。assistant 文本、
- * message_end、agent_end、settle 都不会自动生成报告；显式工具调用才会
- * 构造消息或报告信封并交给父端 Pi。
+ * 该类只记录当前 Pi 是否存在活动回合。assistant 文本、message_end、
+ * agent_end、settle 都不会自动生成报告；显式工具调用才会构造消息或
+ * 报告信封并交给父端 Pi。
  */
 export class ChildReplyCoordinator {
   private readonly agentId: string;
   private readonly port: ChildReplyPort;
-  private readonly coordinationBarriers = new Set<string>();
   private runActive = false;
-  private compactionActive = false;
   private terminalFailure = false;
 
   constructor(options: ChildReplyCoordinatorOptions) {
@@ -66,33 +58,9 @@ export class ChildReplyCoordinator {
     this.port = options.port;
   }
 
-  beginCoordinationBarrier(transactionId: string): boolean {
-    if (this.terminalFailure || !validCompactionTransactionId(transactionId)) return false;
-    this.coordinationBarriers.add(transactionId);
-    return true;
-  }
-
-  completeCoordinationBarrier(transactionId: string, _outcome: string): boolean {
-    if (!validCompactionTransactionId(transactionId)) return false;
-    return this.coordinationBarriers.delete(transactionId);
-  }
-
-  hasCoordinationBarrier(): boolean {
-    return this.coordinationBarriers.size > 0;
-  }
-
-  expectsCoordinationContinuation(_transactionId: string, _outcome: string): boolean {
-    return false;
-  }
-
-  awaitsCoordinationContinuation(_transactionId: string): boolean {
-    return false;
-  }
-
   observeAgentStart(): void {
     if (this.terminalFailure) return;
     this.runActive = true;
-    this.compactionActive = false;
   }
 
   observeAgentEnd(): void {
@@ -119,15 +87,6 @@ export class ChildReplyCoordinator {
     return this.sendMessage(input, "final_report", signal);
   }
 
-  observeCompactionStart(_reason: ChildCompactionReason, _willRetry = false): void {
-    if (this.terminalFailure) return;
-    this.compactionActive = true;
-  }
-
-  observeCompactionEnd(_reason: ChildCompactionReason): void {
-    this.compactionActive = false;
-  }
-
   settle(): void {
     // 自然停止不生成自动 final；生命周期 idle 由真实 agent_settled 事实负责。
     this.runActive = false;
@@ -145,9 +104,6 @@ export class ChildReplyCoordinator {
       || this.terminalFailure
       || signal?.aborted === true
     ) return controlFailure("message_delivery_failed");
-    if (this.compactionActive || this.coordinationBarriers.size > 0) {
-      return controlFailure("compaction_active");
-    }
 
     const envelope = parseChildReplyEnvelope({
       schema: CHILD_REPLY_SCHEMA,
@@ -158,32 +114,12 @@ export class ChildReplyCoordinator {
     });
     if (envelope === undefined) return controlFailure("invalid_argument");
     try {
-      const result: unknown = await this.port.publishReply(envelope, signal);
-      if (!isSynchronousAcceptance(result)) {
-        const acceptance = normalizeReplyAcceptance(result);
-        if (!acceptance.accepted && acceptance.blocked_reason === "compaction_active") {
-          return controlFailure("compaction_active");
-        }
-        throw new Error("message_delivery_failed");
-      }
-    } catch (error) {
-      if (error instanceof ReplyDeliveryRejectedError && error.blockedReason === "compaction_active") {
-        return controlFailure("compaction_active");
-      }
+      await this.port.publishReply(envelope, signal);
+    } catch {
       return controlFailure("message_delivery_failed");
     }
     return Object.freeze({ ok: true, data: Object.freeze({ accepted: true as const }) });
   }
-}
-
-function isSynchronousAcceptance(value: unknown): boolean {
-  if (value === undefined || value === true) return true;
-  if (value === false || value === null || typeof value !== "object") return false;
-  const record = value as Record<string, unknown>;
-  if (typeof record.then === "function") return false;
-  return (record.ok === true || record.accepted === true)
-    && record.ok !== false
-    && record.accepted !== false;
 }
 
 function isNormalReplyInput(value: unknown): value is NormalReplyInput {
@@ -192,10 +128,6 @@ function isNormalReplyInput(value: unknown): value is NormalReplyInput {
   return typeof candidate.message === "string"
     && candidate.message.trim().length > 0
     && Object.keys(candidate).every((key) => key === "message");
-}
-
-function validCompactionTransactionId(value: string): boolean {
-  return typeof value === "string" && value.length > 0 && value.length <= 256;
 }
 
 function utf8Length(value: string): number {

@@ -21,7 +21,6 @@ import {
   type AgentToolRegistrationApi,
 } from "./agent-tools.ts";
 import { ChildReplyCoordinator } from "./child-reply-coordinator.ts";
-import { AutoCompactCoordinationParticipant } from "./auto-compact-coordination.ts";
 import { ParentWaitBatchCoordinator } from "./parent-wait-batch-coordinator.ts";
 import type {
   AvailableHostCapabilities,
@@ -705,8 +704,6 @@ export function createWjPiSubagentsRuntimeActivator(
     const api = asRuntimeApi(extensionApi);
     let active: ActiveRuntime | undefined;
     let lifecycle: Promise<void> = Promise.resolve();
-    let coordinationParticipant: AutoCompactCoordinationParticipant | undefined;
-    let uncoordinatedManualCompactionActive = false;
     let runtimeUi: { readonly runtime: ActiveRuntime; readonly binding: AgentTreeUiBinding } | undefined;
     const bootstrapAtActivation = readChildRuntimeBootstrap(options.environment);
 
@@ -839,9 +836,7 @@ export function createWjPiSubagentsRuntimeActivator(
       if (current === undefined || current.handoffPending === true) return;
       // 作为首个回合的兜底边界；后续每个模型回合由 turn_start 更新水位。
       current.controller.beginParentTurn();
-      current.replyInbox.observeCompactionEnd();
       if (!current.isChild) return;
-      coordinationParticipant?.observeAgentStart();
       try {
         current.replyCoordinator?.observeAgentStart();
       } catch (error) {
@@ -850,7 +845,7 @@ export function createWjPiSubagentsRuntimeActivator(
       }
       refreshContextUsage(current, rawContext);
       if (current.replyInbox.releaseTurnTriggers()) {
-        // 屏障释放只恢复后续控制触发；已接纳消息不由运行时重放。
+        // 生命周期事件只恢复后续控制触发；已提交消息不由运行时重放。
       }
     });
 
@@ -882,69 +877,6 @@ export function createWjPiSubagentsRuntimeActivator(
       current.replyInbox.blockTurnTriggers();
       current.replyCoordinator?.settle();
       refreshContextUsage(current, rawContext);
-    });
-
-    const failChildCompactionInvariant = (current: ActiveRuntime): void => {
-      current.replyInbox.failTurnTriggers();
-      current.upstream?.channel.failProtocol();
-      void current.upstream?.channel.release().catch(() => {});
-    };
-
-    api.on("session_before_compact", (event) => {
-      const current = active;
-      if (current === undefined || current.handoffPending === true) return;
-      const reason = isRecord(event) ? event.reason : undefined;
-      if (reason !== "manual" && reason !== "threshold" && reason !== "overflow") return;
-      current.replyInbox.observeCompactionStart();
-      if (!current.isChild) return;
-      const willRetry = isRecord(event) ? event.willRetry : undefined;
-      if (reason === "manual") {
-        const coordinated = coordinationParticipant?.beginManualCompaction() === true;
-        if (!coordinated) {
-          const adopted = coordinationParticipant === undefined
-            ? !uncoordinatedManualCompactionActive
-            : coordinationParticipant.beginUncoordinatedManualCompaction();
-          if (!adopted) {
-            failChildCompactionInvariant(current);
-            return;
-          }
-          if (coordinationParticipant === undefined) uncoordinatedManualCompactionActive = true;
-        }
-        current.replyCoordinator?.observeCompactionStart("manual", false);
-        return;
-      }
-      if (reason !== "threshold" && reason !== "overflow") return;
-      coordinationParticipant?.revokePendingManualCompactionAuthorization();
-      if (typeof willRetry !== "boolean") return;
-      current.replyCoordinator?.observeCompactionStart(reason, willRetry);
-    });
-
-    api.on("session_compact", (event, rawContext) => {
-      const current = active;
-      if (current === undefined || current.handoffPending === true) return;
-      refreshContextUsage(current, rawContext);
-      const reason = isRecord(event) ? event.reason : undefined;
-      if (reason !== "manual" && reason !== "threshold" && reason !== "overflow") return;
-      current.replyInbox.observeCompactionEnd();
-      if (!current.isChild) return;
-      if (reason === "manual") {
-        const coordinated = coordinationParticipant?.completeManualCompaction() === true;
-        if (!coordinated) {
-          const adopted = coordinationParticipant === undefined
-            ? uncoordinatedManualCompactionActive
-            : coordinationParticipant.completeUncoordinatedManualCompaction();
-          if (!adopted) {
-            failChildCompactionInvariant(current);
-            return;
-          }
-          if (coordinationParticipant === undefined) uncoordinatedManualCompactionActive = false;
-        }
-        current.replyCoordinator?.observeCompactionEnd("manual");
-        return;
-      }
-      if (reason !== "threshold" && reason !== "overflow") return;
-      coordinationParticipant?.revokePendingManualCompactionAuthorization();
-      current.replyCoordinator?.observeCompactionEnd(reason);
     });
 
     const makeState = (transfer: RuntimeTransfer, context: RuntimeContextView): ActiveRuntime => {
@@ -1038,33 +970,9 @@ export function createWjPiSubagentsRuntimeActivator(
     const reloadEventBus = bootstrapAtActivation.kind === "invalid"
       ? undefined
       : readRuntimeReloadEventBus(api.events);
-    const ensureCoordinationParticipant = (): void => {
-      if (coordinationParticipant !== undefined || reloadEventBus === undefined) return;
-      coordinationParticipant = new AutoCompactCoordinationParticipant({
-        eventBus: reloadEventBus,
-        readRuntime: () => {
-          const current = active;
-          if (current === undefined) return undefined;
-          return {
-            ...(current.handoffPending === undefined ? {} : { handoffPending: current.handoffPending }),
-            replyInbox: current.replyInbox,
-            ...(current.replyCoordinator === undefined ? {} : { replyCoordinator: current.replyCoordinator }),
-            ...(current.upstream === undefined ? {} : { upstream: { channel: current.upstream.channel } }),
-          };
-        },
-      });
-    };
-    const closeCoordinationParticipant = async (): Promise<void> => {
-      const participant = coordinationParticipant;
-      coordinationParticipant = undefined;
-      uncoordinatedManualCompactionActive = false;
-      if (participant !== undefined) await participant.close();
-    };
-    ensureCoordinationParticipant();
     let reloadCoordinator: RuntimeReloadCoordinator<ActiveRuntime, RuntimeTransfer>;
 
     const startSession = async (event: unknown, rawContext: unknown): Promise<void> => {
-      ensureCoordinationParticipant();
       const context = readContext(rawContext);
       const sessionEvent = isRecord(event) ? event as RuntimeSessionStartEvent : {};
       const bootstrapResult = readChildRuntimeBootstrap(options.environment);
@@ -1241,7 +1149,7 @@ export function createWjPiSubagentsRuntimeActivator(
         },
         onSessionEvent: (agentId, event) => {
           if (event === "reply" || event === "final_report") {
-            stateReference?.controller.recordAcceptedSessionEvent(agentId, event);
+            stateReference?.controller.recordDispatchedSessionEvent(agentId, event);
           } else {
             stateReference?.controller.notifySessionEvent(agentId, event);
           }
@@ -1283,13 +1191,7 @@ export function createWjPiSubagentsRuntimeActivator(
         rootId,
         currentModel: () => currentModelReference(state.bindings.context),
         currentThinking: () => currentThinking(state.bindings.context),
-        deliverReply: (agentId, reply) => state.replyInbox.acceptResult(agentId, reply),
-        onCompactionPrepare: (agentId, transactionId) =>
-          state.replyInbox.beginChildCompactionBarrier(agentId, transactionId),
-        onCompactionComplete: (agentId, transactionId) => {
-          const completed = state.replyInbox.completeChildCompactionBarrier(agentId, transactionId);
-          return completed;
-        },
+        deliverReply: (agentId, reply) => state.replyInbox.accept(agentId, reply),
         requestIdRegistry,
         bindControlServer: (_agentId, channel) => {
           const server = new SupervisorControlServer(channel, controlHandler);
@@ -1359,12 +1261,10 @@ export function createWjPiSubagentsRuntimeActivator(
       const current = active;
       const reason = isRecord(event) ? event.reason : undefined;
       if (current !== undefined && reason === "reload" && reloadCoordinator.beginHandoff(current)) {
-        await closeCoordinationParticipant();
         disposeRuntimeUi(current);
         applyAgentToolVisibility(api, false, false);
         return;
       }
-      await closeCoordinationParticipant();
       if (current === undefined) {
         await reloadCoordinator.cleanupIncoming();
         return;

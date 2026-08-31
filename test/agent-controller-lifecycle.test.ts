@@ -232,7 +232,7 @@ test("回合水位丢弃上一回合已观察事件，但保留当前回合新�
 
   fake.emitLifecycle({ type: "agent_start", expected_generation: generation(tree) });
   controller.beginParentTurn();
-  fake.emitReply("message", "上一回合已接纳");
+  fake.emitReply("message", "上一回合已提交");
 
   // 新回合开始时，上一回合已经进入父会话的事件不应再次唤醒 wait_agent。
   controller.beginParentTurn();
@@ -388,7 +388,7 @@ test("父端接纳事件可以在 settled 后登记，terminate 建立不可逆�
   assert.equal(idle.ok, true);
   if (idle.ok) assert.equal(idle.data.outcome, "idle");
   assert.equal(controller.notifySessionEvent(AGENT_ID, "reply"), false);
-  assert.equal(controller.recordAcceptedSessionEvent(AGENT_ID, "reply"), true);
+  assert.equal(controller.recordDispatchedSessionEvent(AGENT_ID, "reply"), true);
   const acceptedAfterSettled = await waitForEvent(controller);
   assert.equal(acceptedAfterSettled.ok, true);
   if (acceptedAfterSettled.ok) {

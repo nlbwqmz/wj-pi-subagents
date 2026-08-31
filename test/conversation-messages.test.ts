@@ -107,42 +107,42 @@ test("显式 normal_reply 和 final_report 可在同一活动回合交错多次�
   if (!afterNaturalStop.ok) assert.equal(afterNaturalStop.error.code, "message_delivery_failed");
 });
 
-test("压缩或协调压缩屏障返回 compaction_active，普通传输失败仍保持原错误", async () => {
+test("子端始终尝试父端提交，单次失败不建立持久屏障", async () => {
+  let attempts = 0;
+  let failNext = true;
   const coordinator = new ChildReplyCoordinator({
     agentId: AGENT_ID,
     port: {
       async publishReply(): Promise<void> {
-        throw new Error("父端不可用");
+        attempts += 1;
+        if (failNext) throw new Error("父端不可用");
       },
     },
   });
   coordinator.observeAgentStart();
-  coordinator.observeCompactionStart("threshold");
-  const localBlocked = await coordinator.normalReply({ message: "压缩期间消息" });
-  assert.equal(localBlocked.ok, false);
-  if (!localBlocked.ok) assert.equal(localBlocked.error.code, "compaction_active");
-  coordinator.observeCompactionEnd("threshold");
 
-  coordinator.beginCoordinationBarrier("parent-compaction");
-  const coordinatedBlocked = await coordinator.finalReport({ message: "协调屏障期间报告" });
-  assert.equal(coordinatedBlocked.ok, false);
-  if (!coordinatedBlocked.ok) assert.equal(coordinatedBlocked.error.code, "compaction_active");
-  coordinator.completeCoordinationBarrier("parent-compaction", "succeeded");
-
-  const failed = await coordinator.normalReply({ message: "普通失败" });
+  const failed = await coordinator.normalReply({ message: "提交失败" });
   assert.equal(failed.ok, false);
   if (!failed.ok) assert.equal(failed.error.code, "message_delivery_failed");
+  assert.equal(attempts, 1);
+
+  failNext = false;
+  assert.deepEqual(await coordinator.normalReply({ message: "失败后继续提交" }), {
+    ok: true,
+    data: { accepted: true },
+  });
+  assert.equal(attempts, 2);
 });
-test("父端 Pi 同步接纳决定消息事件，context/UI 异常不撤销已接纳事实", () => {
+test("父端 fire-and-forget 提交决定消息事件，context/UI 异常不撤销已提交事实", () => {
   const delivered: Array<{ readonly customType: string; readonly text: string }> = [];
   const events: string[] = [];
   let throwFromObserver = true;
   const inbox = new ParentReplyInbox({
     readApi: () => ({
-      sendMessage(message: unknown): { readonly ok: true; readonly accepted: true } {
+      sendMessage(message: unknown, options?: unknown): void {
         const record = message as { customType: string; content: readonly { text: string }[] };
         delivered.push({ customType: record.customType, text: record.content[0]!.text });
-        return { ok: true, accepted: true };
+        assert.deepEqual(options, { triggerTurn: true, deliverAs: "steer" });
       },
     }),
     readSenderName: () => { throw new Error("UI 尚未准备"); },
@@ -165,40 +165,25 @@ test("父端 Pi 同步接纳决定消息事件，context/UI 异常不撤销已�
   ]);
   assert.deepEqual(events, ["reply", "final_report"]);
 
-  const barrierInbox = new ParentReplyInbox({
+  let synchronousFailures = 0;
+  const rejectingInbox = new ParentReplyInbox({
     readApi: () => ({
       sendMessage: () => {
-        throw new Error("压缩期间不应调用父端 Pi");
+        synchronousFailures += 1;
+        throw new Error("扩展消息 API 尚未绑定");
       },
     }),
   });
-  barrierInbox.beginSessionCompactionBarrier("parent-compaction");
-  assert.deepEqual(barrierInbox.acceptResult(AGENT_ID, reply), {
-    accepted: false,
-    blocked_reason: "compaction_active",
-  });
-  assert.equal(barrierInbox.accept(AGENT_ID, reply), false);
-  barrierInbox.completeSessionCompactionBarrier("parent-compaction");
-  barrierInbox.observeCompactionStart();
-  assert.deepEqual(barrierInbox.acceptResult(AGENT_ID, reply), {
-    accepted: false,
-    blocked_reason: "compaction_active",
-  });
-  barrierInbox.observeCompactionEnd();
-
-  const rejectingInbox = new ParentReplyInbox({
-    readApi: () => ({ sendMessage: () => ({ ok: false, accepted: false }) }),
-  });
   assert.equal(rejectingInbox.accept(AGENT_ID, reply), false);
   assert.equal(rejectingInbox.acceptTerminal(AGENT_ID), false);
+  assert.equal(synchronousFailures, 2);
 
   const terminalMessages: string[] = [];
   const terminalInbox = new ParentReplyInbox({
     readApi: () => ({
-      sendMessage(message: unknown): { readonly accepted: true } {
+      sendMessage(message: unknown): void {
         const record = message as { customType: string };
         terminalMessages.push(record.customType);
-        return { accepted: true };
       },
     }),
   });

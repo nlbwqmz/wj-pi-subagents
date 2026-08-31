@@ -1,9 +1,3 @@
-import {
-  normalizeReplyAcceptance,
-  ReplyDeliveryRejectedError,
-  type ReplyAcceptance,
-  type ReplyDeliveryDecision,
-} from "./reply-acceptance.ts";
 import type { ChildReplyEnvelope } from "./child-reply-envelope.ts";
 import {
   ManagedRpcCommandRejectedError,
@@ -13,10 +7,6 @@ import {
 } from "./managed-rpc-node.ts";
 import type {
   SupervisorCapabilityManifest,
-  SupervisorCompactionComplete,
-  SupervisorCompactionCompleted,
-  SupervisorCompactionPrepare,
-  SupervisorCompactionPrepared,
   SupervisorControlRequest,
   SupervisorControlResponse,
   SupervisorEvent,
@@ -321,12 +311,6 @@ export interface RpcSupervisorChannel {
   waitForReady(signal: AbortSignal): Promise<void>;
   isReady(): boolean;
   publishReply(reply: SupervisorReply, signal?: AbortSignal): Promise<void>;
-  /** parent 返回协调压缩准备结果。 */
-  respondCompactionPrepared?(response: SupervisorCompactionPrepared): Promise<void>;
-  onCompactionPrepare?(listener: (request: SupervisorCompactionPrepare) => void): () => void;
-  /** parent 返回协调压缩完成结果。 */
-  respondCompactionCompleted?(response: SupervisorCompactionCompleted): Promise<void>;
-  onCompactionComplete?(listener: (request: SupervisorCompactionComplete) => void): () => void;
   establishTerminationBarrier(): void;
   requestClose(signal: AbortSignal): Promise<void>;
   waitForClose(deadline: number | Date): Promise<RpcSupervisorChannelCloseState>;
@@ -399,12 +383,6 @@ export interface RpcSupervisorOptions {
   /** child extension bind 后的实际能力裁决；缺失 manifest 必须失败关闭。 */
   readonly validateCapability?: (capability: SupervisorCapabilityManifest) => boolean;
   readonly now?: () => number;
-  /** 当前父会话同步建立或释放该直接 child 的 reply 接纳令牌。 */
-  readonly onCompactionPrepare?: (transactionId: string) => boolean;
-  readonly onCompactionComplete?: (
-    transactionId: string,
-    outcome: SupervisorCompactionComplete["outcome"],
-  ) => boolean;
 }
 
 export type RpcSupervisorStartupResult =
@@ -534,23 +512,6 @@ function isCompactionReason(value: unknown): value is AgentCompactionReason {
   return value === "manual" || value === "threshold" || value === "overflow";
 }
 
-type CoordinatedCompactionPhase = "preparing" | "prepared" | "release_failed" | "closed";
-
-interface CoordinatedCompactionState {
-  readonly transactionId: string;
-  phase: CoordinatedCompactionPhase;
-  replyPrepared: boolean;
-  preparation?: Promise<boolean>;
-  terminalAccepted?: boolean;
-}
-
-interface ClosedCoordinatedCompaction {
-  readonly accepted: boolean;
-  readonly outcome: SupervisorCompactionComplete["outcome"];
-  readonly continuationExpected: boolean;
-  compensationAccepted?: boolean;
-}
-
 /**
  * 单节点 RPC 监督器。树所有权和公开生命周期仍由注入控制器裁决；本模块只
  * 串行协调该节点的 RPC、监督通道和进程树资源。
@@ -574,26 +535,17 @@ export class RpcSupervisor {
   private unsubscribeChannelFault: (() => void) | undefined;
   private unsubscribeChannelEvent: (() => void) | undefined;
   private unsubscribeChannelSnapshot: (() => void) | undefined;
-  private unsubscribeCompactionPrepare: (() => void) | undefined;
-  private unsubscribeCompactionComplete: (() => void) | undefined;
   private readonly eventListeners = new Set<(event: RpcSupervisorEvent) => void>();
   private readonly activeTools = new Set<string>();
   private readonly retiredToolCallIds = new Set<string>();
-  private readonly coordinatedCompactions = new Map<string, CoordinatedCompactionState>();
-  private readonly closedCoordinatedCompactions = new Map<string, ClosedCoordinatedCompaction>();
-  private readonly manualCompactionAuthorizations = new Set<string>();
-  private activeManualCompactionTransactionId: string | undefined;
-  private uncoordinatedManualCompactionActive = false;
   private runtimeCompactionActive = false;
   private hostPendingInputCount = 0;
   private lifecycleObservationVersion = 0;
   private latestAgentStartVersion = 0;
   private compactionObservationVersion = 0;
-  private compactionContinuationExpected = false;
-  /** 续跑保护的协调事务；迟到旧补偿不得清除新事务的保护。 */
-  private compactionContinuationTransactionId: string | undefined;
-  /** 当前压缩开始前最近一次 agent_start 的观察版本。 */
-  private compactionStartAgentStartVersion: number | undefined;
+  /** compaction_end 后，同代际 stale true 不能重新激活；稳定 false 会清除该 fence。 */
+  private compactionEndFenceVersion: number | undefined;
+  private nativeCompactionWillRetry = false;
   private queueObservationVersion = 0;
   private stateReconciliationQueue: Promise<boolean> = Promise.resolve(false);
   private terminationPromise: Promise<RpcSupervisorTerminationResult> | undefined;
@@ -635,38 +587,28 @@ export class RpcSupervisor {
   }
 
   /**
-   * 在父端 Pi 接纳边界登记一条独立会话消息。保留该布尔入口供旧调用者使用；
-   * 生产回复链路使用 acceptChildReplyResult 传播压缩拒绝原因。
+   * 在父端扩展消息提交边界登记一条独立会话消息。该边界调用 Pi 的
+   * fire-and-forget ExtensionAPI，因此这里只确认同步提交，不推断异步处理结果。
    */
   acceptChildReply(
     envelope: ChildReplyEnvelope,
-    deliver: () => ReplyDeliveryDecision,
+    deliver: () => boolean,
   ): boolean {
-    return this.acceptChildReplyResult(envelope, deliver).accepted;
-  }
-
-  acceptChildReplyResult(
-    envelope: ChildReplyEnvelope,
-    deliver: () => ReplyDeliveryDecision,
-  ): ReplyAcceptance {
     if (
       this.phase !== "ready"
       || this.lifecycleState === "interrupting"
       || this.lifecycleState === "terminating"
       || this.lifecycleState === "terminated"
       || this.lifecycleState === "failed"
-    ) return Object.freeze({ accepted: false });
-    let acceptance: ReplyAcceptance;
+    ) return false;
+    let accepted = false;
     try {
-      acceptance = normalizeReplyAcceptance(deliver());
-    } catch (error) {
-      acceptance = error instanceof ReplyDeliveryRejectedError
-        && error.blockedReason === "compaction_active"
-        ? Object.freeze({ accepted: false, blocked_reason: "compaction_active" })
-        : Object.freeze({ accepted: false });
+      accepted = deliver() === true;
+    } catch {
+      accepted = false;
     }
-    if (acceptance.accepted) this.emitEvent(Object.freeze({ kind: "reply", reply: envelope }));
-    return acceptance;
+    if (accepted) this.emitEvent(Object.freeze({ kind: "reply", reply: envelope }));
+    return accepted;
   }
 
   sendMessage(message: string): Promise<RpcSupervisorCommandResult> {
@@ -687,7 +629,10 @@ export class RpcSupervisor {
     if (this.phase !== "ready") {
       return Object.freeze({ ok: false, code: "agent_unavailable" });
     }
-    if (this.compactionBarrierActive()) {
+    const working = this.lifecycleState === "working";
+    // Pi 0.84.4 RPC 没有 abort_compaction。普通 abort 在压缩期间会成功返回，
+    // 但不会停止压缩，因此只能依据当前原生压缩观察拒绝本次中断。
+    if (this.runtimeCompactionActive) {
       return Object.freeze({
         ok: true,
         accepted: true,
@@ -695,14 +640,41 @@ export class RpcSupervisor {
         blocked_reason: "compaction_active" as const,
       });
     }
-    if (this.lifecycleState !== "working") {
+    if (!working) {
       return Object.freeze({ ok: true, accepted: false, changed: false });
     }
+    const compactionVersionBeforeAbort = this.compactionObservationVersion;
     try {
       await this.commandClient().abort();
+      // compaction 可能在前置状态探针与 abort 命令之间开始。Pi 的普通 abort
+      // 会等待会话静止后成功返回，却没有取消该次压缩；观察代际可识别此竞态。
+      if (
+        this.runtimeCompactionActive
+        || this.compactionObservationVersion !== compactionVersionBeforeAbort
+      ) {
+        return Object.freeze({
+          ok: true,
+          accepted: true,
+          changed: false,
+          blocked_reason: "compaction_active" as const,
+        });
+      }
+      // Pi abort 响应可能晚于 agent_settled；此时真实 idle 已经胜出，不能
+      // 再把生命周期倒写为 interrupting。
+      if (this.lifecycleState !== "working") {
+        return Object.freeze({ ok: true, accepted: true, changed: false });
+      }
       this.applyLifecycle({ type: "interrupt_accepted" });
       return Object.freeze({ ok: true, accepted: true, changed: true });
-    } catch {
+    } catch (error) {
+      if (error instanceof ManagedRpcCommandRejectedError && error.reason === "compaction_active") {
+        return Object.freeze({
+          ok: true,
+          accepted: true,
+          changed: false,
+          blocked_reason: "compaction_active" as const,
+        });
+      }
       return Object.freeze({ ok: false, code: "agent_unavailable" });
     }
   }
@@ -988,241 +960,7 @@ export class RpcSupervisor {
         this.receiveSupervisorSnapshot(snapshot);
       });
     }
-    const onCompactionPrepare = channel.onCompactionPrepare;
-    if (typeof onCompactionPrepare === "function") {
-      this.unsubscribeCompactionPrepare = onCompactionPrepare.call(channel, (request) => {
-        void this.receiveCompactionPrepare(request);
-      });
-    }
-    const onCompactionComplete = channel.onCompactionComplete;
-    if (typeof onCompactionComplete === "function") {
-      this.unsubscribeCompactionComplete = onCompactionComplete.call(channel, (request) => {
-        void this.receiveCompactionComplete(request);
-      });
-    }
   }
-
-  private async receiveCompactionPrepare(request: SupervisorCompactionPrepare): Promise<void> {
-    const channel = this.channel;
-    const respond = channel?.respondCompactionPrepared;
-    if (this.phase !== "ready" || typeof respond !== "function") return;
-    const transactionId = request.transaction_id;
-    const existing = this.coordinatedCompactions.get(transactionId);
-    let accepted: boolean;
-    if (existing !== undefined) {
-      accepted = existing.phase === "prepared" || existing.preparation === undefined
-        ? existing.phase === "prepared"
-        : await existing.preparation;
-    } else if (this.closedCoordinatedCompactions.has(transactionId)) {
-      accepted = false;
-    } else {
-      const state: CoordinatedCompactionState = {
-        transactionId,
-        phase: "preparing",
-        replyPrepared: false,
-      };
-      this.coordinatedCompactions.set(transactionId, state);
-      try {
-        state.replyPrepared = this.options.onCompactionPrepare?.(transactionId) === true;
-      } catch {
-        state.replyPrepared = false;
-      }
-      if (!state.replyPrepared) {
-        state.phase = "closed";
-        this.coordinatedCompactions.delete(transactionId);
-        this.rememberClosedCoordinatedCompaction(transactionId, "not_started", false, false);
-        accepted = false;
-      } else {
-        state.phase = "prepared";
-        state.preparation = Promise.resolve(true);
-        // child 收到 prepared ACK 后才会发出 manual compaction_start；先登记授权，
-        // 避免 ACK 与 Pi 事件跨通道交错时把合法压缩误判为协议故障。
-        this.manualCompactionAuthorizations.add(transactionId);
-        accepted = true;
-      }
-    }
-    try {
-      await respond.call(channel, { transaction_id: transactionId, accepted });
-    } catch {
-      const state = this.coordinatedCompactions.get(transactionId);
-      if (state !== undefined) this.releaseCoordinatedCompaction(state, "not_started");
-      this.receiveTransportFault("protocol_fault", "supervisor");
-    }
-  }
-
-  private async receiveCompactionComplete(request: SupervisorCompactionComplete): Promise<void> {
-    const channel = this.channel;
-    const respond = channel?.respondCompactionCompleted;
-    if (this.phase !== "ready" || typeof respond !== "function") return;
-    const state = this.coordinatedCompactions.get(request.transaction_id);
-    let accepted: boolean;
-    if (state === undefined) {
-      const remembered = this.closedCoordinatedCompactions.get(request.transaction_id);
-      if (remembered === undefined) {
-        accepted = false;
-        this.rememberClosedCoordinatedCompaction(
-          request.transaction_id,
-          request.outcome,
-          false,
-          request.continuation_expected,
-        );
-      } else {
-        accepted = remembered.accepted;
-        if (
-          request.outcome === "not_started"
-          && remembered.accepted
-          && remembered.continuationExpected
-        ) {
-          remembered.compensationAccepted ??= true;
-          if (remembered.compensationAccepted
-            && this.compactionContinuationTransactionId === request.transaction_id) {
-            this.compactionContinuationExpected = false;
-            this.compactionContinuationTransactionId = undefined;
-          }
-        }
-      }
-    } else if (state.terminalAccepted !== undefined) {
-      accepted = state.terminalAccepted;
-    } else {
-      accepted = this.releaseCoordinatedCompaction(
-        state,
-        request.outcome,
-        request.continuation_expected,
-      );
-      if (!accepted && this.coordinatedCompactions.get(request.transaction_id) === state) {
-        state.terminalAccepted = false;
-      }
-    }
-    if (accepted) {
-      // 事务释放事实在 ACK 写入前就已被父端接纳；续跑保护必须从这一刻起
-      // 生效，避免并发状态探针把 ACK 间隙误结算为 idle。
-      if (request.continuation_expected
-        && state !== undefined
-        && state.phase === "closed"
-        && (this.compactionStartAgentStartVersion === undefined
-          || this.latestAgentStartVersion <= this.compactionStartAgentStartVersion)) {
-        this.compactionContinuationExpected = true;
-        this.compactionContinuationTransactionId = request.transaction_id;
-      }
-    }
-    try {
-      await respond.call(channel, {
-        transaction_id: request.transaction_id,
-        accepted,
-      });
-    } catch {
-      this.receiveTransportFault("protocol_fault", "supervisor");
-    }
-    if (accepted) {
-      // 协调屏障可能晚于 Pi 的 compaction_end 事件释放；释放后再校准一次，
-      // 让真实 get_state 决定是否可以从 working 收束到 idle。
-      void this.enqueueStateReconciliation().catch(() => {
-        // 状态探针失败不能伪造 idle；后续状态查询或消息发送仍可重试校准。
-      });
-    }
-  }
-
-  private releaseCoordinatedCompaction(
-    state: CoordinatedCompactionState,
-    outcome: SupervisorCompactionComplete["outcome"],
-    continuationExpected = false,
-  ): boolean {
-    if (state.phase === "closed") return true;
-    let replyReleased = !state.replyPrepared;
-    if (state.replyPrepared) {
-      try {
-        replyReleased = this.options.onCompactionComplete?.(state.transactionId, outcome) === true;
-      } catch {
-        replyReleased = false;
-      }
-      if (replyReleased) state.replyPrepared = false;
-    }
-    const released = replyReleased;
-    if (
-      outcome === "not_started"
-      && this.activeManualCompactionTransactionId !== state.transactionId
-    ) {
-      this.manualCompactionAuthorizations.delete(state.transactionId);
-    }
-    state.phase = released ? "closed" : "release_failed";
-    if (released) {
-      this.coordinatedCompactions.delete(state.transactionId);
-      this.rememberClosedCoordinatedCompaction(
-        state.transactionId,
-        outcome,
-        true,
-        continuationExpected,
-      );
-    }
-    return released;
-  }
-
-  private rememberClosedCoordinatedCompaction(
-    transactionId: string,
-    outcome: SupervisorCompactionComplete["outcome"],
-    accepted = true,
-    continuationExpected = false,
-  ): void {
-    if (!this.closedCoordinatedCompactions.has(transactionId)) {
-      this.closedCoordinatedCompactions.set(transactionId, {
-        accepted,
-        outcome,
-        continuationExpected,
-      });
-    }
-    while (this.closedCoordinatedCompactions.size > 64) {
-      const oldest = this.closedCoordinatedCompactions.keys().next().value;
-      if (oldest === undefined) return;
-      this.closedCoordinatedCompactions.delete(oldest);
-      if (this.activeManualCompactionTransactionId !== oldest) {
-        this.manualCompactionAuthorizations.delete(oldest);
-      }
-    }
-  }
-
-  private beginAuthorizedManualCompaction(): boolean {
-    if (
-      this.activeManualCompactionTransactionId !== undefined
-      || this.manualCompactionAuthorizations.size !== 1
-    ) return false;
-    const transactionId = this.manualCompactionAuthorizations.values().next().value;
-    if (transactionId === undefined) return false;
-    this.manualCompactionAuthorizations.delete(transactionId);
-    this.activeManualCompactionTransactionId = transactionId;
-    return true;
-  }
-
-  private completeAuthorizedManualCompaction(): boolean {
-    const transactionId = this.activeManualCompactionTransactionId;
-    if (transactionId === undefined) return false;
-    this.activeManualCompactionTransactionId = undefined;
-    this.manualCompactionAuthorizations.delete(transactionId);
-    return true;
-  }
-
-  /** 无协调事务时接管外部 manual 生命周期，避免把合法压缩误判为协议损坏。 */
-  private beginUncoordinatedManualCompaction(): boolean {
-    if (
-      this.activeManualCompactionTransactionId !== undefined
-      || this.uncoordinatedManualCompactionActive
-      || this.manualCompactionAuthorizations.size > 0
-      || this.coordinatedCompactions.size > 0
-    ) return false;
-    this.uncoordinatedManualCompactionActive = true;
-    return true;
-  }
-
-  private completeUncoordinatedManualCompaction(): boolean {
-    if (!this.uncoordinatedManualCompactionActive) return false;
-    this.uncoordinatedManualCompactionActive = false;
-    return true;
-  }
-
-  /** 自动压缩撤销全部尚未消费的授权；active manual 独立保留到 compaction_end。 */
-  private revokePendingManualCompactionAuthorizations(): void {
-    this.manualCompactionAuthorizations.clear();
-  }
-
 
   private receiveRpcEvent(event: unknown): void {
     if (this.phase !== "ready") return;
@@ -1233,8 +971,7 @@ export class RpcSupervisor {
     switch (event.type) {
       case "agent_start":
         this.hostPendingInputCount = 0;
-        this.compactionContinuationExpected = false;
-        this.compactionContinuationTransactionId = undefined;
+        this.nativeCompactionWillRetry = false;
         this.markLifecycleObservation("agent_start");
         this.resetToolActivity();
         if (this.lifecycleState === "idle") this.applyLifecycle({ type: "agent_start" });
@@ -1246,6 +983,9 @@ export class RpcSupervisor {
         this.emitActivity(this.runtimeCompactionActive ? "compacting" : "processing");
         return;
       case "agent_settled": {
+        // RPC 事件与 compaction_end 同属 Pi 有序流；若 willRetry 后直接 settled，
+        // 说明后继回合未能产生 agent_start，续跑保护必须在这里收束。
+        this.nativeCompactionWillRetry = false;
         const settlementVersion = this.markLifecycleObservation();
         void this.enqueueStateReconciliation(settlementVersion).catch(() => {
           // 状态探针失败不能伪造 idle；后续状态查询或消息发送仍可重试校准。
@@ -1257,35 +997,16 @@ export class RpcSupervisor {
           this.failRuntime("invalid_rpc_event");
           return;
         }
-        const coordinatedManual = event.reason === "manual"
-          && this.beginAuthorizedManualCompaction();
-        if (
-          event.reason === "manual"
-          && !coordinatedManual
-          && !this.beginUncoordinatedManualCompaction()
-        ) {
-          this.failRuntime("invalid_rpc_event");
-          return;
-        }
-        if (event.reason !== "manual") this.revokePendingManualCompactionAuthorizations();
         this.runtimeCompactionActive = true;
-        this.compactionStartAgentStartVersion = this.latestAgentStartVersion;
         this.compactionObservationVersion += 1;
+        this.compactionEndFenceVersion = undefined;
         this.markLifecycleObservation();
         this.emitActivity("compacting");
         return;
       }
-      case "compaction_end":
-        if (!isCompactionReason(event.reason)) {
-          this.failRuntime("invalid_rpc_event");
-          return;
-        }
-        const coordinatedManual = event.reason === "manual"
-          && this.activeManualCompactionTransactionId !== undefined;
+      case "compaction_end": {
         if (
-          (event.reason === "manual"
-            && !this.completeAuthorizedManualCompaction()
-            && !this.completeUncoordinatedManualCompaction())
+          !isCompactionReason(event.reason)
           || typeof event.aborted !== "boolean"
           || typeof event.willRetry !== "boolean"
           || typeof event.failed !== "boolean"
@@ -1294,19 +1015,16 @@ export class RpcSupervisor {
           return;
         }
         this.runtimeCompactionActive = false;
-        // 已接纳的协调 complete 可能先于 Pi 的 compaction_end 到达；
-        // 同周期的 end 事实不能覆盖明确声明的 continuation_expected。
-        if (this.compactionContinuationTransactionId === undefined) {
-          this.compactionContinuationExpected = event.willRetry;
-        }
+        this.nativeCompactionWillRetry = event.willRetry;
         this.compactionObservationVersion += 1;
         const completionVersion = this.markLifecycleObservation();
+        this.compactionEndFenceVersion = this.compactionObservationVersion;
         this.emitActivity(this.activeTools.size > 0 ? "executing_tools" : "processing");
         void this.enqueueStateReconciliation(completionVersion).catch(() => {
           // 状态探针失败不能伪造 idle；后续状态查询或消息发送仍可重试校准。
         });
-        void coordinatedManual;
         return;
+      }
       case "queue_update": {
         if (!Number.isSafeInteger(event.pendingMessageCount) || (event.pendingMessageCount as number) < 0) {
           this.failRuntime("invalid_rpc_event");
@@ -1505,7 +1223,6 @@ export class RpcSupervisor {
 
   private enterFailedPhase(): void {
     this.phase = "failed";
-    this.releaseCoordinatedCompactions();
     this.activeTools.clear();
     this.retiredToolCallIds.clear();
   }
@@ -1524,26 +1241,6 @@ export class RpcSupervisor {
         : "internal_error";
     this.applyLifecycle({ type: "runtime_failed", error_code: lifecycleCode });
     this.emitEvent(Object.freeze({ kind: "fault", code }));
-  }
-
-  private releaseCoordinatedCompactions(): void {
-    const states = [...this.coordinatedCompactions.values()];
-    for (const state of states) this.releaseCoordinatedCompaction(state, "not_started");
-    this.coordinatedCompactions.clear();
-    this.closedCoordinatedCompactions.clear();
-    this.manualCompactionAuthorizations.clear();
-    this.activeManualCompactionTransactionId = undefined;
-    this.uncoordinatedManualCompactionActive = false;
-    this.runtimeCompactionActive = false;
-    this.compactionContinuationExpected = false;
-    this.compactionContinuationTransactionId = undefined;
-  }
-
-  private compactionBarrierActive(): boolean {
-    return this.runtimeCompactionActive
-      || this.coordinatedCompactions.size > 0
-      || this.activeManualCompactionTransactionId !== undefined
-      || this.uncoordinatedManualCompactionActive;
   }
 
   private async enqueueMessage(
@@ -1565,9 +1262,6 @@ export class RpcSupervisor {
       || this.lifecycleState === "terminated"
       || this.lifecycleState === "failed"
     ) return Object.freeze({ ok: false, code: "message_delivery_failed" });
-    if (this.compactionBarrierActive()) {
-      return Object.freeze({ ok: false, code: "compaction_active" });
-    }
     const submissionMode = mode ?? (this.lifecycleState === "working" ? "steer" : "prompt");
     try {
       const operation = submissionMode === "steer"
@@ -1616,15 +1310,26 @@ export class RpcSupervisor {
     if (this.queueObservationVersion === queueVersion) {
       this.hostPendingInputCount = observed.pendingMessageCount;
     }
-    if (this.compactionObservationVersion === compactionVersion && observed.isCompacting) {
+    let staleCompactionTrue = false;
+    if (!observed.isCompacting) {
+      if (this.compactionObservationVersion === compactionVersion
+        || this.compactionEndFenceVersion !== undefined) {
+        this.runtimeCompactionActive = false;
+      }
+      if (this.compactionEndFenceVersion !== undefined) {
+        this.compactionEndFenceVersion = undefined;
+      }
+    } else if (this.compactionEndFenceVersion !== undefined) {
+      // A probe may have started before compaction_end and returned after it;
+      // the current end fence still classifies that true as stale.
+      staleCompactionTrue = true;
+    } else if (this.compactionObservationVersion === compactionVersion) {
       this.runtimeCompactionActive = true;
     }
     const pendingMessageCount = this.queueObservationVersion === queueVersion
       ? observed.pendingMessageCount
       : this.hostPendingInputCount;
-    const isCompacting = this.compactionObservationVersion === compactionVersion
-      ? observed.isCompacting
-      : this.runtimeCompactionActive;
+    const isCompacting = this.runtimeCompactionActive;
     const activeRun = observed.isStreaming || pendingMessageCount > 0;
     if (activeRun) {
       if (this.lifecycleState === "idle") {
@@ -1640,15 +1345,18 @@ export class RpcSupervisor {
       return true;
     }
 
+    // end 后的同代际 true 既不能重开 compacting，也不是可结算证据；
+    // 只有后续稳定 false 清除 fence 后才能进入 idle。
+    if (staleCompactionTrue) return true;
     // 续跑的 agent_start 可能已经先于旧 settled 事件抵达；旧 settled
     // 不能覆盖这个更新的真实运行事实。
     if (
       (expectedSettlementVersion !== undefined
         && this.latestAgentStartVersion > expectedSettlementVersion)
       || this.latestAgentStartVersion > latestAgentStartAtProbe
-      || this.compactionContinuationExpected
+      || this.nativeCompactionWillRetry
     ) return true;
-    if (isCompacting || this.compactionBarrierActive() || pendingMessageCount !== 0) {
+    if (isCompacting || pendingMessageCount !== 0) {
       this.emitActivity("compacting");
       return true;
     }
@@ -2002,17 +1710,15 @@ export class RpcSupervisor {
     this.unsubscribeChannelFault?.();
     this.unsubscribeChannelEvent?.();
     this.unsubscribeChannelSnapshot?.();
-    this.unsubscribeCompactionPrepare?.();
-    this.unsubscribeCompactionComplete?.();
     this.channelBindingCleanup?.();
     this.unsubscribeRpcEvent = undefined;
     this.unsubscribeRpcFault = undefined;
     this.unsubscribeChannelFault = undefined;
     this.unsubscribeChannelEvent = undefined;
     this.unsubscribeChannelSnapshot = undefined;
-    this.unsubscribeCompactionPrepare = undefined;
-    this.unsubscribeCompactionComplete = undefined;
-    this.releaseCoordinatedCompactions();
+    this.runtimeCompactionActive = false;
+    this.compactionEndFenceVersion = undefined;
+    this.nativeCompactionWillRetry = false;
     this.channelBindingCleanup = undefined;
   }
 }

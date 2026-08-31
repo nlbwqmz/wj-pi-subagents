@@ -15,14 +15,14 @@
 - **上下文复用**：同一个子代理可以连续接收任务，并保留自己的会话上下文。
 - **受控管理**：父代理只能管理自己的直接子代理，支持等待、查询、中断、复用和终止。
 - **状态可视化**：TUI 会显示直接子代理状态，`/agents` 可查看当前会话范围内的完整代理树。
-- **自动压缩协作**：可与 [`wj-pi-auto-compact`](https://github.com/nlbwqmz/wj-pi-auto-compact) 配套使用，在长任务中自动管理上下文压缩。
+- **原生上下文压缩**：依赖 Pi `>= 0.84.4` 的 post-tool 压缩流程，每个根会话和子代理由各自的 Pi 会话独立管理上下文。
 
 ## 运行要求
 
 | 项目 | 要求 |
 | --- | --- |
 | Node.js | `>= 22.19.0` |
-| Pi | `>= 0.84.1`，包名为 `@earendil-works/pi-coding-agent` |
+| Pi | `>= 0.84.4`，包名为 `@earendil-works/pi-coding-agent` |
 | 模型 | 根会话需要已选择并配置可用模型 |
 | Windows | 需要 Bash，推荐 Git for Windows；还需可从 `PATH` 调用 `powershell.exe` |
 
@@ -228,46 +228,11 @@ thinking: high
 
 运行配置在根会话启动时读取。修改后需要退出并重新启动 Pi，`/reload` 不会重新读取这些配置。
 
-## 配套自动压缩插件
+## 上下文压缩
 
-建议同时安装 [`wj-pi-auto-compact`](https://github.com/nlbwqmz/wj-pi-auto-compact)。根会话和子代理在处理长任务时会持续占用上下文，自动压缩可以在使用率达到阈值后调用 Pi 的压缩能力，并在任务尚未结束时继续执行。
+Pi `>= 0.84.4` 会在工具执行结束后通过原生 post-tool 流程判断并执行上下文压缩。根会话和每个子代理都是独立的 Pi 会话，各自根据实际上下文状态完成压缩和后续执行，无需额外安装插件或配置协调协议。
 
-推荐将两个插件安装在相同作用域。用户级安装：
-
-```bash
-pi install npm:wj-pi-subagents
-pi install npm:wj-pi-auto-compact
-```
-
-项目级安装：
-
-```bash
-cd <PROJECT_DIR>
-pi install npm:wj-pi-subagents -l
-pi install npm:wj-pi-auto-compact -l
-```
-
-`wj-pi-auto-compact` 默认在上下文使用率达到 `90%` 时触发。需要调整时创建：
-
-```text
-<USER_HOME>/.pi/agent/wj-pi-auto-compact.json
-```
-
-```json
-{
-  "enabled": true,
-  "maxContextPercent": 90
-}
-```
-
-如果子代理模板省略 `extensions`，已安装的自动压缩插件会按照 Pi 的普通扩展发现规则加载。若模板显式限制扩展，则需要将它加入列表：
-
-```yaml
-extensions:
-  - npm:wj-pi-auto-compact
-```
-
-配置细节参见 [`wj-pi-auto-compact` 文档](https://github.com/nlbwqmz/wj-pi-auto-compact#readme)。
+本插件观察 Pi 原生的压缩生命周期事件和 `get_state.isCompacting`，用于校准代理状态及 TUI 活动提示。父端发往子 Pi 的消息仍由 Pi 命令响应裁决；如果 Pi 正在压缩并拒绝消息，调用方会收到可重试的 `compaction_active`。Pi 0.84.4 没有 `abort_compaction` RPC，因此压缩期间的中断会根据当前原生压缩观察返回 `compaction_active`，不会调用无法取消压缩的普通 `abort`。子端回复使用 Pi 的 fire-and-forget 扩展消息 API，其成功结果只表示父扩展运行时已接受提交。
 
 ## 更新与卸载
 

@@ -98,7 +98,7 @@ export interface AgentControllerOptions {
   readonly onTerminal?: (agentId: string) => boolean | void;
   /** 故障后代已由受管监督器回收、根权威 confirm 前刷新本地上行生命周期事实。 */
   readonly flushUpstreamLifecycle?: () => Promise<void>;
-  /** 生产 inbox 已在消息接纳点登记 reply；避免监督事件再次登记同一通知。 */
+  /** 生产 inbox 已在父扩展消息提交点登记 reply；避免监督事件再次登记同一通知。 */
   readonly replyNotificationsHandledByInbox?: boolean;
   /** 生产运行时必须提供根权威端口；省略仅保留旧单节点测试 seam。 */
   readonly authority?: TreeAuthorityPort;
@@ -201,7 +201,7 @@ export class AgentController {
   private readonly unassignedSupervisors = new Map<AgentSupervisor, () => void>();
   private readonly waiters = new Map<string, Set<PendingWaiter>>();
   private readonly pendingWaiters = new Set<PendingWaiter>();
-  /** 已接纳但尚未被父模型上下文观察的会话通知。 */
+  /** 已提交但尚未被父模型上下文观察的会话通知。 */
   private readonly pendingReplyNotifications = new Map<string, Map<string, PendingReplyNotification>>();
   private replyNotificationSequence = 0;
   /** 当前父 Pi 回合开始前已经进入父会话的通知水位。 */
@@ -448,16 +448,16 @@ export class AgentController {
   }
 
   /**
-   * 记录父 Pi 新回合的通知观察边界。回合开始前已经被 Pi 接纳的消息属于
-   * 当前回合输入，不应在本回合或后续回合再次作为 wait_agent 事件返回；回合
-   * 开始后新到达的消息仍保留给当前回合内的等待。
+   * 记录父 Pi 新回合的通知观察边界。回合开始前已经提交给扩展消息 API 的
+   * 消息属于当前回合输入，不应在本回合或后续回合再次作为 wait_agent 事件返回；
+   * 回合开始后新到达的消息仍保留给当前回合内的等待。
    */
   beginParentTurn(): void {
     this.parentTurnNotificationWatermark = this.replyNotificationSequence;
     this.discardObservedReplyNotifications();
   }
 
-  /** Pi 已同步接纳一条显式会话消息后的唯一事件登记点。 */
+  /** 会话通知登记入口；reply/final_report 只在当前活动状态下接受。 */
   notifySessionEvent(
     agentId: unknown,
     event: "reply" | "final_report" | "idle" | "terminal",
@@ -481,11 +481,12 @@ export class AgentController {
   }
 
   /**
-   * 父端 Pi 已同步接纳 child 消息后的内部事实入口。接纳裁决与生命周期事件
-   * 由不同传输帧承载，故 settled 可能先到；此入口保留已接纳消息，不把 idle
-   * 快照误当成消息失败。它只接受普通回复和显式报告，且拒绝终止屏障后的帧。
+   * 父端 fire-and-forget 扩展 API 已接受 child 消息提交后的内部事实入口。
+   * 提交结果与生命周期事件由不同传输帧承载，故 settled 可能先到；此入口
+   * 保留已提交消息，不把 idle 快照误当成消息失败。它只接受普通回复和显式
+   * 报告，且拒绝终止屏障后的帧。
    */
-  recordAcceptedSessionEvent(
+  recordDispatchedSessionEvent(
     agentId: unknown,
     event: "reply" | "final_report",
   ): boolean {
@@ -946,7 +947,7 @@ export class AgentController {
         // 父会话注入失败只影响上行观察者，不破坏节点等待和生命周期。
       }
     }
-    // 生产运行时由 ParentReplyInbox 在 custom message 被接纳后登记通知；独立
+    // 生产运行时由 ParentReplyInbox 在扩展消息同步提交后登记通知；独立
     // 控制器装配仍从监督事件登记，避免同一消息在两层各计数一次。
     if (
       event.kind === "reply"

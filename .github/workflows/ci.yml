@@ -40,7 +40,7 @@ jobs:
         run: npm run pack:smoke
 
       - name: Install Pi
-        run: npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.84.2
+        run: npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.84.4
 
       - name: Run Pi compatibility smoke test
         run: npm run compat:pi

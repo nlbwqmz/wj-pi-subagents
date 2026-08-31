@@ -4,10 +4,6 @@ import {
   SupervisorFrameDecoder,
   type SupervisorChannelOptions,
   type SupervisorCapabilityManifest,
-  type SupervisorCompactionComplete,
-  type SupervisorCompactionCompleted,
-  type SupervisorCompactionPrepare,
-  type SupervisorCompactionPrepared,
   type SupervisorControlRequest,
   type SupervisorControlResponse,
   type SupervisorFrame,
@@ -22,10 +18,6 @@ import type {
   RpcSupervisorChannelCloseState,
   RpcSupervisorChannelFault,
 } from "./rpc-supervisor.ts";
-import {
-  ReplyDeliveryRejectedError,
-  type ReplyAcceptance,
-} from "./reply-acceptance.ts";
 import {
   createDeferred,
   notifySupervisorListeners,
@@ -52,8 +44,8 @@ export interface StreamSupervisorChannelOptions extends SupervisorChannelOptions
   readonly onCapability?: (capability: SupervisorCapabilityManifest) => void;
   /** child 收到 close 后执行后代优先清理；只有 true 才关闭本地字节流。 */
   readonly onCloseRequested?: () => boolean | Promise<boolean>;
-  /** child 等待父端同步返回 Pi 接纳裁决的内部期限。 */
-  readonly replyAcceptanceTimeoutMs?: number;
+  /** child 等待父端同步返回扩展消息提交结果的内部期限。 */
+  readonly replyDispatchTimeoutMs?: number;
 }
 
 /**
@@ -67,14 +59,10 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
   private readonly initialSnapshot: readonly unknown[];
   private readonly initialSubtreeRevision: number | undefined;
   private readonly onCloseRequested: (() => boolean | Promise<boolean>) | undefined;
-  private readonly replyAcceptanceTimeoutMs: number;
+  private readonly replyDispatchTimeoutMs: number;
   private readonly ready = createDeferred<void>();
   private readonly closed = createDeferred<void>();
-  private readonly replyAcceptances = new Map<string, Deferred<ReplyAcceptance>>();
-  private readonly compactionPrepared = new Map<string, Deferred<boolean>>();
-  private readonly compactionCompleted = new Map<string, Deferred<boolean>>();
-  private readonly compactionPrepareListeners = new Set<(request: SupervisorCompactionPrepare) => void>();
-  private readonly compactionCompleteListeners = new Set<(request: SupervisorCompactionComplete) => void>();
+  private readonly replyDispatches = new Map<string, Deferred<boolean>>();
   private readonly faults = new Set<(fault: RpcSupervisorChannelFault) => void>();
   private readonly eventListeners = new Set<(event: SupervisorEvent) => void>();
   private readonly snapshotListeners = new Set<(snapshot: SupervisorSnapshot) => void>();
@@ -114,8 +102,8 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     this.initialSnapshot = Object.freeze([...(options.initialSnapshot ?? [])]);
     this.initialSubtreeRevision = options.initialSubtreeRevision;
     this.onCloseRequested = options.onCloseRequested;
-    this.replyAcceptanceTimeoutMs = validPositiveDuration(options.replyAcceptanceTimeoutMs)
-      ? options.replyAcceptanceTimeoutMs
+    this.replyDispatchTimeoutMs = validPositiveDuration(options.replyDispatchTimeoutMs)
+      ? options.replyDispatchTimeoutMs
       : validPositiveDuration(options.resyncTimeoutMs)
         ? options.resyncTimeoutMs
         : 5_000;
@@ -167,15 +155,15 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     const frame = this.protocol.publishReply(reply);
     const requestId = frame.request_id;
     if (requestId === undefined) throw new Error("message_delivery_failed");
-    const waiter = createDeferred<ReplyAcceptance>();
+    const waiter = createDeferred<boolean>();
     void waiter.promise.catch(() => {});
-    this.replyAcceptances.set(requestId, waiter);
+    this.replyDispatches.set(requestId, waiter);
     try {
       await this.send(frame);
-      const accepted = await this.waitForReplyAcceptance(waiter, signal);
-      if (!accepted.accepted) throw new ReplyDeliveryRejectedError(accepted.blocked_reason);
+      const accepted = await this.waitForReplyDispatch(waiter, signal);
+      if (!accepted) throw new Error("message_delivery_failed");
     } finally {
-      if (this.replyAcceptances.get(requestId) === waiter) this.replyAcceptances.delete(requestId);
+      if (this.replyDispatches.get(requestId) === waiter) this.replyDispatches.delete(requestId);
     }
   }
 
@@ -202,51 +190,6 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
 
   async publishControlResponse(response: SupervisorControlResponse): Promise<void> {
     await this.send(this.protocol.publishControlResponse(response));
-  }
-
-  async requestCompactionPrepare(transactionId: string, signal?: AbortSignal): Promise<boolean> {
-    return this.requestCompactionAcknowledgement(
-      transactionId,
-      this.compactionPrepared,
-      this.protocol.publishCompactionPrepare({ transaction_id: transactionId }),
-      signal,
-    );
-  }
-
-  async respondCompactionPrepared(response: SupervisorCompactionPrepared): Promise<void> {
-    await this.send(this.protocol.publishCompactionPrepared(response));
-  }
-
-  onCompactionPrepare(listener: (request: SupervisorCompactionPrepare) => void): () => void {
-    this.compactionPrepareListeners.add(listener);
-    return () => this.compactionPrepareListeners.delete(listener);
-  }
-
-  async requestCompactionComplete(
-    transactionId: string,
-    outcome: SupervisorCompactionComplete["outcome"],
-    signal?: AbortSignal,
-    continuationExpected = false,
-  ): Promise<boolean> {
-    return this.requestCompactionAcknowledgement(
-      transactionId,
-      this.compactionCompleted,
-      this.protocol.publishCompactionComplete({
-        transaction_id: transactionId,
-        outcome,
-        continuation_expected: continuationExpected,
-      }),
-      signal,
-    );
-  }
-
-  async respondCompactionCompleted(response: SupervisorCompactionCompleted): Promise<void> {
-    await this.send(this.protocol.publishCompactionCompleted(response));
-  }
-
-  onCompactionComplete(listener: (request: SupervisorCompactionComplete) => void): () => void {
-    this.compactionCompleteListeners.add(listener);
-    return () => this.compactionCompleteListeners.delete(listener);
   }
 
   establishTerminationBarrier(): void {
@@ -276,9 +219,8 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     if (this.released) return;
     this.released = true;
     this.endpointClosed = true;
-    for (const waiter of this.replyAcceptances.values()) waiter.reject(new Error("监督通道已关闭"));
-    this.replyAcceptances.clear();
-    this.rejectCompactionWaiters("监督通道已关闭");
+    for (const waiter of this.replyDispatches.values()) waiter.reject(new Error("监督通道已关闭"));
+    this.replyDispatches.clear();
     try {
       if (!this.transport.stdin.destroyed) this.transport.stdin.destroy();
       if (!this.transport.stdout.destroyed) this.transport.stdout.destroy();
@@ -377,24 +319,12 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
       notifySupervisorListeners(this.controlRequestListeners, result.control_request);
     }
     if (result.kind === "accepted" && result.control_response !== undefined) {
-      const acceptance = readReplyAcceptance(result.control_response);
-      if (acceptance === undefined) {
+      const dispatch = readReplyDispatch(result.control_response);
+      if (dispatch === undefined) {
         notifySupervisorListeners(this.controlResponseListeners, result.control_response);
       } else {
-        this.resolveReplyAcceptance(acceptance.operationId, acceptance.acceptance);
+        this.resolveReplyDispatch(dispatch.operationId, dispatch.accepted);
       }
-    }
-    if (result.kind === "accepted" && result.compaction_prepare !== undefined) {
-      notifySupervisorListeners(this.compactionPrepareListeners, result.compaction_prepare);
-    }
-    if (result.kind === "accepted" && result.compaction_prepared !== undefined) {
-      this.resolveCompactionAcknowledgement(this.compactionPrepared, result.compaction_prepared);
-    }
-    if (result.kind === "accepted" && result.compaction_complete !== undefined) {
-      notifySupervisorListeners(this.compactionCompleteListeners, result.compaction_complete);
-    }
-    if (result.kind === "accepted" && result.compaction_completed !== undefined) {
-      this.resolveCompactionAcknowledgement(this.compactionCompleted, result.compaction_completed);
     }
     if (result.kind === "accepted" && result.close_requested === true) {
       this.handleCloseRequested();
@@ -482,20 +412,20 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     for (const item of pending) item.completion.reject(new Error("监督通道不可用"));
   }
 
-  private resolveReplyAcceptance(operationId: string, acceptance: ReplyAcceptance): void {
-    const waiter = this.replyAcceptances.get(operationId);
+  private resolveReplyDispatch(operationId: string, accepted: boolean): void {
+    const waiter = this.replyDispatches.get(operationId);
     if (waiter === undefined) return;
-    this.replyAcceptances.delete(operationId);
-    waiter.resolve(acceptance);
+    this.replyDispatches.delete(operationId);
+    waiter.resolve(accepted);
   }
 
-  private async waitForReplyAcceptance(
-    waiter: Deferred<ReplyAcceptance>,
+  private async waitForReplyDispatch(
+    waiter: Deferred<boolean>,
     signal?: AbortSignal,
-  ): Promise<ReplyAcceptance> {
+  ): Promise<boolean> {
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<ReplyAcceptance>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("message_delivery_failed")), this.replyAcceptanceTimeoutMs);
+    const timeout = new Promise<boolean>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("message_delivery_failed")), this.replyDispatchTimeoutMs);
       timer.unref?.();
     });
     try {
@@ -504,43 +434,6 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
-  }
-
-  private async requestCompactionAcknowledgement(
-    transactionId: string,
-    waiters: Map<string, Deferred<boolean>>,
-    frame: SupervisorFrame,
-    signal?: AbortSignal,
-  ): Promise<boolean> {
-    if (waiters.has(transactionId)) throw new Error("压缩协调事务已存在");
-    const waiter = createDeferred<boolean>();
-    void waiter.promise.catch(() => {});
-    waiters.set(transactionId, waiter);
-    try {
-      await this.send(frame);
-      return signal === undefined
-        ? await waiter.promise
-        : await raceSupervisorAbort(waiter.promise, signal);
-    } finally {
-      if (waiters.get(transactionId) === waiter) waiters.delete(transactionId);
-    }
-  }
-
-  private resolveCompactionAcknowledgement(
-    waiters: Map<string, Deferred<boolean>>,
-    response: SupervisorCompactionPrepared | SupervisorCompactionCompleted,
-  ): void {
-    const waiter = waiters.get(response.transaction_id);
-    if (waiter === undefined) return;
-    waiters.delete(response.transaction_id);
-    waiter.resolve(response.accepted);
-  }
-
-  private rejectCompactionWaiters(message: string): void {
-    for (const waiter of this.compactionPrepared.values()) waiter.reject(new Error(message));
-    this.compactionPrepared.clear();
-    for (const waiter of this.compactionCompleted.values()) waiter.reject(new Error(message));
-    this.compactionCompleted.clear();
   }
 
   private onEof(): void {
@@ -578,9 +471,8 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     if (this.faultNotified) return;
     this.faultNotified = true;
     this.closed.resolve();
-    for (const waiter of this.replyAcceptances.values()) waiter.reject(new Error("监督通道不可用"));
-    this.replyAcceptances.clear();
-    this.rejectCompactionWaiters("监督通道不可用");
+    for (const waiter of this.replyDispatches.values()) waiter.reject(new Error("监督通道不可用"));
+    this.replyDispatches.clear();
     if (!this.ready.settled()) this.ready.reject(new Error("监督通道不可用"));
     for (const listener of this.faults) {
       try {
@@ -592,26 +484,21 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
   }
 }
 
-function readReplyAcceptance(
+function readReplyDispatch(
   response: SupervisorControlResponse,
-): { readonly operationId: string; readonly acceptance: ReplyAcceptance } | undefined {
+): { readonly operationId: string; readonly accepted: boolean } | undefined {
   if (!response.ok || typeof response.data !== "object" || response.data === null || Array.isArray(response.data)) {
     return undefined;
   }
   const data = response.data as Record<string, unknown>;
-  if (data.kind !== "reply_acceptance" || typeof data.accepted !== "boolean") return undefined;
-  const blockedReason = data.blocked_reason;
   if (
-    (blockedReason !== undefined && blockedReason !== "compaction_active")
-    || (data.accepted === true && blockedReason !== undefined)
+    data.kind !== "reply_dispatch"
+    || typeof data.accepted !== "boolean"
+    || Object.keys(data).some((key) => key !== "kind" && key !== "accepted")
   ) return undefined;
   return Object.freeze({
     operationId: response.operation_id,
-    acceptance: data.accepted === true
-      ? Object.freeze({ accepted: true })
-      : blockedReason === "compaction_active"
-        ? Object.freeze({ accepted: false, blocked_reason: "compaction_active" as const })
-        : Object.freeze({ accepted: false }),
+    accepted: data.accepted,
   });
 }
 

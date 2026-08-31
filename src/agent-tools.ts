@@ -237,7 +237,7 @@ export const PARENT_COORDINATION_SYSTEM_PROMPT = [
   "  - **注意**：`idle` 仅表示当前没有正在执行的 `turn`，不表示任务已完成。在收到 `final_report` 前，父代理不得将任务判定为已完成，也不得重复委派或接管。",
   "",
   "- `send_message` 错误处理",
-  "  - `compaction_active`：等待屏障解除后，再使用原工具发送。",
+  "  - `compaction_active`：Pi 正在压缩且未接纳消息；等待压缩结束后，再使用原工具发送。",
   "  - `reply_too_large`：精简消息内容后重发。",
   "",
   "- 回收与资源管理",
@@ -267,7 +267,7 @@ export const CHILD_COORDINATION_SYSTEM_PROMPT = [
   "",
   "- 向上通信规则",
   "  - `assistant` 文本不构成通知：普通回复中的 `assistant` 文本不会自动通知父代理。需要父代理看到进度、问题或结果时，必须显式调用对应的回传工具。",
-  "  - `accepted: true` 的含义：仅表示父端已接纳消息，不表示父代理已读取、已处理或已理解消息内容。",
+  "  - `accepted: true` 的含义：仅表示父端扩展运行时已接受消息提交，不表示父代理已读取、已处理或已理解消息内容。",
   "",
   "- 工具使用规范",
   "  - `normal_reply` （中途进度/问题/阻塞）：",
@@ -289,9 +289,6 @@ export const CHILD_COORDINATION_SYSTEM_PROMPT = [
   "    - 处理方式：精简消息内容后使用原工具重发。",
   "    - 禁止：原样重试。",
   "    - 送达判断：成功返回 `accepted: true` 前，不得视为已送达。",
-  "  - `compaction_active`：",
-  "    - 含义：当前消息未被接纳，因系统处于压缩或协调屏障期间。",
-  "    - 处理方式：不要在屏障期间重发；等待屏障解除后，再使用原工具发送。",
   "",
   "- 提交后限制",
   "  - 完成 `final_report` 后禁止重复：",
@@ -317,7 +314,7 @@ const childReplyDescription =
   "Call normal_reply only when your direct parent explicitly asks for a progress report or when blocked on an issue that the parent must handle or decide.";
 
 const childFinalReportDescription =
-  "Send an explicit report to the direct parent. A successful call only means the parent Pi accepted this message; it does not end the current turn or session, and it may be called multiple times.";
+  "Send an explicit report to the direct parent. A successful call only means the parent extension runtime accepted the message submission; it does not mean Pi completed asynchronous delivery, and it does not end the current turn or session. It may be called multiple times.";
 
 /** 返回给 Pi 的固定工具结果；details 只包含控制器安全数据。 */
 function toolResult<T>(result: ControlResult<T>, dataOnly = false): unknown {

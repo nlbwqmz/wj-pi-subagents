@@ -56,7 +56,7 @@ export interface LifecycleReduction {
   readonly diagnostic?: "stale_generation" | "invalid_transition";
 }
 
-/** 会话事件不携带正文，正文只通过父 Pi 已接纳的 custom message 展示。 */
+/** 会话事件不携带正文，正文只通过已提交给父 Pi 的 custom message 展示。 */
 export interface SessionEvent {
   readonly agent_id: string;
   readonly type: SessionEventType;
