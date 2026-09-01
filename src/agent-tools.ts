@@ -1,5 +1,8 @@
 import type { AgentController } from "./agent-controller.ts";
-import { WAIT_AGENT_MAX_TARGETS } from "./agent-controller.ts";
+import {
+  WAIT_AGENT_MAX_TARGETS,
+  normalizeWaitAgentInput,
+} from "./agent-controller.ts";
 import type { ChildReplyCoordinator } from "./child-reply-coordinator.ts";
 import {
   ParentWaitBatchCoordinator,
@@ -350,12 +353,14 @@ function executeTool(
   ) => Promise<ControlResult<unknown>>,
   dataOnly = false,
   lookups: AgentToolRenderLookups = {},
+  prepareArguments?: (args: unknown) => unknown,
 ): Record<string, unknown> {
   return {
     name,
     label: name,
     description: descriptions[name],
     parameters: schemas[name],
+    ...(prepareArguments === undefined ? {} : { prepareArguments }),
     executionMode: name === "wait_agent" ? "parallel" : "sequential",
     renderCall: (
       params: unknown,
@@ -382,6 +387,45 @@ function executeTool(
   };
 }
 
+/**
+ * Pi 在 schema 校验前允许 prepareArguments 做兼容转换。这里保留 Pi 对
+ * 整数原始值的常见 coercion，再用控制器契约生成稳定的预校验错误；renderer
+ * 不需要也不应该根据尚未执行的 raw args 猜测错误类别。
+ */
+function prepareWaitAgentArguments(value: unknown): unknown {
+  try {
+    const coerced = coerceWaitAgentTimeout(value);
+    const normalized = normalizeWaitAgentInput(coerced);
+    if (normalized !== undefined) return normalized;
+  } catch {
+    // Getter、Proxy 或其他畸形宿主输入统一落入稳定 invalid_argument envelope。
+  }
+  throw new SubagentToolError(controlFailure("invalid_argument").error);
+}
+
+function coerceWaitAgentTimeout(value: unknown): unknown {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
+  const candidate = value as Record<string, unknown>;
+  if (!("timeout_ms" in candidate)) return value;
+  const timeout = candidate.timeout_ms;
+  if (timeout === null) {
+    const { timeout_ms: _omitted, ...withoutTimeout } = candidate;
+    return withoutTimeout;
+  }
+  const coerced = coerceInteger(timeout);
+  if (coerced === timeout) return value;
+  return { ...candidate, timeout_ms: coerced };
+}
+
+function coerceInteger(value: unknown): unknown {
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isInteger(parsed) ? parsed : value;
+  }
+  if (typeof value === "boolean") return value ? 1 : 0;
+  return value;
+}
+
 export interface AgentToolRegistrationOptions extends AgentToolRenderLookups {
   readonly waitBatchCoordinator?: ParentWaitBatchCoordinator;
 }
@@ -402,7 +446,7 @@ export function registerAgentTools(
     executeTool("spawn_agent", provider, async (controller, params) => controller.spawnAgent(params), false, lookups),
     executeTool("send_message", provider, async (controller, params) => controller.sendMessage(params), false, lookups),
     executeTool("wait_agent", provider, async (controller, params, call): Promise<WaitAgentToolResult> =>
-      waitBatchCoordinator.wait(controller, call.toolCallId, params, call.signal, call.context), false, lookups),
+      waitBatchCoordinator.wait(controller, call.toolCallId, params, call.signal, call.context), false, lookups, prepareWaitAgentArguments),
     executeTool("interrupt_agent", provider, async (controller, params) => {
       const agentId = readAgentId(params);
       return controller.interruptAgent(agentId);

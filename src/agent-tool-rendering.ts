@@ -28,6 +28,7 @@ import {
 
 const SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const UNSAFE_DISPLAY_PATTERN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/gu;
+const MAX_UNEXPECTED_ERROR_REASON_WIDTH = 240;
 const MAX_COLLAPSED_BODY_LINES = 4;
 const INTERNAL_ERROR_REASON = controlFailure("internal_error").error.message;
 
@@ -302,7 +303,10 @@ export function renderAgentToolResult(
 
   const error = readStableError(result);
   if (error !== undefined || context.isError === true) {
-    const failure = error ?? { code: "internal_error", reason: INTERNAL_ERROR_REASON };
+    const failure = error ?? {
+      code: "internal_error",
+      reason: readUnexpectedErrorReason(result) ?? INTERNAL_ERROR_REASON,
+    };
     return createSafeTextComponent([{
       text: `${failure.code}: ${failure.reason}${formatStableErrorDetails(error?.details)}`,
       color: "error",
@@ -770,6 +774,77 @@ function readTemplates(value: unknown): readonly {
     });
   }
   return templates;
+}
+
+function readUnexpectedErrorReason(result: AgentToolResultView): string | undefined {
+  const content = readProperty(result, "content");
+  if (!Array.isArray(content)) return undefined;
+  for (const item of content) {
+    if (readProperty(item, "type") !== "text") continue;
+    const text = readProperty(item, "text");
+    if (typeof text !== "string") continue;
+    const structuredMessage = extractStructuredErrorMessage(text);
+    const message = structuredMessage === undefined
+      ? extractErrorMessage(text)
+      : structuredMessage ?? undefined;
+    if (message === undefined) continue;
+    return truncateToDisplayWidth(message, MAX_UNEXPECTED_ERROR_REASON_WIDTH);
+  }
+  return undefined;
+}
+
+function extractStructuredErrorMessage(value: string): string | null | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+  const record = readRecord(parsed);
+  const error = readRecord(readProperty(record, "error"));
+  const message = readProperty(error, "message");
+  if (typeof message !== "string") return null;
+  return extractErrorMessage(message) ?? null;
+}
+
+function extractErrorMessage(value: string): string | undefined {
+  const lines = sanitizeMultiline(value).split("\n");
+  const first = lines[0]?.trim() ?? "";
+  if (first.length === 0) {
+    const firstContent = lines.findIndex((line) => line.trim().length > 0);
+    if (firstContent < 0) return undefined;
+    return extractErrorMessage(lines.slice(firstContent).join("\n"));
+  }
+
+  if (isTracebackHeader(first)) {
+    for (let index = lines.length - 1; index > 0; index -= 1) {
+      const candidate = lines[index]?.trim() ?? "";
+      if (
+        candidate.length === 0
+        || isTracebackHeader(candidate)
+        || isStackFrameLine(candidate)
+      ) continue;
+      return candidate;
+    }
+    return undefined;
+  }
+
+  const messageLines: string[] = [];
+  for (const line of lines) {
+    const candidate = line.trim();
+    if (isTracebackHeader(candidate) || isStackFrameLine(candidate)) break;
+    messageLines.push(line);
+  }
+  const message = messageLines.join("\n").trim();
+  return message.length === 0 ? undefined : message;
+}
+
+function isTracebackHeader(value: string): boolean {
+  return /^Traceback \(most recent call last\):$/iu.test(value);
+}
+
+function isStackFrameLine(value: string): boolean {
+  return /^(?:at\b|File\s+["'`]|[^\s@]+@(?:file:|[a-z]:[\\/]|\/))/iu.test(value);
 }
 
 function readStableError(result: AgentToolResultView): {
