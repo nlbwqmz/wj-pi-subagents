@@ -84,10 +84,9 @@ try {
     throw new Error("Smoke 测试包仍包含旧扩展入口");
   }
   console.log("Smoke 测试包验证通过");
+  console.log(`可安装目录：${installedPackagePath}`);
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   console.error(`Smoke 打包失败：${message}`);
   process.exitCode = 1;
-} finally {
-  rmSync(smokeRoot, { recursive: true, force: true });
 }

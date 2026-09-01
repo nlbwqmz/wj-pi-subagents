@@ -281,6 +281,19 @@ npm test
 npm run check
 ```
 
+生成并保留一个从 npm tarball 安装的本地测试包：
+
+```bash
+npm run pack:smoke
+```
+
+每次执行都会重建 `package-smoke/`。验证通过后，可安装的包目录为
+`package-smoke/node_modules/wj-pi-subagents`。例如在仓库根目录执行：
+
+```bash
+pi install "./package-smoke/node_modules/wj-pi-subagents"
+```
+
 本项目不需要开发服务器。在目标项目中临时加载源码：
 
 ```bash
