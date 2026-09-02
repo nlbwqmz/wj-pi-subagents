@@ -26,6 +26,12 @@ import {
   type StartupDiagnosticDetails,
 } from "./startup-diagnostic.ts";
 
+import {
+  normalizeWaitAgentArgumentIssue,
+  waitAgentArgumentIssueMessage,
+  type WaitAgentArgumentIssue,
+} from "./wait-agent-arguments.ts";
+
 type InternalAgentLifecycleState = AgentLifecycleState;
 
 export {
@@ -70,7 +76,7 @@ export const PUBLIC_ERROR_CODES = Object.freeze([
 
 export type PublicErrorCode = (typeof PUBLIC_ERROR_CODES)[number];
 
-export type PublicErrorDetails = StartupDiagnosticDetails;
+export type PublicErrorDetails = StartupDiagnosticDetails | WaitAgentArgumentIssue;
 
 export interface PublicControlError {
   readonly code: PublicErrorCode;
@@ -127,13 +133,17 @@ const ERROR_METADATA: Readonly<Record<PublicErrorCode, Readonly<{
 /** 所有公开失败均从此处创建，避免把路径、异常或句柄带出控制器。 */
 export function controlFailure(code: PublicErrorCode, details: unknown = EMPTY_DETAILS): ControlFailure {
   const metadata = ERROR_METADATA[code];
+  const waitAgentIssue = code === "invalid_argument"
+    ? normalizeWaitAgentArgumentIssue(details)
+    : undefined;
+  const normalizedDetails = waitAgentIssue ?? normalizeStartupDiagnosticDetails(code, details);
   return Object.freeze({
     ok: false,
     error: Object.freeze({
       code,
-      message: metadata.message,
+      message: waitAgentIssue === undefined ? metadata.message : waitAgentArgumentIssueMessage(waitAgentIssue),
       retryable: metadata.retryable,
-      details: normalizeStartupDiagnosticDetails(code, details),
+      details: normalizedDetails,
     }),
   });
 }

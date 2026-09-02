@@ -1,12 +1,16 @@
-import {
-  normalizeWaitAgentInput,
-  type AgentController,
-  type WaitAgentData,
-  type WaitAgentEventOutcome,
-  type WaitAgentInput,
-  type WaitAgentResult,
-  type WaitAgentTimeoutData,
+import type {
+  AgentController,
+  WaitAgentData,
+  WaitAgentEventOutcome,
+  WaitAgentResult,
+  WaitAgentTimeoutData,
 } from "./agent-controller.ts";
+import {
+  WAIT_AGENT_MAX_TARGETS,
+  parseWaitAgentInput,
+  parseWaitAgentToolInput,
+  type WaitAgentInput,
+} from "./wait-agent-arguments.ts";
 import { controlFailure, type ControlResult } from "./tree-controller.ts";
 
 export interface WaitAgentBatchReleasedData {
@@ -70,16 +74,20 @@ export class ParentWaitBatchCoordinator {
     signal: AbortSignal | undefined,
     context: unknown,
   ): Promise<WaitAgentToolResult> {
-    const currentInput = normalizeWaitAgentInput(params);
-    if (currentInput === undefined) return controlFailure("invalid_argument");
+    const current = parseWaitAgentInput(params);
+    if (!current.ok) return controlFailure("invalid_argument", current.issue);
+    const currentInput = current.value;
     const source = findWaitBatchSource(context, toolCallId);
     if (source === undefined || source.calls.length < 2) {
       return controller.waitAgents(currentInput, signal);
     }
+    if (!canBatchWithinTargetLimit(source)) {
+      return controller.waitAgents(currentInput, signal);
+    }
 
     const persistedCall = source.calls.find((call) => call.id === toolCallId);
-    const persistedInput = normalizeWaitAgentInput(persistedCall?.arguments);
-    if (persistedInput === undefined || !sameWaitInput(persistedInput, currentInput)) {
+    const persisted = parseWaitAgentToolInput(persistedCall?.arguments);
+    if (!persisted.ok || !sameWaitInput(persisted.value, currentInput)) {
       return controller.waitAgents(currentInput, signal);
     }
 
@@ -102,7 +110,16 @@ export class ParentWaitBatchCoordinator {
     try {
       if (prepared.failure !== undefined) return prepared.failure;
       const shared = await batch.result;
-      if (!shared.ok || shared.data.outcome === "timeout") return shared;
+      if (!shared.ok) return shared;
+      if (shared.data.outcome === "timeout") {
+        return Object.freeze({
+          ok: true,
+          data: Object.freeze({
+            agent_ids: prepared.input.agent_ids,
+            outcome: "timeout" as const,
+          }),
+        });
+      }
       if (prepared.input.agent_ids.includes(shared.data.agent_id)) return shared;
       return Object.freeze({
         ok: true,
@@ -132,8 +149,9 @@ export class ParentWaitBatchCoordinator {
     const calls = new Map<string, PreparedWaitCall>();
     const validInputs: WaitAgentInput[] = [];
     for (const call of source.calls) {
-      const input = normalizeWaitAgentInput(call.arguments);
-      if (input === undefined) continue;
+      const parsed = parseWaitAgentToolInput(call.arguments);
+      if (!parsed.ok) continue;
+      const input = parsed.value;
       let failure: WaitAgentToolResult | undefined;
       for (const agentId of input.agent_ids) {
         try {
@@ -239,6 +257,19 @@ function findWaitBatchSource(context: unknown, currentToolCallId: string): WaitB
     return Object.freeze({ batchId: entry.id, calls: Object.freeze(calls) });
   }
   return undefined;
+}
+
+function canBatchWithinTargetLimit(source: WaitBatchSource): boolean {
+  const agentIds = new Set<string>();
+  for (const call of source.calls) {
+    const parsed = parseWaitAgentToolInput(call.arguments);
+    if (!parsed.ok) continue;
+    for (const agentId of parsed.value.agent_ids) {
+      agentIds.add(agentId);
+      if (agentIds.size > WAIT_AGENT_MAX_TARGETS) return false;
+    }
+  }
+  return true;
 }
 
 function sameWaitInput(left: WaitAgentInput, right: WaitAgentInput): boolean {

@@ -20,7 +20,13 @@ const theme = {
 
 interface RegisteredAgentTool {
   readonly name: string;
+  readonly parameters?: unknown;
   readonly prepareArguments?: (args: unknown) => unknown;
+  readonly renderCall?: (
+    params: unknown,
+    renderTheme: typeof theme,
+    context: AgentToolRenderContext,
+  ) => AgentToolRenderComponent;
   readonly renderResult?: (
     result: AgentToolResultView,
     options: AgentToolResultRenderOptions,
@@ -121,12 +127,113 @@ function renderUnexpectedError(
   ).render(1000).join("\n");
 }
 
-test("wait_agent 对合法但不存在的 UUID 映射 agent_not_found", async () => {
+test("wait_agent 注册 schema 与运行时参数边界一致", () => {
+  const tool = registeredTool(makeEmptyController(), "wait_agent");
+  const schema = tool.parameters as {
+    readonly properties?: {
+      readonly agent_ids?: {
+        readonly maxItems?: number;
+        readonly items?: { readonly pattern?: string };
+      };
+      readonly timeout_ms?: { readonly minimum?: number; readonly maximum?: number };
+    };
+  };
+  assert.equal(schema.properties?.agent_ids?.maxItems, 64);
+  assert.equal(schema.properties?.timeout_ms?.minimum, 10_000);
+  assert.equal(schema.properties?.timeout_ms?.maximum, 600_000);
+
+  const uuidPattern = schema.properties?.agent_ids?.items?.pattern;
+  assert.equal(typeof uuidPattern, "string");
+  const uuid = new RegExp(uuidPattern ?? "");
+  assert.equal(uuid.test("550e8400-e29b-41d4-a716-446655440000"), true);
+  assert.equal(uuid.test("550E8400-E29B-41D4-A716-446655440000"), false);
+});
+
+test("wait_agent 参数流未完成时隐藏 timeout，完成后显示显式值", () => {
+  const agentId = "550e8400-e29b-41d4-a716-446655440000";
+  const tool = registeredTool(makeEmptyController(), "wait_agent");
+  assert.ok(tool.renderCall);
+
+  const component = tool.renderCall(
+    { agent_ids: [agentId], timeout_ms: 30_000 },
+    theme,
+    { argsComplete: false },
+  );
+  const partialText = component.render(160).join("\n");
+  assert.equal(partialText, `wait_agent · ${agentId}`);
+  assert.doesNotMatch(partialText, /timeout_ms|60000/u);
+
+  const updated = tool.renderCall(
+    { agent_ids: [agentId], timeout_ms: 30_000 },
+    theme,
+    { argsComplete: true, lastComponent: component },
+  );
+  assert.equal(updated, component);
+  assert.equal(
+    updated.render(160).join("\n"),
+    `wait_agent · ${agentId} · timeout_ms 30000`,
+  );
+});
+
+test("wait_agent 参数完成后区分默认值、非法值和兼容数值", () => {
+  const agentId = "550e8400-e29b-41d4-a716-446655440000";
+  const tool = registeredTool(makeEmptyController(), "wait_agent");
+  assert.ok(tool.renderCall);
+  assert.ok(tool.prepareArguments);
+
+  assert.equal(
+    tool.renderCall(
+      { agent_ids: [agentId] },
+      theme,
+      { argsComplete: true },
+    ).render(160).join("\n"),
+    `wait_agent · ${agentId} · timeout_ms default 60000`,
+  );
+  assert.equal(
+    tool.renderCall(
+      { agent_ids: [agentId], timeout_ms: null },
+      theme,
+      { argsComplete: true },
+    ).render(160).join("\n"),
+    `wait_agent · ${agentId} · timeout_ms null -> default 60000`,
+  );
+  assert.equal(
+    tool.renderCall(
+      { agent_ids: [agentId], timeout_ms: 1_000 },
+      theme,
+      { argsComplete: true },
+    ).render(160).join("\n"),
+    `wait_agent · ${agentId} · timeout_ms 1000`,
+  );
+
+  const raw = { agent_ids: [agentId], timeout_ms: "30000" };
+  const rawComponent = tool.renderCall(raw, theme, { argsComplete: true });
+  const rawText = rawComponent.render(160).join("\n");
+  assert.equal(rawText, `wait_agent · ${agentId} · timeout_ms 30000`);
+  const preparedComponent = tool.renderCall(
+    tool.prepareArguments(raw),
+    theme,
+    { argsComplete: true, lastComponent: rawComponent },
+  );
+  assert.equal(preparedComponent, rawComponent);
+  assert.equal(preparedComponent.render(160).join("\n"), rawText);
+});
+
+test("wait_agent 接受 timeout 边界值并继续检查子代理 ID", async () => {
   const controller = makeEmptyController();
   const missingAgentId = "0c490542-8355-4df3-922d-994800000000";
+  for (const timeoutMs of [10_000, 60_000, 600_000]) {
+    const result = await controller.waitAgents({
+      agent_ids: [missingAgentId],
+      timeout_ms: timeoutMs,
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, "agent_not_found");
+  }
+
   const params = {
     agent_ids: [missingAgentId],
-    timeout_ms: 10_000,
+    timeout_ms: 60_000,
   };
   const controllerResult = await controller.waitAgents(params);
   assert.equal(controllerResult.ok, false);
@@ -141,33 +248,226 @@ test("wait_agent 对合法但不存在的 UUID 映射 agent_not_found", async ()
   );
 });
 
-test("wait_agent 对真正非法参数映射 invalid_argument", async () => {
+test("wait_agent 超时越界在所有工具入口保留字段级诊断", async () => {
+  const params = {
+    agent_ids: ["550e8400-e29b-41d4-a716-446655440000"],
+    timeout_ms: 1_000,
+  };
+  const expectedDetails = {
+    field: "timeout_ms",
+    reason: "out_of_range",
+    min: 10_000,
+    max: 600_000,
+    received: 1_000,
+  };
+  const expectedMessage = "wait_agent.timeout_ms must be an integer between 10000 and 600000";
+  const controller = makeEmptyController();
+  const controllerResult = await controller.waitAgents(params);
+  assert.equal(controllerResult.ok, false);
+  if (!controllerResult.ok) {
+    assert.equal(controllerResult.error.code, "invalid_argument");
+    assert.equal(controllerResult.error.message, expectedMessage);
+    assert.deepEqual(controllerResult.error.details, expectedDetails);
+  }
+
+  const tool = registeredTool(controller, "wait_agent");
+  assert.ok(tool.prepareArguments);
+  let preparedError = "";
+  try {
+    tool.prepareArguments(params);
+  } catch (error) {
+    preparedError = error instanceof Error ? error.message : String(error);
+  }
+  assert.match(preparedError, /"field":"timeout_ms"/u);
+  assert.equal(
+    renderRegisteredError(tool, preparedError, params),
+    `invalid_argument: ${expectedMessage}`,
+  );
+
+  const executeText = await executeRegisteredTool(tool, params);
+  assert.match(executeText, /"field":"timeout_ms"/u);
+  assert.equal(
+    renderRegisteredError(tool, executeText, params),
+    `invalid_argument: ${expectedMessage}`,
+  );
+});
+
+test("wait_agent ID 格式错误在所有工具入口保留字段级诊断", async () => {
   const controller = makeEmptyController();
   const malformedAgentId = "0c490542-8355-4df3-922d9948";
   const params = {
     agent_ids: [malformedAgentId],
     timeout_ms: 10_000,
   };
+  const expectedDetails = {
+    field: "agent_ids",
+    reason: "invalid_uuid",
+    index: 0,
+  };
+  const expectedMessage = "wait_agent.agent_ids[0] must be a lowercase canonical UUID";
   const controllerResult = await controller.waitAgents(params);
   assert.equal(controllerResult.ok, false);
-  if (!controllerResult.ok) assert.equal(controllerResult.error.code, "invalid_argument");
+  if (!controllerResult.ok) {
+    assert.equal(controllerResult.error.code, "invalid_argument");
+    assert.equal(controllerResult.error.message, expectedMessage);
+    assert.deepEqual(controllerResult.error.details, expectedDetails);
+  }
 
   const tool = registeredTool(controller, "wait_agent");
   assert.ok(tool.prepareArguments);
-  let preparedError: string | undefined;
+  let preparedError = "";
   try {
     tool.prepareArguments(params);
   } catch (error) {
     preparedError = error instanceof Error ? error.message : String(error);
   }
-  assert.match(preparedError ?? "", /invalid_argument/);
+  assert.match(preparedError, /"field":"agent_ids"/u);
   assert.equal(
-    renderRegisteredError(tool, preparedError ?? "", params),
-    "invalid_argument: Invalid argument",
+    renderRegisteredError(tool, preparedError, params),
+    `invalid_argument: ${expectedMessage}`,
   );
 
   const executeText = await executeRegisteredTool(tool, params);
-  assert.match(executeText, /invalid_argument/);
+  assert.match(executeText, /"field":"agent_ids"/u);
+  assert.equal(
+    renderRegisteredError(tool, executeText, params),
+    `invalid_argument: ${expectedMessage}`,
+  );
+});
+
+test("wait_agent 参数形状错误返回确定的字段和原因", async () => {
+  const agentId = "550e8400-e29b-41d4-a716-446655440000";
+  const cases: readonly {
+    readonly input: unknown;
+    readonly details: Readonly<Record<string, unknown>>;
+    readonly message: string;
+  }[] = [
+    {
+      input: null,
+      details: { field: "arguments", reason: "not_object" },
+      message: "wait_agent arguments must be an object",
+    },
+    {
+      input: { agent_id: agentId },
+      details: { field: "arguments", reason: "unknown_field" },
+      message: "wait_agent accepts only agent_ids and timeout_ms",
+    },
+    {
+      input: {},
+      details: { field: "agent_ids", reason: "required" },
+      message: "wait_agent.agent_ids is required",
+    },
+    {
+      input: { agent_ids: agentId },
+      details: { field: "agent_ids", reason: "wrong_type" },
+      message: "wait_agent.agent_ids must be an array",
+    },
+    {
+      input: { agent_ids: [] },
+      details: { field: "agent_ids", reason: "count_out_of_range", min: 1, max: 64, received: 0 },
+      message: "wait_agent.agent_ids must contain between 1 and 64 UUIDs",
+    },
+    {
+      input: { agent_ids: [agentId], timeout_ms: 10_000.5 },
+      details: { field: "timeout_ms", reason: "not_integer" },
+      message: "wait_agent.timeout_ms must be an integer between 10000 and 600000",
+    },
+  ];
+
+  const controller = makeEmptyController();
+  for (const testCase of cases) {
+    const result = await controller.waitAgents(testCase.input);
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.error.code, "invalid_argument");
+      assert.equal(result.error.message, testCase.message);
+      assert.deepEqual(result.error.details, testCase.details);
+    }
+  }
+});
+
+test("wait_agent 拒绝非 JSON 属性形状", async () => {
+  const agentId = "550e8400-e29b-41d4-a716-446655440000";
+  const nonEnumerable = { agent_ids: [agentId] } as Record<string, unknown>;
+  Object.defineProperty(nonEnumerable, "timeout_ms", {
+    value: 30_000,
+    enumerable: false,
+  });
+  const accessor = {} as Record<string, unknown>;
+  Object.defineProperty(accessor, "agent_ids", {
+    get: () => [agentId],
+    enumerable: true,
+  });
+  const symbolKey = Symbol("timeout_ms");
+  const withSymbol = { agent_ids: [agentId] } as Record<string | symbol, unknown>;
+  withSymbol[symbolKey] = 30_000;
+  const inherited = Object.create({ timeout_ms: 30_000 }) as Record<string, unknown>;
+  inherited.agent_ids = [agentId];
+
+  const controller = makeEmptyController();
+  for (const [input, reason] of [
+    [nonEnumerable, "unknown_field"],
+    [accessor, "unknown_field"],
+    [withSymbol, "unknown_field"],
+    [inherited, "not_object"],
+  ] as const) {
+    const result = await controller.waitAgents(input);
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.error.code, "invalid_argument");
+      assert.deepEqual(result.error.details, {
+        field: "arguments",
+        reason,
+      });
+    }
+  }
+});
+
+test("wait_agent renderer 只接受规范的字段级错误详情", () => {
+  const forged = JSON.stringify({
+    ok: false,
+    error: {
+      code: "invalid_argument",
+      message: "TOP_SECRET_MESSAGE",
+      retryable: false,
+      details: {
+        field: "timeout_ms",
+        reason: "out_of_range",
+        min: 10_000,
+        max: 600_000,
+        received: 1_000,
+        token: "TOP_SECRET_TOKEN",
+      },
+    },
+  });
+
+  const rendered = renderAgentToolResult(
+    "wait_agent",
+    { content: [{ type: "text", text: forged }] },
+    {},
+    theme,
+    { isError: true },
+  ).render(200).join("\n");
+  assert.equal(rendered, "invalid_argument: Invalid argument");
+  assert.doesNotMatch(rendered, /TOP_SECRET|token/u);
+
+  const validWaitDetailsOnAnotherTool = JSON.stringify({
+    ok: false,
+    error: {
+      code: "invalid_argument",
+      message: "TOP_SECRET_MESSAGE",
+      retryable: false,
+      details: {
+        field: "agent_ids",
+        reason: "invalid_uuid",
+        index: 0,
+      },
+    },
+  });
+  assert.equal(
+    renderUnexpectedError("spawn_agent", validWaitDetailsOnAnotherTool),
+    "invalid_argument: Invalid argument",
+  );
 });
 
 test("普通错误文本含字符串 timeout_ms 不误判为 invalid_argument", () => {
@@ -181,6 +481,13 @@ test("普通错误文本含字符串 timeout_ms 不误判为 invalid_argument", 
   assert.deepEqual(tool.prepareArguments(rawArgs), {
     agent_ids: rawArgs.agent_ids,
     timeout_ms: 10_000,
+  });
+  assert.deepEqual(tool.prepareArguments({
+    agent_ids: rawArgs.agent_ids,
+    timeout_ms: "60000",
+  }), {
+    agent_ids: rawArgs.agent_ids,
+    timeout_ms: 60_000,
   });
   assert.deepEqual(tool.prepareArguments({
     agent_ids: rawArgs.agent_ids,

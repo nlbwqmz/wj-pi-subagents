@@ -1,9 +1,12 @@
 import type { AgentController } from "./agent-controller.ts";
+import type { ChildReplyCoordinator } from "./child-reply-coordinator.ts";
 import {
   WAIT_AGENT_MAX_TARGETS,
-  normalizeWaitAgentInput,
-} from "./agent-controller.ts";
-import type { ChildReplyCoordinator } from "./child-reply-coordinator.ts";
+  WAIT_AGENT_MAX_TIMEOUT_MS,
+  WAIT_AGENT_MIN_TIMEOUT_MS,
+  WAIT_AGENT_UUID_PATTERN_SOURCE,
+  parseWaitAgentToolInput,
+} from "./wait-agent-arguments.ts";
 import {
   ParentWaitBatchCoordinator,
   type WaitAgentToolResult,
@@ -93,12 +96,14 @@ interface JsonSchema {
   readonly maxLength?: number;
   readonly minimum?: number;
   readonly maximum?: number;
+  readonly pattern?: string;
 }
 
 const uuidSchema: JsonSchema = Object.freeze({
   type: "string",
   minLength: 36,
   maxLength: 36,
+  pattern: WAIT_AGENT_UUID_PATTERN_SOURCE,
 });
 
 const schemas: Readonly<Record<AgentToolName, JsonSchema>> = Object.freeze({
@@ -140,7 +145,11 @@ const schemas: Readonly<Record<AgentToolName, JsonSchema>> = Object.freeze({
         minItems: 1,
         maxItems: WAIT_AGENT_MAX_TARGETS,
       }),
-      timeout_ms: Object.freeze({ type: "integer", minimum: 10_000, maximum: 600_000 }),
+      timeout_ms: Object.freeze({
+        type: "integer",
+        minimum: WAIT_AGENT_MIN_TIMEOUT_MS,
+        maximum: WAIT_AGENT_MAX_TIMEOUT_MS,
+      }),
     }),
     required: Object.freeze(["agent_ids"]),
     additionalProperties: false,
@@ -393,37 +402,9 @@ function executeTool(
  * 不需要也不应该根据尚未执行的 raw args 猜测错误类别。
  */
 function prepareWaitAgentArguments(value: unknown): unknown {
-  try {
-    const coerced = coerceWaitAgentTimeout(value);
-    const normalized = normalizeWaitAgentInput(coerced);
-    if (normalized !== undefined) return normalized;
-  } catch {
-    // Getter、Proxy 或其他畸形宿主输入统一落入稳定 invalid_argument envelope。
-  }
-  throw new SubagentToolError(controlFailure("invalid_argument").error);
-}
-
-function coerceWaitAgentTimeout(value: unknown): unknown {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
-  const candidate = value as Record<string, unknown>;
-  if (!("timeout_ms" in candidate)) return value;
-  const timeout = candidate.timeout_ms;
-  if (timeout === null) {
-    const { timeout_ms: _omitted, ...withoutTimeout } = candidate;
-    return withoutTimeout;
-  }
-  const coerced = coerceInteger(timeout);
-  if (coerced === timeout) return value;
-  return { ...candidate, timeout_ms: coerced };
-}
-
-function coerceInteger(value: unknown): unknown {
-  if (typeof value === "string" && value.trim() !== "") {
-    const parsed = Number(value);
-    return Number.isInteger(parsed) ? parsed : value;
-  }
-  if (typeof value === "boolean") return value ? 1 : 0;
-  return value;
+  const parsed = parseWaitAgentToolInput(value);
+  if (parsed.ok) return parsed.value;
+  throw new SubagentToolError(controlFailure("invalid_argument", parsed.issue).error);
 }
 
 export interface AgentToolRegistrationOptions extends AgentToolRenderLookups {

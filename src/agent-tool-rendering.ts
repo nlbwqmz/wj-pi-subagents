@@ -7,9 +7,13 @@ import {
 import { displayWidth, truncateToDisplayWidth } from "./agent-tree-ui.ts";
 import {
   WAIT_AGENT_DEFAULT_TIMEOUT_MS,
-  WAIT_AGENT_MAX_TIMEOUT_MS,
-  WAIT_AGENT_MIN_TIMEOUT_MS,
-} from "./agent-controller.ts";
+  coerceWaitAgentTimeoutValue,
+  isValidWaitAgentTimeout,
+  isWaitAgentArgumentIssue,
+  normalizeWaitAgentArgumentIssue,
+  waitAgentArgumentIssueMessage,
+  type WaitAgentArgumentIssue,
+} from "./wait-agent-arguments.ts";
 import {
   AGENT_FAULT_CODES,
   AGENT_LIFECYCLE_STATES,
@@ -50,6 +54,7 @@ export interface AgentToolRenderLookups {
 
 export interface AgentToolRenderContext {
   readonly args?: unknown;
+  readonly argsComplete?: boolean;
   readonly expanded?: boolean;
   readonly isError?: boolean;
   readonly lastComponent?: unknown;
@@ -244,9 +249,14 @@ export function renderAgentToolCall(
       : agentIds.length === 1
         ? agentIds[0]!
         : `${agentIds.length} agents`;
-    const timeout = readWaitTimeout(input, lookups);
+    const timeout = context.argsComplete === false
+      ? undefined
+      : formatWaitTimeout(readWaitTimeout(input, lookups));
+    const callTitle = timeout === undefined
+      ? `${name} · ${target}`
+      : `${name} · ${target} · timeout_ms ${timeout}`;
     return createSafeTextComponent([
-      title(`${name} · ${target} · timeout_ms ${timeout}`),
+      title(callTitle),
     ], theme, context);
   }
   if (name === "interrupt_agent" || name === "terminate_agent" || name === "get_agent_status") {
@@ -301,7 +311,7 @@ export function renderAgentToolResult(
     return createSafeTextComponent([{ text: "Processing", color: "warning" }], theme, context);
   }
 
-  const error = readStableError(result);
+  const error = readStableError(name, result);
   if (error !== undefined || context.isError === true) {
     const failure = error ?? {
       code: "internal_error",
@@ -847,10 +857,12 @@ function isStackFrameLine(value: string): boolean {
   return /^(?:at\b|File\s+["'`]|[^\s@]+@(?:file:|[a-z]:[\\/]|\/))/iu.test(value);
 }
 
-function readStableError(result: AgentToolResultView): {
+type StableErrorDetails = StartupDiagnosticDetails | WaitAgentArgumentIssue;
+
+function readStableError(name: string, result: AgentToolResultView): {
   readonly code: string;
   readonly reason: string;
-  readonly details?: StartupDiagnosticDetails;
+  readonly details?: StableErrorDetails;
 } | undefined {
   const content = readProperty(result, "content");
   if (!Array.isArray(content)) return undefined;
@@ -868,10 +880,12 @@ function readStableError(result: AgentToolResultView): {
     const error = readRecord(readProperty(record, "error"));
     const code = readProperty(error, "code");
     if (typeof code === "string" && isPublicErrorCode(code)) {
-      const details = readSafeErrorDetails(code, readProperty(error, "details"));
+      const details = readSafeErrorDetails(name, code, readProperty(error, "details"));
       return {
         code,
-        reason: stableErrorReason(code),
+        reason: isWaitAgentArgumentIssue(details)
+          ? waitAgentArgumentIssueMessage(details)
+          : stableErrorReason(code),
         ...(details === undefined ? {} : { details }),
       };
     }
@@ -891,16 +905,20 @@ function stableErrorReason(code: PublicErrorCode): string {
   }
 }
 
-function formatStableErrorDetails(details: StartupDiagnosticDetails | undefined): string {
-  if (details === undefined) return "";
+function formatStableErrorDetails(details: StableErrorDetails | undefined): string {
+  if (details === undefined || isWaitAgentArgumentIssue(details)) return "";
   const entries = Object.entries(details);
   return entries.length === 0 ? "" : ` (${entries.map(([key, value]) => `${key}: ${value}`).join(", ")})`;
 }
 
 function readSafeErrorDetails(
+  name: string,
   code: PublicErrorCode,
   value: unknown,
-): StartupDiagnosticDetails | undefined {
+): StableErrorDetails | undefined {
+  if (name === "wait_agent" && code === "invalid_argument") {
+    return normalizeWaitAgentArgumentIssue(value);
+  }
   if (!isCanonicalStartupDiagnosticDetails(code, value)) return undefined;
   const details = normalizeStartupDiagnosticDetails(code, value);
   return hasStartupDiagnosticDetails(details) ? details : undefined;
@@ -917,25 +935,70 @@ function readFaultCode(value: unknown): AgentFaultCode | undefined {
     : undefined;
 }
 
+type WaitTimeoutPresentation =
+  | { readonly kind: "explicit"; readonly value: number }
+  | { readonly kind: "explicit_default"; readonly value: number }
+  | { readonly kind: "default"; readonly value: number }
+  | { readonly kind: "invalid"; readonly display: string };
+
 function readWaitTimeout(
   input: Record<string, unknown> | undefined,
   lookups: AgentToolRenderLookups,
-): number {
-  const explicit = readOptionalSafeInteger(input, "timeout_ms");
-  if (explicit !== undefined && explicit >= WAIT_AGENT_MIN_TIMEOUT_MS && explicit <= WAIT_AGENT_MAX_TIMEOUT_MS) {
-    return explicit;
+): WaitTimeoutPresentation {
+  const hasExplicit = hasOwnProperty(input, "timeout_ms");
+  const raw = readProperty(input, "timeout_ms");
+  if (hasExplicit && raw === null) {
+    return Object.freeze({ kind: "explicit_default", value: readConfiguredWaitTimeout(lookups) });
   }
+  if (raw !== undefined) {
+    const explicit = coerceWaitAgentTimeoutValue(raw);
+    if (isValidWaitAgentTimeout(explicit)) {
+      return Object.freeze({ kind: "explicit", value: explicit });
+    }
+    return Object.freeze({ kind: "invalid", display: displayWaitTimeoutValue(raw) });
+  }
+  return Object.freeze({
+    kind: "default",
+    value: readConfiguredWaitTimeout(lookups),
+  });
+}
+
+function readConfiguredWaitTimeout(lookups: AgentToolRenderLookups): number {
   let configured: unknown;
   try {
     configured = lookups.readWaitTimeoutMs?.();
   } catch {
     configured = undefined;
   }
-  return Number.isSafeInteger(configured)
-    && (configured as number) >= WAIT_AGENT_MIN_TIMEOUT_MS
-    && (configured as number) <= WAIT_AGENT_MAX_TIMEOUT_MS
-    ? configured as number
+  return isValidWaitAgentTimeout(configured)
+    ? configured
     : WAIT_AGENT_DEFAULT_TIMEOUT_MS;
+}
+
+function formatWaitTimeout(timeout: WaitTimeoutPresentation): string {
+  if (timeout.kind === "default") return `default ${timeout.value}`;
+  if (timeout.kind === "explicit_default") return `null -> default ${timeout.value}`;
+  return timeout.kind === "explicit" ? String(timeout.value) : timeout.display;
+}
+
+function hasOwnProperty(
+  record: Record<string, unknown> | undefined,
+  key: string,
+): boolean {
+  try {
+    return record !== undefined && Object.hasOwn(record, key);
+  } catch {
+    return false;
+  }
+}
+
+function displayWaitTimeoutValue(value: unknown): string {
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
+    return String(value);
+  }
+  if (typeof value === "string") return JSON.stringify(value);
+  if (Array.isArray(value)) return "<array>";
+  return typeof value === "object" && value !== null ? "<object>" : `<${typeof value}>`;
 }
 
 function resolveName(agentId: string, lookups: AgentToolRenderLookups): string | undefined {

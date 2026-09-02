@@ -29,10 +29,21 @@ import {
   type RpcSupervisorTerminationResult,
 } from "./rpc-supervisor.ts";
 
-export const WAIT_AGENT_MIN_TIMEOUT_MS = 10_000;
-export const WAIT_AGENT_MAX_TIMEOUT_MS = 600_000;
-export const WAIT_AGENT_DEFAULT_TIMEOUT_MS = 60_000;
-export const WAIT_AGENT_MAX_TARGETS = 64;
+import {
+  WAIT_AGENT_DEFAULT_TIMEOUT_MS,
+  isValidWaitAgentTimeout,
+  parseWaitAgentInput,
+  type WaitAgentInput,
+} from "./wait-agent-arguments.ts";
+
+export {
+  WAIT_AGENT_DEFAULT_TIMEOUT_MS,
+  WAIT_AGENT_MAX_TARGETS,
+  WAIT_AGENT_MAX_TIMEOUT_MS,
+  WAIT_AGENT_MIN_TIMEOUT_MS,
+  normalizeWaitAgentInput,
+} from "./wait-agent-arguments.ts";
+export type { WaitAgentInput } from "./wait-agent-arguments.ts";
 
 export interface SpawnAgentInput {
   readonly template_id: string;
@@ -42,11 +53,6 @@ export interface SpawnAgentInput {
 export interface SendMessageInput {
   readonly agent_id: string;
   readonly message: string;
-}
-
-export interface WaitAgentInput {
-  readonly agent_ids: readonly string[];
-  readonly timeout_ms?: number;
 }
 
 export interface AgentSupervisorFactoryInput {
@@ -232,7 +238,7 @@ export class AgentController {
     this.flushUpstreamLifecycle = options.flushUpstreamLifecycle;
     this.replyNotificationsHandledByInbox = options.replyNotificationsHandledByInbox === true;
     this.authority = options.authority;
-    if (!validWaitTimeout(this.waitTimeoutMs)) throw new TypeError("默认等待期限无效");
+    if (!isValidWaitAgentTimeout(this.waitTimeoutMs)) throw new TypeError("默认等待期限无效");
     this.unsubscribeTreeChange = this.tree.onChange(() => this.resolveAllReadyWaiters());
   }
 
@@ -390,8 +396,9 @@ export class AgentController {
   }
 
   async waitAgents(input: WaitAgentInput | unknown, signal?: AbortSignal): Promise<WaitAgentResult> {
-    const parsed = normalizeWaitAgentInput(input);
-    if (parsed === undefined) return controlFailure("invalid_argument");
+    const parsedResult = parseWaitAgentInput(input);
+    if (!parsedResult.ok) return controlFailure("invalid_argument", parsedResult.issue);
+    const parsed = parsedResult.value;
     for (const agentId of parsed.agent_ids) {
       const target = await this.admittedDirectChild(agentId, "wait_agent");
       if (!target.ok) return target;
@@ -1223,24 +1230,6 @@ function isSendMessageInput(value: unknown): value is SendMessageInput {
     && candidate.message.length > 0
     && utf8Length(candidate.message) <= 16 * 1024
     && Object.keys(candidate).every((key) => key === "agent_id" || key === "message");
-}
-
-export function normalizeWaitAgentInput(value: unknown): WaitAgentInput | undefined {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-  const candidate = value as Record<string, unknown>;
-  if (!Array.isArray(candidate.agent_ids)) return undefined;
-  if (candidate.agent_ids.length < 1 || candidate.agent_ids.length > WAIT_AGENT_MAX_TARGETS) return undefined;
-  if (!candidate.agent_ids.every(isCanonicalUuid)) return undefined;
-  if (candidate.timeout_ms !== undefined && !validWaitTimeout(candidate.timeout_ms as number)) return undefined;
-  if (!Object.keys(candidate).every((key) => key === "agent_ids" || key === "timeout_ms")) return undefined;
-  return Object.freeze({
-    agent_ids: Object.freeze([...new Set(candidate.agent_ids as string[])]),
-    ...(candidate.timeout_ms === undefined ? {} : { timeout_ms: candidate.timeout_ms as number }),
-  });
-}
-
-function validWaitTimeout(value: number): boolean {
-  return Number.isSafeInteger(value) && value >= WAIT_AGENT_MIN_TIMEOUT_MS && value <= WAIT_AGENT_MAX_TIMEOUT_MS;
 }
 
 function makeWaitData(status: AgentSnapshot, outcome: WaitAgentEventOutcome): WaitAgentData {

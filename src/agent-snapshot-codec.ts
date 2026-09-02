@@ -105,7 +105,8 @@ const ACTIVITY_KEYS = new Set(["phase"]);
 const FAULT_KEYS = new Set(["code", "message", "retryable", "details"]);
 const UTF8_ENCODER = new TextEncoder();
 const RFC3339_MILLIS_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+export const CANONICAL_AGENT_UUID_PATTERN_SOURCE = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$";
+const UUID_PATTERN = new RegExp(CANONICAL_AGENT_UUID_PATTERN_SOURCE);
 
 export function isCanonicalAgentUuid(value: unknown): value is string {
   return typeof value === "string" && UUID_PATTERN.test(value);
