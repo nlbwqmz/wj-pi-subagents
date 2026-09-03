@@ -2,7 +2,7 @@
   "name": "wj-pi-subagents",
   "version": "0.3.2",
   "author": "WJ",
-  "description": "Create and manage recursive subagents in Pi",
+  "description": "Multi-level subagent orchestration plugin for Pi — no built-in templates, no preset workflows, everything is yours to shape",
   "homepage": "https://github.com/nlbwqmz/wj-pi-subagents#readme",
   "bugs": {
     "url": "https://github.com/nlbwqmz/wj-pi-subagents/issues"
@@ -17,6 +17,7 @@
     "pi-package",
     "pi",
     "subagents",
+    "multi-agent",
     "ai-agents",
     "pi-extensions"
   ],
