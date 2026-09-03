@@ -120,6 +120,7 @@ interface ManagedAgentEntry {
 interface PendingWaiter {
   readonly agentIds: readonly string[];
   readonly resolve: (result: WaitAgentResult) => void;
+  readonly reject: (reason: Error) => void;
   readonly timer: ReturnType<typeof setTimeout>;
   readonly signal?: AbortSignal;
   readonly abortListener?: () => void;
@@ -409,13 +410,13 @@ export class AgentController {
         // 状态探针失败时等待器保留最近一次安全快照，不伪造 terminal 或 idle。
       }
     }
-    if (signal?.aborted === true) return controlFailure("agent_unavailable");
+    if (signal?.aborted === true) throw operationAbortedError();
 
     const immediate = this.readyWaitResult(parsed.agent_ids);
     if (immediate !== undefined) return immediate;
     const timeout = parsed.timeout_ms ?? this.waitTimeoutMs;
 
-    return new Promise<WaitAgentResult>((resolve) => {
+    return new Promise<WaitAgentResult>((resolve, reject) => {
       let waiter!: PendingWaiter;
       const timer = setTimeout(() => {
         this.finishWaiter(waiter, Object.freeze({
@@ -425,10 +426,11 @@ export class AgentController {
       }, timeout);
       const abortListener = signal === undefined
         ? undefined
-        : () => this.finishWaiter(waiter, controlFailure("agent_unavailable"));
+        : () => this.abortWaiter(waiter);
       waiter = {
         agentIds: parsed.agent_ids,
         resolve,
+        reject,
         timer,
         ...(signal === undefined ? {} : { signal }),
         ...(abortListener === undefined ? {} : { abortListener }),
@@ -443,9 +445,11 @@ export class AgentController {
         signal.addEventListener("abort", abortListener, { once: true });
       }
       // 原子检查、登记、再次检查，避免事件恰好落在登记边界丢失。
-      const ready = signal?.aborted === true
-        ? controlFailure("agent_unavailable")
-        : this.readyWaitResult(parsed.agent_ids);
+      if (signal?.aborted === true) {
+        this.abortWaiter(waiter);
+        return;
+      }
+      const ready = this.readyWaitResult(parsed.agent_ids);
       if (ready !== undefined) this.finishWaiter(waiter, ready);
     });
   }
@@ -1137,7 +1141,17 @@ export class AgentController {
   }
 
   private finishWaiter(waiter: PendingWaiter, result: WaitAgentResult): void {
-    if (!this.pendingWaiters.delete(waiter)) return;
+    if (!this.removeWaiter(waiter)) return;
+    waiter.resolve(result);
+  }
+
+  private abortWaiter(waiter: PendingWaiter): void {
+    if (!this.removeWaiter(waiter)) return;
+    waiter.reject(operationAbortedError());
+  }
+
+  private removeWaiter(waiter: PendingWaiter): boolean {
+    if (!this.pendingWaiters.delete(waiter)) return false;
     clearTimeout(waiter.timer);
     if (waiter.signal !== undefined && waiter.abortListener !== undefined) {
       waiter.signal.removeEventListener("abort", waiter.abortListener);
@@ -1148,7 +1162,7 @@ export class AgentController {
       set.delete(waiter);
       if (set.size === 0) this.waiters.delete(agentId);
     }
-    waiter.resolve(result);
+    return true;
   }
 
   private readyWaitResult(agentIds: readonly string[]): WaitAgentResult | undefined {
@@ -1230,6 +1244,10 @@ function isSendMessageInput(value: unknown): value is SendMessageInput {
     && candidate.message.length > 0
     && utf8Length(candidate.message) <= 16 * 1024
     && Object.keys(candidate).every((key) => key === "agent_id" || key === "message");
+}
+
+function operationAbortedError(): Error {
+  return new Error("Operation aborted");
 }
 
 function makeWaitData(status: AgentSnapshot, outcome: WaitAgentEventOutcome): WaitAgentData {

@@ -35,6 +35,7 @@ const UNSAFE_DISPLAY_PATTERN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u
 const MAX_UNEXPECTED_ERROR_REASON_WIDTH = 240;
 const MAX_COLLAPSED_BODY_LINES = 4;
 const INTERNAL_ERROR_REASON = controlFailure("internal_error").error.message;
+const OPERATION_ABORTED_REASON = "Operation aborted";
 
 export interface AgentToolRenderTheme {
   fg(
@@ -312,10 +313,23 @@ export function renderAgentToolResult(
   }
 
   const error = readStableError(name, result);
+  const unexpectedErrorReason = error === undefined && context.isError === true
+    ? readUnexpectedErrorReason(result)
+    : undefined;
+  if (
+    name === "wait_agent"
+    && error === undefined
+    && unexpectedErrorReason === OPERATION_ABORTED_REASON
+  ) {
+    return createSafeTextComponent([{
+      text: OPERATION_ABORTED_REASON,
+      color: "error",
+    }], theme, context);
+  }
   if (error !== undefined || context.isError === true) {
     const failure = error ?? {
       code: "internal_error",
-      reason: readUnexpectedErrorReason(result) ?? INTERNAL_ERROR_REASON,
+      reason: unexpectedErrorReason ?? INTERNAL_ERROR_REASON,
     };
     return createSafeTextComponent([{
       text: `${failure.code}: ${failure.reason}${formatStableErrorDetails(error?.details)}`,

@@ -299,26 +299,38 @@ test("稳定 idle 和 failed 状态无需等待后续事件", async () => {
   }
 });
 
-test("interrupting 必须等待真实 agent_settled，idle 不会误报 starting 就绪", async () => {
+test("wait_agent 主动取消只拒绝当前等待，interrupting 必须等待真实 agent_settled", async () => {
   const fake = new FakeSupervisor();
   const { controller, tree } = makeController(fake);
   const spawned = await controller.spawnAgent({ template_id: "demo", name: "中断测试" });
   assert.equal(spawned.ok, true, JSON.stringify(spawned));
 
+  const alreadyAborted = new AbortController();
+  alreadyAborted.abort();
+  await assert.rejects(
+    controller.waitAgents(
+      { agent_ids: [AGENT_ID], timeout_ms: 10_000 },
+      alreadyAborted.signal,
+    ),
+    { name: "Error", message: "Operation aborted" },
+  );
+
+  fake.emitLifecycle({ type: "agent_start", expected_generation: generation(tree) });
   const abort = new AbortController();
-  const initialWaitPromise = controller.waitAgents(
+  const wait = controller.waitAgents(
     { agent_ids: [AGENT_ID], timeout_ms: 10_000 },
     abort.signal,
   );
+  await new Promise<void>((resolve) => setImmediate(resolve));
   abort.abort();
-  const initialWait = await initialWaitPromise;
-  if (!initialWait.ok) {
-    assert.equal(initialWait.error.code, "agent_unavailable");
-  } else {
-    assert.fail("starting -> idle 不应创建隐式 idle 事件");
-  }
+  await assert.rejects(wait, {
+    name: "Error",
+    message: "Operation aborted",
+  });
+  const stillWorking = tree.getStatus(AGENT_ID);
+  assert.equal(stillWorking.ok, true);
+  if (stillWorking.ok) assert.equal(stillWorking.data.state, "working");
 
-  fake.emitLifecycle({ type: "agent_start", expected_generation: generation(tree) });
   const interrupted = await controller.interruptAgent(AGENT_ID);
   assert.equal(interrupted.ok, true);
   if (interrupted.ok) assert.equal(interrupted.data.state, "interrupting");

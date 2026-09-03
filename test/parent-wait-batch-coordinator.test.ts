@@ -241,6 +241,56 @@ test("wait_agent 批次 union 超过目标上限时退回独立调用", async ()
   }
 });
 
+test("wait_agent 批次取消传播 Operation aborted 且不改变目标状态", async () => {
+  const { controller, tree } = makeController();
+  const firstSpawn = await controller.spawnAgent({ template_id: "demo", name: "first" });
+  const secondSpawn = await controller.spawnAgent({ template_id: "demo", name: "second" });
+  assert.equal(firstSpawn.ok, true);
+  assert.equal(secondSpawn.ok, true);
+
+  for (const agentId of [FIRST_AGENT_ID, SECOND_AGENT_ID]) {
+    tree.applyLifecycleEvent(agentId, {
+      type: "agent_start",
+      expected_generation: generation(tree, agentId),
+    });
+  }
+
+  const coordinator = new ParentWaitBatchCoordinator();
+  const abort = new AbortController();
+  const context = batchContext();
+  try {
+    const first = coordinator.wait(
+      controller,
+      "wait-call-1",
+      { agent_ids: [FIRST_AGENT_ID], timeout_ms: 30_000 },
+      abort.signal,
+      context,
+    );
+    const second = coordinator.wait(
+      controller,
+      "wait-call-2",
+      { agent_ids: [SECOND_AGENT_ID], timeout_ms: 30_000 },
+      abort.signal,
+      context,
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    abort.abort();
+
+    await Promise.all([
+      assert.rejects(first, { name: "Error", message: "Operation aborted" }),
+      assert.rejects(second, { name: "Error", message: "Operation aborted" }),
+    ]);
+    for (const agentId of [FIRST_AGENT_ID, SECOND_AGENT_ID]) {
+      const status = tree.getStatus(agentId);
+      assert.equal(status.ok, true);
+      if (status.ok) assert.equal(status.data.state, "working");
+    }
+  } finally {
+    coordinator.clear();
+    controller.dispose();
+  }
+});
+
 test("wait_agent 批次对 persisted raw 和 prepared timeout 使用同一规范值", async () => {
   const { controller, tree } = makeController();
   const firstSpawn = await controller.spawnAgent({ template_id: "demo", name: "first" });

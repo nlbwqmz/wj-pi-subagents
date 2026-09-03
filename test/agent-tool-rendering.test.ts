@@ -470,6 +470,14 @@ test("wait_agent renderer 只接受规范的字段级错误详情", () => {
   );
 });
 
+test("wait_agent 主动取消展示 Pi 标准提示", () => {
+  assert.equal(renderUnexpectedError("wait_agent", "Operation aborted"), "Operation aborted");
+  assert.equal(
+    renderUnexpectedError("spawn_agent", "Operation aborted"),
+    "internal_error: Operation aborted",
+  );
+});
+
 test("普通错误文本含字符串 timeout_ms 不误判为 invalid_argument", () => {
   const message = "Supervisor failed while handling timeout_ms=\"10000\"";
   const rawArgs = {
