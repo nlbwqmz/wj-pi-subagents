@@ -8,10 +8,29 @@ import {
   type AgentToolResultRenderOptions,
   type AgentToolResultView,
 } from "../src/agent-tool-rendering.ts";
-import { AgentController } from "../src/agent-controller.ts";
+import {
+  AgentController,
+  type AgentSupervisor,
+} from "../src/agent-controller.ts";
 import { createAgentFault } from "../src/agent-snapshot-codec.ts";
-import { registerAgentTools } from "../src/agent-tools.ts";
-import { controlFailure, TreeController } from "../src/tree-controller.ts";
+import {
+  registerAgentTools,
+  SEND_MESSAGE_HANDOFF_NOTICE,
+} from "../src/agent-tools.ts";
+import type {
+  RpcSupervisorCommandResult,
+  RpcSupervisorEvent,
+  RpcSupervisorInterruptResult,
+  RpcSupervisorStartupResult,
+  RpcSupervisorTerminationResult,
+} from "../src/rpc-supervisor.ts";
+import {
+  controlFailure,
+  ROOT_TREE_ACTOR,
+  TreeController,
+  type AgentLifecycleEvent,
+  type ReserveStartingChildInput,
+} from "../src/tree-controller.ts";
 
 const theme = {
   fg: (_color: string, text: string): string => text,
@@ -788,4 +807,135 @@ test("状态和树渲染展示快照内的规范启动详情", () => {
   assert.match(tree, /model_unavailable/);
   assert.match(tree, /provider: wj-provider/);
   assert.match(tree, /model: gpt-5\.6-terra/);
+});
+
+const HANDOFF_AGENT_ID = "550e8400-e29b-41d4-a716-446655440000";
+
+class HandoffSupervisor implements AgentSupervisor {
+  tree: TreeController | undefined;
+  reservation: ReserveStartingChildInput | undefined;
+
+  start(): Promise<RpcSupervisorStartupResult> {
+    if (this.tree !== undefined && this.reservation !== undefined) {
+      const reserved = this.tree.reserveStartingChild(ROOT_TREE_ACTOR, this.reservation);
+      assert.equal(reserved.ok, true);
+      this.tree.applyLifecycleEvent(HANDOFF_AGENT_ID, {
+        type: "startup_ready",
+        expected_generation: 0,
+      });
+    }
+    return Promise.resolve({ ok: true, agent_id: HANDOFF_AGENT_ID, state: "idle" });
+  }
+
+  sendMessage(_message: string): Promise<RpcSupervisorCommandResult> {
+    return Promise.resolve({ ok: true, accepted: true });
+  }
+
+  interrupt(): Promise<RpcSupervisorInterruptResult> {
+    return Promise.resolve({ ok: true, accepted: true, changed: true });
+  }
+
+  terminate(): Promise<RpcSupervisorTerminationResult> {
+    return Promise.resolve({
+      ok: true,
+      agent_id: HANDOFF_AGENT_ID,
+      state: "terminated",
+      cleanup: "confirmed",
+    });
+  }
+
+  onEvent(_listener: (event: RpcSupervisorEvent) => void): () => void {
+    return () => {};
+  }
+
+  wasForcedTerminationUsed(): boolean {
+    return false;
+  }
+}
+
+function makeHandoffController(fake: HandoffSupervisor): AgentController {
+  const tree = new TreeController({
+    config: {
+      maxDepth: 3,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 8,
+      waitTimeoutMs: 10_000,
+    },
+    idFactory: () => HANDOFF_AGENT_ID,
+  });
+  fake.tree = tree;
+  return new AgentController({
+    tree,
+    allowUnvalidatedTemplates: true,
+    createSupervisor: (input) => {
+      fake.reservation = input.reservation;
+      return fake;
+    },
+    replyNotificationsHandledByInbox: false,
+  });
+}
+
+test("send_message 成功返回在 JSON 顶层附带移交提示，details 保持纯数据", async () => {
+  const fake = new HandoffSupervisor();
+  const controller = makeHandoffController(fake);
+  const spawned = await controller.spawnAgent({ template_id: "demo", name: "移交提示测试" });
+  assert.equal(spawned.ok, true, JSON.stringify(spawned));
+  if (!spawned.ok) return;
+
+  const tool = registeredTool(controller, "send_message");
+  assert.ok(tool.execute);
+  const result = await tool.execute(
+    "notice-test-call",
+    { agent_id: HANDOFF_AGENT_ID, message: "首个任务" },
+    undefined,
+    undefined,
+    {},
+  ) as {
+    content: readonly { readonly type: string; readonly text: string }[];
+    details: unknown;
+  };
+
+  assert.deepEqual(JSON.parse(result.content[0]!.text), {
+    ok: true,
+    data: { accepted: true },
+    notice: SEND_MESSAGE_HANDOFF_NOTICE,
+  });
+  assert.deepEqual(result.details, { accepted: true });
+});
+
+test("其余工具成功返回的 JSON 形态不变，不附带 notice 字段", async () => {
+  const fake = new HandoffSupervisor();
+  const controller = makeHandoffController(fake);
+  const tool = registeredTool(controller, "spawn_agent");
+  assert.ok(tool.execute);
+  const result = await tool.execute(
+    "notice-test-call",
+    { template_id: "demo", name: "形态测试" },
+    undefined,
+    undefined,
+    {},
+  ) as {
+    content: readonly { readonly type: string; readonly text: string }[];
+    details: unknown;
+  };
+
+  const parsed = JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+  assert.equal("notice" in parsed, false);
+  assert.deepEqual(parsed, {
+    ok: true,
+    data: {
+      agent_id: HANDOFF_AGENT_ID,
+      name: "形态测试",
+      template_id: "demo",
+      depth: 1,
+      state: "idle",
+    },
+  });
+  assert.deepEqual(result.details, {
+    agent_id: HANDOFF_AGENT_ID,
+    name: "形态测试",
+    template_id: "demo",
+    depth: 1,
+    state: "idle",
+  });
 });

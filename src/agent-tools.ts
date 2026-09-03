@@ -51,6 +51,15 @@ export const AGENT_TOOL_NAMES = Object.freeze([
 export const CHILD_REPLY_TOOL_NAME = "normal_reply" as const;
 export const CHILD_FINAL_REPORT_TOOL_NAME = "final_report" as const;
 
+/**
+ * send_message 成功返回附带的移交提示；文案与父代理准则的
+ * “所有权转移硬边界”“禁止处理已交接范围”条款逐字对齐，只唤醒不扩展。
+ */
+export const SEND_MESSAGE_HANDOFF_NOTICE =
+  "若是对该子代理的任务下发，则任务范围已移交该子代理，应遵守“禁止处理已交接范围”要求，"
+  + "不得再对该范围进行任何直接处理，包括但不限于读取文件、搜索代码、执行命令、分析实现、修改内容、运行验证或自行补充调查；"
+  + "不得以“只读操作”“确认细节”“降低风险”或“尽快完成”为理由介入。";
+
 export type AgentToolName = (typeof AGENT_TOOL_NAMES)[number];
 
 /** 公开工具错误使用稳定 JSON 外壳，不把异常、路径或句柄带回模型。 */
@@ -328,10 +337,14 @@ const childFinalReportDescription =
   "Send an explicit report to the direct parent. A successful call only means the parent extension runtime accepted the message submission; it does not mean Pi completed asynchronous delivery, and it does not end the current turn or session. It may be called multiple times.";
 
 /** 返回给 Pi 的固定工具结果；details 只包含控制器安全数据。 */
-function toolResult<T>(result: ControlResult<T>, dataOnly = false): unknown {
+function toolResult<T>(result: ControlResult<T>, dataOnly = false, notice?: string): unknown {
   if (!result.ok) throw new SubagentToolError(result.error);
+  const payload = dataOnly ? result.data : result;
   return {
-    content: [{ type: "text", text: JSON.stringify(dataOnly ? result.data : result) }],
+    content: [{
+      type: "text",
+      text: JSON.stringify(notice === undefined ? payload : { ...payload, notice }),
+    }],
     details: result.data,
   };
 }
@@ -362,6 +375,7 @@ function executeTool(
   dataOnly = false,
   lookups: AgentToolRenderLookups = {},
   prepareArguments?: (args: unknown) => unknown,
+  successNotice?: string,
 ): Record<string, unknown> {
   return {
     name,
@@ -391,7 +405,7 @@ function executeTool(
       toolCallId,
       signal,
       context,
-    }), dataOnly),
+    }), dataOnly, successNotice),
   };
 }
 
@@ -424,7 +438,7 @@ export function registerAgentTools(
       return controller.getAgentTemplates();
     }, true, lookups),
     executeTool("spawn_agent", provider, async (controller, params) => controller.spawnAgent(params), false, lookups),
-    executeTool("send_message", provider, async (controller, params) => controller.sendMessage(params), false, lookups),
+    executeTool("send_message", provider, async (controller, params) => controller.sendMessage(params), false, lookups, undefined, SEND_MESSAGE_HANDOFF_NOTICE),
     executeTool("wait_agent", provider, async (controller, params, call): Promise<WaitAgentToolResult> =>
       waitBatchCoordinator.wait(controller, call.toolCallId, params, call.signal, call.context), false, lookups, prepareWaitAgentArguments),
     executeTool("interrupt_agent", provider, async (controller, params) => {
