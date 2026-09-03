@@ -1,6 +1,6 @@
 {
   "name": "wj-pi-subagents",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "author": "WJ",
   "description": "Multi-level subagent orchestration plugin for Pi — no built-in templates, no preset workflows, everything is yours to shape",
   "homepage": "https://github.com/nlbwqmz/wj-pi-subagents#readme",
