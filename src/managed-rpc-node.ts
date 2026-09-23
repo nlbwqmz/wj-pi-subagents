@@ -1,4 +1,5 @@
-import { existsSync } from "node:fs";
+import { accessSync, constants, existsSync } from "node:fs";
+import { basename, delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import type { Readable, Writable } from "node:stream";
@@ -126,18 +127,66 @@ export interface ManagedRpcNodeAssemblyOptions {
   /** 测试/打包时可指定已编译的桥接入口。 */
   readonly bridgeScriptPath?: string;
   readonly bridgeFactory?: ManagedRpcBridgeFactory;
+  /** 测试可指定桥接 JS 运行环境；缺省按宿主形态自动解析。 */
+  readonly bridgeRuntimePath?: string;
+  /** 测试可替换 PATH 查找实现；生产使用进程环境。 */
+  readonly bridgeRuntimePathEnv?: string;
+}
+
+/**
+ * 解析运行桥接脚本的 JS 运行环境。通常与宿主相同；但单文件编译宿主
+ * （execPath 是产品二进制而非 node/bun）不能执行脚本，此时回退到
+ * PATH 上的 node（其次 bun）。找不到时保留旧行为，由启动握手报错。
+ */
+export function resolveBridgeRuntime(
+  execPath: string = process.execPath,
+  pathEnv: string | undefined = process.env.PATH,
+): string {
+  const base = basename(execPath).toLowerCase().replace(/\.exe$/, "");
+  if (base === "node" || base === "nodejs" || base === "bun") return execPath;
+  for (const name of ["node", "bun"]) {
+    const found = findExecutableOnPath(name, pathEnv);
+    if (found !== undefined) return found;
+  }
+  return execPath;
+}
+
+function findExecutableOnPath(name: string, pathEnv: string | undefined): string | undefined {
+  if (pathEnv === undefined || pathEnv === "") return undefined;
+  const candidates = process.platform === "win32" ? [`${name}.exe`, `${name}.cmd`, name] : [name];
+  for (const dir of pathEnv.split(delimiter)) {
+    if (dir === "") continue;
+    for (const candidate of candidates) {
+      const full = join(dir, candidate);
+      try {
+        if (!existsSync(full)) continue;
+        if (process.platform !== "win32") accessSync(full, constants.X_OK);
+      } catch {
+        continue;
+      }
+      return full;
+    }
+  }
+  return undefined;
+}
+
+function needsTypeStrippingFlag(runtimePath: string, scriptPath: string): boolean {
+  if (!scriptPath.endsWith(".ts")) return false;
+  const base = basename(runtimePath).toLowerCase().replace(/\.(exe|cmd)$/, "");
+  return base === "node" || base === "nodejs";
 }
 
 /** 生成平台适配器在启动前接收的桥接进程说明。 */
 export function createManagedRpcNodeLaunchSpec(
-  options: Pick<ManagedRpcNodeAssemblyOptions, "cwd" | "env" | "bridgeScriptPath">,
+  options: Pick<ManagedRpcNodeAssemblyOptions, "cwd" | "env" | "bridgeScriptPath" | "bridgeRuntimePath" | "bridgeRuntimePathEnv">,
 ): ManagedRpcNodeLaunchOptions {
   const scriptPath = options.bridgeScriptPath
     ?? defaultBridgeScriptPath();
+  const runtime = options.bridgeRuntimePath ?? resolveBridgeRuntime(process.execPath, options.bridgeRuntimePathEnv);
   return Object.freeze({
-    command: process.execPath,
+    command: runtime,
     args: Object.freeze([
-      ...(scriptPath.endsWith(".ts") ? ["--experimental-strip-types"] : []),
+      ...(needsTypeStrippingFlag(runtime, scriptPath) ? ["--experimental-strip-types"] : []),
       scriptPath,
     ]),
     ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
