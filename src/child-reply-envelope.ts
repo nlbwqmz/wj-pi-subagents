@@ -1,4 +1,5 @@
 import { isCanonicalAgentUuid } from "./agent-snapshot-codec.ts";
+import { REPLY_MAX_TEXT_BYTES } from "./child-reply-limits.ts";
 
 /** clean-break 后的会话消息协议；旧 v5 任务/提交信封不再解析。 */
 export const CHILD_REPLY_SCHEMA = "wj-pi-subagents/conversation" as const;
@@ -37,7 +38,7 @@ export interface ChildReplyEnvelopeLimits {
 }
 
 export const CHILD_REPLY_ENVELOPE_LIMITS: Required<ChildReplyEnvelopeLimits> = Object.freeze({
-  maxTextBytes: 32 * 1024,
+  maxTextBytes: REPLY_MAX_TEXT_BYTES,
 });
 
 export function parseChildReplyEnvelope(

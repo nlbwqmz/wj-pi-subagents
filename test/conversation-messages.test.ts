@@ -14,6 +14,7 @@ import {
   parseTerminalNotice,
   type ChildReplyEnvelope,
 } from "../src/child-reply-envelope.ts";
+import { REPLY_MAX_TEXT_BYTES } from "../src/child-reply-limits.ts";
 import {
   ChildReplyCoordinator,
   type ChildReplyPort,
@@ -70,6 +71,37 @@ test("新消息信封只接受 message/final_report 闭集并拒绝旧字段", (
     error_code: "runtime_fault",
     task_id: "旧字段",
   }), undefined);
+});
+
+test("回复正文上限为 64 KiB：恰好通过，超 1 字节拒绝", async () => {
+  const sent: ChildReplyEnvelope[] = [];
+  const coordinator = new ChildReplyCoordinator({
+    agentId: AGENT_ID,
+    port: {
+      async publishReply(reply): Promise<void> {
+        sent.push(reply);
+      },
+    },
+  });
+  coordinator.observeAgentStart();
+
+  const exact = "x".repeat(REPLY_MAX_TEXT_BYTES);
+  assert.deepEqual(await coordinator.finalReport({ message: exact }), {
+    ok: true,
+    data: { accepted: true },
+  });
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0]?.text, exact);
+
+  const oversized = await coordinator.finalReport({ message: `${exact}x` });
+  assert.equal(oversized.ok, false);
+  if (!oversized.ok) assert.equal(oversized.error.code, "reply_too_large");
+  assert.equal(sent.length, 1);
+
+  // 信封默认 limits 与协调器上限同源：恰好通过、超限拒绝、编码可用。
+  assert.ok(parseChildReplyEnvelope(envelope("final_report", exact)));
+  assert.equal(parseChildReplyEnvelope(envelope("final_report", `${exact}x`)), undefined);
+  assert.doesNotThrow(() => encodeChildReplyEnvelope(envelope("final_report", exact)));
 });
 
 test("显式 normal_reply 和 final_report 可在同一活动回合交错多次发送", async () => {

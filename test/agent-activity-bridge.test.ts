@@ -321,4 +321,17 @@ test("真实桥接进程忽略禁用块与未知块，仅在结构违约时关�
   }
 });
 
+test("真实桥接进程拒绝超过 64 KiB 的 prompt/steer 命令正文", async () => {
+  const session = startBridge([]);
+  try {
+    await session.client.start(AbortSignal.timeout(2_000));
+    const exact = "x".repeat(64 * 1024);
+    await session.client.prompt(exact);
+    await assert.rejects(() => session.client.prompt(`${exact}x`), /桥接命令失败/u);
+    await assert.rejects(() => session.client.steer(`${exact}x`), /桥接命令失败/u);
+  } finally {
+    await session.close();
+  }
+});
+
 void AGENT_ID;

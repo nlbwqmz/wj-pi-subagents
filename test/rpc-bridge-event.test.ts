@@ -289,7 +289,7 @@ test("任务桥接忽略非 assistant 的 message_end；活动路径逐块忽略
   });
 });
 
-test("真正 child 最终文本按拼接后的 32 KiB UTF-8 总长度区分回复超限", () => {
+test("真正 child 最终文本按拼接后的 64 KiB UTF-8 总长度区分回复超限", () => {
   const exactFirst = "x".repeat(REPLY_MAX_TEXT_BYTES - 4);
   const exact = normalizeAssistantMessageEnd({
     type: "message_end",
@@ -311,11 +311,12 @@ test("真正 child 最终文本按拼接后的 32 KiB UTF-8 总长度区分回�
     reason: "reply_too_large",
   });
 
+  // 多字节字符按 UTF-8 字节计算：21,846 个三字节字符 = 65,538 字节，超过 64 KiB 上限。
   assert.deepEqual(normalizeAssistantMessageEnd({
     type: "message_end",
     message: {
       role: "assistant",
-      content: [{ type: "text", text: "测".repeat(10_923) }],
+      content: [{ type: "text", text: "测".repeat(Math.ceil((REPLY_MAX_TEXT_BYTES + 1) / 3)) }],
     },
   }), {
     kind: "rejected",

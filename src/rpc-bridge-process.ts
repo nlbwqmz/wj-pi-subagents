@@ -36,7 +36,8 @@ import {
 const MAX_FRAME_BYTES = MANAGED_RPC_BRIDGE_MAX_FRAME_BYTES;
 const PROTOCOL = MANAGED_RPC_BRIDGE_PROTOCOL;
 const CREDENTIAL_ENV = MANAGED_RPC_BRIDGE_CREDENTIAL_ENV;
-const MAX_MESSAGE_BYTES = 16 * 1024;
+/** 父端向子代理投递的 prompt/steer 命令正文上限；与回复上限对齐。 */
+const MAX_MESSAGE_BYTES = 64 * 1024;
 const COMPACTION_ACTIVE_PROMPT_ERROR =
   "Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.";
 const HOST_BUSY_PROMPT_ERROR =
