@@ -316,6 +316,12 @@ An authorized project configuration takes precedence over user configuration. Wh
 
 Runtime configuration is read when the root session starts. After changing it, exit and restart Pi; `/reload` does not re-read these settings.
 
+### Bridge runtime
+
+Subagent bridge processes run on a JavaScript runtime. Pi normally reuses its own executable; when Pi itself is a compiled single binary (its executable is not `node`/`nodejs`/`bun`), the plugin resolves `node`, then `bun`, from `PATH`.
+
+To pin the runtime explicitly, set the `WJ_PI_SUBAGENTS_BRIDGE_RUNTIME` environment variable to the runtime executable path before starting Pi. If no runtime can be resolved, `spawn_agent` fails fast with `spawn_failed` instead of waiting for the startup timeout.
+
 ## 🗜️ Context Compaction
 
 Pi `>= 0.85.1` decides on and runs context compaction through the native post-tool flow after each tool execution. The root session and every subagent are independent Pi sessions; each compacts and continues based on its actual context state, with no extra plugin or coordination protocol required.
