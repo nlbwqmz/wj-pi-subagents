@@ -316,6 +316,12 @@ Confirm the existing implementation and constraints first, then make the changes
 
 运行时配置在根会话启动时读取。修改后需退出并重启 Pi；`/reload` 不会重新读取这些配置。
 
+### 桥接运行时
+
+子代理桥接进程运行在 JavaScript 运行时之上。Pi 通常复用自身的可执行文件；当 Pi 本身是单文件编译产物（其可执行文件不是 `node`/`nodejs`/`bun`）时，插件会从 `PATH` 中依次解析 `node`、`bun`。
+
+如需显式固定运行时，可在启动 Pi 前把 `WJ_PI_SUBAGENTS_BRIDGE_RUNTIME` 环境变量设置为运行时可执行文件的路径。若无法解析到可用运行时，`spawn_agent` 会立即以 `spawn_failed` 失败，而不是等待启动超时。
+
 ## 🗜️ 上下文压缩
 
 Pi `>= 0.85.1` 在每次工具执行后，通过原生的 post-tool 流程决定并执行上下文压缩。根会话与每个子代理都是独立的 Pi 会话，各自根据实际上下文状态完成压缩并继续工作，无需任何额外的插件或协调协议。
