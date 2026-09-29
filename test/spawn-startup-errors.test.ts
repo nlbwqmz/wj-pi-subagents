@@ -3,6 +3,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  BridgeRuntimeUnavailableError,
   FakeManagedRpcNode,
   MANAGED_RPC_BRIDGE_CREDENTIAL_ENV,
   ManagedRpcBridgeClient,
@@ -53,6 +54,12 @@ class StartupFailureNode extends FakeManagedRpcNode {
 class GenericStartupFailureNode extends FakeManagedRpcNode {
   override async start(): Promise<void> {
     throw new Error("未分类启动失败");
+  }
+}
+
+class BridgeRuntimeBlockedNode extends FakeManagedRpcNode {
+  override async start(): Promise<void> {
+    throw new BridgeRuntimeUnavailableError();
   }
 }
 
@@ -421,6 +428,31 @@ test("未分类的启动异常保持 spawn_failed", async () => {
     actor: ROOT_TREE_ACTOR,
     reservation: { templateId: "browser", name: "未分类故障" },
     managedNode: new GenericStartupFailureNode(),
+    channel: new StartupTestChannel(),
+    startupTimeoutMs: 1_000,
+    gracefulShutdownMs: 50,
+  });
+
+  const result = await supervisor.start();
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.code, "spawn_failed");
+});
+
+test("桥接运行时不可用归类为 spawn_failed 而不是启动超时", async () => {
+  const tree = new TreeController({
+    config: {
+      maxDepth: 2,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 8,
+      waitTimeoutMs: 10_000,
+    },
+    idFactory: () => AGENT_ID,
+  });
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "browser", name: "桥接运行时缺失" },
+    managedNode: new BridgeRuntimeBlockedNode(),
     channel: new StartupTestChannel(),
     startupTimeoutMs: 1_000,
     gracefulShutdownMs: 50,

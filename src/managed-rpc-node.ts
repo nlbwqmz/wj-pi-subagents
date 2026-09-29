@@ -1,5 +1,5 @@
 import { accessSync, constants, existsSync } from "node:fs";
-import { basename, delimiter, join } from "node:path";
+import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import type { Readable, Writable } from "node:stream";
@@ -40,6 +40,8 @@ export type ManagedRpcTransportFault = "eof" | "protocol_fault" | "process_exit"
 export const MANAGED_RPC_BRIDGE_PROTOCOL = "wj-pi-subagents/managed-rpc/10" as const;
 /** 只用于节点启动事务的一次性本地认证，不进入公开控制面。 */
 export const MANAGED_RPC_BRIDGE_CREDENTIAL_ENV = "WJ_PI_SUBAGENTS_MANAGED_RPC_CREDENTIAL" as const;
+/** 操作者显式指定桥接 JS 运行时；优先级低于装配选项，高于宿主形态解析。 */
+export const BRIDGE_RUNTIME_ENV = "WJ_PI_SUBAGENTS_BRIDGE_RUNTIME" as const;
 /** 外层桥接 JSON 正文的硬边界。 */
 export const MANAGED_RPC_BRIDGE_MAX_FRAME_BYTES = 64 * 1024;
 /** 单个高层命令的重组边界，覆盖长模板配置和监督启动快照。 */
@@ -113,6 +115,11 @@ export interface ManagedRpcNodeLaunchOptions {
 export interface ManagedRpcNodeOptions {
   readonly processTreeAdapter: ProcessTreeAdapter;
   readonly launch: ManagedRpcNodeLaunchOptions;
+  /**
+   * 装配期已确认的启动阻塞。start 在触碰进程树之前立即抛出，让监督器把
+   * 环境问题归类为 spawn_failed，而不是在装配处被吞成 internal_error。
+   */
+  readonly startupBlocked?: Error;
   /** 首个 bridge start 命令携带的 Pi RpcClient 配置，不进入 OS 命令行。 */
   readonly rpcOptions?: Readonly<Record<string, unknown>>;
   /** 测试可注入 bridge；生产默认使用有界本地帧桥。 */
@@ -127,40 +134,59 @@ export interface ManagedRpcNodeAssemblyOptions {
   /** 测试/打包时可指定已编译的桥接入口。 */
   readonly bridgeScriptPath?: string;
   readonly bridgeFactory?: ManagedRpcBridgeFactory;
-  /** 测试可指定桥接 JS 运行环境；缺省按宿主形态自动解析。 */
+  /** 装配级运行时覆盖；优先于环境变量与宿主形态解析。 */
   readonly bridgeRuntimePath?: string;
-  /** 测试可替换 PATH 查找实现；生产使用进程环境。 */
+  /** 测试可替换 PATH 查找输入；生产使用进程环境。 */
   readonly bridgeRuntimePathEnv?: string;
+  /** 测试/宿主可覆盖宿主可执行文件路径；生产使用 process.execPath。 */
+  readonly hostExecPath?: string;
+}
+
+/** 编译宿主上找不到可用 JS 运行时；节点启动时立即抛出，由监督器归类为 spawn_failed。 */
+export class BridgeRuntimeUnavailableError extends Error {
+  constructor() {
+    super("未找到可用的桥接 JS 运行时（node/bun）");
+    this.name = "BridgeRuntimeUnavailableError";
+  }
 }
 
 /**
  * 解析运行桥接脚本的 JS 运行环境。通常与宿主相同；但单文件编译宿主
  * （execPath 是产品二进制而非 node/bun）不能执行脚本，此时回退到
- * PATH 上的 node（其次 bun）。找不到时保留旧行为，由启动握手报错。
+ * PATH 上的 node（其次 bun）。找不到时返回 undefined，由装配入口转为
+ * 启动期阻塞错误，避免用产品二进制重演启动超时。
  */
 export function resolveBridgeRuntime(
   execPath: string = process.execPath,
   pathEnv: string | undefined = process.env.PATH,
-): string {
+  platform: string = process.platform,
+): string | undefined {
   const base = basename(execPath).toLowerCase().replace(/\.exe$/, "");
   if (base === "node" || base === "nodejs" || base === "bun") return execPath;
   for (const name of ["node", "bun"]) {
-    const found = findExecutableOnPath(name, pathEnv);
+    const found = findExecutableOnPath(name, pathEnv, platform);
     if (found !== undefined) return found;
   }
-  return execPath;
+  return undefined;
 }
 
-function findExecutableOnPath(name: string, pathEnv: string | undefined): string | undefined {
+function findExecutableOnPath(
+  name: string,
+  pathEnv: string | undefined,
+  platform: string,
+): string | undefined {
   if (pathEnv === undefined || pathEnv === "") return undefined;
-  const candidates = process.platform === "win32" ? [`${name}.exe`, `${name}.cmd`, name] : [name];
-  for (const dir of pathEnv.split(delimiter)) {
+  const separator = platform === "win32" ? ";" : ":";
+  // Windows Job Object helper 以 CreateProcess 启动，无法执行 .cmd 或无扩展名
+  // 脚本；只接受 .exe，避免选中不可启动的候选并阻断后续 bun 回退。
+  const candidates = platform === "win32" ? [`${name}.exe`] : [name];
+  for (const dir of pathEnv.split(separator)) {
     if (dir === "") continue;
     for (const candidate of candidates) {
       const full = join(dir, candidate);
       try {
         if (!existsSync(full)) continue;
-        if (process.platform !== "win32") accessSync(full, constants.X_OK);
+        if (platform !== "win32") accessSync(full, constants.X_OK);
       } catch {
         continue;
       }
@@ -178,11 +204,17 @@ function needsTypeStrippingFlag(runtimePath: string, scriptPath: string): boolea
 
 /** 生成平台适配器在启动前接收的桥接进程说明。 */
 export function createManagedRpcNodeLaunchSpec(
-  options: Pick<ManagedRpcNodeAssemblyOptions, "cwd" | "env" | "bridgeScriptPath" | "bridgeRuntimePath" | "bridgeRuntimePathEnv">,
+  options: Pick<
+    ManagedRpcNodeAssemblyOptions,
+    "cwd" | "env" | "bridgeScriptPath" | "bridgeRuntimePath" | "bridgeRuntimePathEnv" | "hostExecPath"
+  >,
 ): ManagedRpcNodeLaunchOptions {
   const scriptPath = options.bridgeScriptPath
     ?? defaultBridgeScriptPath();
-  const runtime = options.bridgeRuntimePath ?? resolveBridgeRuntime(process.execPath, options.bridgeRuntimePathEnv);
+  const runtime = options.bridgeRuntimePath
+    ?? nonEmptyRuntime(process.env[BRIDGE_RUNTIME_ENV])
+    ?? resolveBridgeRuntime(options.hostExecPath ?? process.execPath, options.bridgeRuntimePathEnv);
+  if (runtime === undefined) throw new BridgeRuntimeUnavailableError();
   return Object.freeze({
     command: runtime,
     args: Object.freeze([
@@ -192,6 +224,10 @@ export function createManagedRpcNodeLaunchSpec(
     ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
     ...(options.env === undefined ? {} : { env: Object.freeze({ ...options.env }) }),
   });
+}
+
+function nonEmptyRuntime(value: string | undefined): string | undefined {
+  return value === undefined || value === "" ? undefined : value;
 }
 
 /**
@@ -216,9 +252,21 @@ function defaultBridgeScriptPath(): string {
 
 /** 生产装配便捷入口；返回值仍是单一 `ManagedRpcNode` 深模块。 */
 export function createManagedRpcNode(options: ManagedRpcNodeAssemblyOptions): ManagedRpcNode {
+  let launch: ManagedRpcNodeLaunchOptions;
+  let startupBlocked: Error | undefined;
+  try {
+    launch = createManagedRpcNodeLaunchSpec(options);
+  } catch (error) {
+    if (!(error instanceof BridgeRuntimeUnavailableError)) throw error;
+    // 装配错误在控制器边界会被吞成 internal_error；延迟到 start 抛出，
+    // 让监督器把环境缺失归类为 spawn_failed。占位启动说明不会被使用。
+    startupBlocked = error;
+    launch = Object.freeze({ command: process.execPath, args: Object.freeze([]) });
+  }
   return new ManagedRpcNode({
     processTreeAdapter: options.processTreeAdapter,
-    launch: createManagedRpcNodeLaunchSpec(options),
+    launch,
+    ...(startupBlocked === undefined ? {} : { startupBlocked }),
     ...(options.rpcOptions === undefined ? {} : { rpcOptions: options.rpcOptions }),
     ...(options.bridgeFactory === undefined ? {} : { bridgeFactory: options.bridgeFactory }),
   });
@@ -256,6 +304,7 @@ export class ManagedRpcNode implements ManagedRpcNodeLike {
     readonly launch: NonNullable<ProcessTreeAdapter["launch"]>;
   };
   private readonly launchSpec: ManagedRpcNodeLaunchOptions;
+  private readonly startupBlocked: Error | undefined;
   private readonly rpcOptions: Readonly<Record<string, unknown>> | undefined;
   private readonly bridgeFactory: ManagedRpcBridgeFactory;
   private phase: NodePhase = "new";
@@ -288,6 +337,7 @@ export class ManagedRpcNode implements ManagedRpcNodeLike {
       ...(options.launch.cwd === undefined ? {} : { cwd: options.launch.cwd }),
       ...(options.launch.env === undefined ? {} : { env: Object.freeze({ ...options.launch.env }) }),
     });
+    this.startupBlocked = options.startupBlocked;
     this.rpcOptions = options.rpcOptions === undefined
       ? undefined
       : copyRpcOptions(options.rpcOptions);
@@ -409,6 +459,7 @@ export class ManagedRpcNode implements ManagedRpcNodeLike {
     if (this.phase !== "new") throw new Error("受管 RPC 节点已启动");
     this.phase = "starting";
     try {
+      if (this.startupBlocked !== undefined) throw this.startupBlocked;
       if (signal?.aborted || this.cleanupRequested()) throw abortError();
       const credential = randomBytes(32).toString("base64url");
       const launchSpec = withBridgeCredential(this.launchSpec, credential, context?.environment);
