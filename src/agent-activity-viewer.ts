@@ -51,6 +51,13 @@ const WAIT_AGENT_RUNNING_TEXT = "…";
 const FROZEN_DRAFT_ELLIPSIS = "…";
 const EMPTY_ACTIVITY_TEXT = "No cached activity yet";
 const OLDER_ACTIVITY_OMITTED_TEXT = "Older activity omitted";
+
+/**
+ * 单次顶层调用在面板上逐条显示的嵌套记录上限。超出的嵌套记录不生成条目，
+ * 聚合为一行 `其余 N 条省略`；该边界与 Pi 嵌套调用记录的上限一致。
+ */
+export const NESTED_ACTIVITY_DISPLAY_LIMIT = 256;
+
 /** 模型调用失败条目的折叠前缀；错误与已中止两种收尾同形。 */
 const MODEL_CALL_FAILURE_TITLE_PREFIX = "Error:";
 const VIEWER_HEADER_TEXT = "AGENT ACTIVITY";
@@ -431,6 +438,11 @@ interface ToolDisplayEntry {
   readonly settlementKey: string;
   toolName: string;
   origin: SafeToolOrigin;
+  /**
+   * 嵌套条目的显示前缀（如 `codemode->`、`codemode->…->`）；顶层调用缺省。
+   * 前缀只加在工具名前，不参与摘要内容与展开正文。
+   */
+  nestedPrefix: string | undefined;
   state: ToolRunState;
   /** 专用摘要：只有来源验证通过的专用工具携带；结束事实覆盖开始。 */
   summary: SafeToolSummary | undefined;
@@ -1116,6 +1128,7 @@ export class AgentActivityViewerModel {
   private projectEntries(): DisplayEntry[] {
     const entries: DisplayEntry[] = [];
     const toolIndex = new Map<string, ToolDisplayEntry>();
+    const nested = createNestedProjectionState();
 
     for (const entry of this.entries) {
       const body = entry.body;
@@ -1160,11 +1173,49 @@ export class AgentActivityViewerModel {
         continue;
       }
 
-      if (body.type === "tool_execution_start") {
+      if (body.type === "tool_execution_start" || body.type === "tool_execution_end") {
         // 旧 replay 可包含 start/end 两个事实，按运行实例、toolCallId 与
-        // executionGeneration 合并；缺省代次 1 保持旧条目兼容。
+        // executionGeneration 合并；缺省代次 1 保持旧条目兼容。结束事实自包含
+        // 状态与摘要：开始缺失时仍建立完成条目，只有身份匹配的结束事实才能
+        // 更新或回填既有条目。
         const identity = toolProjectionIdentity(entry);
-        if (toolIndex.has(identity)) continue;
+        const existing = toolIndex.get(identity);
+        if (existing !== undefined) {
+          if (body.type === "tool_execution_start") continue;
+          // 匹配结束原地更新（幂等或回填），绝不退回运行中；结束事实携带更
+          // 完整的摘要与错误正文，覆盖开始事实的输入参数摘要。
+          existing.toolName = body.toolName;
+          existing.origin = body.origin;
+          existing.state = body.isError ? { phase: "failure" } : { phase: "success" };
+          existing.summary = body.summary;
+          existing.errorText = body.errorText;
+          existing.errorCode = body.errorCode;
+          // 开始事实缺失父引用而结束事实携带时补齐显示前缀：嵌套关系是调用
+          // 事实而非单条事实的属性，但已在创建时确定的超量计数不再回改，
+          // 保证可见条目不会同时被计入聚合行。
+          if (body.parentToolCallId !== undefined && existing.nestedPrefix === undefined) {
+            const parentKey = nestedCallKey(entry.incarnation_id, body.parentToolCallId);
+            const chain = Object.freeze([
+              ...(nested.chains.get(parentKey) ?? ["codemode"]),
+              body.toolName,
+            ]);
+            nested.chains.set(nestedCallKey(entry.incarnation_id, body.toolCallId), chain);
+            existing.nestedPrefix = nestedDisplayPrefix(chain);
+          }
+          continue;
+        }
+        const callKey = nestedCallKey(entry.incarnation_id, body.toolCallId);
+        // 已聚合的超量调用：后续事实不重复计数，也不生成条目。
+        if (nested.omittedCalls.has(callKey)) continue;
+        const projection = projectNestedCall(
+          nested,
+          entry.incarnation_id,
+          body.toolCallId,
+          body.toolName,
+          body.parentToolCallId,
+        );
+        if (projection.aggregate !== undefined) entries.push(projection.aggregate);
+        if (projection.omitted) continue;
         const tool: ToolDisplayEntry = {
           kind: "tool",
           entryId: entry.entry_id,
@@ -1174,48 +1225,18 @@ export class AgentActivityViewerModel {
           settlementKey: canonicalEntryIdentity(entry),
           toolName: body.toolName,
           origin: body.origin,
-          state: { phase: "running" },
+          nestedPrefix: projection.nestedPrefix,
+          state: body.type === "tool_execution_start"
+            ? { phase: "running" }
+            : body.isError ? { phase: "failure" } : { phase: "success" },
           summary: body.summary,
-          errorText: undefined,
-          errorCode: undefined,
+          errorText: body.type === "tool_execution_end" ? body.errorText : undefined,
+          errorCode: body.type === "tool_execution_end" ? body.errorCode : undefined,
         };
         entries.push(tool);
         toolIndex.set(identity, tool);
         continue;
       }
-
-      // 结束事实自包含状态与摘要：开始缺失时仍建立完成条目。只有运行实例、
-      // 活动 ID 与代次都匹配的结束事实才能更新或回填既有条目。
-      const identity = toolProjectionIdentity(entry);
-      const existing = toolIndex.get(identity);
-      const state: ToolRunState = body.isError ? { phase: "failure" } : { phase: "success" };
-      if (existing === undefined) {
-        const tool: ToolDisplayEntry = {
-          kind: "tool",
-          entryId: entry.entry_id,
-          incarnationId: entry.incarnation_id,
-          toolCallId: body.toolCallId,
-          generation: body.executionGeneration ?? 1,
-          settlementKey: canonicalEntryIdentity(entry),
-          toolName: body.toolName,
-          origin: body.origin,
-          state,
-          summary: body.summary,
-          errorText: body.errorText,
-          errorCode: body.errorCode,
-        };
-        entries.push(tool);
-        toolIndex.set(identity, tool);
-        continue;
-      }
-      // 匹配结束原地更新（幂等或回填），绝不退回运行中；结束事实携带更
-      // 完整的摘要与错误正文，覆盖开始事实的输入参数摘要。
-      existing.toolName = body.toolName;
-      existing.origin = body.origin;
-      existing.state = state;
-      existing.summary = body.summary;
-      existing.errorText = body.errorText;
-      existing.errorCode = body.errorCode;
     }
 
     if (toolIndex.size > 0) {
@@ -1478,9 +1499,19 @@ export class AgentActivityViewerModel {
           continue;
         }
 
+        if (entry.kind === "nested_omitted") {
+          // 超量嵌套记录的聚合行：只展示省略数量，不参与选中与展开。
+          addStatic(Object.freeze([{
+            text: `其余 ${entry.count} 条省略`,
+            style: "terminal" as const,
+          }]));
+          continue;
+        }
+
         const visual = toolDisplayVisual(entry);
+        const nestedPrefix = entry.nestedPrefix ?? "";
         // 工具摘要统一作为标题：状态图标位于标题前缀；可展开项顺序为折叠符、
-        // 状态图标、摘要，不可展开项由状态图标占据最左侧。
+        // 状态图标、嵌套前缀、摘要，不可展开项由状态图标占据最左侧。
         if (entry.summary !== undefined) {
           const shell = entry.summary.tool === "bash" || entry.summary.tool === "powershell";
           // codemode 脚本与 Shell 命令一样是预格式化正文；结束事实缺少
@@ -1505,12 +1536,13 @@ export class AgentActivityViewerModel {
               width
                 - (expandable ? 2 : 0)
                 - displayWidth(suffix)
+                - displayWidth(nestedPrefix)
                 - displayWidth(visual.icon) - 1,
             );
             const failureTail = statusFailureTail(entry.summary!);
             const summaryText = formatStatusSummary(entry.summary!, summaryWidth, failureTail);
             return toolTitleLine({
-              label: `${summaryText}${suffix}`,
+              label: `${nestedPrefix}${summaryText}${suffix}`,
               visual,
               width,
               ...(expandable ? { key: expandKey, expanded } : {}),
@@ -1560,7 +1592,7 @@ export class AgentActivityViewerModel {
             ...(entry.errorCode === undefined ? [] : [entry.errorCode]),
           ];
           return toolTitleLine({
-            label: `${runningLabel}${
+            label: `${nestedPrefix}${runningLabel}${
               suffixParts.length === 0 ? "" : ` · ${suffixParts.join(SUMMARY_SEPARATOR)}`
             }`,
             visual,
@@ -1671,6 +1703,11 @@ type DisplayEntry =
       /** 发起该次失败的模型；压缩自身失败等场景不可得时缺失。 */
       readonly provider?: string;
       readonly model?: string;
+    }
+  | {
+      /** 单次调用超量嵌套记录的聚合行；位置固定在其首个超量记录处。 */
+      readonly kind: "nested_omitted";
+      count: number;
     }
   | {
       readonly kind: "live";
@@ -2682,6 +2719,91 @@ function toolProjectionIdentity(entry: CanonicalAgentActivityEntry): string {
     body.toolCallId,
     body.executionGeneration ?? 1,
   ]);
+}
+
+type NestedOmittedDisplayEntry = Extract<DisplayEntry, { readonly kind: "nested_omitted" }>;
+
+/** 嵌套投影状态：按运行实例与活动 ID 记录显示链与根调用，并累计超量记录。 */
+interface NestedProjectionState {
+  readonly chains: Map<string, readonly string[]>;
+  readonly roots: Map<string, string>;
+  readonly counts: Map<string, number>;
+  readonly omittedCalls: Set<string>;
+  readonly omittedByRoot: Map<string, NestedOmittedDisplayEntry>;
+}
+
+interface NestedCallProjection {
+  readonly nestedPrefix: string | undefined;
+  /** true 表示该嵌套记录超出显示上限，不生成可见条目。 */
+  readonly omitted: boolean;
+  /** 首次出现超量记录时返回聚合条目，由调用方按时间线位置插入。 */
+  readonly aggregate?: NestedOmittedDisplayEntry;
+}
+
+function nestedCallKey(incarnationId: string, toolCallId: string): string {
+  return `${incarnationId}\u0000${toolCallId}`;
+}
+
+function createNestedProjectionState(): NestedProjectionState {
+  return {
+    chains: new Map(),
+    roots: new Map(),
+    counts: new Map(),
+    omittedCalls: new Set(),
+    omittedByRoot: new Map(),
+  };
+}
+
+/**
+ * 嵌套条目的显示前缀：完整调用链拼接为 `codemode->A->B`；链超过 3 段时
+ * 中间省略为 `codemode->…->B`。顶层调用没有前缀。
+ */
+function nestedDisplayPrefix(chain: readonly string[]): string | undefined {
+  if (chain.length < 2) return undefined;
+  if (chain.length <= 3) return `${chain.slice(0, -1).join("->")}->`;
+  return `${chain[0]}->…->`;
+}
+
+/**
+ * 把一次工具调用投影到嵌套关系：顶层调用建立自身链；嵌套调用按父链拼接
+ * 显示前缀，父条目未被观察到时以 codemode 根标记兜底（当前只有内置
+ * codemode 扩展执行嵌套调用）。超过单次调用显示上限的嵌套记录不生成条目，
+ * 只累加聚合计数。
+ */
+function projectNestedCall(
+  state: NestedProjectionState,
+  incarnationId: string,
+  toolCallId: string,
+  toolName: string,
+  parentToolCallId: string | undefined,
+): NestedCallProjection {
+  const key = nestedCallKey(incarnationId, toolCallId);
+  if (parentToolCallId === undefined) {
+    state.chains.set(key, Object.freeze([toolName]));
+    state.roots.set(key, toolCallId);
+    return { nestedPrefix: undefined, omitted: false };
+  }
+  const parentKey = nestedCallKey(incarnationId, parentToolCallId);
+  const chain = Object.freeze([...(state.chains.get(parentKey) ?? ["codemode"]), toolName]);
+  state.chains.set(key, chain);
+  const rootCallId = state.roots.get(parentKey) ?? parentToolCallId;
+  state.roots.set(key, rootCallId);
+  // 超量计数与聚合按运行实例隔离：不同运行实例复用同一根活动 ID 时不串联。
+  const rootKey = nestedCallKey(incarnationId, rootCallId);
+  const count = (state.counts.get(rootKey) ?? 0) + 1;
+  state.counts.set(rootKey, count);
+  if (count <= NESTED_ACTIVITY_DISPLAY_LIMIT) {
+    return { nestedPrefix: nestedDisplayPrefix(chain), omitted: false };
+  }
+  state.omittedCalls.add(key);
+  const existing = state.omittedByRoot.get(rootKey);
+  if (existing !== undefined) {
+    existing.count += 1;
+    return { nestedPrefix: undefined, omitted: true };
+  }
+  const aggregate: NestedOmittedDisplayEntry = { kind: "nested_omitted", count: 1 };
+  state.omittedByRoot.set(rootKey, aggregate);
+  return { nestedPrefix: undefined, omitted: true, aggregate };
 }
 
 /** 返回当前可观察 replay 中尚未被 end 收束的工具规范原子身份。 */

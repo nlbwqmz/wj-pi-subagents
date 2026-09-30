@@ -918,6 +918,66 @@ test("活动事件闭集校验器接受合法事件并拒绝违约、未知与�
   assert.equal(oversized.kind, "event");
 });
 
+test("嵌套父引用按闭集校验：合法接受，未知键、自引用与不一致组合拒绝", () => {
+  const start = {
+    type: "tool_execution_start",
+    toolCallId: "call_1/1",
+    toolName: "read",
+    origin: "pi_native",
+    executionGeneration: 1,
+    parentToolCallId: "call_1",
+  };
+  const end = {
+    type: "tool_execution_end",
+    toolCallId: "call_1/1",
+    toolName: "read",
+    origin: "pi_native",
+    executionGeneration: 1,
+    isError: false,
+    parentToolCallId: "call_1",
+  };
+  assert.deepEqual(parseAgentActivityEvent(start), {
+    kind: "event",
+    event: start,
+  });
+  assert.deepEqual(parseAgentActivityEvent(end), {
+    kind: "event",
+    event: end,
+  });
+  assert.equal(parseCanonicalAgentActivityEvent(start).kind, "event");
+  assert.equal(parseCanonicalAgentActivityEvent(end).kind, "event");
+  // 未知键仍被 canonical 闭集拒绝。
+  assert.equal(parseCanonicalAgentActivityEvent({ ...start, unknown: 1 }).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityEvent({ ...end, unknown: 1 }).kind, "invalid");
+  // 非法组合：自引用、与活动 ID 不一致、空串、非文本、超长。
+  for (const parentToolCallId of ["call_1/1", "call_2", "", 42, "p".repeat(257), "call_1/"]) {
+    assert.equal(
+      parseAgentActivityEvent({ ...start, parentToolCallId }).kind,
+      "invalid",
+      JSON.stringify(parentToolCallId),
+    );
+    assert.equal(
+      parseCanonicalAgentActivityEvent({ ...end, parentToolCallId }).kind,
+      "invalid",
+      JSON.stringify(parentToolCallId),
+    );
+  }
+  // 顶层调用仍可缺省父引用；嵌套调用可同时携带专用摘要。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "codemode",
+    origin: "pi_extension",
+    summary: { tool: "codemode", code: "return 1;", codeLines: 1 },
+  }).kind, "event");
+  assert.equal(parseAgentActivityEvent({
+    ...start,
+    toolName: "codemode",
+    origin: "pi_extension",
+    summary: { tool: "codemode", code: "return 1;", codeLines: 1 },
+  }).kind, "event");
+});
+
 test("pi_extension 来源的 codemode 摘要按开始/结束形状分别闭合", () => {
   // 开始事实：code 与 codeLines 成对在场。
   assert.equal(parseAgentActivityEvent({

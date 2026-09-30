@@ -575,6 +575,11 @@ export type SafeAgentActivityEvent =
       readonly toolCallId: string;
       readonly toolName: string;
       readonly origin: SafeToolOrigin;
+      /**
+       * 嵌套调用的直接父工具活动 ID；顶层调用缺省。Pi 为脚本内嵌套调用
+       * 分配 `<父 id>/<n>` 形式的活动 ID，并同时带上该父引用。
+       */
+      readonly parentToolCallId?: string;
       /** 同一运行实例内复用 toolCallId 时递增；旧事实缺省为首代。 */
       readonly executionGeneration?: number;
       /** 仅来源验证通过的专用工具可携带的白名单摘要。 */
@@ -585,6 +590,8 @@ export type SafeAgentActivityEvent =
       readonly toolCallId: string;
       readonly toolName: string;
       readonly origin: SafeToolOrigin;
+      /** 与开始事实相同的嵌套父引用；顶层调用缺省。 */
+      readonly parentToolCallId?: string;
       /** 与开始事实相同的执行代次；旧事实缺省为首代。 */
       readonly executionGeneration?: number;
       readonly isError: boolean;
@@ -971,10 +978,15 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
       if (
         !hasOnlyToolEventKeys(
           value,
-          ["type", "toolCallId", "toolName", "origin", "executionGeneration", "summary"],
+          [
+            "type", "toolCallId", "toolName", "origin", "parentToolCallId",
+            "executionGeneration", "summary",
+          ],
         )
         || (value.executionGeneration !== undefined
           && !isValidToolExecutionGeneration(value.executionGeneration))
+        || (value.parentToolCallId !== undefined
+          && !isValidParentToolCallId(value.toolCallId, value.parentToolCallId))
       ) return INVALID_ACTIVITY_EVENT;
       if (!isSafeToolOrigin(value.origin)) return INVALID_ACTIVITY_EVENT;
       if (value.summary !== undefined) {
@@ -995,6 +1007,9 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
           toolCallId: value.toolCallId,
           toolName: value.toolName,
           origin: value.origin,
+          ...(value.parentToolCallId === undefined
+            ? {}
+            : { parentToolCallId: value.parentToolCallId }),
           ...(value.executionGeneration === undefined
             ? {}
             : { executionGeneration: value.executionGeneration }),
@@ -1010,12 +1025,14 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
         || !hasOnlyToolEventKeys(
           value,
           [
-            "type", "toolCallId", "toolName", "origin", "executionGeneration", "isError",
-            "summary", "errorText", "errorCode",
+            "type", "toolCallId", "toolName", "origin", "parentToolCallId", "executionGeneration",
+            "isError", "summary", "errorText", "errorCode",
           ],
         )
         || (value.executionGeneration !== undefined
           && !isValidToolExecutionGeneration(value.executionGeneration))
+        || (value.parentToolCallId !== undefined
+          && !isValidParentToolCallId(value.toolCallId, value.parentToolCallId))
       ) return INVALID_ACTIVITY_EVENT;
       if (!isSafeToolOrigin(value.origin)) return INVALID_ACTIVITY_EVENT;
       if (value.summary !== undefined) {
@@ -1058,6 +1075,9 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
           toolCallId: value.toolCallId,
           toolName: value.toolName,
           origin: value.origin,
+          ...(value.parentToolCallId === undefined
+            ? {}
+            : { parentToolCallId: value.parentToolCallId }),
           ...(value.executionGeneration === undefined
             ? {}
             : { executionGeneration: value.executionGeneration }),
@@ -1157,7 +1177,7 @@ export function parseCanonicalAgentActivityEvent(
         !hasExactKeysWithOptional(
           value,
           ["type", "toolCallId", "toolName", "origin", "executionGeneration"],
-          ["summary"],
+          ["parentToolCallId", "summary"],
         )
         || !Object.prototype.hasOwnProperty.call(value, "executionGeneration")
         || !isValidToolExecutionGeneration(value.executionGeneration)
@@ -1168,7 +1188,7 @@ export function parseCanonicalAgentActivityEvent(
         !hasExactKeysWithOptional(
           value,
           ["type", "toolCallId", "toolName", "origin", "executionGeneration", "isError"],
-          ["summary", "errorText", "errorCode"],
+          ["parentToolCallId", "summary", "errorText", "errorCode"],
         )
         || !Object.prototype.hasOwnProperty.call(value, "executionGeneration")
         || !isValidToolExecutionGeneration(value.executionGeneration)
@@ -1588,7 +1608,9 @@ function normalizeLocalDisplayOrdering(
  * 只保留白名单参数与结果事实，Shell 外 Pi 工具失败时自包含净化后的完整
  * 错误正文，插件工具失败时自包含规范稳定错误码。专用解析宽容未来新增字段
  * 并忽略它们；必需字段缺失或类型错误、开始参数缺失或来源验证失败时完整
- * 降级为无载荷安全兜底。允许未来新增字段并忽略它们；关联身份缺失或来源
+ * 降级为无载荷安全兜底。嵌套调用的父引用是有界结构事实：它在开始与结束
+ * 事实中随条目携带，非法父引用（越界、自引用或与活动 ID 不一致）属于结构
+ * 违约。允许未来新增字段并忽略它们；关联身份缺失或来源
  * 闭集之外属于结构违约，由调用方决定是否升级，不在本函数内降级。
  */
 export function normalizeOwnToolActivityEvent(
@@ -1656,6 +1678,9 @@ export function normalizeOwnToolActivityEvent(
       toolCallId: event.toolCallId,
       toolName: event.toolName,
       origin,
+      ...(event.parentToolCallId === undefined
+        ? {}
+        : { parentToolCallId: event.parentToolCallId }),
       ...(effectiveGeneration === undefined ? {} : { executionGeneration: effectiveGeneration }),
       ...(summary === undefined ? {} : { summary }),
     });
@@ -1704,6 +1729,9 @@ export function normalizeOwnToolActivityEvent(
       toolCallId: event.toolCallId,
       toolName: event.toolName,
       origin,
+      ...(event.parentToolCallId === undefined
+        ? {}
+        : { parentToolCallId: event.parentToolCallId }),
       ...(effectiveGeneration === undefined ? {} : { executionGeneration: effectiveGeneration }),
       isError: event.isError,
       ...(summary === undefined ? {} : { summary }),
@@ -3196,6 +3224,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function validBoundedText(value: unknown, maxBytes: number): value is string {
   return typeof value === "string" && value.length > 0 && utf8Length(value) <= maxBytes;
+}
+
+/**
+ * 嵌套父引用的严格校验：父引用是有界文本、不得自引用，且嵌套调用的活动
+ * ID 必须形如 `<父 id>/<n>`（Pi 为脚本内嵌套调用分配的 ID 规则）。顶层
+ * 调用没有父引用，不经过本谓词。
+ */
+export function isValidParentToolCallId(toolCallId: string, parentToolCallId: unknown): parentToolCallId is string {
+  if (!validBoundedText(parentToolCallId, MAX_TOOL_ID_BYTES)) return false;
+  if (parentToolCallId === toolCallId) return false;
+  return toolCallId.startsWith(`${parentToolCallId}/`);
 }
 
 function utf8Length(value: string): number {

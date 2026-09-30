@@ -1476,6 +1476,60 @@ test("codemode 必需参数缺失或来源未验证时降级为无摘要兜底",
   }
 });
 
+test("产生端采集嵌套调用的父引用，顶层调用不携带该字段", () => {
+  const nestedStart = normalizeOwnToolActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1/1",
+    toolName: "read",
+    parentToolCallId: "call_1",
+    args: { path: "src/a.ts" },
+  }, "pi_native");
+  assert.equal(nestedStart.kind, "event");
+  if (nestedStart.kind !== "event" || nestedStart.event.type !== "tool_execution_start") return;
+  assert.equal(nestedStart.event.parentToolCallId, "call_1");
+  // 嵌套条目的专用摘要照常提取，父引用不改变其余渲染输入。
+  assert.deepEqual(summaryOf(nestedStart.event), { tool: "read", path: "src/a.ts" });
+
+  const nestedEnd = normalizeOwnToolActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1/1",
+    toolName: "read",
+    parentToolCallId: "call_1",
+    result: { content: [{ type: "text", text: "文件正文不得跨进程" }] },
+    isError: false,
+  }, "pi_native", { path: "src/a.ts" });
+  assert.equal(nestedEnd.kind, "event");
+  if (nestedEnd.kind !== "event" || nestedEnd.event.type !== "tool_execution_end") return;
+  assert.equal(nestedEnd.event.parentToolCallId, "call_1");
+  assert.deepEqual(summaryOf(nestedEnd.event), { tool: "read", path: "src/a.ts" });
+
+  const topLevel = normalizeOwnToolActivityEvent(mutationStart("codemode", { code: "return 1;" }), "pi_extension");
+  assert.equal(topLevel.kind, "event");
+  if (topLevel.kind !== "event" || topLevel.event.type !== "tool_execution_start") return;
+  assert.equal("parentToolCallId" in topLevel.event, false);
+});
+
+test("产生端拒绝越界、自引用或与活动 ID 不一致的父引用", () => {
+  const base = {
+    type: "tool_execution_start",
+    toolCallId: "call_1/1",
+    toolName: "read",
+    args: { path: "a.ts" },
+  };
+  for (const parentToolCallId of ["", 42, "p".repeat(257), "call_1/1", "call_2", "call_1" + "/"]) {
+    assert.equal(
+      normalizeOwnToolActivityEvent({ ...base, parentToolCallId }, "pi_native").kind,
+      "invalid",
+      JSON.stringify(parentToolCallId),
+    );
+  }
+  // 合法父引用仍被接受。
+  assert.equal(
+    normalizeOwnToolActivityEvent({ ...base, parentToolCallId: "call_1" }, "pi_native").kind,
+    "event",
+  );
+});
+
 test("tool_search 开始摘要携带查询词，描述与未来字段不跨进程", () => {
   const start = normalizeOwnToolActivityEvent(
     mutationStart("tool_search", { query: "mcp resource", limit: 5, futureField: "不得跨进程" }),

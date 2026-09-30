@@ -4,11 +4,13 @@ import { randomUUID } from "node:crypto";
 import { Markdown, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import {
   AgentActivityViewerModel,
+  NESTED_ACTIVITY_DISPLAY_LIMIT,
   displayWidth,
   renderAgentActivityViewerSurface,
 } from "../src/agent-activity-viewer.ts";
 import type {
   SafeAgentActivityDisplayEvent,
+  SafeAgentActivityEvent,
   SafeToolSummary,
   SafeToolOrigin,
 } from "../src/rpc-bridge-event.ts";
@@ -22,7 +24,7 @@ import {
   type CanonicalAgentActivityEntry,
 } from "../src/canonical-activity.ts";
 import type { AgentLifecycleState } from "../src/agent-snapshot-codec.ts";
-import type { AgentActivitySnapshot } from "../src/agent-activity-cache.ts";
+import { AgentActivityCache, type AgentActivitySnapshot } from "../src/agent-activity-cache.ts";
 
 const AGENT_ID = "550e8400-e29b-41d4-a716-446655440002";
 const INCARNATION_ID = "7f9c24e8-5b3d-4f6a-8c1e-9d2b7a4f6e81";
@@ -105,6 +107,7 @@ function toolStart(
   summary?: SafeToolSummary,
   entryId: string = randomUUID(),
   executionGeneration?: number,
+  parentToolCallId?: string,
 ): CanonicalAgentActivityEntry {
   return Object.freeze({
     contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
@@ -116,6 +119,7 @@ function toolStart(
       toolCallId,
       toolName,
       origin,
+      ...(parentToolCallId === undefined ? {} : { parentToolCallId }),
       ...(executionGeneration === undefined ? {} : { executionGeneration }),
       ...(summary === undefined ? {} : { summary }),
     }),
@@ -133,6 +137,7 @@ function toolEnd(
   errorCode?: string,
   entryId: string = randomUUID(),
   executionGeneration?: number,
+  parentToolCallId?: string,
 ): CanonicalAgentActivityEntry {
   return Object.freeze({
     contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
@@ -144,6 +149,7 @@ function toolEnd(
       toolCallId,
       toolName,
       origin,
+      ...(parentToolCallId === undefined ? {} : { parentToolCallId }),
       ...(executionGeneration === undefined ? {} : { executionGeneration }),
       isError,
       ...(summary === undefined ? {} : { summary }),
@@ -2153,6 +2159,126 @@ test("codemode 失败条目状态图标为失败，脚本错误正文不进入�
   assert.ok(lines.includes('│ throw new Error("boom");'), lines.join("\n"));
 });
 
+test("嵌套条目带 codemode-> 前缀，自身摘要不回归", () => {
+  const code = "await tools.read({ path: \"a.ts\" });";
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart("call_1", "codemode", "pi_extension", INCARNATION_ID, {
+      tool: "codemode", code, codeLines: 1,
+    }),
+    toolStart("call_1/1", "read", "pi_native", INCARNATION_ID, {
+      tool: "read", path: "src/a.ts",
+    }, undefined, undefined, "call_1"),
+    toolEnd("call_1/1", "read", false, "pi_native", INCARNATION_ID, {
+      tool: "read", path: "src/a.ts",
+    }, undefined, undefined, undefined, undefined, "call_1"),
+    toolEnd("call_1", "codemode", false, "pi_extension", INCARNATION_ID, {
+      tool: "codemode", code, codeLines: 1, isError: false, nestedCalls: 1,
+    }),
+  ], { viewport_height: 20 });
+  const lines = viewer.render(160).slice(1, -1);
+  // 顶层 codemode 条目不带前缀，行为与 02 一致。
+  assert.ok(lines.includes("▸ ✓ codemode · 1 lines · 1 nested calls"), lines.join("\n"));
+  // 嵌套条目：前缀只加在工具名前，自身摘要（path）原样保留。
+  assert.ok(lines.includes("✓ codemode->read · src/a.ts"), lines.join("\n"));
+  assert.equal(lines.filter((line) => line.includes("codemode->read")).length, 1, lines.join("\n"));
+  // 前缀不参与摘要：嵌套条目本身没有可展开正文，也不影响顶层展开入口。
+  assert.doesNotMatch(lines.join("\n"), /src\/a\.ts.*src\/a\.ts/u);
+});
+
+test("多级嵌套链按完整调用链拼接，超过 3 层省略中间", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart("call_1", "codemode", "pi_extension", INCARNATION_ID, {
+      tool: "codemode", code: "return 1;", codeLines: 1,
+    }),
+    toolStart("call_1/1", "A", "unknown", INCARNATION_ID, undefined, undefined, undefined, "call_1"),
+    toolStart("call_1/1/1", "B", "unknown", INCARNATION_ID, undefined, undefined, undefined, "call_1/1"),
+    toolStart("call_1/1/1/1", "D", "unknown", INCARNATION_ID, undefined, undefined, undefined, "call_1/1/1"),
+    // 父条目未被观察到时仍标记嵌套来源，前缀退化为根标记。
+    toolStart("call_2/1", "orphan", "unknown", INCARNATION_ID, undefined, undefined, undefined, "call_2"),
+  ], { viewport_height: 20 });
+  const lines = viewer.render(160).slice(1, -1);
+  assert.ok(lines.includes("↻ codemode->A"), lines.join("\n"));
+  assert.ok(lines.includes("↻ codemode->A->B"), lines.join("\n"));
+  assert.ok(lines.includes("↻ codemode->…->D"), lines.join("\n"));
+  assert.ok(lines.includes("↻ codemode->orphan"), lines.join("\n"));
+});
+
+test("嵌套条目保持自身折叠与选中能力，不改变生命周期", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart("call_1", "codemode", "pi_extension", INCARNATION_ID, {
+      tool: "codemode", code: "await tools.bash({ command: \"npm test\" });", codeLines: 1,
+    }),
+    toolEnd("call_1/1", "bash", false, "pi_native", INCARNATION_ID, {
+      tool: "bash", command: "npm test",
+    }, undefined, undefined, undefined, undefined, "call_1"),
+    toolEnd("call_1/2", "mcp__docs__search", true, "mcp", INCARNATION_ID, {
+      tool: "mcp__docs__search", server: "docs", mcpTool: "search", isError: true, annotations: { readOnlyHint: true },
+    }, undefined, undefined, undefined, undefined, "call_1"),
+  ], { viewport_height: 20 });
+  const lines = viewer.render(160).slice(1, -1);
+  assert.ok(lines.includes("▸ ✓ codemode->bash"), lines.join("\n"));
+  assert.ok(lines.includes("× codemode->mcp__docs__search · read-only"), lines.join("\n"));
+  // 选中最新嵌套条目并沿用既有展开按键；展开体只显示命令正文。
+  assert.match(viewer.getSelectedKey() ?? "", /tool-command:/u);
+  assert.equal(viewer.handleInput("\r"), "changed");
+  const expanded = viewer.render(160).slice(1, -1);
+  assert.ok(expanded.includes("▾ ✓ codemode->bash"), expanded.join("\n"));
+  assert.ok(expanded.includes("│ npm test"), expanded.join("\n"));
+  // 嵌套条目只是活动事实：不改变生命周期状态。
+  assert.equal(viewer.getPublicState().lifecycle_state, "working");
+});
+
+test("单次调用超过 256 条嵌套记录时聚合显示其余数量", () => {
+  const total = 300;
+  const nested: CanonicalAgentActivityEntry[] = [];
+  for (let index = 1; index <= total; index += 1) {
+    nested.push(toolEnd(`call_1/${index}`, "read", false, "pi_native", INCARNATION_ID, {
+      tool: "read", path: `src/f${index}.ts`,
+    }, undefined, undefined, undefined, undefined, "call_1"));
+  }
+  const entries: CanonicalAgentActivityEntry[] = [
+    toolStart("call_1", "codemode", "pi_extension", INCARNATION_ID, {
+      tool: "codemode", code: "return 1;", codeLines: 1,
+    }),
+    ...nested,
+    // 另一次调用不受前一次超量影响，仍逐条显示。
+    toolStart("call_2", "codemode", "pi_extension", INCARNATION_ID, {
+      tool: "codemode", code: "return 2;", codeLines: 1,
+    }),
+    toolEnd("call_2/1", "grep", false, "pi_native", INCARNATION_ID, {
+      tool: "grep", pattern: "x", path: "src",
+    }, undefined, undefined, undefined, undefined, "call_2"),
+  ];
+  const viewer = new AgentActivityViewerModel(viewerAgent(), entries, { viewport_height: 400 });
+  const lines = viewer.render(160).slice(1, -1);
+  assert.equal(
+    lines.filter((line) => line.includes("codemode->read")).length,
+    NESTED_ACTIVITY_DISPLAY_LIMIT,
+    lines.join("\n"),
+  );
+  // 超量部分只聚合为一行，紧跟在逐条显示的末尾。
+  assert.equal(lines.filter((line) => line.includes("其余")).length, 1, lines.join("\n"));
+  assert.ok(lines.includes(`其余 ${total - NESTED_ACTIVITY_DISPLAY_LIMIT} 条省略`), lines.join("\n"));
+  const omittedIndex = lines.findIndex((line) => line.includes("其余"));
+  assert.ok(lines[omittedIndex - 1]?.includes("codemode->read"), lines.join("\n"));
+  // 另一次调用的嵌套条目仍逐条显示。
+  assert.ok(lines.includes("✓ codemode->grep · /x/ · src"), lines.join("\n"));
+  assert.ok(lines.indexOf("✓ codemode->grep · /x/ · src") > omittedIndex, lines.join("\n"));
+
+  // 增量到达时聚合数量原地增长，不新增聚合行。
+  const grown = [
+    ...entries,
+    toolEnd("call_1/301", "read", false, "pi_native", INCARNATION_ID, {
+      tool: "read", path: "src/f301.ts",
+    }, undefined, undefined, undefined, undefined, "call_1"),
+  ];
+  viewer.syncFrom(grown);
+  const grownLines = viewer.render(160).slice(1, -1);
+  assert.equal(grownLines.filter((line) => line.includes("其余")).length, 1, grownLines.join("\n"));
+  assert.ok(grownLines.includes(`其余 ${total + 1 - NESTED_ACTIVITY_DISPLAY_LIMIT} 条省略`), grownLines.join("\n"));
+  assert.equal(grownLines.filter((line) => line.includes("codemode->read")).length, NESTED_ACTIVITY_DISPLAY_LIMIT);
+});
+
 test("tool_search 折叠态显示查询词与加载工具数量", () => {
   const start = toolStart("t1", "tool_search", "pi_extension", INCARNATION_ID, {
     tool: "tool_search", query: "mcp resource",
@@ -2299,6 +2425,167 @@ test("端到端：MCP 工具失败事件经产生端规范化后面板显示失�
   const lines = viewer.render(160).slice(1, -1);
   assert.ok(lines.includes("× mcp__docs__search · read-only"), lines.join("\n"));
   assert.doesNotMatch(lines.join("\n"), /错误正文不得上屏|结构化正文不得上屏/u);
+});
+
+test("端到端：codemode 嵌套调用原始事件经产生端规范化后面板显示前缀条目与超量聚合", () => {
+  const entryOf = (normalized: ReturnType<typeof normalizeOwnToolActivityEvent>): CanonicalAgentActivityEntry => {
+    assert.equal(normalized.kind, "event");
+    if (normalized.kind !== "event") throw new Error("unreachable");
+    return Object.freeze({
+      contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+      agent_id: AGENT_ID,
+      incarnation_id: INCARNATION_ID,
+      entry_id: randomUUID(),
+      body: normalized.event,
+    });
+  };
+  const entries: CanonicalAgentActivityEntry[] = [
+    entryOf(normalizeOwnToolActivityEvent({
+      type: "tool_execution_start",
+      toolCallId: "call_1",
+      toolName: "codemode",
+      args: { code: "await tools.read({ path: \"a.ts\" });" },
+    }, "pi_extension")),
+    entryOf(normalizeOwnToolActivityEvent({
+      type: "tool_execution_end",
+      toolCallId: "call_1/1",
+      toolName: "read",
+      parentToolCallId: "call_1",
+      result: { content: [{ type: "text", text: "文件正文不得上屏" }] },
+      isError: false,
+    }, "pi_native", { path: "a.ts" })),
+    // 多级链：脚本内工具再发起嵌套调用。
+    entryOf(normalizeOwnToolActivityEvent({
+      type: "tool_execution_end",
+      toolCallId: "call_1/2",
+      toolName: "grep",
+      parentToolCallId: "call_1",
+      result: { content: [{ type: "text", text: "匹配正文不得上屏" }] },
+      isError: false,
+    }, "pi_native", { pattern: "x", path: "src" })),
+    entryOf(normalizeOwnToolActivityEvent({
+      type: "tool_execution_end",
+      toolCallId: "call_1/2/1",
+      toolName: "mcp__docs__search",
+      parentToolCallId: "call_1/2",
+      result: { content: [{ type: "text", text: "MCP 正文不得上屏" }] },
+      isError: true,
+    }, "mcp")),
+  ];
+  // 超量：单次调用超过 256 条嵌套记录只聚合为一行。
+  for (let index = 1; index <= NESTED_ACTIVITY_DISPLAY_LIMIT + 1; index += 1) {
+    entries.push(entryOf(normalizeOwnToolActivityEvent({
+      type: "tool_execution_end",
+      toolCallId: `call_1/3/${index}`,
+      toolName: "ls",
+      parentToolCallId: "call_1/3",
+      result: { content: [] },
+      isError: false,
+    }, "pi_native", { path: "." })));
+  }
+  entries.push(entryOf(normalizeOwnToolActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "codemode",
+    result: { content: [{ type: "text", text: "Script completed" }], details: { calls: [] } },
+    isError: false,
+  }, "pi_extension", { code: "await tools.read({ path: \"a.ts\" });" })));
+
+  const viewer = new AgentActivityViewerModel(viewerAgent(), entries, { viewport_height: 500 });
+  const lines = viewer.render(200).slice(1, -1);
+  assert.ok(lines.includes("✓ codemode->read · a.ts"), lines.join("\n"));
+  assert.ok(lines.includes("× codemode->grep->mcp__docs__search"), lines.join("\n"));
+  assert.ok(lines.includes("✓ codemode->grep · /x/ · src"), lines.join("\n"));
+  assert.equal(lines.filter((line) => line.includes("其余")).length, 1, lines.join("\n"));
+  assert.ok(lines.includes("其余 1 条省略"), lines.join("\n"));
+  // 外部正文与结果正文都不上屏。
+  assert.doesNotMatch(lines.join("\n"), /文件正文不得上屏|MCP 正文不得上屏|匹配正文不得上屏|Script completed/u);
+});
+
+test("结束事实补齐开始事实缺失的父引用后显示前缀", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart("call_1", "codemode", "pi_extension", INCARNATION_ID, {
+      tool: "codemode", code: "return 1;", codeLines: 1,
+    }),
+    toolStart("call_1/1", "read", "pi_native", INCARNATION_ID, {
+      tool: "read", path: "a.ts",
+    }),
+    toolEnd("call_1/1", "read", false, "pi_native", INCARNATION_ID, {
+      tool: "read", path: "a.ts",
+    }, undefined, undefined, undefined, undefined, "call_1"),
+  ], { viewport_height: 20 });
+  const lines = viewer.render(160).slice(1, -1);
+  assert.ok(lines.includes("✓ codemode->read · a.ts"), lines.join("\n"));
+});
+
+test("不同运行实例复用同一活动 ID 时嵌套超量计数不串联", () => {
+  const incarnationB = "3f1c2f44-9a1b-4c3d-8e5f-6a7b8c9d0e1f";
+  const entries: CanonicalAgentActivityEntry[] = [
+    toolStart("call_1", "codemode", "pi_extension", INCARNATION_ID, {
+      tool: "codemode", code: "return 1;", codeLines: 1,
+    }),
+  ];
+  for (let index = 1; index <= NESTED_ACTIVITY_DISPLAY_LIMIT; index += 1) {
+    entries.push(toolEnd(`call_1/${index}`, "read", false, "pi_native", INCARNATION_ID, {
+      tool: "read", path: `a${index}.ts`,
+    }, undefined, undefined, undefined, undefined, "call_1"));
+  }
+  entries.push(
+    toolStart("call_1", "codemode", "pi_extension", incarnationB, {
+      tool: "codemode", code: "return 2;", codeLines: 1,
+    }),
+    toolEnd("call_1/1", "read", false, "pi_native", incarnationB, {
+      tool: "read", path: "b.ts",
+    }, undefined, undefined, undefined, undefined, "call_1"),
+  );
+  const viewer = new AgentActivityViewerModel(viewerAgent(), entries, { viewport_height: 400 });
+  const lines = viewer.render(160).slice(1, -1);
+  // 第二个运行实例的同名根调用不受第一个实例已达上限的计数影响。
+  assert.ok(lines.includes("✓ codemode->read · b.ts"), lines.join("\n"));
+  assert.equal(lines.filter((line) => line.includes("其余")).length, 0, lines.join("\n"));
+});
+
+test("端到端：活动缓存到面板的嵌套超量记录聚合显示", () => {
+  const cache = new AgentActivityCache();
+  const entryOf = (body: SafeAgentActivityEvent): CanonicalAgentActivityEntry => Object.freeze({
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+    agent_id: AGENT_ID,
+    incarnation_id: INCARNATION_ID,
+    entry_id: randomUUID(),
+    body,
+  });
+  const codemode = normalizeOwnToolActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "codemode",
+    args: { code: "return 1;" },
+  }, "pi_extension");
+  assert.equal(codemode.kind, "event");
+  if (codemode.kind !== "event") return;
+  cache.record(AGENT_ID, entryOf(codemode.event));
+  // 运行中的嵌套调用不受活动窗口裁剪，全部进入权威快照。
+  for (let index = 1; index <= NESTED_ACTIVITY_DISPLAY_LIMIT + 1; index += 1) {
+    const nested = normalizeOwnToolActivityEvent({
+      type: "tool_execution_start",
+      toolCallId: `call_1/${index}`,
+      toolName: "read",
+      parentToolCallId: "call_1",
+      args: { path: `f${index}.ts` },
+    }, "pi_native");
+    assert.equal(nested.kind, "event");
+    if (nested.kind !== "event") return;
+    cache.record(AGENT_ID, entryOf(nested.event));
+  }
+  const snapshot = cache.readSnapshot(AGENT_ID);
+  assert.equal(snapshot.entries.length, NESTED_ACTIVITY_DISPLAY_LIMIT + 2);
+  const viewer = new AgentActivityViewerModel(viewerAgent(), snapshot, { viewport_height: 400 });
+  const lines = viewer.render(160).slice(1, -1);
+  assert.equal(
+    lines.filter((line) => line.includes("codemode->read")).length,
+    NESTED_ACTIVITY_DISPLAY_LIMIT,
+    lines.join("\n"),
+  );
+  assert.ok(lines.includes("其余 1 条省略"), lines.join("\n"));
 });
 
 test("bash 失败只显示状态与完整 command，不显示 stdout、stderr 或退出码", () => {
