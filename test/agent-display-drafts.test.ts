@@ -570,7 +570,7 @@ test("监督通道 display 帧端到端交付，事件身份与外层身份绑�
 });
 
 test("display 帧属于固定协议版本与帧 kind 闭集", () => {
-  assert.equal(SUPERVISOR_PROTOCOL_VERSION, "wj-pi-subagents/30");
+  assert.equal(SUPERVISOR_PROTOCOL_VERSION, "wj-pi-subagents/31");
   assert.equal((SUPERVISOR_FRAME_KINDS as readonly string[]).includes("display"), true);
   // 闭集校验：身份不完整的显示事件在通道边界前即被拒绝。
   assert.equal(

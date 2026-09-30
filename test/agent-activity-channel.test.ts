@@ -11,6 +11,8 @@ import {
   SupervisorChannel,
   SupervisorProtocolError,
   SupervisorRequestIdRegistry,
+  decodeSupervisorFrame,
+  encodeSupervisorFrame,
   type SupervisorActivityDelivery,
   type SupervisorFrame,
   type SupervisorReceiveResult,
@@ -549,6 +551,42 @@ test("规范条目经字节流适配层分发到 parent 观察者，大正文分
     unsubscribe();
     channels.destroy();
   }
+});
+
+test("监督通道单字符串上限为 64 KB：32 KB 与 64 KB 的帧内字符串可跨端发布/接收，超过上限按 frame_too_large 拒绝", () => {
+  const nodesWithScopeName = (childAgentId: string, grandchildAgentId: string, name: string) => {
+    const [scope, grandchild] = childSnapshotNodes(childAgentId, grandchildAgentId);
+    assert.ok(scope && grandchild);
+    return Object.freeze([
+      Object.freeze({ ...scope, name }),
+      grandchild,
+    ]);
+  };
+
+  // 32 KB 边界值与 64 KB 上限值都必须是可承载的单字符串，且经 JSON 转义后的 wire 编码可往返。
+  for (const bytes of [32 * 1024, 64 * 1024]) {
+    const { parent, child, childAgentId, grandchildAgentId } = readyPair();
+    const frame = child.publishSnapshot(nodesWithScopeName(childAgentId, grandchildAgentId, "n".repeat(bytes)), 2);
+    assert.deepEqual(decodeSupervisorFrame(encodeSupervisorFrame(frame)).payload, frame.payload);
+    const result = parent.receive(frame);
+    assert.equal(result.kind, "accepted");
+    assert.equal(result.kind === "accepted" && result.applied, true);
+    assert.equal(parent.getPublicState().state, "ready");
+  }
+
+  // 超过上限的单字符串在接收端按 frame_too_large 协议故障拒绝。
+  const { parent, child, childAgentId, grandchildAgentId } = readyPair();
+  const frame = child.publishSnapshot(childSnapshotNodes(childAgentId, grandchildAgentId), 2);
+  const overLimit = Object.freeze({
+    ...frame,
+    payload: Object.freeze({
+      ...frame.payload,
+      nodes: nodesWithScopeName(childAgentId, grandchildAgentId, "n".repeat(64 * 1024 + 1)),
+    }),
+  });
+  const result = parent.receive(overLimit);
+  assert.equal(result.kind, "protocol_fault");
+  assert.equal(result.kind === "protocol_fault" && result.error, "frame_too_large");
 });
 
 test("分块传输 helper 与通道内联判断一致：小块单帧，大块多帧", () => {

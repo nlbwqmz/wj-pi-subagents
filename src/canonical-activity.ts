@@ -6,10 +6,11 @@ import { createHash } from "node:crypto";
 import { isCanonicalUuid } from "./tree-controller.ts";
 
 /**
- * 规范活动条目契约版本。版本字符串随原子正文或身份语义的不兼容变化递增；
- * 旧版本条目不得与当前运行实例混用，接收端按协议故障处理。
+ * 规范活动条目契约版本。版本字符串随原子正文、身份语义或 wire 字段
+ * 闭集/预算的不兼容变化递增；旧版本条目不得与当前运行实例混用，接收端
+ * 按协议故障处理。
  */
-export const CANONICAL_ACTIVITY_CONTRACT_VERSION = "wj-pi-subagents.activity/12";
+export const CANONICAL_ACTIVITY_CONTRACT_VERSION = "wj-pi-subagents.activity/13";
 
 /**
  * 工具活动条目身份的派生命名空间。工具开始与结束是同一条目的状态事实，

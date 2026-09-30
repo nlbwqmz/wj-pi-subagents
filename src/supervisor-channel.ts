@@ -40,7 +40,7 @@ import {
 } from "./tree-controller.ts";
 
 /** 父子监督通道与 Pi 任务 RPC 完全隔离的固定协议版本。 */
-export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/30";
+export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/31";
 
 export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "hello",
@@ -84,8 +84,11 @@ const SUPERVISOR_FRAME_KEYS = new Set([
 export const SUPERVISOR_CHANNEL_LIMITS = Object.freeze({
   /** 覆盖最大控制正文、完整快照及 JSON 转义后的监督帧。 */
   maxFrameBytes: 512 * 1024,
-  /** 身份、快照等普通监督字段沿用原有字符串预算。 */
-  maxStringBytes: 16 * 1024,
+  /**
+   * 身份、快照、活动等普通监督字段共用的单字符串预算；控制帧正文另用
+   * maxControlStringBytes 的独立预算。
+   */
+  maxStringBytes: 64 * 1024,
   /** 根权威向递归子控制器交付模板正文时使用的独立有界字符串预算。 */
   maxControlStringBytes: 64 * 1024,
   maxJsonDepth: 16,

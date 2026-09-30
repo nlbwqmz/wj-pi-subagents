@@ -335,7 +335,7 @@ test("控制响应在监督 wire 上保留规范启动错误 details", () => {
 });
 
 test("旧协议、已删除压缩帧和旧任务字段稳定拒绝为 protocol_mismatch", () => {
-  assert.equal(SUPERVISOR_PROTOCOL_VERSION, "wj-pi-subagents/30");
+  assert.equal(SUPERVISOR_PROTOCOL_VERSION, "wj-pi-subagents/31");
   assert.equal((SUPERVISOR_FRAME_KINDS as readonly string[]).includes("compaction_prepare"), false);
   assert.equal((SUPERVISOR_FRAME_KINDS as readonly string[]).includes("compaction_prepared"), false);
   assert.equal((SUPERVISOR_FRAME_KINDS as readonly string[]).includes("compaction_complete"), false);
