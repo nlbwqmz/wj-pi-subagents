@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { REPLY_MAX_TEXT_BYTES } from "../src/child-reply-limits.ts";
 import {
+  ACTIVITY_FIELD_MAX_BYTES,
   ACTIVITY_MAX_TEXT_BYTES,
   normalizeAssistantMessageEnd,
   normalizeAssistantMessageUpdate,
@@ -10,6 +11,7 @@ import {
   parseAgentActivityDisplayEvent,
   parseCanonicalAgentActivityDisplayEvent,
   parseAgentActivityEvent,
+  parseCanonicalAgentActivityEvent,
 } from "../src/rpc-bridge-event.ts";
 
 const AGENT_ID = "550e8400-e29b-41d4-a716-446655440000";
@@ -914,4 +916,180 @@ test("活动事件闭集校验器接受合法事件并拒绝违约、未知与�
     content: [{ type: "text", text: "z".repeat(ACTIVITY_MAX_TEXT_BYTES + 1) }],
   });
   assert.equal(oversized.kind, "event");
+});
+
+test("pi_extension 来源的 codemode 摘要按开始/结束形状分别闭合", () => {
+  // 开始事实：code 与 codeLines 成对在场。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "codemode",
+    origin: "pi_extension",
+    summary: { tool: "codemode", code: "return 1;", codeLines: 1 },
+  }).kind, "event");
+  // 结束事实：isError 与事件一致，nestedCalls 可选。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "codemode",
+    origin: "pi_extension",
+    isError: false,
+    summary: { tool: "codemode", code: "return 1;", codeLines: 1, isError: false, nestedCalls: 3 },
+  }).kind, "event");
+  // 开始参数缓存缺失：结束事实省略脚本正文仍合法。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "codemode",
+    origin: "pi_extension",
+    isError: true,
+    summary: { tool: "codemode", isError: true, nestedCalls: 0 },
+  }).kind, "event");
+});
+
+test("pi_extension 摘要的未知键、形状错配与值域偏离一律拒绝", () => {
+  const startBase = {
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "codemode",
+    origin: "pi_extension",
+  };
+  // 开始事实不允许结束字段。
+  assert.equal(parseAgentActivityEvent({
+    ...startBase,
+    summary: { tool: "codemode", code: "x", codeLines: 1, isError: false },
+  }).kind, "invalid");
+  // code 与 codeLines 单边缺失。
+  assert.equal(parseAgentActivityEvent({
+    ...startBase,
+    summary: { tool: "codemode", code: "x" },
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    ...startBase,
+    summary: { tool: "codemode", codeLines: 1 },
+  }).kind, "invalid");
+  // codeLines 必须是至少 1 的整数；code 不能为空。
+  assert.equal(parseAgentActivityEvent({
+    ...startBase,
+    summary: { tool: "codemode", code: "x", codeLines: 0 },
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    ...startBase,
+    summary: { tool: "codemode", code: "", codeLines: 1 },
+  }).kind, "invalid");
+  // 摘要 tool 必须与工具名一致。
+  assert.equal(parseAgentActivityEvent({
+    ...startBase,
+    summary: { tool: "read", code: "x", codeLines: 1 },
+  }).kind, "invalid");
+  // 结束事实：isError 与事件不一致。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "codemode",
+    origin: "pi_extension",
+    isError: false,
+    summary: { tool: "codemode", isError: true, nestedCalls: 1 },
+  }).kind, "invalid");
+  // 结束事实：nestedCalls 负数或非整数。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "codemode",
+    origin: "pi_extension",
+    isError: false,
+    summary: { tool: "codemode", isError: false, nestedCalls: -1 },
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "codemode",
+    origin: "pi_extension",
+    isError: false,
+    summary: { tool: "codemode", isError: false, nestedCalls: 1.5 },
+  }).kind, "invalid");
+  // 结束事实：code 与 codeLines 单边缺失。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "codemode",
+    origin: "pi_extension",
+    isError: false,
+    summary: { tool: "codemode", code: "x", isError: false },
+  }).kind, "invalid");
+});
+
+test("来源未验证的内置扩展工具携带专用摘要即违约", () => {
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "codemode",
+    origin: "unknown",
+    summary: { tool: "codemode", code: "return 1;", codeLines: 1 },
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "codemode",
+    origin: "plugin",
+    summary: { tool: "codemode", code: "return 1;", codeLines: 1 },
+  }).kind, "invalid");
+});
+
+test("command 与 code 的 32 KB 截断边界在 wire 上同时生效", () => {
+  const atLimit = "x".repeat(ACTIVITY_FIELD_MAX_BYTES);
+  const overLimit = "x".repeat(ACTIVITY_FIELD_MAX_BYTES + 1);
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "bash",
+    origin: "pi_native",
+    summary: { tool: "bash", command: atLimit },
+  }).kind, "event");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "bash",
+    origin: "pi_native",
+    summary: { tool: "bash", command: overLimit },
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "codemode",
+    origin: "pi_extension",
+    summary: { tool: "codemode", code: atLimit, codeLines: 1 },
+  }).kind, "event");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "codemode",
+    origin: "pi_extension",
+    summary: { tool: "codemode", code: overLimit, codeLines: 1 },
+  }).kind, "invalid");
+});
+
+test("canonical wire 接受 pi_extension 摘要并拒绝未知摘要键", () => {
+  assert.equal(parseCanonicalAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "codemode",
+    origin: "pi_extension",
+    executionGeneration: 1,
+    isError: false,
+    summary: {
+      tool: "codemode", code: "return 1;", codeLines: 1, isError: false, nestedCalls: 2,
+    },
+  }).kind, "event");
+  assert.equal(parseCanonicalAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "codemode",
+    origin: "pi_extension",
+    executionGeneration: 1,
+    isError: false,
+    summary: {
+      tool: "codemode", code: "return 1;", codeLines: 1, isError: false, nestedCalls: 2, extra: 1,
+    },
+  }).kind, "invalid");
 });

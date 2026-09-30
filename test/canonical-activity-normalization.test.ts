@@ -1170,6 +1170,67 @@ test("命令正文的控制字符在产生端净化且保留多行结构", () =>
   });
 });
 
+test("32 KB 以内的 shell command 原样保留，不附加任何截断标记", () => {
+  const command = Array.from({ length: 2000 }, (_, index) => `echo line-${index}`).join("\n");
+  assert.ok(Buffer.byteLength(command, "utf8") < 32 * 1024);
+  const normalized = normalizeOwnToolActivityEvent(
+    mutationStart("bash", { command }),
+    "pi_native",
+  );
+  assert.equal(normalized.kind, "event");
+  if (normalized.kind !== "event" || normalized.event.type !== "tool_execution_start") return;
+  assert.deepEqual(summaryOf(normalized.event), { tool: "bash", command });
+});
+
+test("超过 32 KB 的 shell command 按行截断，标记携带原文总行数", () => {
+  const lines = Array.from({ length: 4000 }, (_, index) => `echo line-${index}`);
+  const command = lines.join("\n");
+  assert.ok(Buffer.byteLength(command, "utf8") > 32 * 1024);
+  const normalized = normalizeOwnToolActivityEvent(
+    mutationStart("powershell", { command }),
+    "pi_native",
+  );
+  assert.equal(normalized.kind, "event");
+  if (normalized.kind !== "event" || normalized.event.type !== "tool_execution_start") return;
+  const summary = summaryOf(normalized.event) as { readonly command: string };
+  assert.ok(Buffer.byteLength(summary.command, "utf8") <= 32 * 1024);
+  assert.match(summary.command, /\n…（已截断，原文共 4000 行）$/u);
+  // 保留部分必须是完整行序列，不得出现半行。
+  const kept = summary.command.replace(/\n…（已截断，原文共 4000 行）$/u, "");
+  assert.deepEqual(kept.split("\n"), lines.slice(0, kept.split("\n").length));
+});
+
+test("单行超过 32 KB 时按字节兜底截断，标记同样携带原文行数", () => {
+  const command = "x".repeat(40 * 1024);
+  const normalized = normalizeOwnToolActivityEvent(
+    mutationStart("bash", { command }),
+    "pi_native",
+  );
+  assert.equal(normalized.kind, "event");
+  if (normalized.kind !== "event" || normalized.event.type !== "tool_execution_start") return;
+  const summary = summaryOf(normalized.event) as { readonly command: string };
+  assert.ok(Buffer.byteLength(summary.command, "utf8") <= 32 * 1024);
+  assert.match(summary.command, /\n…（已截断，原文共 1 行）$/u);
+  const kept = summary.command.replace(/\n…（已截断，原文共 1 行）$/u, "");
+  assert.ok(command.startsWith(kept));
+});
+
+test("字节兜底截断不切断多字节字符，也不引入替换字符", () => {
+  const command = "中".repeat(20 * 1024);
+  const normalized = normalizeOwnToolActivityEvent(
+    mutationStart("bash", { command }),
+    "pi_native",
+  );
+  assert.equal(normalized.kind, "event");
+  if (normalized.kind !== "event" || normalized.event.type !== "tool_execution_start") return;
+  const summary = summaryOf(normalized.event) as { readonly command: string };
+  assert.ok(Buffer.byteLength(summary.command, "utf8") <= 32 * 1024);
+  const kept = summary.command.replace(/\n…（已截断，原文共 1 行）$/u, "");
+  assert.ok(command.startsWith(kept));
+  assert.equal(kept.includes("\ufffd"), false);
+  assert.ok(kept.length > 0);
+});
+
 test("write/edit/bash/powershell 必需字段缺失或类型错误时完整降级为安全兜底", () => {
   const cases: readonly {
     readonly toolName: string;
@@ -1245,6 +1306,174 @@ test("write/bash 结束事实缺少缓存的开始参数时降级为无摘要兜
   assert.equal(bashEnd.kind, "event");
   if (bashEnd.kind !== "event" || bashEnd.event.type !== "tool_execution_end") return;
   assert.equal(bashEnd.event.summary, undefined);
+});
+
+test("codemode 开始摘要携带截断后的脚本与原文行数，其余参数不跨进程", () => {
+  const code = "const text = await tools.read({ path: \"a.ts\" });\nreturn text.length;";
+  const start = normalizeOwnToolActivityEvent(
+    mutationStart("codemode", { code, futureField: "不得跨进程" }),
+    "pi_extension",
+  );
+  assert.equal(start.kind, "event");
+  if (start.kind !== "event" || start.event.type !== "tool_execution_start") return;
+  assert.deepEqual(summaryOf(start.event), {
+    tool: "codemode",
+    code,
+    codeLines: 2,
+  });
+  assert.equal(JSON.stringify(start.event).includes("futureField"), false);
+});
+
+test("codemode 结束摘要携带 isError 与嵌套调用数，脚本正文从开始参数缓存补齐", () => {
+  const code = "await tools.read({ path: \"a.ts\" });";
+  const result = {
+    content: [{ type: "text", text: "Script completed\n输出正文不得跨进程" }],
+    details: {
+      calls: [
+        { id: "call_1/1", name: "read", args: "{\"path\":\"a.ts\"}", status: "ok" },
+        { id: "call_1/2", name: "grep", args: "{}", status: "error", error: "错误正文不得跨进程" },
+      ],
+      fullOutputPath: "/tmp/codemode-out",
+    },
+  };
+  const end = normalizeOwnToolActivityEvent(
+    mutationEnd("codemode", result, false),
+    "pi_extension",
+    { code },
+  );
+  assert.equal(end.kind, "event");
+  if (end.kind !== "event" || end.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(end.event), {
+    tool: "codemode",
+    code,
+    codeLines: 1,
+    isError: false,
+    nestedCalls: 2,
+  });
+  assert.equal(end.event.errorText, undefined);
+  const serialized = JSON.stringify(end.event);
+  assert.equal(serialized.includes("Script completed"), false);
+  assert.equal(serialized.includes("输出正文不得跨进程"), false);
+  assert.equal(serialized.includes("错误正文不得跨进程"), false);
+  assert.equal(serialized.includes("/tmp/codemode-out"), false);
+});
+
+test("codemode 失败事实如实记录 isError，脚本错误正文不进入条目", () => {
+  const end = normalizeOwnToolActivityEvent(
+    mutationEnd("codemode", {
+      content: [{ type: "text", text: "Script error:\nError: boom" }],
+      details: { calls: [] },
+    }, true),
+    "pi_extension",
+    { code: "throw new Error(\"boom\")" },
+  );
+  assert.equal(end.kind, "event");
+  if (end.kind !== "event" || end.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(end.event), {
+    tool: "codemode",
+    code: "throw new Error(\"boom\")",
+    codeLines: 1,
+    isError: true,
+    nestedCalls: 0,
+  });
+  assert.equal(end.event.errorText, undefined);
+  assert.equal(JSON.stringify(end.event).includes("Script error"), false);
+});
+
+test("codemode 开始参数缓存缺失时结束摘要仍携带状态与嵌套调用数", () => {
+  const end = normalizeOwnToolActivityEvent(
+    mutationEnd("codemode", { details: { calls: [] } }, false),
+    "pi_extension",
+  );
+  assert.equal(end.kind, "event");
+  if (end.kind !== "event" || end.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(end.event), {
+    tool: "codemode",
+    isError: false,
+    nestedCalls: 0,
+  });
+});
+
+test("codemode 结果缺少嵌套调用记录时不臆造 nestedCalls", () => {
+  const end = normalizeOwnToolActivityEvent(
+    mutationEnd("codemode", { content: [{ type: "text", text: "x" }] }, false),
+    "pi_extension",
+    { code: "return 1;" },
+  );
+  assert.equal(end.kind, "event");
+  if (end.kind !== "event" || end.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(end.event), {
+    tool: "codemode",
+    code: "return 1;",
+    codeLines: 1,
+    isError: false,
+  });
+});
+
+test("codemode 的模型分类调用不计入嵌套工具调用数", () => {
+  const end = normalizeOwnToolActivityEvent(
+    mutationEnd("codemode", {
+      details: {
+        calls: [
+          { id: "call_1/1", name: "read", args: "{}", status: "ok" },
+          {
+            id: "call_1/models.classify/1",
+            name: "models.classify",
+            args: "provider/model",
+            status: "ok",
+          },
+          { id: "call_1/2", name: "grep", args: "{}", status: "ok" },
+        ],
+      },
+    }, false),
+    "pi_extension",
+    { code: "return 1;" },
+  );
+  assert.equal(end.kind, "event");
+  if (end.kind !== "event" || end.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(end.event), {
+    tool: "codemode",
+    code: "return 1;",
+    codeLines: 1,
+    isError: false,
+    nestedCalls: 2,
+  });
+});
+
+test("超过 32 KB 的 codemode 脚本与 command 共用截断规则与标记", () => {
+  const lines = Array.from({ length: 4000 }, (_, index) => `const value${index} = ${index};`);
+  const code = lines.join("\n");
+  assert.ok(Buffer.byteLength(code, "utf8") > 32 * 1024);
+  const start = normalizeOwnToolActivityEvent(
+    mutationStart("codemode", { code }),
+    "pi_extension",
+  );
+  assert.equal(start.kind, "event");
+  if (start.kind !== "event" || start.event.type !== "tool_execution_start") return;
+  const summary = summaryOf(start.event) as { readonly code: string; readonly codeLines: number };
+  assert.ok(Buffer.byteLength(summary.code, "utf8") <= 32 * 1024);
+  assert.match(summary.code, /\n…（已截断，原文共 4000 行）$/u);
+  assert.equal(summary.codeLines, 4000);
+});
+
+test("codemode 必需参数缺失或来源未验证时降级为无摘要兜底", () => {
+  const missingCode = normalizeOwnToolActivityEvent(
+    mutationStart("codemode", { code: 42 }),
+    "pi_extension",
+  );
+  assert.equal(missingCode.kind, "event");
+  if (missingCode.kind !== "event" || missingCode.event.type !== "tool_execution_start") return;
+  assert.equal(missingCode.event.summary, undefined);
+
+  for (const origin of ["unknown", "pi_native", "plugin"] as const) {
+    const wrongOrigin = normalizeOwnToolActivityEvent(
+      mutationStart("codemode", { code: "return 1;" }),
+      origin,
+    );
+    assert.equal(wrongOrigin.kind, "event", origin);
+    if (wrongOrigin.kind !== "event" || wrongOrigin.event.type !== "tool_execution_start") continue;
+    assert.equal(wrongOrigin.event.summary, undefined, origin);
+  }
 });
 
 test("活动事件闭集对 Shell 工具拒绝错误正文，write/edit 可携带且键集合严格闭合", () => {

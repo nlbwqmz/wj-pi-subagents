@@ -36,6 +36,39 @@ test("内置来源但名字不在 Pi 原生闭集时安全兜底", () => {
   );
 });
 
+test("内置 codemode 扩展注册的工具携带 pi_extension 身份", () => {
+  // 真实注册来源是 `builtin:codemode`（内置扩展名），与内置基础工具的
+  // `builtin:<toolName>` 同形；判定按来源路径而非工具名。
+  assert.equal(
+    classifyRegisteredToolOrigin(
+      "codemode",
+      { path: "builtin:codemode", source: "builtin", scope: "temporary" },
+      PLUGIN_PATH,
+    ),
+    "pi_extension",
+  );
+});
+
+test("第三方 replaceable 替换内置 codemode 后同名工具回落 unknown", () => {
+  assert.equal(
+    classifyRegisteredToolOrigin(
+      "codemode",
+      { path: "D:/extensions/other/codemode.ts", source: "package" },
+      PLUGIN_PATH,
+    ),
+    "unknown",
+  );
+  // 其他内置扩展在本次适配前仍是安全兜底。
+  assert.equal(
+    classifyRegisteredToolOrigin(
+      "tool_search",
+      { path: "builtin:tool-search", source: "builtin", scope: "temporary" },
+      PLUGIN_PATH,
+    ),
+    "unknown",
+  );
+});
+
 test("本插件注册实现的管理与回复工具携带 plugin 身份", () => {
   for (const name of [
     "get_agent_templates",

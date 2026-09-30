@@ -53,14 +53,16 @@ export type SafeAgentActivityContentBlock =
   | { readonly type: "thinking"; readonly thinking: string };
 
 /**
- * 工具来源身份闭集。只有来源验证通过的工具才能获得 pi_native 或 plugin 身份；
- * 第三方扩展、MCP、同名覆盖与来源不明工具一律安全兜底为 unknown。
+ * 工具来源身份闭集。只有来源验证通过的工具才能获得 pi_native、pi_extension
+ * 或 plugin 身份；第三方扩展、MCP、同名覆盖与来源不明工具一律安全兜底为
+ * unknown。
  */
-export type SafeToolOrigin = "pi_native" | "plugin" | "unknown";
+export type SafeToolOrigin = "pi_native" | "pi_extension" | "plugin" | "unknown";
 
 /** 来源身份闭集谓词；wire 校验与产生端判定共用同一形状。 */
 export function isSafeToolOrigin(value: unknown): value is SafeToolOrigin {
-  return value === "pi_native" || value === "plugin" || value === "unknown";
+  return value === "pi_native" || value === "pi_extension"
+    || value === "plugin" || value === "unknown";
 }
 
 /**
@@ -82,6 +84,14 @@ export const PLUGIN_TOOL_SUMMARY_NAMES: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * 允许专用摘要规则的 Pi 内置扩展工具名闭集。只有来源验证为 pi_extension
+ * 的同名实现才能携带专用摘要；第三方替换与来源不明工具一律安全兜底。
+ */
+export const PI_EXTENSION_TOOL_SUMMARY_NAMES: ReadonlySet<string> = new Set([
+  "codemode",
+]);
+
+/**
  * 允许失败事实携带完整原始错误正文的 Pi 原生工具闭集。Shell 工具（bash/
  * powershell）除外：其失败只表达成功或失败，stdout、stderr、退出码、超时
  * 正文与异常正文都不进入规范条目。
@@ -96,7 +106,7 @@ const FIND_DEFAULT_LIMIT = 1000;
 const LS_DEFAULT_LIMIT = 500;
 
 /**
- * 专用工具摘要闭集（Pi 原生与本插件）。字段是硬编码白名单：原始参数中的
+ * 专用工具摘要闭集（Pi 原生、内置扩展与本插件）。字段是硬编码白名单：原始参数中的
  * 未来新增字段、文件正文、图片数据、匹配正文、路径列表、目录条目、写入/
  * 编辑统计、命令输出、模板配置、depth、初始 state 与任务正文都不在这里
  * 出现。专用解析宽容原始输入变化；摘要自身的键集合是严格闭集。
@@ -251,6 +261,19 @@ export type SafeToolSummary =
     }
   | {
       readonly tool: "get_agent_tree";
+    }
+  | {
+      /**
+       * 内置 codemode 扩展的脚本事实：开始事实携带截断后的脚本与原文行数，
+       * 结束事实携带失败状态与脚本内嵌套调用数。脚本正文在结束事实中从
+       * 开始参数缓存补齐，缓存缺失时省略；嵌套调用的参数、错误与结果正文
+       * 永不进入摘要。
+       */
+      readonly tool: "codemode";
+      readonly code?: string;
+      readonly codeLines?: number;
+      readonly isError?: boolean;
+      readonly nestedCalls?: number;
     };
 
 /**
@@ -299,6 +322,10 @@ const STATUS_SUMMARY_KEYS = Object.freeze([
   "tool", "agent_id", "name", "state", "phase", "error_code", "termination_result",
 ] as const);
 const TREE_SUMMARY_KEYS = Object.freeze(["tool"] as const);
+const CODEMODE_START_SUMMARY_KEYS = Object.freeze(["tool", "code", "codeLines"] as const);
+const CODEMODE_END_SUMMARY_KEYS = Object.freeze([
+  "tool", "code", "codeLines", "isError", "nestedCalls",
+] as const);
 
 /** wait_agent 摘要允许的全部 outcome 值闭集（含等待包装事实）。 */
 type WaitAgentSummaryOutcome =
@@ -355,6 +382,53 @@ export function sanitizeSafeActivityText(value: string): string {
     .replace(/\t/gu, "  ")
     .replace(ACTIVITY_ANSI_PATTERN, "")
     .replace(ACTIVITY_UNSAFE_PATTERN, " ");
+}
+
+/**
+ * 单个活动字段（`code` 与 `command`）的 UTF-8 字节上限。超限时产生端
+ * 按行截断并携带统一标记，被截断部分不可恢复；wire 校验拒绝超限字段。
+ */
+export const ACTIVITY_FIELD_MAX_BYTES = 32 * 1024;
+
+/** 统一截断标记的固定部分；标记中的 `N` 是截断前原文的总行数。 */
+const ACTIVITY_TRUNCATION_MARKER_PREFIX = "\n…（已截断，原文共 ";
+const ACTIVITY_TRUNCATION_MARKER_SUFFIX = " 行）";
+
+/**
+ * 活动字段截断：上限 32 KB（UTF-8 字节）。超限时保留完整行；单行本身
+ * 超限时按字节兜底截断。两种方式共用同一标记，标记计入上限。
+ */
+function truncateActivityField(value: string): string {
+  if (utf8Length(value) <= ACTIVITY_FIELD_MAX_BYTES) return value;
+  const lines = value.split("\n");
+  const marker = `${ACTIVITY_TRUNCATION_MARKER_PREFIX}${lines.length}${
+    ACTIVITY_TRUNCATION_MARKER_SUFFIX}`;
+  const budget = ACTIVITY_FIELD_MAX_BYTES - utf8Length(marker);
+  if (budget <= 0) return truncateToUtf8Bytes(marker, ACTIVITY_FIELD_MAX_BYTES);
+  let kept = "";
+  let keptBytes = 0;
+  let keptLineCount = 0;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    // 行间分隔符属于下一行的开销；首行没有分隔符。
+    const lineBytes = utf8Length(line) + (index === 0 ? 0 : 1);
+    if (keptBytes + lineBytes > budget) break;
+    kept += `${index === 0 ? "" : "\n"}${line}`;
+    keptBytes += lineBytes;
+    keptLineCount += 1;
+  }
+  // 单行本身超限：保留完整行不可能，按字节兜底截断第一行。
+  if (keptLineCount === 0) kept = truncateToUtf8Bytes(lines[0] ?? "", budget);
+  return `${kept}${marker}`;
+}
+
+/** 在 UTF-8 字符边界内截断到指定字节数，不切断多字节字符。 */
+function truncateToUtf8Bytes(value: string, maxBytes: number): string {
+  const bytes = new TextEncoder().encode(value);
+  if (bytes.byteLength <= maxBytes) return value;
+  let end = Math.max(0, maxBytes);
+  while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end -= 1;
+  return new TextDecoder().decode(bytes.subarray(0, end));
 }
 
 /** 一条实时 assistant stream 的完整有序身份。 */
@@ -791,7 +865,13 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
       ) return INVALID_ACTIVITY_EVENT;
       if (!isSafeToolOrigin(value.origin)) return INVALID_ACTIVITY_EVENT;
       if (value.summary !== undefined) {
-        if (parseToolSummary(value.toolName, value.origin, value.summary) === undefined) {
+        if (parseToolSummary(
+          value.toolName,
+          value.origin,
+          value.summary,
+          "tool_execution_start",
+          undefined,
+        ) === undefined) {
           return INVALID_ACTIVITY_EVENT;
         }
       }
@@ -826,7 +906,13 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
       ) return INVALID_ACTIVITY_EVENT;
       if (!isSafeToolOrigin(value.origin)) return INVALID_ACTIVITY_EVENT;
       if (value.summary !== undefined) {
-        if (parseToolSummary(value.toolName, value.origin, value.summary) === undefined) {
+        if (parseToolSummary(
+          value.toolName,
+          value.origin,
+          value.summary,
+          "tool_execution_end",
+          value.isError,
+        ) === undefined) {
           return INVALID_ACTIVITY_EVENT;
         }
       }
@@ -1413,11 +1499,14 @@ export function normalizeOwnToolActivityEvent(
     effectiveGeneration !== undefined
     && !isValidToolExecutionGeneration(effectiveGeneration)
   ) return INVALID_ACTIVITY_EVENT;
-  // 专用摘要只作用于来源验证通过的原生专用工具与插件专用工具；其余来源
-  // 与工具都是无载荷安全兜底。
+  // 专用摘要只作用于来源验证通过的原生专用工具、内置扩展专用工具与插件
+  // 专用工具；其余来源与工具都是无载荷安全兜底。
   const dedicatedPiTool = origin === "pi_native"
     && typeof event.toolName === "string"
     && PI_TOOL_SUMMARY_NAMES.has(event.toolName);
+  const dedicatedPiExtensionTool = origin === "pi_extension"
+    && typeof event.toolName === "string"
+    && PI_EXTENSION_TOOL_SUMMARY_NAMES.has(event.toolName);
   const dedicatedPluginTool = origin === "plugin"
     && typeof event.toolName === "string"
     && PLUGIN_TOOL_SUMMARY_NAMES.has(event.toolName);
@@ -1430,9 +1519,11 @@ export function normalizeOwnToolActivityEvent(
     // 无载荷安全兜底。
     const summary = dedicatedPiTool
       ? extractPiToolSummary(event.toolName, event.args)
-      : dedicatedPluginTool
-        ? extractPluginToolSummary(event.toolName, event.args, undefined, undefined, resolveAgentName)
-        : undefined;
+      : dedicatedPiExtensionTool
+        ? extractPiExtensionToolSummary(event.toolName, event.args)
+        : dedicatedPluginTool
+          ? extractPluginToolSummary(event.toolName, event.args, undefined, undefined, resolveAgentName)
+          : undefined;
     return parseAgentActivityEvent({
       type: "tool_execution_start",
       toolCallId: event.toolCallId,
@@ -1449,18 +1540,21 @@ export function normalizeOwnToolActivityEvent(
       || typeof event.isError !== "boolean"
     ) return INVALID_ACTIVITY_EVENT;
     // Pi 的结束事件不携带参数；只有产生端缓存的开始参数齐全时，结束事实
-    // 才能自包含输入参数，否则整体降级为无摘要兜底。
+    // 才能自包含输入参数，否则整体降级为无摘要兜底。内置扩展的结束事实
+    // 自包含状态与嵌套调用数，不要求开始参数缓存存在。
     const summary = dedicatedPiTool && isRecord(startArgs)
       ? extractPiToolSummary(event.toolName, startArgs, event.result, event.isError)
-      : dedicatedPluginTool && isRecord(startArgs)
-        ? extractPluginToolSummary(
-          event.toolName,
-          startArgs,
-          event.result,
-          event.isError,
-          resolveAgentName,
-        )
-        : undefined;
+      : dedicatedPiExtensionTool
+        ? extractPiExtensionToolSummary(event.toolName, startArgs, event.result, event.isError)
+        : dedicatedPluginTool && isRecord(startArgs)
+          ? extractPluginToolSummary(
+            event.toolName,
+            startArgs,
+            event.result,
+            event.isError,
+            resolveAgentName,
+          )
+          : undefined;
     // 错误正文只属于允许展开错误的 Pi 工具；Shell 工具失败只表达成功或失败。
     const errorText = summary !== undefined && event.isError
       && PI_TOOL_ERROR_TEXT_NAMES.has(event.toolName)
@@ -1842,13 +1936,14 @@ function extractPiToolSummary(
       }
       case "bash":
       case "powershell": {
-        // command 是必需字段；摘要与状态无关，始终自包含完整命令。
+        // command 是必需字段；摘要与状态无关，始终自包含命令，超过 32 KB 时
+        // 按行截断并带统一标记。
         const command = args.command;
         if (typeof command !== "string") return undefined;
         typedField(args, "timeout", (value) => typeof value === "number");
         return {
           tool: toolName,
-          command: sanitizeSafeActivityText(command),
+          command: truncateActivityField(sanitizeSafeActivityText(command)),
           ...optionalShellTimeout(args),
         };
       }
@@ -1859,6 +1954,71 @@ function extractPiToolSummary(
     if (error instanceof SummaryFieldTypeError) return undefined;
     throw error;
   }
+}
+
+/**
+ * 从内置扩展工具事实提取专用摘要。当前闭集只有 codemode：开始事实要求
+ * code 参数存在且净化后非空；结束事实自包含失败状态与嵌套调用数，脚本
+ * 正文从开始参数缓存补齐。嵌套调用记录的参数、错误与结果正文一律不
+ * 进入摘要。必需字段缺失或类型错误时返回 undefined（完整降级）；结束
+ * 事实缺少嵌套调用记录时只省略 nestedCalls。
+ */
+function extractPiExtensionToolSummary(
+  toolName: string,
+  args: unknown,
+  result?: unknown,
+  isError?: boolean,
+): SafeToolSummary | undefined {
+  switch (toolName) {
+    case "codemode": {
+      const codeField = isRecord(args) && typeof args.code === "string"
+        ? codemodeCodeFacts(args.code)
+        : undefined;
+      if (isError === undefined) {
+        // 开始事实：脚本正文是必需参数；缺失或净化后为空时完整降级。
+        return codeField === undefined ? undefined : { tool: "codemode", ...codeField };
+      }
+      const nestedCalls = readCodemodeNestedCalls(result);
+      return {
+        tool: "codemode",
+        ...(codeField ?? {}),
+        isError,
+        ...(nestedCalls === undefined ? {} : { nestedCalls }),
+      };
+    }
+    default:
+      return undefined;
+  }
+}
+
+/** codemode 脚本正文事实：净化、截断，并保留净化后原文总行数。 */
+function codemodeCodeFacts(
+  code: string,
+): { readonly code: string; readonly codeLines: number } | undefined {
+  const sanitized = sanitizeSafeActivityText(code);
+  if (sanitized.length === 0) return undefined;
+  return {
+    code: truncateActivityField(sanitized),
+    codeLines: sanitized.split("\n").length,
+  };
+}
+
+/**
+ * codemode 结果上的嵌套工具调用数。codemode 的 `models.classify` 记录与
+ * 嵌套工具调用共用同一个 calls 数组，但它不经过 `ctx.executeTool`，不会
+ * 产生面板嵌套条目，因此不计入；记录结构异常时不臆造事实。
+ */
+function readCodemodeNestedCalls(result: unknown): number | undefined {
+  if (!isRecord(result)) return undefined;
+  const details = readRecord(result.details);
+  const calls = details?.calls;
+  if (!Array.isArray(calls)) return undefined;
+  return calls.filter((call) => !isCodemodeModelCallRecord(call)).length;
+}
+
+/** codemode 的模型调用记录：只用于把 `models.classify` 排除出嵌套工具调用数。 */
+function isCodemodeModelCallRecord(call: unknown): boolean {
+  return isRecord(call) && call.name === "models.classify";
 }
 
 /**
@@ -2270,6 +2430,9 @@ function parsePiToolSummary(
     case "powershell": {
       if (!hasOnlySummaryKeys(value, SHELL_SUMMARY_KEYS)) return undefined;
       if (typeof value.command !== "string" || value.command.length === 0) return undefined;
+      // command 与 code 共用 32 KB 上限：超限字段必须在产生端被截断，
+      // wire 不接受未截断的超长字段。
+      if (utf8Length(value.command) > ACTIVITY_FIELD_MAX_BYTES) return undefined;
       // 与产生端提取一致：只有有限正数 timeout 属于闭集。
       if (
         value.timeout !== undefined
@@ -2280,6 +2443,57 @@ function parsePiToolSummary(
     default:
       return undefined;
   }
+}
+
+/**
+ * wire 闭集校验：摘要只允许来源验证通过的内置扩展专用工具携带，键集合与
+ * 类型严格闭合。开始事实要求脚本正文与行数同时在场；结束事实要求 isError
+ * 与事件事实一致，嵌套调用数可选但值域受限；脚本正文在结束事实中可缺省
+ * （开始参数缓存缺失），但一旦出现则必须与行数成对且不超过 32 KB。
+ */
+function parsePiExtensionToolSummary(
+  toolName: string,
+  value: unknown,
+  eventType: "tool_execution_start" | "tool_execution_end",
+  eventIsError: boolean | undefined,
+): SafeToolSummary | undefined {
+  if (!PI_EXTENSION_TOOL_SUMMARY_NAMES.has(toolName)) return undefined;
+  if (!isRecord(value) || value.tool !== toolName) return undefined;
+  switch (toolName) {
+    case "codemode": {
+      if (eventType === "tool_execution_start") {
+        if (!hasOnlySummaryKeys(value, CODEMODE_START_SUMMARY_KEYS)) return undefined;
+        if (!validCodemodeCodeFacts(value, false)) return undefined;
+        return value as unknown as SafeToolSummary;
+      }
+      if (!hasOnlySummaryKeys(value, CODEMODE_END_SUMMARY_KEYS)) return undefined;
+      if (!validCodemodeCodeFacts(value, true)) return undefined;
+      // isError 是结束事实的冗余自包含状态：必须与事件事实一致。
+      if (typeof value.isError !== "boolean" || value.isError !== eventIsError) return undefined;
+      if (!validSummaryCount(value, "nestedCalls")) return undefined;
+      return value as unknown as SafeToolSummary;
+    }
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * codemode 脚本正文事实的共享校验：code 与 codeLines 同进同出；code 非空
+ * 且不超过 32 KB；codeLines 是至少 1 的整数。`optional` 为真时允许两者
+ * 同时缺省（结束事实的开始参数缓存缺失）。
+ */
+function validCodemodeCodeFacts(value: Record<string, unknown>, optional: boolean): boolean {
+  const hasCode = value.code !== undefined;
+  const hasCodeLines = value.codeLines !== undefined;
+  if (!hasCode && !hasCodeLines) return optional;
+  if (!hasCode || !hasCodeLines) return false;
+  return typeof value.code === "string"
+    && value.code.length > 0
+    && utf8Length(value.code) <= ACTIVITY_FIELD_MAX_BYTES
+    && typeof value.codeLines === "number"
+    && Number.isSafeInteger(value.codeLines)
+    && value.codeLines >= 1;
 }
 
 /**
@@ -2417,15 +2631,21 @@ function validOptionalName(value: Record<string, unknown>, key: string): boolean
 }
 
 /**
- * wire 摘要校验总入口：按来源身份分派到 Pi 原生与本插件专用规则；来源
- * 降级或闭集外工具一律拒绝。
+ * wire 摘要校验总入口：按来源身份分派到 Pi 原生、内置扩展与本插件专用
+ * 规则；来源降级或闭集外工具一律拒绝。内置扩展的结束事实需要与事件
+ * isError 一致性校验，因此额外携带事件类型与状态。
  */
 function parseToolSummary(
   toolName: string,
   origin: SafeToolOrigin,
   value: unknown,
+  eventType: "tool_execution_start" | "tool_execution_end",
+  eventIsError: boolean | undefined,
 ): SafeToolSummary | undefined {
   if (origin === "pi_native") return parsePiToolSummary(toolName, origin, value);
+  if (origin === "pi_extension") {
+    return parsePiExtensionToolSummary(toolName, value, eventType, eventIsError);
+  }
   if (origin === "plugin") return parsePluginToolSummary(toolName, origin, value);
   return undefined;
 }

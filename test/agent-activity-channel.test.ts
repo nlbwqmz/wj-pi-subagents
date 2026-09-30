@@ -17,6 +17,7 @@ import {
   type SupervisorFrame,
   type SupervisorReceiveResult,
 } from "../src/supervisor-channel.ts";
+import { normalizeOwnToolActivityEvent } from "../src/rpc-bridge-event.ts";
 import {
   StreamSupervisorChannel,
 } from "../src/stream-supervisor-channel.ts";
@@ -594,4 +595,41 @@ test("分块传输 helper 与通道内联判断一致：小块单帧，大块多
   const inlined = chunkCanonicalAgentActivityEntry(small, 192 * 1024);
   assert.equal(inlined.length, 1);
   assert.deepEqual(inlined[0], small);
+});
+
+test("产生端截断后的超长 codemode 条目经通道发布/接收完整交付，不触发 frame_too_large", () => {
+  const { parent, child, childAgentId } = readyPair();
+  const delivered: SupervisorActivityDelivery[] = [];
+  // 真实链路形状：一次 4000 行的 codemode 脚本先经产生端截断到 32 KB 以内。
+  const lines = Array.from({ length: 4000 }, (_, index) => `const value${index} = ${index};`);
+  const normalized = normalizeOwnToolActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "codemode",
+    args: { code: lines.join("\n") },
+  }, "pi_extension");
+  assert.equal(normalized.kind, "event");
+  if (normalized.kind !== "event" || normalized.event.type !== "tool_execution_start") return;
+  const summary = normalized.event.summary;
+  assert.ok(summary !== undefined && summary.tool === "codemode");
+  assert.ok(Buffer.byteLength(summary.code ?? "", "utf8") <= 32 * 1024);
+  assert.match(summary.code ?? "", /\n…（已截断，原文共 4000 行）$/u);
+  const entry: CanonicalAgentActivityEntry = Object.freeze({
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+    agent_id: childAgentId,
+    incarnation_id: randomUUID(),
+    entry_id: randomUUID(),
+    body: Object.freeze({
+      type: "tool_execution_start" as const,
+      toolCallId: "call_1",
+      toolName: "codemode",
+      origin: "pi_extension" as const,
+      executionGeneration: 1,
+      summary,
+    }),
+  });
+  deliverAll(parent, child.publishActivity({ entry }), delivered);
+  assert.equal(parent.getPublicState().state, "ready");
+  assert.equal(delivered.length, 1);
+  assert.deepEqual(delivered[0]?.entry, entry);
 });

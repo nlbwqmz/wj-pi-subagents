@@ -2085,6 +2085,74 @@ test("bash 与 powershell 多行命令逐项折叠，展开后完整显示", () 
   assert.ok(lines.includes("│ Get-ChildItem src"), lines.join("\n"));
 });
 
+test("codemode 折叠态显示脚本行数与嵌套调用数，展开体显示脚本正文", () => {
+  const code = "const text = await tools.read({ path: \"a.ts\" });\nreturn text.length;";
+  const start = toolStart("t1", "codemode", "pi_extension", INCARNATION_ID, {
+    tool: "codemode", code, codeLines: 2,
+  });
+  const end = toolEnd("t1", "codemode", false, "pi_extension", INCARNATION_ID, {
+    tool: "codemode", code, codeLines: 2, isError: false, nestedCalls: 3,
+  });
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [start, end], { viewport_height: 20 });
+  let lines = viewer.render(160).slice(1, -1);
+  assert.ok(lines.includes("▸ ✓ codemode · 2 lines · 3 nested calls"), lines.join("\n"));
+  // 折叠态不显示脚本正文；条目保持单一。
+  assert.doesNotMatch(lines.join("\n"), /return text\.length/u);
+  assert.equal(lines.filter((line) => line.includes("codemode")).length, 1, lines.join("\n"));
+  assert.match(viewer.getSelectedKey() ?? "", /tool-code:/u);
+
+  // 展开：脚本作为预格式化正文逐行带引导线，保留原始换行。
+  assert.equal(viewer.handleInput("\r"), "changed");
+  lines = viewer.render(160).slice(1, -1);
+  assert.ok(lines.includes("▾ ✓ codemode · 2 lines · 3 nested calls"), lines.join("\n"));
+  assert.ok(lines.includes('│ const text = await tools.read({ path: "a.ts" });'), lines.join("\n"));
+  assert.ok(lines.includes("│ return text.length;"), lines.join("\n"));
+});
+
+test("codemode 结束事实原地更新后展开状态与脚本内容保持", () => {
+  const code = "await tools.read({ path: \"a.ts\" });";
+  const start = toolStart("t1", "codemode", "pi_extension", INCARNATION_ID, {
+    tool: "codemode", code, codeLines: 1,
+  });
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [start], { viewport_height: 20 });
+  assert.equal(viewer.handleInput("\r"), "changed");
+  assert.ok(viewer.render(160).some((line) => line.startsWith("│ await tools.read")));
+
+  viewer.syncFrom([start, toolEnd("t1", "codemode", false, "pi_extension", INCARNATION_ID, {
+    tool: "codemode", code, codeLines: 1, isError: false, nestedCalls: 4,
+  })]);
+  const lines = viewer.render(160).slice(1, -1);
+  assert.ok(lines.includes("▾ ✓ codemode · 1 lines · 4 nested calls"), lines.join("\n"));
+  assert.ok(lines.includes('│ await tools.read({ path: "a.ts" });'), lines.join("\n"));
+  assert.equal(lines.filter((line) => line.includes("codemode")).length, 1, lines.join("\n"));
+});
+
+test("codemode 结束摘要缺少脚本正文时不提供展开入口，仍显示嵌套调用数", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "codemode", false, "pi_extension", INCARNATION_ID, {
+      tool: "codemode", isError: false, nestedCalls: 0,
+    }),
+  ], { viewport_height: 20 });
+  const lines = viewer.render(160).slice(1, -1);
+  assert.ok(lines.includes("✓ codemode · 0 nested calls"), lines.join("\n"));
+  assert.equal(viewer.getSelectedKey(), undefined);
+});
+
+test("codemode 失败条目状态图标为失败，脚本错误正文不进入面板", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "codemode", true, "pi_extension", INCARNATION_ID, {
+      tool: "codemode", code: "throw new Error(\"boom\");", codeLines: 1,
+      isError: true, nestedCalls: 0,
+    }),
+  ], { viewport_height: 20 });
+  let lines = viewer.render(160).slice(1, -1);
+  assert.ok(lines.includes("▸ × codemode · 1 lines · 0 nested calls"), lines.join("\n"));
+  assert.doesNotMatch(lines.join("\n"), /Script error|Error: boom/u);
+  assert.equal(viewer.handleInput("\r"), "changed");
+  lines = viewer.render(160).slice(1, -1);
+  assert.ok(lines.includes('│ throw new Error("boom");'), lines.join("\n"));
+});
+
 test("bash 失败只显示状态与完整 command，不显示 stdout、stderr 或退出码", () => {
   const theme = {
     fg: (color: string, text: string): string => `<fg:${color}>${text}</fg:${color}>`,

@@ -641,9 +641,19 @@ export const PI_NATIVE_TOOL_NAMES: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * 携带 pi_extension 身份的内置扩展注册来源路径闭集。内置扩展与内置基础
+ * 工具都使用 `builtin:<name>` 形式，但基础工具的名部分是工具名，扩展的名
+ * 部分是扩展名；判定只按注册来源路径，不按工具名，因此第三方 replaceable
+ * 替换后路径变化时自动回落 unknown。
+ */
+export const PI_EXTENSION_TOOL_SOURCE_PATHS: ReadonlySet<string> = new Set([
+  "builtin:codemode",
+]);
+
+/**
  * 来源验证：按当前会话注册表判定工具实现来源。只有注册来源确认是 Pi 内置
- * 实现（builtin）或本插件自身入口时，才授予 pi_native/plugin 身份；第三方
- * 扩展、MCP、SDK 工具与同名覆盖一律安全兜底为 unknown。
+ * 实现（builtin）或本插件自身入口时，才授予 pi_native/pi_extension/plugin
+ * 身份；第三方扩展、MCP、SDK 工具与同名覆盖一律安全兜底为 unknown。
  */
 export function classifyRegisteredToolOrigin(
   toolName: string,
@@ -652,7 +662,12 @@ export function classifyRegisteredToolOrigin(
 ): SafeToolOrigin {
   if (!isRecord(sourceInfo)) return "unknown";
   if (sourceInfo.source === "builtin") {
-    return PI_NATIVE_TOOL_NAMES.has(toolName) ? "pi_native" : "unknown";
+    if (PI_NATIVE_TOOL_NAMES.has(toolName)) return "pi_native";
+    if (
+      typeof sourceInfo.path === "string"
+      && PI_EXTENSION_TOOL_SOURCE_PATHS.has(sourceInfo.path)
+    ) return "pi_extension";
+    return "unknown";
   }
   if (typeof sourceInfo.path !== "string") return "unknown";
   if (!sameExtensionPath(sourceInfo.path, selfExtensionPath)) return "unknown";

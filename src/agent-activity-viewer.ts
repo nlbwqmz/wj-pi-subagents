@@ -131,13 +131,15 @@ type CachedBodyKind =
   | "guided-markdown-terminal"
   | "guided-tool-error"
   | "guided-model-call-failure"
-  | "guided-shell-command";
+  | "guided-shell-command"
+  | "guided-codemode-code";
 
 /** 预格式化正文：不解析 Markdown、不做字符截断，只按宽度软折行。 */
 function isPreformattedBodyKind(kind: CachedBodyKind): boolean {
   return kind === "guided-tool-error"
     || kind === "guided-model-call-failure"
-    || kind === "guided-shell-command";
+    || kind === "guided-shell-command"
+    || kind === "guided-codemode-code";
 }
 
 /** 正文块行样式：工具失败与模型调用失败共用面板既有的错误色。 */
@@ -514,6 +516,10 @@ function toolMessageKey(entryId: string): string {
 
 function toolCommandKey(entryId: string): string {
   return `tool-command:${entryId}`;
+}
+
+function toolCodeKey(entryId: string): string {
+  return `tool-code:${entryId}`;
 }
 
 function parentMessageKey(entryId: string): string {
@@ -1069,6 +1075,7 @@ export class AgentActivityViewerModel {
       || key.startsWith("tool-error:")
       || key.startsWith("tool-message:")
       || key.startsWith("tool-command:")
+      || key.startsWith("tool-code:")
       || key.startsWith("parent-message:")
       || key.startsWith("model-call-failure:");
   }
@@ -1475,14 +1482,20 @@ export class AgentActivityViewerModel {
         // 状态图标、摘要，不可展开项由状态图标占据最左侧。
         if (entry.summary !== undefined) {
           const shell = entry.summary.tool === "bash" || entry.summary.tool === "powershell";
+          // codemode 脚本与 Shell 命令一样是预格式化正文；结束事实缺少
+          // 脚本正文（开始参数缓存缺失）时没有可展开内容。
+          const codeBody = entry.summary.tool === "codemode" ? entry.summary.code : undefined;
           const messageBody = toolMessageBody(entry.summary);
           const errorBody = shell ? undefined : entry.errorText;
-          const expandable = shell || errorBody !== undefined || messageBody !== undefined;
+          const expandable = shell || codeBody !== undefined
+            || errorBody !== undefined || messageBody !== undefined;
           const expandKey = shell
             ? toolCommandKey(entry.entryId)
-            : errorBody !== undefined
-              ? toolErrorKey(entry.entryId)
-              : toolMessageKey(entry.entryId);
+            : codeBody !== undefined
+              ? toolCodeKey(entry.entryId)
+              : errorBody !== undefined
+                ? toolErrorKey(entry.entryId)
+                : toolMessageKey(entry.entryId);
           const expanded = expandable && this.expandedKeys.has(expandKey);
           addDynamicLine((width) => {
             const suffix = toolLineSuffix(visual, entry.errorCode);
@@ -1509,6 +1522,13 @@ export class AgentActivityViewerModel {
               `tool-command:${entry.incarnationId}:${entry.entryId}`,
               "guided-shell-command",
               entry.summary.command,
+            );
+          } else if (codeBody !== undefined) {
+            addMaybeExpandedCached(
+              expanded,
+              `tool-code:${entry.incarnationId}:${entry.entryId}`,
+              "guided-codemode-code",
+              codeBody,
             );
           } else if (errorBody !== undefined) {
             addMaybeExpandedCached(
@@ -1907,7 +1927,8 @@ function renderCachedBodyBlock(
     case "guided-model-call-failure":
       return renderGuidedBody(width, (bodyWidth) => renderPreformattedErrorBody(source, bodyWidth));
     case "guided-shell-command":
-      return renderGuidedBody(width, (bodyWidth) => renderShellCommandBody(source, bodyWidth));
+    case "guided-codemode-code":
+      return renderGuidedBody(width, (bodyWidth) => renderPreformattedBody(source, bodyWidth));
   }
 }
 
@@ -1961,14 +1982,14 @@ function renderPreformattedErrorBody(
 }
 
 /**
- * Shell 工具的完整命令：默认折叠，展开后作为独立预格式化正文显示。
- * 单行与多行命令采用同一种软换行结构，不截断命令字符。
+ * 预格式化正文（Shell 命令与 codemode 脚本）：默认折叠，展开后作为独立
+ * 预格式化正文显示。单行与多行内容采用同一种软换行结构，不截断字符。
  */
-function renderShellCommandBody(
-  command: string,
+function renderPreformattedBody(
+  value: string,
   width: number,
 ): readonly ViewerSemanticLine[] {
-  const safe = sanitizeViewerMarkup(command);
+  const safe = sanitizeViewerMarkup(value);
   if (safe.length === 0) return Object.freeze([]);
   return Object.freeze(wrapPlainText(safe, width).map((line) => Object.freeze({
     text: line,
@@ -2077,8 +2098,17 @@ function summaryFragments(summary: SafeToolSummary): SummaryFragments {
     }
     case "bash":
     case "powershell": {
-      // 状态摘要只显示工具名和可选 timeout；完整 command 在独立代码区域。
+      // 状态摘要只显示工具名和可选 timeout；command 正文（可能已在产生端
+      // 截断）在独立可展开代码区域。
       const tail = summary.timeout === undefined ? [] : [`timeout ${summary.timeout}`];
+      return { head: [summary.tool], path: "", tail };
+    }
+    case "codemode": {
+      // 折叠态只显示脚本行数与嵌套调用数；截断后的脚本在独立可展开正文区。
+      const tail = [
+        ...(summary.codeLines === undefined ? [] : [`${summary.codeLines} lines`]),
+        ...(summary.nestedCalls === undefined ? [] : [`${summary.nestedCalls} nested calls`]),
+      ];
       return { head: [summary.tool], path: "", tail };
     }
     case "get_agent_templates": {
