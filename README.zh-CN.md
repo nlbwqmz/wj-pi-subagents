@@ -247,7 +247,7 @@ pi
 | --- | :-: | :-: | --- |
 | `description` | 是 | 无 | 模板的用途 |
 | `tools` | 否 | Pi 默认工具 | 子代理可用的业务工具 |
-| `extensions` | 否 | Pi 默认扩展发现机制 | 子代理可用的额外扩展来源 |
+| `extensions` | 否 | Pi 默认扩展发现机制 | 子代理可用的额外扩展来源：本地路径、`npm:`、`git:`、URL 或 `builtin:<name>` |
 | `allowSubagents` | 否 | `true` | 子代理是否可以创建下一级子代理 |
 | `contextFiles` | 否 | `true` | 是否加载 `AGENTS.md`、`CLAUDE.md` 等上下文文件 |
 | `systemPromptMode` | 否 | `append` | `append` 将模板正文追加到基础系统提示之后；`replace` 替换基础系统提示 |
@@ -264,6 +264,19 @@ pi
 | `tools: []` | 无业务工具，仅保留运行子代理所必需的工具 |
 | 省略 `extensions` | 采用 Pi 正常的扩展发现规则 |
 | `extensions: []` | 禁用正常扩展发现，仅加载本插件自身 |
+
+`extensions` 支持本地路径、`npm:`、`git:`、URL 与 `builtin:<name>`。`builtin:<name>` 引用 pi 内置扩展（如 `builtin:mcp`），需要 pi 0.99.0 或更高版本。声明 `extensions` 时本插件会传入 `--no-extensions`，因此未显式列出的内置扩展（如 `builtin:llama.cpp`、`builtin:codemode`、`builtin:tool-search`）也会被屏蔽，只有列出的项通过 `-e` 加载。
+
+仅加载内置 MCP 扩展的示例：
+
+```markdown
+---
+description: 使用 MCP 工具完成资料核查
+extensions:
+  - builtin:mcp
+---
+先通过 MCP 工具收集事实，再给出结论。
+```
 
 完整示例：
 

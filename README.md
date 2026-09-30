@@ -247,7 +247,7 @@ The template directory only reads direct, lowercase `.md` files and does not sca
 | --- | :-: | :-: | --- |
 | `description` | Yes | None | What the template is for |
 | `tools` | No | Pi's default tools | Business tools available to the subagent |
-| `extensions` | No | Pi's default extension discovery | Additional extension sources for the subagent |
+| `extensions` | No | Pi's default extension discovery | Additional extension sources for the subagent: local paths, `npm:`, `git:`, URLs, or `builtin:<name>` |
 | `allowSubagents` | No | `true` | Whether the subagent may create the next level of subagents |
 | `contextFiles` | No | `true` | Whether to load context files such as `AGENTS.md` and `CLAUDE.md` |
 | `systemPromptMode` | No | `append` | `append` appends the template body; `replace` replaces the base system prompt |
@@ -264,6 +264,19 @@ Omitting `tools` or `extensions` is not the same as passing an empty array:
 | `tools: []` | No business tools; only the tools required to run a subagent |
 | Omit `extensions` | Use Pi's normal extension discovery rules |
 | `extensions: []` | Disable normal extension discovery; load only this plugin itself |
+
+`extensions` accepts local paths, `npm:`, `git:`, URLs, and `builtin:<name>`. `builtin:<name>` references a Pi built-in extension (for example `builtin:mcp`) and requires Pi 0.99.0 or later. When `extensions` is declared, this plugin passes `--no-extensions`, so built-in extensions that are not listed (such as `builtin:llama.cpp`, `builtin:codemode`, and `builtin:tool-search`) are also disabled; only the listed entries load through `-e`.
+
+Example that loads only the built-in MCP extension:
+
+```markdown
+---
+description: Verify facts with MCP tools
+extensions:
+  - builtin:mcp
+---
+Gather facts through the MCP tools first, then report the conclusion.
+```
 
 Full example:
 

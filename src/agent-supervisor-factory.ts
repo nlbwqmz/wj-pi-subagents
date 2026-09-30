@@ -392,7 +392,11 @@ function resolveTemplateExtensionSource(template: TemplateDefinition, source: st
 }
 
 function isLocalExtensionSource(source: string): boolean {
-  if (source.startsWith("npm:") || source.startsWith("git:")) return false;
+  if (
+    source.startsWith("npm:")
+    || source.startsWith("git:")
+    || source.startsWith("builtin:")
+  ) return false;
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(source) || /^git@/i.test(source)) return false;
   return true;
 }
