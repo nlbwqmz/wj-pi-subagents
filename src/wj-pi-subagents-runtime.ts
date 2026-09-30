@@ -648,12 +648,23 @@ export const PI_NATIVE_TOOL_NAMES: ReadonlySet<string> = new Set([
  */
 export const PI_EXTENSION_TOOL_SOURCE_PATHS: ReadonlySet<string> = new Set([
   "builtin:codemode",
+  "builtin:tool-search",
+]);
+
+/**
+ * 携带 mcp 身份的内置 mcp 扩展注册来源路径闭集。内置 mcp 扩展注册的工具
+ * （`mcp__<server>__<tool>` 与资源工具）与内置基础工具同形为
+ * `builtin:<name>`，因此判定同样只看来源路径；第三方 replaceable 替换后
+ * 路径变化时回落 unknown。
+ */
+export const MCP_TOOL_SOURCE_PATHS: ReadonlySet<string> = new Set([
+  "builtin:mcp",
 ]);
 
 /**
  * 来源验证：按当前会话注册表判定工具实现来源。只有注册来源确认是 Pi 内置
- * 实现（builtin）或本插件自身入口时，才授予 pi_native/pi_extension/plugin
- * 身份；第三方扩展、MCP、SDK 工具与同名覆盖一律安全兜底为 unknown。
+ * 实现（builtin）或本插件自身入口时，才授予 pi_native/pi_extension/mcp/
+ * plugin 身份；第三方扩展、SDK 工具与同名覆盖一律安全兜底为 unknown。
  */
 export function classifyRegisteredToolOrigin(
   toolName: string,
@@ -663,15 +674,34 @@ export function classifyRegisteredToolOrigin(
   if (!isRecord(sourceInfo)) return "unknown";
   if (sourceInfo.source === "builtin") {
     if (PI_NATIVE_TOOL_NAMES.has(toolName)) return "pi_native";
-    if (
-      typeof sourceInfo.path === "string"
-      && PI_EXTENSION_TOOL_SOURCE_PATHS.has(sourceInfo.path)
-    ) return "pi_extension";
+    if (typeof sourceInfo.path === "string") {
+      if (PI_EXTENSION_TOOL_SOURCE_PATHS.has(sourceInfo.path)) return "pi_extension";
+      if (MCP_TOOL_SOURCE_PATHS.has(sourceInfo.path)) return "mcp";
+    }
     return "unknown";
   }
   if (typeof sourceInfo.path !== "string") return "unknown";
   if (!sameExtensionPath(sourceInfo.path, selfExtensionPath)) return "unknown";
   return SYSTEM_TOOL_NAMES.has(toolName) ? "plugin" : "unknown";
+}
+
+/**
+ * 查询当前注册表里的工具条目；宿主查询失败、返回非数组或工具未注册时
+ * 返回 undefined。来源判定与 annotations 解析共用同一查询。
+ */
+function findRegisteredTool(
+  api: { readonly getAllTools: () => unknown },
+  toolName: string,
+): Record<string, unknown> | undefined {
+  let tools: unknown;
+  try {
+    tools = api.getAllTools();
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(tools)) return undefined;
+  const registered = tools.find((tool) => isRecord(tool) && tool.name === toolName);
+  return isRecord(registered) ? registered : undefined;
 }
 
 /**
@@ -684,17 +714,22 @@ export function createToolOriginResolver(
   selfExtensionPath: string,
 ): (toolName: string) => SafeToolOrigin {
   return (toolName: string): SafeToolOrigin => {
-    let tools: unknown;
-    try {
-      tools = api.getAllTools();
-    } catch {
-      return "unknown";
-    }
-    if (!Array.isArray(tools)) return "unknown";
-    const registered = tools.find((tool) => isRecord(tool) && tool.name === toolName);
+    const registered = findRegisteredTool(api, toolName);
     if (registered === undefined) return "unknown";
     return classifyRegisteredToolOrigin(toolName, registered.sourceInfo, selfExtensionPath);
   };
+}
+
+/**
+ * 构建 MCP 工具 annotations 的实时解析器。annotations 是工具定义上的静态
+ * 事实，不在工具执行事件上，只能查询当前注册表；查询失败或工具已注销时
+ * 返回 undefined，不影响其余摘要事实。返回注册表原始对象，由产生端按
+ * 闭集净化（只保留实际存在的布尔 hint）。
+ */
+export function createMcpToolAnnotationsResolver(
+  api: { readonly getAllTools: () => unknown },
+): (toolName: string) => unknown {
+  return (toolName: string): unknown => findRegisteredTool(api, toolName)?.annotations;
 }
 
 function sameExtensionPath(left: string, right: string): boolean {
@@ -1037,6 +1072,9 @@ export function createWjPiSubagentsRuntimeActivator(
       api,
       options.selfExtensionPath ?? defaultSelfExtensionPath(),
     );
+    // MCP annotations 解析器：annotations 是工具定义上的静态事实，不在
+    // 工具事件上；摘要提取时实时查询当前注册表，查询失败时不携带。
+    const resolveMcpAnnotations = createMcpToolAnnotationsResolver(api);
     // send_message 摘要的目标名称解析器：摘要提取时实时查询直接子快照，
     // 查询失败或缺名时不携带名称，不影响正文事实。
     let ownToolActivityNormalizerState = createOwnToolActivityNormalizerState();
@@ -1044,6 +1082,7 @@ export function createWjPiSubagentsRuntimeActivator(
       resolveToolOrigin,
       (agentId) => readDirectChildDisplayName(active, agentId, false),
       ownToolActivityNormalizerState,
+      resolveMcpAnnotations,
     );
     // 使顶层草稿可以被完整消息精确替换；epoch 与 source generation 都随
     // reload 轮换，后者是 receiver 可压缩旧流元数据的顺序屏障。
@@ -1404,6 +1443,7 @@ export function createWjPiSubagentsRuntimeActivator(
           resolveToolOrigin,
           (agentId) => readDirectChildDisplayName(active, agentId, false),
           ownToolActivityNormalizerState,
+          resolveMcpAnnotations,
         );
         rotateOwnDisplayEpoch(active);
         active.bindings.api = api;
@@ -1446,6 +1486,7 @@ export function createWjPiSubagentsRuntimeActivator(
             resolveToolOrigin,
             (agentId) => readDirectChildDisplayName(active, agentId, false),
             ownToolActivityNormalizerState,
+            resolveMcpAnnotations,
           );
           rotateOwnDisplayEpoch(current);
           applyAgentToolVisibility(api, current.managementEnabled, current.isChild);
@@ -1481,6 +1522,7 @@ export function createWjPiSubagentsRuntimeActivator(
         resolveToolOrigin,
         (agentId) => readDirectChildDisplayName(active, agentId, false),
         ownToolActivityNormalizerState,
+        resolveMcpAnnotations,
       );
 
       const rootId = bootstrap?.rootId ?? readRootId(options.rootIdFactory);

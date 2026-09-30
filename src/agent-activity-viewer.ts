@@ -12,6 +12,7 @@ import {
   isMessageToolSummary,
   sanitizeSafeActivityText,
   type SafeAgentActivityContentBlock,
+  type SafeMcpToolAnnotations,
   type SafeToolOrigin,
   type SafeToolSummary,
 } from "./rpc-bridge-event.ts";
@@ -2111,6 +2112,27 @@ function summaryFragments(summary: SafeToolSummary): SummaryFragments {
       ];
       return { head: [summary.tool], path: "", tail };
     }
+    case "tool_search": {
+      // 折叠态显示查询词与加载结果：查询词在头部，加载的工具名列表作为
+      // 可中间省略的路径字段，尾部只保留数量事实（截断时给出前/总数）。
+      const head = ["tool_search"];
+      if (summary.query !== undefined) head.push(`"${summary.query}"`);
+      const loaded = summary.loaded ?? [];
+      const tail = summary.loadedTotal === undefined
+        ? []
+        : [loaded.length === summary.loadedTotal
+          ? `${summary.loadedTotal} tools`
+          : `${loaded.length}/${summary.loadedTotal} tools`];
+      return { head, path: loaded.join(", "), tail };
+    }
+    case "list_mcp_resources":
+    case "list_mcp_resource_templates":
+    case "read_mcp_resource": {
+      // 服务器在头部；资源 URI 作为可中间省略的路径字段。
+      const head: string[] = [summary.tool];
+      if (summary.server !== undefined) head.push(summary.server);
+      return { head, path: summary.uri ?? "", tail: [] };
+    }
     case "get_agent_templates": {
       // 成功只显示模板数量；失败摘要没有该字段，也不显示模板配置。
       const tail = summary.count === undefined ? [] : [`${summary.count} templates`];
@@ -2198,7 +2220,32 @@ function summaryFragments(summary: SafeToolSummary): SummaryFragments {
       // 成功只显示工具名与成功状态；不保存 revision、scope、节点列表或统计。
       return { head: ["get_agent_tree"], path: "", tail: [] };
     }
+    default: {
+      // MCP 工具：工具名本身携带服务器与工具名（哈希后缀保留在工具名
+      // 侧）；只读、破坏性等 annotations 作为风险提示并列显示。
+      return {
+        head: [summary.tool],
+        path: "",
+        tail: mcpAnnotationLabels(summary.annotations),
+      };
+    }
   }
+}
+
+/**
+ * MCP annotations 的显示标签：只显示实际存在的 true hint（缺省与 false
+ * 不产生标签，避免把默认值误当风险事实）；顺序与 MCP 规范定义一致。
+ */
+function mcpAnnotationLabels(
+  annotations: SafeMcpToolAnnotations | undefined,
+): readonly string[] {
+  if (annotations === undefined) return [];
+  return [
+    ...(annotations.readOnlyHint === true ? ["read-only"] : []),
+    ...(annotations.destructiveHint === true ? ["destructive"] : []),
+    ...(annotations.idempotentHint === true ? ["idempotent"] : []),
+    ...(annotations.openWorldHint === true ? ["open world"] : []),
+  ];
 }
 
 /** 显示层固定八位短 ID：完整 UUID 的前八位；内部关联仍使用完整 UUID。 */

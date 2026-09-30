@@ -12,7 +12,7 @@ import type {
   SafeToolSummary,
   SafeToolOrigin,
 } from "../src/rpc-bridge-event.ts";
-import { normalizeRpcBridgeEvent } from "../src/rpc-bridge-event.ts";
+import { normalizeOwnToolActivityEvent, normalizeRpcBridgeEvent } from "../src/rpc-bridge-event.ts";
 import {
   AgentDisplayDraftRegistry,
   type AgentDisplayDraftView,
@@ -2151,6 +2151,154 @@ test("codemode 失败条目状态图标为失败，脚本错误正文不进入�
   assert.equal(viewer.handleInput("\r"), "changed");
   lines = viewer.render(160).slice(1, -1);
   assert.ok(lines.includes('│ throw new Error("boom");'), lines.join("\n"));
+});
+
+test("tool_search 折叠态显示查询词与加载工具数量", () => {
+  const start = toolStart("t1", "tool_search", "pi_extension", INCARNATION_ID, {
+    tool: "tool_search", query: "mcp resource",
+  });
+  const end = toolEnd("t1", "tool_search", false, "pi_extension", INCARNATION_ID, {
+    tool: "tool_search",
+    query: "mcp resource",
+    isError: false,
+    loaded: ["read", "grep", "mcp__docs__search"],
+    loadedTotal: 3,
+  });
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [start, end], { viewport_height: 20 });
+  const lines = viewer.render(160).slice(1, -1);
+  assert.ok(
+    lines.includes('✓ tool_search · "mcp resource" · read, grep, mcp__docs__search · 3 tools'),
+    lines.join("\n"),
+  );
+  // tool_search 没有独立展开体：不提供展开入口。
+  assert.equal(viewer.getSelectedKey(), undefined);
+});
+
+test("tool_search 加载列表超过 20 个时折叠态显示截断数量", () => {
+  const loaded = Array.from({ length: 20 }, (_, index) => `tool_${index}`);
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "tool_search", false, "pi_extension", INCARNATION_ID, {
+      tool: "tool_search", query: "docs", isError: false, loaded, loadedTotal: 25,
+    }),
+  ], { viewport_height: 20 });
+  const lines = viewer.render(200).slice(1, -1);
+  assert.ok(lines.join("\n").includes("20/25 tools"), lines.join("\n"));
+});
+
+test("tool_search 失败条目显示失败状态与查询词，无匹配时显示零总数", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "tool_search", false, "pi_extension", INCARNATION_ID, {
+      tool: "tool_search", query: "不存在", isError: false, loaded: [], loadedTotal: 0,
+    }),
+    toolEnd("t2", "tool_search", true, "pi_extension", INCARNATION_ID, {
+      tool: "tool_search", query: "bad", isError: true,
+    }),
+  ], { viewport_height: 20 });
+  const lines = viewer.render(160).slice(1, -1);
+  assert.ok(lines.includes('✓ tool_search · "不存在" · 0 tools'), lines.join("\n"));
+  assert.ok(lines.includes('× tool_search · "bad"'), lines.join("\n"));
+});
+
+test("MCP 工具折叠态显示工具名与实际存在的风险注解", () => {
+  const toolName = "mcp__docs__search";
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", toolName, true, "mcp", INCARNATION_ID, {
+      tool: toolName,
+      server: "docs",
+      mcpTool: "search",
+      isError: true,
+      annotations: { readOnlyHint: true, destructiveHint: true },
+    }),
+    toolEnd("t2", "mcp__docs__list", false, "mcp", INCARNATION_ID, {
+      tool: "mcp__docs__list", server: "docs", mcpTool: "list", isError: false,
+    }),
+  ], { viewport_height: 20 });
+  const lines = viewer.render(160).slice(1, -1);
+  assert.ok(lines.includes("× mcp__docs__search · read-only · destructive"), lines.join("\n"));
+  // 缺省 annotations 不产生标签，也不提供展开入口。
+  assert.ok(lines.includes("✓ mcp__docs__list"), lines.join("\n"));
+  assert.equal(viewer.getSelectedKey(), undefined);
+});
+
+test("MCP 工具带哈希后缀时折叠态显示完整工具名", () => {
+  const toolName = "mcp__very_long_server__very_long_tool_name_a1b2c3d4";
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart("t1", toolName, "mcp", INCARNATION_ID, {
+      tool: toolName, server: "very_long_server", mcpTool: "very_long_tool_name_a1b2c3d4",
+    }),
+  ], { viewport_height: 20 });
+  const lines = viewer.render(160).slice(1, -1);
+  assert.ok(lines.some((line) => line.includes(toolName)), lines.join("\n"));
+});
+
+test("MCP 资源工具折叠态显示服务器与资源 URI", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "read_mcp_resource", false, "mcp", INCARNATION_ID, {
+      tool: "read_mcp_resource", server: "docs", uri: "file:///spec.md", isError: false,
+    }),
+    toolEnd("t2", "list_mcp_resources", true, "mcp", INCARNATION_ID, {
+      tool: "list_mcp_resources", server: "docs", isError: true,
+    }),
+  ], { viewport_height: 20 });
+  const lines = viewer.render(160).slice(1, -1);
+  assert.ok(lines.includes("✓ read_mcp_resource · docs · file:///spec.md"), lines.join("\n"));
+  assert.ok(lines.includes("× list_mcp_resources · docs"), lines.join("\n"));
+});
+
+test("端到端：tool_search 原始事件经产生端规范化后在面板显示查询与加载结果", () => {
+  const normalized = normalizeOwnToolActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_search",
+    toolName: "tool_search",
+    isError: false,
+    result: {
+      content: [{ type: "text", text: "Loaded 2 tools. 工具描述正文不得上屏" }],
+      details: { loaded: ["read", "mcp__docs__search"] },
+    },
+  }, "pi_extension", { query: "resource" });
+  assert.equal(normalized.kind, "event");
+  if (normalized.kind !== "event") return;
+  const entry: CanonicalAgentActivityEntry = Object.freeze({
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+    agent_id: AGENT_ID,
+    incarnation_id: INCARNATION_ID,
+    entry_id: randomUUID(),
+    body: normalized.event,
+  });
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [entry], { viewport_height: 20 });
+  const lines = viewer.render(160).slice(1, -1);
+  assert.ok(
+    lines.includes('✓ tool_search · "resource" · read, mcp__docs__search · 2 tools'),
+    lines.join("\n"),
+  );
+  assert.doesNotMatch(lines.join("\n"), /工具描述正文不得上屏/u);
+});
+
+test("端到端：MCP 工具失败事件经产生端规范化后面板显示失败且无外部正文", () => {
+  const normalized = normalizeOwnToolActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_mcp",
+    toolName: "mcp__docs__search",
+    isError: true,
+    result: {
+      content: [{ type: "text", text: "MCP 错误正文不得上屏" }],
+      structuredContent: { secret: "结构化正文不得上屏" },
+      details: { server: "docs", tool: "search" },
+    },
+  }, "mcp", undefined, undefined, undefined, () => ({ readOnlyHint: true }));
+  assert.equal(normalized.kind, "event");
+  if (normalized.kind !== "event") return;
+  const entry: CanonicalAgentActivityEntry = Object.freeze({
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+    agent_id: AGENT_ID,
+    incarnation_id: INCARNATION_ID,
+    entry_id: randomUUID(),
+    body: normalized.event,
+  });
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [entry], { viewport_height: 20 });
+  const lines = viewer.render(160).slice(1, -1);
+  assert.ok(lines.includes("× mcp__docs__search · read-only"), lines.join("\n"));
+  assert.doesNotMatch(lines.join("\n"), /错误正文不得上屏|结构化正文不得上屏/u);
 });
 
 test("bash 失败只显示状态与完整 command，不显示 stdout、stderr 或退出码", () => {

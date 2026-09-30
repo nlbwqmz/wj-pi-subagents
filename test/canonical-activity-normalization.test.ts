@@ -1476,6 +1476,376 @@ test("codemode 必需参数缺失或来源未验证时降级为无摘要兜底",
   }
 });
 
+test("tool_search 开始摘要携带查询词，描述与未来字段不跨进程", () => {
+  const start = normalizeOwnToolActivityEvent(
+    mutationStart("tool_search", { query: "mcp resource", limit: 5, futureField: "不得跨进程" }),
+    "pi_extension",
+  );
+  assert.equal(start.kind, "event");
+  if (start.kind !== "event" || start.event.type !== "tool_execution_start") return;
+  assert.deepEqual(summaryOf(start.event), { tool: "tool_search", query: "mcp resource" });
+  assert.equal(JSON.stringify(start.event).includes("futureField"), false);
+  assert.equal(JSON.stringify(start.event).includes("limit"), false);
+});
+
+test("tool_search 查询词超过 1 KB 时按 UTF-8 字节截断且不切断多字节字符", () => {
+  const query = "搜".repeat(1000);
+  assert.ok(Buffer.byteLength(query, "utf8") > 1024);
+  const start = normalizeOwnToolActivityEvent(
+    mutationStart("tool_search", { query }),
+    "pi_extension",
+  );
+  assert.equal(start.kind, "event");
+  if (start.kind !== "event" || start.event.type !== "tool_execution_start") return;
+  const summary = summaryOf(start.event) as { readonly query: string };
+  assert.ok(Buffer.byteLength(summary.query, "utf8") <= 1024);
+  assert.equal(summary.query.endsWith("搜"), true);
+});
+
+test("tool_search 结束摘要携带加载工具与真实总数，查询词从开始参数缓存补齐", () => {
+  const loaded = Array.from({ length: 25 }, (_, index) => `tool_${index}`);
+  const end = normalizeOwnToolActivityEvent(
+    mutationEnd("tool_search", {
+      content: [{ type: "text", text: "Loaded 25 tools. 工具描述正文不得跨进程" }],
+      details: { loaded },
+    }),
+    "pi_extension",
+    { query: "docs" },
+  );
+  assert.equal(end.kind, "event");
+  if (end.kind !== "event" || end.event.type !== "tool_execution_end") return;
+  const summary = summaryOf(end.event) as {
+    readonly query: string;
+    readonly loaded: readonly string[];
+    readonly loadedTotal: number;
+    readonly isError: boolean;
+  };
+  assert.equal(summary.query, "docs");
+  assert.equal(summary.isError, false);
+  assert.equal(summary.loaded.length, 20);
+  assert.equal(summary.loaded[0], "tool_0");
+  assert.equal(summary.loadedTotal, 25);
+  const serialized = JSON.stringify(end.event);
+  assert.equal(serialized.includes("工具描述正文不得跨进程"), false);
+  assert.equal(serialized.includes("Loaded 25 tools"), false);
+});
+
+test("tool_search 无匹配结果携带空加载列表与零总数", () => {
+  const end = normalizeOwnToolActivityEvent(
+    mutationEnd("tool_search", {
+      content: [{ type: "text", text: "No matching tools found." }],
+      details: { loaded: [] },
+    }),
+    "pi_extension",
+    { query: "不存在的工具" },
+  );
+  assert.equal(end.kind, "event");
+  if (end.kind !== "event" || end.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(end.event), {
+    tool: "tool_search",
+    query: "不存在的工具",
+    isError: false,
+    loaded: [],
+    loadedTotal: 0,
+  });
+});
+
+test("tool_search 失败事实不携带加载结果，查询词缓存缺失时省略", () => {
+  const end = normalizeOwnToolActivityEvent(
+    mutationEnd("tool_search", {
+      content: [{ type: "text", text: "query must not be empty" }],
+    }, true),
+    "pi_extension",
+  );
+  assert.equal(end.kind, "event");
+  if (end.kind !== "event" || end.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(end.event), { tool: "tool_search", isError: true });
+  assert.equal(JSON.stringify(end.event).includes("query must not be empty"), false);
+});
+
+test("tool_search 成功事实缺少加载结果结构时完整降级为无摘要兜底", () => {
+  for (const result of [
+    { content: [{ type: "text", text: "x" }] },
+    { details: { loaded: "not-an-array" } },
+    { details: { loaded: ["read", 42] } },
+  ]) {
+    const end = normalizeOwnToolActivityEvent(
+      mutationEnd("tool_search", result),
+      "pi_extension",
+      { query: "docs" },
+    );
+    // 事件仍按安全兜底登记；只是不携带可能被 wire 拒绝的摘要。
+    assert.equal(end.kind, "event");
+    if (end.kind !== "event" || end.event.type !== "tool_execution_end") continue;
+    assert.equal(end.event.summary, undefined);
+  }
+});
+
+test("tool_search 必需参数缺失或来源未验证时降级为无摘要兜底", () => {
+  const missingQuery = normalizeOwnToolActivityEvent(
+    mutationStart("tool_search", { query: 42 }),
+    "pi_extension",
+  );
+  assert.equal(missingQuery.kind, "event");
+  if (missingQuery.kind !== "event" || missingQuery.event.type !== "tool_execution_start") return;
+  assert.equal(missingQuery.event.summary, undefined);
+
+  for (const origin of ["unknown", "pi_native", "mcp", "plugin"] as const) {
+    const wrongOrigin = normalizeOwnToolActivityEvent(
+      mutationStart("tool_search", { query: "docs" }),
+      origin,
+    );
+    assert.equal(wrongOrigin.kind, "event", origin);
+    if (wrongOrigin.kind !== "event" || wrongOrigin.event.type !== "tool_execution_start") continue;
+    assert.equal(wrongOrigin.event.summary, undefined, origin);
+  }
+});
+
+test("MCP 工具开始摘要携带服务器与工具名，参数与未来字段不跨进程", () => {
+  const start = normalizeOwnToolActivityEvent(
+    mutationStart("mcp__docs__search", { query: "secret", futureField: "不得跨进程" }),
+    "mcp",
+  );
+  assert.equal(start.kind, "event");
+  if (start.kind !== "event" || start.event.type !== "tool_execution_start") return;
+  assert.deepEqual(summaryOf(start.event), {
+    tool: "mcp__docs__search",
+    server: "docs",
+    mcpTool: "search",
+  });
+  assert.equal(JSON.stringify(start.event).includes("futureField"), false);
+  assert.equal(JSON.stringify(start.event).includes("secret"), false);
+});
+
+test("MCP 工具名带哈希后缀时仍能解析出服务器与工具名", () => {
+  const toolName = "mcp__very_long_server__very_long_tool_name_a1b2c3d4";
+  const start = normalizeOwnToolActivityEvent(
+    mutationStart(toolName, {}),
+    "mcp",
+  );
+  assert.equal(start.kind, "event");
+  if (start.kind !== "event" || start.event.type !== "tool_execution_start") return;
+  assert.deepEqual(summaryOf(start.event), {
+    tool: toolName,
+    server: "very_long_server",
+    mcpTool: "very_long_tool_name_a1b2c3d4",
+  });
+});
+
+test("MCP 工具结束摘要携带失败状态与实际存在的 annotations", () => {
+  const end = normalizeOwnToolActivityEvent(
+    mutationEnd("mcp__docs__search", {
+      content: [{ type: "text", text: "MCP 结果正文不得跨进程" }],
+      structuredContent: { secret: "结构化正文不得跨进程" },
+      details: { server: "docs", tool: "search" },
+    }, true),
+    "mcp",
+    undefined,
+    undefined,
+    undefined,
+    () => ({ readOnlyHint: true, destructiveHint: false }),
+  );
+  assert.equal(end.kind, "event");
+  if (end.kind !== "event" || end.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(end.event), {
+    tool: "mcp__docs__search",
+    server: "docs",
+    mcpTool: "search",
+    isError: true,
+    annotations: { readOnlyHint: true, destructiveHint: false },
+  });
+  const serialized = JSON.stringify(end.event);
+  assert.equal(serialized.includes("MCP 结果正文不得跨进程"), false);
+  assert.equal(serialized.includes("结构化正文不得跨进程"), false);
+});
+
+test("MCP 工具无 annotations 时不携带空对象，解析器缺失时也不臆造", () => {
+  const end = normalizeOwnToolActivityEvent(
+    mutationEnd("mcp__docs__search", {
+      content: [{ type: "text", text: "结果" }],
+      details: { server: "docs", tool: "search" },
+    }),
+    "mcp",
+    undefined,
+    undefined,
+    undefined,
+    () => undefined,
+  );
+  assert.equal(end.kind, "event");
+  if (end.kind !== "event" || end.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(end.event), {
+    tool: "mcp__docs__search",
+    server: "docs",
+    mcpTool: "search",
+    isError: false,
+  });
+});
+
+test("MCP annotations 在产生端只保留实际存在的布尔 hint", () => {
+  const toolName = "mcp__docs__search";
+  const end = normalizeOwnToolActivityEvent(
+    mutationEnd(toolName, { details: { server: "docs", tool: "search" } }),
+    "mcp",
+    undefined,
+    undefined,
+    undefined,
+    () => ({ readOnlyHint: true, destructiveHint: "yes", unknownHint: true, title: "x" }),
+  );
+  assert.equal(end.kind, "event");
+  if (end.kind !== "event" || end.event.type !== "tool_execution_end") return;
+  // 未知键与非布尔字段被过滤；实际存在的布尔 hint 保留。
+  assert.deepEqual(summaryOf(end.event), {
+    tool: toolName,
+    server: "docs",
+    mcpTool: "search",
+    isError: false,
+    annotations: { readOnlyHint: true },
+  });
+
+  // 空对象与非对象解析结果不产生 annotations。
+  for (const value of [{}, null, "nope"] as const) {
+    const empty = normalizeOwnToolActivityEvent(
+      mutationEnd(toolName, { details: { server: "docs", tool: "search" } }),
+      "mcp",
+      undefined,
+      undefined,
+      undefined,
+      () => value,
+    );
+    assert.equal(empty.kind, "event");
+    if (empty.kind !== "event" || empty.event.type !== "tool_execution_end") continue;
+    assert.deepEqual(summaryOf(empty.event), {
+      tool: toolName,
+      server: "docs",
+      mcpTool: "search",
+      isError: false,
+    });
+  }
+});
+
+test("MCP 工具名不符合命名规则或来源未验证时降级为无摘要兜底", () => {
+  const malformed = normalizeOwnToolActivityEvent(
+    mutationStart("mcp__malformed", {}),
+    "mcp",
+  );
+  assert.equal(malformed.kind, "event");
+  if (malformed.kind !== "event" || malformed.event.type !== "tool_execution_start") return;
+  assert.equal(malformed.event.summary, undefined);
+
+  for (const origin of ["unknown", "pi_native", "pi_extension", "plugin"] as const) {
+    const wrongOrigin = normalizeOwnToolActivityEvent(
+      mutationStart("mcp__docs__search", {}),
+      origin,
+    );
+    assert.equal(wrongOrigin.kind, "event", origin);
+    if (wrongOrigin.kind !== "event" || wrongOrigin.event.type !== "tool_execution_start") continue;
+    assert.equal(wrongOrigin.event.summary, undefined, origin);
+  }
+});
+
+test("MCP 资源工具开始摘要携带服务器与资源 URI，列出工具不携带 URI", () => {
+  const read = normalizeOwnToolActivityEvent(
+    mutationStart("read_mcp_resource", {
+      server: "docs",
+      uri: "file:///spec.md",
+      futureField: "不得跨进程",
+    }),
+    "mcp",
+  );
+  assert.equal(read.kind, "event");
+  if (read.kind !== "event" || read.event.type !== "tool_execution_start") return;
+  assert.deepEqual(summaryOf(read.event), {
+    tool: "read_mcp_resource",
+    server: "docs",
+    uri: "file:///spec.md",
+  });
+  assert.equal(JSON.stringify(read.event).includes("futureField"), false);
+
+  const list = normalizeOwnToolActivityEvent(
+    mutationStart("list_mcp_resources", { server: "docs", cursor: "opaque" }),
+    "mcp",
+  );
+  assert.equal(list.kind, "event");
+  if (list.kind !== "event" || list.event.type !== "tool_execution_start") return;
+  assert.deepEqual(summaryOf(list.event), { tool: "list_mcp_resources", server: "docs" });
+});
+
+test("MCP 资源工具结束摘要携带 isError，服务器与 URI 从开始参数缓存补齐", () => {
+  const end = normalizeOwnToolActivityEvent(
+    mutationEnd("read_mcp_resource", {
+      content: [{ type: "text", text: "资源正文不得跨进程" }],
+      structuredContent: { contents: ["外部数据不得跨进程"] },
+      details: { server: "docs", tool: "read_mcp_resource" },
+    }),
+    "mcp",
+    { server: "docs", uri: "file:///spec.md" },
+  );
+  assert.equal(end.kind, "event");
+  if (end.kind !== "event" || end.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(end.event), {
+    tool: "read_mcp_resource",
+    server: "docs",
+    uri: "file:///spec.md",
+    isError: false,
+  });
+  const serialized = JSON.stringify(end.event);
+  assert.equal(serialized.includes("资源正文不得跨进程"), false);
+  assert.equal(serialized.includes("外部数据不得跨进程"), false);
+});
+
+test("MCP 资源工具失败事实携带 isError，外部错误正文不进入条目", () => {
+  const end = normalizeOwnToolActivityEvent(
+    mutationEnd("read_mcp_resource", {
+      content: [{ type: "text", text: "MCP 错误正文不得跨进程" }],
+    }, true),
+    "mcp",
+    { server: "docs", uri: "file:///spec.md" },
+  );
+  assert.equal(end.kind, "event");
+  if (end.kind !== "event" || end.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(end.event), {
+    tool: "read_mcp_resource",
+    server: "docs",
+    uri: "file:///spec.md",
+    isError: true,
+  });
+  assert.equal(JSON.stringify(end.event).includes("MCP 错误正文不得跨进程"), false);
+});
+
+test("MCP 资源工具缺少服务器参数或来源未验证时降级为无摘要兜底", () => {
+  const missingServer = normalizeOwnToolActivityEvent(
+    mutationStart("list_mcp_resources", {}),
+    "mcp",
+  );
+  assert.equal(missingServer.kind, "event");
+  if (missingServer.kind !== "event" || missingServer.event.type !== "tool_execution_start") return;
+  assert.equal(missingServer.event.summary, undefined);
+
+  for (const origin of ["unknown", "pi_native", "pi_extension", "plugin"] as const) {
+    const wrongOrigin = normalizeOwnToolActivityEvent(
+      mutationStart("list_mcp_resources", { server: "docs" }),
+      origin,
+    );
+    assert.equal(wrongOrigin.kind, "event", origin);
+    if (wrongOrigin.kind !== "event" || wrongOrigin.event.type !== "tool_execution_start") continue;
+    assert.equal(wrongOrigin.event.summary, undefined, origin);
+  }
+});
+
+test("MCP 资源工具开始参数缓存缺失时结束摘要仍携带 isError", () => {
+  const end = normalizeOwnToolActivityEvent(
+    mutationEnd("list_mcp_resources", {
+      content: [{ type: "text", text: "JSON 列表正文不得跨进程" }],
+      details: { server: "", tool: "list_mcp_resources" },
+    }),
+    "mcp",
+  );
+  assert.equal(end.kind, "event");
+  if (end.kind !== "event" || end.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(end.event), { tool: "list_mcp_resources", isError: false });
+  assert.equal(JSON.stringify(end.event).includes("JSON 列表正文不得跨进程"), false);
+});
+
 test("活动事件闭集对 Shell 工具拒绝错误正文，write/edit 可携带且键集合严格闭合", () => {
   // Shell 工具失败不携带错误正文：携带即协议违约。
   assert.equal(parseAgentActivityEvent({

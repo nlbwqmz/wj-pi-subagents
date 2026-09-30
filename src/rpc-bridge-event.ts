@@ -53,15 +53,15 @@ export type SafeAgentActivityContentBlock =
   | { readonly type: "thinking"; readonly thinking: string };
 
 /**
- * 工具来源身份闭集。只有来源验证通过的工具才能获得 pi_native、pi_extension
- * 或 plugin 身份；第三方扩展、MCP、同名覆盖与来源不明工具一律安全兜底为
+ * 工具来源身份闭集。只有来源验证通过的工具才能获得 pi_native、pi_extension、
+ * mcp 或 plugin 身份；第三方扩展、同名覆盖与来源不明工具一律安全兜底为
  * unknown。
  */
-export type SafeToolOrigin = "pi_native" | "pi_extension" | "plugin" | "unknown";
+export type SafeToolOrigin = "pi_native" | "pi_extension" | "mcp" | "plugin" | "unknown";
 
 /** 来源身份闭集谓词；wire 校验与产生端判定共用同一形状。 */
 export function isSafeToolOrigin(value: unknown): value is SafeToolOrigin {
-  return value === "pi_native" || value === "pi_extension"
+  return value === "pi_native" || value === "pi_extension" || value === "mcp"
     || value === "plugin" || value === "unknown";
 }
 
@@ -89,6 +89,7 @@ export const PLUGIN_TOOL_SUMMARY_NAMES: ReadonlySet<string> = new Set([
  */
 export const PI_EXTENSION_TOOL_SUMMARY_NAMES: ReadonlySet<string> = new Set([
   "codemode",
+  "tool_search",
 ]);
 
 /**
@@ -105,11 +106,18 @@ const GREP_DEFAULT_LIMIT = 100;
 const FIND_DEFAULT_LIMIT = 1000;
 const LS_DEFAULT_LIMIT = 500;
 
+/** 内置 mcp 扩展的资源工具名闭集；它们共用同一摘要形状。 */
+export type McpResourceToolName =
+  | "list_mcp_resources"
+  | "list_mcp_resource_templates"
+  | "read_mcp_resource";
+
 /**
  * 专用工具摘要闭集（Pi 原生、内置扩展与本插件）。字段是硬编码白名单：原始参数中的
  * 未来新增字段、文件正文、图片数据、匹配正文、路径列表、目录条目、写入/
- * 编辑统计、命令输出、模板配置、depth、初始 state 与任务正文都不在这里
- * 出现。专用解析宽容原始输入变化；摘要自身的键集合是严格闭集。
+ * 编辑统计、命令输出、模板配置、depth、初始 state、任务正文、MCP 结果正文
+ * 与错误正文都不在这里出现。专用解析宽容原始输入变化；摘要自身的键集合
+ * 是严格闭集。
  */
 export type SafeToolSummary =
   | {
@@ -274,7 +282,55 @@ export type SafeToolSummary =
       readonly codeLines?: number;
       readonly isError?: boolean;
       readonly nestedCalls?: number;
+    }
+  | {
+      /**
+       * 内置 tool-search 扩展的查询事实：开始事实携带截断后的查询词，
+       * 结束事实携带失败状态、实际加载的工具名（最多 20 个）与真实总数。
+       * 查询词在结束事实中从开始参数缓存补齐，缓存缺失时省略；工具
+       * 描述正文永不进入摘要。
+       */
+      readonly tool: "tool_search";
+      readonly query?: string;
+      readonly isError?: boolean;
+      readonly loaded?: readonly string[];
+      readonly loadedTotal?: number;
+    }
+  | {
+      /**
+       * 内置 mcp 扩展的 MCP 工具事实：开始与结束事实都携带服务器与原始
+       * 工具名（从工具名按命名规则解析，带哈希后缀时后缀留在工具名侧），
+       * 结束事实携带失败状态与工具定义上实际存在的 annotations。MCP 结果
+       * 正文（content/structuredContent）与错误正文永不进入摘要。
+       */
+      readonly tool: `mcp__${string}`;
+      readonly server: string;
+      readonly mcpTool: string;
+      readonly isError?: boolean;
+      readonly annotations?: SafeMcpToolAnnotations;
+    }
+  | {
+      /**
+       * 内置 mcp 扩展的资源工具事实：开始事实携带服务器与可选资源 URI，
+       * 结束事实携带失败状态；服务器与 URI 在结束事实中从开始参数缓存
+       * 补齐，缓存缺失时省略。资源正文与错误正文永不进入摘要。
+       */
+      readonly tool: McpResourceToolName;
+      readonly server?: string;
+      readonly uri?: string;
+      readonly isError?: boolean;
     };
+
+/**
+ * MCP 工具定义上实际存在的 annotations hint 闭集。只携带实际存在的 hint
+ * （缺省的不补 false）；四个 hint 全部缺省时不携带 annotations 对象。
+ */
+export interface SafeMcpToolAnnotations {
+  readonly readOnlyHint?: boolean;
+  readonly destructiveHint?: boolean;
+  readonly idempotentHint?: boolean;
+  readonly openWorldHint?: boolean;
+}
 
 /**
  * 消息类插件工具摘要：send_message、normal_reply 与 final_report 的摘要
@@ -325,6 +381,18 @@ const TREE_SUMMARY_KEYS = Object.freeze(["tool"] as const);
 const CODEMODE_START_SUMMARY_KEYS = Object.freeze(["tool", "code", "codeLines"] as const);
 const CODEMODE_END_SUMMARY_KEYS = Object.freeze([
   "tool", "code", "codeLines", "isError", "nestedCalls",
+] as const);
+const TOOL_SEARCH_START_SUMMARY_KEYS = Object.freeze(["tool", "query"] as const);
+const TOOL_SEARCH_END_SUMMARY_KEYS = Object.freeze([
+  "tool", "query", "isError", "loaded", "loadedTotal",
+] as const);
+const MCP_TOOL_START_SUMMARY_KEYS = Object.freeze(["tool", "server", "mcpTool"] as const);
+const MCP_TOOL_END_SUMMARY_KEYS = Object.freeze([
+  "tool", "server", "mcpTool", "isError", "annotations",
+] as const);
+const MCP_RESOURCE_START_SUMMARY_KEYS = Object.freeze(["tool", "server", "uri"] as const);
+const MCP_RESOURCE_END_SUMMARY_KEYS = Object.freeze([
+  "tool", "server", "uri", "isError",
 ] as const);
 
 /** wait_agent 摘要允许的全部 outcome 值闭集（含等待包装事实）。 */
@@ -389,6 +457,51 @@ export function sanitizeSafeActivityText(value: string): string {
  * 按行截断并携带统一标记，被截断部分不可恢复；wire 校验拒绝超限字段。
  */
 export const ACTIVITY_FIELD_MAX_BYTES = 32 * 1024;
+
+/** tool_search 查询词的 UTF-8 字节上限；超限时产生端按字节截断。 */
+export const TOOL_SEARCH_QUERY_MAX_BYTES = 1024;
+
+/** tool_search 结束摘要最多携带的已加载工具名数量；总数另由 loadedTotal 表达。 */
+export const TOOL_SEARCH_LOADED_LIMIT = 20;
+
+/** MCP 资源工具 URI 的 UTF-8 字节上限；URI 是资源标识，不是正文。 */
+export const MCP_RESOURCE_URI_MAX_BYTES = 2048;
+
+/** 内置 mcp 扩展的资源工具名闭集；它们共用同一摘要形状。 */
+export const MCP_RESOURCE_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "list_mcp_resources",
+  "list_mcp_resource_templates",
+  "read_mcp_resource",
+]);
+
+/** 资源工具名类型守卫；wire 校验与产生端共用，避免失实的窄化断言。 */
+export function isMcpResourceToolName(value: string): value is McpResourceToolName {
+  return MCP_RESOURCE_TOOL_NAMES.has(value);
+}
+
+/** MCP annotations 的 4 个布尔 hint 闭集（MCP 规范定义）。 */
+const MCP_ANNOTATION_HINTS = Object.freeze([
+  "readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint",
+] as const);
+
+/**
+ * 从 MCP 工具名解析服务器与原始工具名。命名规则为
+ * `mcp__<server>__<tool>`；超长或重名时工具名带 8 位哈希后缀（截断发生在
+ * 整名上），因此按第一个 `__` 分隔才能让后缀留在工具名侧，而服务器名
+ * 不被后缀影响。名字不符合规则时返回 undefined。
+ */
+export function parseMcpToolName(
+  toolName: string,
+): { readonly server: string; readonly mcpTool: string } | undefined {
+  if (!toolName.startsWith("mcp__")) return undefined;
+  const rest = toolName.slice("mcp__".length);
+  const separator = rest.indexOf("__");
+  if (separator <= 0 || separator + 2 >= rest.length) return undefined;
+  return Object.freeze({
+    server: rest.slice(0, separator),
+    mcpTool: rest.slice(separator + 2),
+  });
+}
 
 /** 统一截断标记的固定部分；标记中的 `N` 是截断前原文的总行数。 */
 const ACTIVITY_TRUNCATION_MARKER_PREFIX = "\n…（已截断，原文共 ";
@@ -1468,7 +1581,8 @@ function normalizeLocalDisplayOrdering(
  * 产生端规范化：把子代理自身观察到的原始 Pi 工具执行事实缩减为安全闭集。
  * 原始结果与错误正文在此处丢弃，永不跨进程；来源身份由调用方验证后随
  * 规范化输入传递。来源验证通过的 Pi 原生专用工具（read/grep/find/ls/write/
- * edit/bash/powershell）与本插件专用工具（get_agent_templates/spawn_agent/
+ * edit/bash/powershell）、内置扩展专用工具（codemode/tool_search 与内置
+ * mcp 扩展的工具）与本插件专用工具（get_agent_templates/spawn_agent/
  * send_message/normal_reply/final_report/wait_agent/interrupt_agent/
  * terminate_agent/get_agent_status/get_agent_tree）各自使用专用摘要规则：
  * 只保留白名单参数与结果事实，Shell 外 Pi 工具失败时自包含净化后的完整
@@ -1483,6 +1597,7 @@ export function normalizeOwnToolActivityEvent(
   startArgs?: unknown,
   resolveAgentName?: (agentId: string) => string | undefined,
   executionGeneration?: number,
+  resolveMcpAnnotations?: (toolName: string) => unknown,
 ): AgentActivityEventNormalization {
   if (!isRecord(event) || typeof event.type !== "string") return INVALID_ACTIVITY_EVENT;
   if (!isSafeToolOrigin(origin)) return INVALID_ACTIVITY_EVENT;
@@ -1507,6 +1622,10 @@ export function normalizeOwnToolActivityEvent(
   const dedicatedPiExtensionTool = origin === "pi_extension"
     && typeof event.toolName === "string"
     && PI_EXTENSION_TOOL_SUMMARY_NAMES.has(event.toolName);
+  const dedicatedMcpTool = origin === "mcp"
+    && typeof event.toolName === "string"
+    && (MCP_RESOURCE_TOOL_NAMES.has(event.toolName)
+      || parseMcpToolName(event.toolName) !== undefined);
   const dedicatedPluginTool = origin === "plugin"
     && typeof event.toolName === "string"
     && PLUGIN_TOOL_SUMMARY_NAMES.has(event.toolName);
@@ -1521,9 +1640,17 @@ export function normalizeOwnToolActivityEvent(
       ? extractPiToolSummary(event.toolName, event.args)
       : dedicatedPiExtensionTool
         ? extractPiExtensionToolSummary(event.toolName, event.args)
-        : dedicatedPluginTool
-          ? extractPluginToolSummary(event.toolName, event.args, undefined, undefined, resolveAgentName)
-          : undefined;
+        : dedicatedMcpTool
+          ? extractMcpToolSummary(
+            event.toolName,
+            event.args,
+            undefined,
+            undefined,
+            resolveMcpAnnotations,
+          )
+          : dedicatedPluginTool
+            ? extractPluginToolSummary(event.toolName, event.args, undefined, undefined, resolveAgentName)
+            : undefined;
     return parseAgentActivityEvent({
       type: "tool_execution_start",
       toolCallId: event.toolCallId,
@@ -1546,15 +1673,23 @@ export function normalizeOwnToolActivityEvent(
       ? extractPiToolSummary(event.toolName, startArgs, event.result, event.isError)
       : dedicatedPiExtensionTool
         ? extractPiExtensionToolSummary(event.toolName, startArgs, event.result, event.isError)
-        : dedicatedPluginTool && isRecord(startArgs)
-          ? extractPluginToolSummary(
+        : dedicatedMcpTool
+          ? extractMcpToolSummary(
             event.toolName,
             startArgs,
             event.result,
             event.isError,
-            resolveAgentName,
+            resolveMcpAnnotations,
           )
-          : undefined;
+          : dedicatedPluginTool && isRecord(startArgs)
+            ? extractPluginToolSummary(
+              event.toolName,
+              startArgs,
+              event.result,
+              event.isError,
+              resolveAgentName,
+            )
+            : undefined;
     // 错误正文只属于允许展开错误的 Pi 工具；Shell 工具失败只表达成功或失败。
     const errorText = summary !== undefined && event.isError
       && PI_TOOL_ERROR_TEXT_NAMES.has(event.toolName)
@@ -1650,12 +1785,14 @@ export function isOwnToolActivityNormalizerState(
  * 运行时使用的有状态专用规范化器：Pi 的工具结束事件不携带参数，本工厂按
  * 工具活动 ID 缓存开始事件的参数，供结束事实自包含输入参数。缓存有界，
  * 溢出时淘汰最旧的待决条目；宿主查询失败时全部工具保守兜底为 unknown。
- * 可选的目标名称解析器供 send_message 摘要携带接收者名称。
+ * 可选的目标名称解析器供 send_message 摘要携带接收者名称；可选的 MCP
+ * annotations 解析器供 MCP 工具结束摘要携带实际存在的 hint。
  */
 export function createOwnToolActivityNormalizer(
   resolveToolOrigin: (toolName: string) => SafeToolOrigin,
   resolveAgentName?: (agentId: string) => string | undefined,
   state: OwnToolActivityNormalizerState = createOwnToolActivityNormalizerState(),
+  resolveMcpAnnotations?: (toolName: string) => unknown,
 ): (event: unknown) => AgentActivityEventNormalization {
   const pendingKey = (toolCallId: string, generation: number): string =>
     `${toolCallId}\u0000${generation}`;
@@ -1717,6 +1854,7 @@ export function createOwnToolActivityNormalizer(
       pending?.args,
       resolveAgentName,
       executionGeneration,
+      resolveMcpAnnotations,
     );
     // Do not let malformed host events mutate the generation/argument ledger.
     if (normalized.kind !== "event") return normalized;
@@ -1957,11 +2095,12 @@ function extractPiToolSummary(
 }
 
 /**
- * 从内置扩展工具事实提取专用摘要。当前闭集只有 codemode：开始事实要求
- * code 参数存在且净化后非空；结束事实自包含失败状态与嵌套调用数，脚本
- * 正文从开始参数缓存补齐。嵌套调用记录的参数、错误与结果正文一律不
- * 进入摘要。必需字段缺失或类型错误时返回 undefined（完整降级）；结束
- * 事实缺少嵌套调用记录时只省略 nestedCalls。
+ * 从内置扩展工具事实提取专用摘要。codemode：开始事实要求 code 参数存在
+ * 且净化后非空；结束事实自包含失败状态与嵌套调用数，脚本正文从开始参数
+ * 缓存补齐。tool_search：开始事实要求查询词，结束事实自包含失败状态与
+ * 加载结果，查询词从开始参数缓存补齐。嵌套调用记录的参数、错误与结果
+ * 正文一律不进入摘要。必需字段缺失或类型错误时返回 undefined（完整
+ * 降级）；结束事实缺少缓存或结果结构异常时只省略对应字段。
  */
 function extractPiExtensionToolSummary(
   toolName: string,
@@ -1986,9 +2125,128 @@ function extractPiExtensionToolSummary(
         ...(nestedCalls === undefined ? {} : { nestedCalls }),
       };
     }
+    case "tool_search": {
+      const queryField = isRecord(args) && typeof args.query === "string"
+        ? toolSearchQueryFacts(args.query)
+        : undefined;
+      if (isError === undefined) {
+        // 开始事实：查询词是必需参数；缺失或净化后为空时完整降级。
+        return queryField === undefined ? undefined : { tool: "tool_search", ...queryField };
+      }
+      if (isError === false) {
+        // 成功事实必须自包含加载结果；结果结构异常时完整降级为无摘要
+        // 兜底，避免产生 wire 拒绝的形状（事件本身仍按安全兜底登记）。
+        const loadedFacts = readToolSearchLoadedFacts(result);
+        if (loadedFacts === undefined) return undefined;
+        return {
+          tool: "tool_search",
+          ...(queryField ?? {}),
+          isError,
+          ...loadedFacts,
+        };
+      }
+      // 失败事实没有加载结果。
+      return { tool: "tool_search", ...(queryField ?? {}), isError };
+    }
     default:
       return undefined;
   }
+}
+
+/** tool_search 查询词事实：净化并按 1 KB 字节上限截断（不切断多字节字符）。 */
+function toolSearchQueryFacts(query: string): { readonly query: string } | undefined {
+  const sanitized = sanitizeSafeActivityText(query);
+  if (sanitized.length === 0) return undefined;
+  return { query: truncateToUtf8Bytes(sanitized, TOOL_SEARCH_QUERY_MAX_BYTES) };
+}
+
+/**
+ * tool_search 结果上的加载工具事实：加载列表必须是全部有界工具名的数组，
+ * 结构异常时整体降级（不臆造事实）；最多保留 20 个，loadedTotal 为真实
+ * 总数。工具描述与结果正文一律不进入。
+ */
+function readToolSearchLoadedFacts(
+  result: unknown,
+): { readonly loaded: readonly string[]; readonly loadedTotal: number } | undefined {
+  if (!isRecord(result)) return undefined;
+  const details = readRecord(result.details);
+  const loaded = details?.loaded;
+  if (!Array.isArray(loaded)) return undefined;
+  if (!loaded.every((name) => validBoundedText(name, MAX_TOOL_ID_BYTES))) return undefined;
+  return Object.freeze({
+    loaded: Object.freeze(loaded.slice(0, TOOL_SEARCH_LOADED_LIMIT)),
+    loadedTotal: loaded.length,
+  });
+}
+
+/**
+ * 从内置 mcp 扩展工具事实提取专用摘要。MCP 工具的开始与结束事实都要求
+ * 工具名可按 `mcp__<server>__<tool>` 解析（带哈希后缀时后缀留在工具名
+ * 侧），结束事实另携带失败状态与当前注册表上实际存在的 annotations。
+ * 资源工具的开始事实要求服务器参数，结束事实从开始参数缓存补齐服务器
+ * 与 URI（缓存缺失时只保留失败状态）。MCP 结果正文（content/
+ * structuredContent）与错误正文一律不进入摘要。
+ */
+function extractMcpToolSummary(
+  toolName: string,
+  args: unknown,
+  result?: unknown,
+  isError?: boolean,
+  resolveMcpAnnotations?: (toolName: string) => unknown,
+): SafeToolSummary | undefined {
+  if (isMcpResourceToolName(toolName)) {
+    const serverField = isRecord(args) && validBoundedText(args.server, MAX_TOOL_ID_BYTES)
+      ? args.server
+      : undefined;
+    const uriField = toolName === "read_mcp_resource" && isRecord(args)
+      && validBoundedText(args.uri, MCP_RESOURCE_URI_MAX_BYTES)
+      ? args.uri
+      : undefined;
+    if (isError === undefined) {
+      // 开始事实：服务器是必需参数；缺失时完整降级。
+      if (serverField === undefined) return undefined;
+      return {
+        tool: toolName,
+        server: serverField,
+        ...(uriField === undefined ? {} : { uri: uriField }),
+      };
+    }
+    return {
+      tool: toolName,
+      ...(serverField === undefined ? {} : { server: serverField }),
+      ...(uriField === undefined ? {} : { uri: uriField }),
+      isError,
+    };
+  }
+  const parsed = parseMcpToolName(toolName);
+  if (parsed === undefined) return undefined;
+  if (isError === undefined) {
+    return { tool: toolName as `mcp__${string}`, ...parsed };
+  }
+  const annotations = sanitizeMcpAnnotations(resolveMcpAnnotations?.(toolName));
+  return {
+    tool: toolName as `mcp__${string}`,
+    ...parsed,
+    isError,
+    ...(annotations === undefined ? {} : { annotations }),
+  };
+}
+
+/**
+ * MCP annotations 产生端净化：只保留实际存在的布尔 hint，缺省的不补
+ * false；空对象、非对象与无有效 hint 一律降级为不携带。
+ */
+function sanitizeMcpAnnotations(value: unknown): SafeMcpToolAnnotations | undefined {
+  if (!isRecord(value)) return undefined;
+  const hints: { -readonly [K in keyof SafeMcpToolAnnotations]?: boolean } = {};
+  let present = false;
+  for (const hint of MCP_ANNOTATION_HINTS) {
+    const hintValue = value[hint];
+    if (typeof hintValue !== "boolean") continue;
+    hints[hint] = hintValue;
+    present = true;
+  }
+  return present ? hints : undefined;
 }
 
 /** codemode 脚本正文事实：净化、截断，并保留净化后原文总行数。 */
@@ -2447,9 +2705,9 @@ function parsePiToolSummary(
 
 /**
  * wire 闭集校验：摘要只允许来源验证通过的内置扩展专用工具携带，键集合与
- * 类型严格闭合。开始事实要求脚本正文与行数同时在场；结束事实要求 isError
- * 与事件事实一致，嵌套调用数可选但值域受限；脚本正文在结束事实中可缺省
- * （开始参数缓存缺失），但一旦出现则必须与行数成对且不超过 32 KB。
+ * 类型严格闭合。开始事实要求必需输入字段在场；结束事实要求 isError 与
+ * 事件事实一致；输入字段在结束事实中可缺省（开始参数缓存缺失），但一旦
+ * 出现则必须与开始事实同形状。
  */
 function parsePiExtensionToolSummary(
   toolName: string,
@@ -2473,9 +2731,126 @@ function parsePiExtensionToolSummary(
       if (!validSummaryCount(value, "nestedCalls")) return undefined;
       return value as unknown as SafeToolSummary;
     }
+    case "tool_search": {
+      if (eventType === "tool_execution_start") {
+        if (!hasOnlySummaryKeys(value, TOOL_SEARCH_START_SUMMARY_KEYS)) return undefined;
+        if (!validToolSearchQuery(value, false)) return undefined;
+        return value as unknown as SafeToolSummary;
+      }
+      if (!hasOnlySummaryKeys(value, TOOL_SEARCH_END_SUMMARY_KEYS)) return undefined;
+      if (!validToolSearchQuery(value, true)) return undefined;
+      // isError 是结束事实的冗余自包含状态：必须与事件事实一致。
+      if (typeof value.isError !== "boolean" || value.isError !== eventIsError) return undefined;
+      // 成功事实必须携带加载结果；失败事实不携带结果侧事实。
+      if (value.isError === false) {
+        if (!validToolSearchLoadedFacts(value, true)) return undefined;
+      } else if (value.loaded !== undefined || value.loadedTotal !== undefined) {
+        return undefined;
+      }
+      return value as unknown as SafeToolSummary;
+    }
     default:
       return undefined;
   }
+}
+
+/**
+ * tool_search 查询词事实的共享校验：非空且不超过 1 KB；`optional` 为真时
+ * 允许缺省（结束事实的开始参数缓存缺失）。
+ */
+function validToolSearchQuery(value: Record<string, unknown>, optional: boolean): boolean {
+  if (value.query === undefined) return optional;
+  return typeof value.query === "string"
+    && value.query.length > 0
+    && utf8Length(value.query) <= TOOL_SEARCH_QUERY_MAX_BYTES;
+}
+
+/**
+ * tool_search 加载工具事实的共享校验：loaded 与 loadedTotal 同进同出；
+ * loaded 是最多 20 个有界工具名；loadedTotal 是不小于 loaded 长度的非负
+ * 整数。`required` 为真时（成功事实）两者必须在场。
+ */
+function validToolSearchLoadedFacts(value: Record<string, unknown>, required: boolean): boolean {
+  const hasLoaded = value.loaded !== undefined;
+  const hasTotal = value.loadedTotal !== undefined;
+  if (!hasLoaded && !hasTotal) return !required;
+  if (!hasLoaded || !hasTotal) return false;
+  const loaded = value.loaded;
+  if (!Array.isArray(loaded) || loaded.length > TOOL_SEARCH_LOADED_LIMIT) return false;
+  if (!loaded.every((name) => validBoundedText(name, MAX_TOOL_ID_BYTES))) return false;
+  const total = value.loadedTotal;
+  return typeof total === "number"
+    && Number.isSafeInteger(total)
+    && total >= loaded.length;
+}
+
+/**
+ * wire 闭集校验：摘要只允许来源验证通过的内置 mcp 扩展工具携带，键集合与
+ * 类型严格闭合。MCP 工具的开始与结束事实都要求服务器与工具名在场（工具名
+ * 解析规则与产生端一致，带哈希后缀时后缀留在工具名侧）；annotations 只
+ * 允许实际存在的 4 个布尔 hint，空对象与未知键拒绝。资源工具摘要允许
+ * 服务器与 URI 缺省（开始参数缓存缺失），但类型必须正确，且 URI 只允许
+ * 出现在读取工具上。
+ */
+function parseMcpToolSummary(
+  toolName: string,
+  value: unknown,
+  eventType: "tool_execution_start" | "tool_execution_end",
+  eventIsError: boolean | undefined,
+): SafeToolSummary | undefined {
+  if (!isRecord(value) || value.tool !== toolName) return undefined;
+  if (isMcpResourceToolName(toolName)) {
+    if (eventType === "tool_execution_start") {
+      if (!hasOnlySummaryKeys(value, MCP_RESOURCE_START_SUMMARY_KEYS)) return undefined;
+      if (!validMcpResourceFacts(value, toolName, true)) return undefined;
+      return value as unknown as SafeToolSummary;
+    }
+    if (!hasOnlySummaryKeys(value, MCP_RESOURCE_END_SUMMARY_KEYS)) return undefined;
+    if (typeof value.isError !== "boolean" || value.isError !== eventIsError) return undefined;
+    if (!validMcpResourceFacts(value, toolName, false)) return undefined;
+    return value as unknown as SafeToolSummary;
+  }
+  if (parseMcpToolName(toolName) === undefined) return undefined;
+  if (!validBoundedText(value.server, MAX_TOOL_ID_BYTES)) return undefined;
+  if (!validBoundedText(value.mcpTool, MAX_TOOL_ID_BYTES)) return undefined;
+  if (eventType === "tool_execution_start") {
+    if (!hasOnlySummaryKeys(value, MCP_TOOL_START_SUMMARY_KEYS)) return undefined;
+    return value as unknown as SafeToolSummary;
+  }
+  if (!hasOnlySummaryKeys(value, MCP_TOOL_END_SUMMARY_KEYS)) return undefined;
+  if (typeof value.isError !== "boolean" || value.isError !== eventIsError) return undefined;
+  if (!validMcpAnnotations(value.annotations)) return undefined;
+  return value as unknown as SafeToolSummary;
+}
+
+/**
+ * MCP 资源工具事实的共享校验：server 与 uri 缺省可选但存在时必须有界
+ * 文本；`requireServer` 为真时（开始事实）服务器必须在场；uri 只允许出现
+ * 在 read_mcp_resource 上。
+ */
+function validMcpResourceFacts(
+  value: Record<string, unknown>,
+  toolName: string,
+  requireServer: boolean,
+): boolean {
+  if (value.server === undefined) {
+    if (requireServer) return false;
+  } else if (!validBoundedText(value.server, MAX_TOOL_ID_BYTES)) return false;
+  if (value.uri === undefined) return true;
+  return toolName === "read_mcp_resource"
+    && validBoundedText(value.uri, MCP_RESOURCE_URI_MAX_BYTES);
+}
+
+/**
+ * MCP annotations 的 wire 校验：缺省合法；存在时必须是至少一个已知布尔
+ * hint 的普通对象，空对象与未知键拒绝。
+ */
+function validMcpAnnotations(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!isRecord(value) || Object.keys(value).length === 0) return false;
+  return Object.keys(value).every((key) =>
+    (MCP_ANNOTATION_HINTS as readonly string[]).includes(key)
+    && typeof value[key] === "boolean");
 }
 
 /**
@@ -2645,6 +3020,9 @@ function parseToolSummary(
   if (origin === "pi_native") return parsePiToolSummary(toolName, origin, value);
   if (origin === "pi_extension") {
     return parsePiExtensionToolSummary(toolName, value, eventType, eventIsError);
+  }
+  if (origin === "mcp") {
+    return parseMcpToolSummary(toolName, value, eventType, eventIsError);
   }
   if (origin === "plugin") return parsePluginToolSummary(toolName, origin, value);
   return undefined;

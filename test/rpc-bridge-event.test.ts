@@ -1093,3 +1093,290 @@ test("canonical wire 接受 pi_extension 摘要并拒绝未知摘要键", () => 
     },
   }).kind, "invalid");
 });
+
+test("pi_extension 来源的 tool_search 摘要按开始/结束形状分别闭合", () => {
+  // 开始事实：query 必需，不允许结束字段。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "tool_search",
+    origin: "pi_extension",
+    summary: { tool: "tool_search", query: "docs" },
+  }).kind, "event");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "tool_search",
+    origin: "pi_extension",
+    summary: { tool: "tool_search", query: "docs", isError: false },
+  }).kind, "invalid");
+  // 成功结束事实必须携带 loaded 与 loadedTotal；query 可缺省（开始参数缓存缺失）。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "tool_search",
+    origin: "pi_extension",
+    isError: false,
+    summary: { tool: "tool_search", query: "docs", isError: false, loaded: ["read"], loadedTotal: 1 },
+  }).kind, "event");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "tool_search",
+    origin: "pi_extension",
+    isError: false,
+    summary: { tool: "tool_search", isError: false },
+  }).kind, "invalid");
+  // 失败事实不携带加载结果。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "tool_search",
+    origin: "pi_extension",
+    isError: true,
+    summary: { tool: "tool_search", isError: true },
+  }).kind, "event");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "tool_search",
+    origin: "pi_extension",
+    isError: true,
+    summary: { tool: "tool_search", isError: true, loaded: [], loadedTotal: 0 },
+  }).kind, "invalid");
+  // isError 是结束事实的冗余自包含状态：必须与事件事实一致。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "tool_search",
+    origin: "pi_extension",
+    isError: false,
+    summary: { tool: "tool_search", isError: true, loaded: [], loadedTotal: 0 },
+  }).kind, "invalid");
+});
+
+test("tool_search 摘要的未知键与值域偏离一律拒绝", () => {
+  const endBase = {
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "tool_search",
+    origin: "pi_extension",
+    isError: false,
+  };
+  // 未知键。
+  assert.equal(parseAgentActivityEvent({
+    ...endBase,
+    summary: { tool: "tool_search", isError: false, loaded: [], loadedTotal: 0, extra: 1 },
+  }).kind, "invalid");
+  // 空查询词与超 1 KB 查询词。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "tool_search",
+    origin: "pi_extension",
+    summary: { tool: "tool_search", query: "" },
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "tool_search",
+    origin: "pi_extension",
+    summary: { tool: "tool_search", query: "x".repeat(1025) },
+  }).kind, "invalid");
+  // loaded 超 20 个、单边缺失、元素非法、总数小于列表长度。
+  const twenty = Array.from({ length: 20 }, (_, index) => `tool_${index}`);
+  assert.equal(parseAgentActivityEvent({
+    ...endBase,
+    summary: { tool: "tool_search", isError: false, loaded: [...twenty, "tool_20"], loadedTotal: 21 },
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    ...endBase,
+    summary: { tool: "tool_search", isError: false, loaded: ["read"] },
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    ...endBase,
+    summary: { tool: "tool_search", isError: false, loaded: [42], loadedTotal: 1 },
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    ...endBase,
+    summary: { tool: "tool_search", isError: false, loaded: ["read", "grep"], loadedTotal: 1 },
+  }).kind, "invalid");
+});
+
+test("mcp 来源的 MCP 工具摘要按开始/结束形状分别闭合", () => {
+  const toolName = "mcp__docs__search";
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName,
+    origin: "mcp",
+    summary: { tool: toolName, server: "docs", mcpTool: "search" },
+  }).kind, "event");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName,
+    origin: "mcp",
+    isError: false,
+    summary: { tool: toolName, server: "docs", mcpTool: "search", isError: false },
+  }).kind, "event");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName,
+    origin: "mcp",
+    isError: true,
+    summary: {
+      tool: toolName,
+      server: "docs",
+      mcpTool: "search",
+      isError: true,
+      annotations: { readOnlyHint: true, destructiveHint: false },
+    },
+  }).kind, "event");
+  // 未知键、缺少服务器/工具名、工具名不可解析、isError 不一致。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName,
+    origin: "mcp",
+    summary: { tool: toolName, server: "docs", mcpTool: "search", extra: 1 },
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName,
+    origin: "mcp",
+    summary: { tool: toolName, server: "docs" },
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "mcp__malformed",
+    origin: "mcp",
+    summary: { tool: "mcp__malformed", server: "docs", mcpTool: "search" },
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName,
+    origin: "mcp",
+    isError: false,
+    summary: { tool: toolName, server: "docs", mcpTool: "search", isError: true },
+  }).kind, "invalid");
+  // 来源不匹配：mcp 摘要不能冒充其他来源，其他来源摘要也不能冒充 mcp。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName,
+    origin: "pi_extension",
+    summary: { tool: toolName, server: "docs", mcpTool: "search" },
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "codemode",
+    origin: "mcp",
+    summary: { tool: "codemode", code: "return 1;", codeLines: 1 },
+  }).kind, "invalid");
+});
+
+test("MCP 工具 annotations 只接受实际存在的已知布尔 hint", () => {
+  const toolName = "mcp__docs__search";
+  const endWith = (annotations: unknown): unknown => ({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName,
+    origin: "mcp",
+    isError: false,
+    summary: { tool: toolName, server: "docs", mcpTool: "search", isError: false, annotations },
+  });
+  // 空对象、未知键、非布尔值均拒绝。
+  assert.equal(parseAgentActivityEvent(endWith({})).kind, "invalid");
+  assert.equal(parseAgentActivityEvent(endWith({ unknownHint: true })).kind, "invalid");
+  assert.equal(parseAgentActivityEvent(endWith({ readOnlyHint: "true" })).kind, "invalid");
+  // 实际存在的 false hint 与多个 hint 均合法。
+  assert.equal(parseAgentActivityEvent(endWith({ readOnlyHint: false })).kind, "event");
+  assert.equal(parseAgentActivityEvent(endWith({
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  })).kind, "event");
+});
+
+test("mcp 来源的 MCP 资源工具摘要按开始/结束形状分别闭合", () => {
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "read_mcp_resource",
+    origin: "mcp",
+    summary: { tool: "read_mcp_resource", server: "docs", uri: "file:///spec.md" },
+  }).kind, "event");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "list_mcp_resources",
+    origin: "mcp",
+    summary: { tool: "list_mcp_resources", server: "docs" },
+  }).kind, "event");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "list_mcp_resources",
+    origin: "mcp",
+    isError: false,
+    summary: { tool: "list_mcp_resources", isError: false },
+  }).kind, "event");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "read_mcp_resource",
+    origin: "mcp",
+    isError: true,
+    summary: {
+      tool: "read_mcp_resource",
+      server: "docs",
+      uri: "file:///spec.md",
+      isError: true,
+    },
+  }).kind, "event");
+  // 开始事实缺少服务器、列表工具携带 URI、未知键、isError 不一致均拒绝。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "list_mcp_resources",
+    origin: "mcp",
+    summary: { tool: "list_mcp_resources" },
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "list_mcp_resources",
+    origin: "mcp",
+    summary: { tool: "list_mcp_resources", server: "docs", uri: "file:///spec.md" },
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "read_mcp_resource",
+    origin: "mcp",
+    summary: { tool: "read_mcp_resource", server: "docs", extra: 1 },
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "read_mcp_resource",
+    origin: "mcp",
+    isError: false,
+    summary: { tool: "read_mcp_resource", server: "docs", uri: "file:///spec.md", isError: true },
+  }).kind, "invalid");
+  // 来源不匹配拒绝。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "read_mcp_resource",
+    origin: "pi_extension",
+    summary: { tool: "read_mcp_resource", server: "docs", uri: "file:///spec.md" },
+  }).kind, "invalid");
+});

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   classifyRegisteredToolOrigin,
+  createMcpToolAnnotationsResolver,
   createToolOriginResolver,
   PI_NATIVE_TOOL_NAMES,
 } from "../src/wj-pi-subagents-runtime.ts";
@@ -58,11 +59,54 @@ test("第三方 replaceable 替换内置 codemode 后同名工具回落 unknown"
     ),
     "unknown",
   );
-  // 其他内置扩展在本次适配前仍是安全兜底。
+});
+
+test("内置 tool-search 扩展注册的工具携带 pi_extension 身份", () => {
+  // 真实注册来源是 `builtin:tool-search`（内置扩展名）；判定按来源路径。
   assert.equal(
     classifyRegisteredToolOrigin(
       "tool_search",
       { path: "builtin:tool-search", source: "builtin", scope: "temporary" },
+      PLUGIN_PATH,
+    ),
+    "pi_extension",
+  );
+});
+
+test("内置 mcp 扩展注册的工具与资源工具携带 mcp 身份", () => {
+  // 工具名带哈希后缀时来源判定不受影响：判定只看注册来源路径。
+  for (const name of [
+    "mcp__docs__search",
+    "mcp__very_long_server_name__very_long_tool_name_a1b2c3d4",
+    "list_mcp_resources",
+    "list_mcp_resource_templates",
+    "read_mcp_resource",
+  ]) {
+    assert.equal(
+      classifyRegisteredToolOrigin(
+        name,
+        { path: "builtin:mcp", source: "builtin", scope: "temporary" },
+        PLUGIN_PATH,
+      ),
+      "mcp",
+      name,
+    );
+  }
+});
+
+test("第三方 replaceable 替换内置 tool-search 或 mcp 后同名工具回落 unknown", () => {
+  assert.equal(
+    classifyRegisteredToolOrigin(
+      "tool_search",
+      { path: "D:/extensions/other/tool-search.ts", source: "package" },
+      PLUGIN_PATH,
+    ),
+    "unknown",
+  );
+  assert.equal(
+    classifyRegisteredToolOrigin(
+      "read_mcp_resource",
+      { path: "D:/extensions/other/mcp.ts", source: "package" },
       PLUGIN_PATH,
     ),
     "unknown",
@@ -187,4 +231,26 @@ test("来源解析器按当前注册表实时判定，查询失败全部兜底",
   assert.equal(failing("read"), "unknown");
   const malformed = createToolOriginResolver({ getAllTools: () => "not-an-array" }, PLUGIN_PATH);
   assert.equal(malformed("read"), "unknown");
+});
+
+test("MCP annotations 解析器按注册表返回原始 annotations，查询失败兜底", () => {
+  const raw = { readOnlyHint: true, destructiveHint: false, unknownHint: true };
+  const resolver = createMcpToolAnnotationsResolver({
+    getAllTools: () => [
+      { name: "mcp__docs__search", annotations: raw },
+      { name: "mcp__docs__list" },
+    ],
+  });
+  assert.deepEqual(resolver("mcp__docs__search"), raw);
+  assert.equal(resolver("mcp__docs__list"), undefined);
+  assert.equal(resolver("unregistered"), undefined);
+
+  const failing = createMcpToolAnnotationsResolver({
+    getAllTools: () => {
+      throw new Error("宿主不可用");
+    },
+  });
+  assert.equal(failing("mcp__docs__search"), undefined);
+  const malformed = createMcpToolAnnotationsResolver({ getAllTools: () => "not-an-array" });
+  assert.equal(malformed("mcp__docs__search"), undefined);
 });
