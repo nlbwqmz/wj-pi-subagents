@@ -245,6 +245,65 @@ test("tools 和 extensions 只接受原生字符串数组，并拒绝空项和 t
   });
 });
 
+test("tools 拒绝 +name 与 -name 修饰符形态并定位到 tools 字段", () => {
+  const snapshot = discoverUserTemplates(new Map([
+    ["plus.md", "---\ndescription: 加号修饰符\ntools: ['+read']\n---\n"],
+    ["minus.md", "---\ndescription: 减号修饰符\ntools: [-grep]\n---\n"],
+    ["mixed.md", "---\ndescription: 修饰符与普通名混用\ntools: [read, '+mcp_tool']\n---\n"],
+    ["trimmed.md", "---\ndescription: 带空白修饰符\ntools: [' -read ']\n---\n"],
+  ]));
+
+  assert.deepEqual(snapshot.templates, []);
+  assert.deepEqual(diagnosticReasons(snapshot), {
+    "minus.md": "tool_modifier_unsupported",
+    "mixed.md": "tool_modifier_unsupported",
+    "plus.md": "tool_modifier_unsupported",
+    "trimmed.md": "tool_modifier_unsupported",
+  });
+  assert.equal(
+    snapshot.invalidCandidates.every((diagnostic) => diagnostic.field === "tools"),
+    true,
+  );
+});
+
+test("保留系统工具名优先于修饰符形态诊断", () => {
+  const snapshot = discoverUserTemplates(new Map([
+    ["reserved-first.md", "---\ndescription: 保留名在前\ntools: [spawn_agent, '+read']\n---\n"],
+    ["modifier-first.md", "---\ndescription: 修饰符在前\ntools: ['+read', spawn_agent]\n---\n"],
+  ]));
+
+  assert.deepEqual(diagnosticReasons(snapshot), {
+    "modifier-first.md": "reserved_tool",
+    "reserved-first.md": "reserved_tool",
+  });
+  assert.equal(
+    snapshot.invalidCandidates.every((diagnostic) => diagnostic.field === "tools"),
+    true,
+  );
+});
+
+test("tools 接受 * 出现在任意位置或多次出现的通配条目", () => {
+  const snapshot = discoverUserTemplates(new Map([
+    ["leading.md", "---\ndescription: 前缀通配\ntools: ['*']\n---\n"],
+    ["middle.md", "---\ndescription: 中缀通配\ntools: ['mcp*server']\n---\n"],
+    ["trailing.md", "---\ndescription: 后缀通配\ntools: ['mcp_*']\n---\n"],
+    ["multiple.md", "---\ndescription: 多次通配\ntools: ['*a*', 'b*c*d']\n---\n"],
+    ["mixed.md", "---\ndescription: 与普通名混用\ntools: [read, '*']\n---\n"],
+  ]));
+
+  assert.deepEqual(
+    snapshot.templates.map((template) => [template.templateId, template.tools]),
+    [
+      ["leading", ["*"]],
+      ["middle", ["mcp*server"]],
+      ["mixed", ["read", "*"]],
+      ["multiple", ["*a*", "b*c*d"]],
+      ["trailing", ["mcp_*"]],
+    ],
+  );
+  assert.deepEqual(snapshot.invalidCandidates, []);
+});
+
 test("description 必填，按 trim 后 Unicode code point 数校验", () => {
   const withinLimit = "😀".repeat(512);
   const beyondLimit = "😀".repeat(513);

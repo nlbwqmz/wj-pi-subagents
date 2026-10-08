@@ -77,6 +77,7 @@ export type TemplateCandidateDiagnosticReason =
   | "description_invalid"
   | "description_too_long"
   | "tools_invalid"
+  | "tool_modifier_unsupported"
   | "reserved_tool"
   | "extensions_invalid"
   | "allow_subagents_invalid"
@@ -538,6 +539,14 @@ function parseCandidate(
       fieldDiagnosticDetails("tools", toolsField),
     );
   }
+  if (tools?.some((tool) => tool.startsWith("+") || tool.startsWith("-")) === true) {
+    return invalidCandidate(
+      source,
+      fileName,
+      "tool_modifier_unsupported",
+      fieldDiagnosticDetails("tools", toolsField),
+    );
+  }
 
   const extensionsField = frontmatter.fields.get("extensions");
   const parsedExtensions = parseStringArray(extensionsField);
@@ -786,6 +795,8 @@ function candidateReasonLabel(reason: TemplateCandidateDiagnosticReason): string
       return "Description exceeds 512 Unicode code points";
     case "tools_invalid":
       return "Invalid tools configuration";
+    case "tool_modifier_unsupported":
+      return "Template tools does not support + or - modifiers; their baseline comes from the host's default tool configuration, so the extension cannot guarantee the declaration matches actual capabilities";
     case "reserved_tool":
       return "Tools contains a reserved system tool";
     case "extensions_invalid":
