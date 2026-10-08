@@ -123,7 +123,6 @@ export function createAgentSupervisorFactory(
       ...(options.nodeFactory === undefined
         ? {
           validateCapability: (capability: SupervisorCapabilityManifest) => childCapabilityMatches(capability, {
-            template,
             extensionPath,
             childReplyTools,
             managementTools,
@@ -275,8 +274,7 @@ export function buildManagedRpcOptions(
   });
 }
 
-interface ExpectedChildCapability {
-  readonly template: TemplateDefinition;
+export interface ExpectedChildCapability {
   readonly extensionPath: string;
   readonly childReplyTools: readonly string[];
   readonly managementTools: readonly string[];
@@ -284,7 +282,8 @@ interface ExpectedChildCapability {
   readonly expectedThinking: string | undefined;
 }
 
-function childCapabilityMatches(
+/** 子进程启动能力裁决：只校验扩展自己负责的边界，不重建 pi 的工具选择结果。 */
+export function childCapabilityMatches(
   capability: SupervisorCapabilityManifest,
   expected: ExpectedChildCapability,
 ): boolean {
@@ -292,10 +291,6 @@ function childCapabilityMatches(
     ...expected.childReplyTools,
     ...expected.managementTools,
   ])) return false;
-  if (expected.template.tools !== undefined && !sameStringSet(
-    capability.business_active_tools,
-    expected.template.tools,
-  )) return false;
 
   const systemNames = new Set(capability.system_active_tools);
   const sourceNames = Object.keys(capability.system_tool_sources);

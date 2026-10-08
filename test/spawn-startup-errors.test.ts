@@ -19,6 +19,7 @@ import {
   type RpcSupervisorChannel,
   type RpcSupervisorChannelCloseState,
   type RpcSupervisorChannelFault,
+  type RpcSupervisorStartupResult,
 } from "../src/rpc-supervisor.ts";
 import {
   controlFailure,
@@ -26,9 +27,15 @@ import {
   TreeController,
 } from "../src/tree-controller.ts";
 import {
+  SUPERVISOR_PROTOCOL_VERSION,
   SupervisorRequestIdRegistry,
+  type SupervisorCapabilityManifest,
   type SupervisorReply,
 } from "../src/supervisor-channel.ts";
+import {
+  childCapabilityMatches,
+  type ExpectedChildCapability,
+} from "../src/agent-supervisor-factory.ts";
 import { RUNTIME_INTERNAL_ENV_KEYS } from "../src/root-runtime-context.ts";
 import {
   classifyPiStartupError,
@@ -41,6 +48,57 @@ const BRIDGE_CREDENTIAL = "startup-diagnostic-test-credential-0001";
 const SUPERVISOR_CREDENTIAL = "startup-supervisor-test-credential-0001";
 const AGENT_ID = "550e8400-e29b-41d4-a716-446655440000";
 const ROOT_ID = "startup-diagnostic-root";
+const CHILD_EXTENSION_PATH = "/opt/pi/extensions/wj-pi-subagents.ts";
+
+const EXPECTED_CHILD_CAPABILITY: ExpectedChildCapability = Object.freeze({
+  extensionPath: CHILD_EXTENSION_PATH,
+  childReplyTools: Object.freeze(["normal_reply", "final_report"]),
+  managementTools: Object.freeze([]),
+  expectedModel: undefined,
+  expectedThinking: undefined,
+});
+
+function reportedCapability(
+  overrides: Partial<SupervisorCapabilityManifest> = {},
+): SupervisorCapabilityManifest {
+  return Object.freeze({
+    protocol_version: SUPERVISOR_PROTOCOL_VERSION,
+    business_active_tools: [],
+    system_active_tools: ["normal_reply", "final_report"],
+    system_tool_sources: {
+      normal_reply: CHILD_EXTENSION_PATH,
+      final_report: CHILD_EXTENSION_PATH,
+    },
+    self_extension_path: CHILD_EXTENSION_PATH,
+    ...overrides,
+  });
+}
+
+async function startWithReportedCapability(
+  capability: SupervisorCapabilityManifest,
+  expected: ExpectedChildCapability = EXPECTED_CHILD_CAPABILITY,
+): Promise<RpcSupervisorStartupResult> {
+  const tree = new TreeController({
+    config: {
+      maxDepth: 2,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 8,
+      waitTimeoutMs: 10_000,
+    },
+    idFactory: () => AGENT_ID,
+  });
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "browser", name: "启动接受裁决" },
+    managedNode: new FakeManagedRpcNode(),
+    channel: new StartupTestChannel(undefined, capability),
+    validateCapability: (actual) => childCapabilityMatches(actual, expected),
+    startupTimeoutMs: 1_000,
+    gracefulShutdownMs: 50,
+  });
+  return supervisor.start();
+}
 
 class StartupFailureNode extends FakeManagedRpcNode {
   override async start(): Promise<void> {
@@ -71,13 +129,16 @@ class HangingStateNode extends FakeManagedRpcNode {
 
 class StartupTestChannel implements RpcSupervisorChannel {
   private readonly startupFault: RpcSupervisorChannelFault | undefined;
+  private readonly capability: SupervisorCapabilityManifest | undefined;
   private faultListener: ((fault: RpcSupervisorChannelFault) => void) | undefined;
 
-  constructor(startupFault?: RpcSupervisorChannelFault) {
+  constructor(startupFault?: RpcSupervisorChannelFault, capability?: SupervisorCapabilityManifest) {
     this.startupFault = startupFault;
+    this.capability = capability;
   }
 
   async bind(): Promise<void> {}
+  getCapability(): SupervisorCapabilityManifest | undefined { return this.capability; }
   async waitForReady(): Promise<void> { if (this.startupFault !== undefined) this.faultListener?.(this.startupFault); }
   isReady(): boolean { return true; }
   async publishReply(_reply: SupervisorReply): Promise<void> {}
@@ -380,6 +441,75 @@ test("启动阶段协议故障归为 protocol_mismatch，而不是通用 spawn_f
   const result = await supervisor.start();
   assert.equal(result.ok, false);
   if (!result.ok) assert.equal(result.code, "protocol_mismatch");
+});
+
+test("子进程上报的业务活动工具集与模板声明不同时不再拒绝启动", async () => {
+  // 回归场景：模板声明 tools: ["*"]，子端上报展开后的真实工具名；
+  // 此前的字面集合比较会因此拒绝启动，现在业务活动工具集不参与裁决。
+  const result = await startWithReportedCapability(reportedCapability({
+    business_active_tools: ["read", "grep", "mcp__demo__echo"],
+  }));
+
+  assert.deepEqual(result, {
+    ok: true,
+    agent_id: AGENT_ID,
+    state: "idle",
+  });
+});
+
+test("协议工具集不匹配时启动仍然拒绝", async () => {
+  const result = await startWithReportedCapability(reportedCapability({
+    system_active_tools: ["normal_reply"],
+  }));
+
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.code, "capability_mismatch");
+});
+
+test("系统工具来源路径与扩展身份不一致时启动仍然拒绝", async () => {
+  const result = await startWithReportedCapability(reportedCapability({
+    system_tool_sources: {
+      normal_reply: "/opt/pi/extensions/other.ts",
+      final_report: CHILD_EXTENSION_PATH,
+    },
+  }));
+
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.code, "capability_mismatch");
+});
+
+test("扩展路径身份不一致时启动仍然拒绝", async () => {
+  const result = await startWithReportedCapability(reportedCapability({
+    self_extension_path: "/opt/pi/extensions/other.ts",
+  }));
+
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.code, "capability_mismatch");
+});
+
+test("provider、model 与 thinking 不匹配时启动仍然拒绝", async () => {
+  const expected: ExpectedChildCapability = Object.freeze({
+    ...EXPECTED_CHILD_CAPABILITY,
+    expectedModel: "wj-provider/demo-model",
+    expectedThinking: "high",
+  });
+  const matching = await startWithReportedCapability(reportedCapability({
+    provider: "wj-provider",
+    model: "demo-model",
+    thinking: "high",
+  }), expected);
+  assert.equal(matching.ok, true);
+
+  const mismatches: readonly Partial<SupervisorCapabilityManifest>[] = [
+    { provider: "wj-provider", model: "other-model", thinking: "high" },
+    { provider: "wj-provider", model: "demo-model", thinking: "low" },
+    { model: "demo-model", thinking: "high" },
+  ];
+  for (const mismatch of mismatches) {
+    const result = await startWithReportedCapability(reportedCapability(mismatch), expected);
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, "capability_mismatch");
+  }
 });
 
 test("工具错误保留规范启动 details，忽略伪造消息和敏感附加字段", () => {
