@@ -56,9 +56,11 @@ export const CHILD_FINAL_REPORT_TOOL_NAME = "final_report" as const;
  * “所有权转移硬边界”“禁止处理已交接范围”条款逐字对齐，只唤醒不扩展。
  */
 export const SEND_MESSAGE_HANDOFF_NOTICE =
-  "若是对该子代理的任务下发，则任务范围已移交该子代理，应遵守“禁止处理已交接范围”要求，"
-  + "不得再对该范围进行任何直接处理，包括但不限于读取文件、搜索代码、执行命令、分析实现、修改内容、运行验证或自行补充调查；"
-  + "不得以“只读操作”“确认细节”“降低风险”或“尽快完成”为理由介入。";
+  "If this is a task assignment to the subagent, the task scope has been handed off to that subagent; "
+  + "it must comply with the \"do not process handed-off scope\" requirement, and must not perform any direct processing on that scope, "
+  + "including but not limited to reading files, searching code, executing commands, analyzing implementations, modifying content, "
+  + "running verification, or conducting its own supplementary investigation; "
+  + "it must not intervene on the grounds of \"read-only operations\", \"confirming details\", \"reducing risk\", or \"getting it done faster\".";
 
 /**
  * wait_agent 被父代理输入唤醒时附带的移交提示；只在该次结果 outcome 为
