@@ -419,6 +419,43 @@ test("排除字段拒绝 final_report 等协议工具字面名", () => {
   assert.equal(snapshot.invalidCandidates[0]?.field, "excludeTools");
 });
 
+test("排除字段拒绝 +name 与 -name 修饰符形态并定位到 excludeTools 字段", () => {
+  const snapshot = discoverUserTemplates(new Map([
+    ["plus.md", "---\ndescription: 加号修饰符\nexcludeTools: ['+read']\n---\n"],
+    ["minus.md", "---\ndescription: 减号修饰符\nexcludeTools: [-mcp_*]\n---\n"],
+    ["mixed.md", "---\ndescription: 修饰符与普通名混用\nexcludeTools: [read, '+future_business_tool']\n---\n"],
+    ["trimmed.md", "---\ndescription: 带空白修饰符\nexcludeTools: [' -read ']\n---\n"],
+  ]));
+
+  assert.deepEqual(snapshot.templates, []);
+  assert.deepEqual(diagnosticReasons(snapshot), {
+    "minus.md": "tool_modifier_unsupported",
+    "mixed.md": "tool_modifier_unsupported",
+    "plus.md": "tool_modifier_unsupported",
+    "trimmed.md": "tool_modifier_unsupported",
+  });
+  assert.equal(
+    snapshot.invalidCandidates.every((diagnostic) => diagnostic.field === "excludeTools"),
+    true,
+  );
+});
+
+test("排除字段保留名优先于修饰符形态诊断", () => {
+  const snapshot = discoverUserTemplates(new Map([
+    ["reserved-first.md", "---\ndescription: 保留名在前\nexcludeTools: [spawn_agent, '+read']\n---\n"],
+    ["modifier-first.md", "---\ndescription: 修饰符在前\nexcludeTools: ['+read', spawn_agent]\n---\n"],
+  ]));
+
+  assert.deepEqual(diagnosticReasons(snapshot), {
+    "modifier-first.md": "reserved_tool",
+    "reserved-first.md": "reserved_tool",
+  });
+  assert.equal(
+    snapshot.invalidCandidates.every((diagnostic) => diagnostic.field === "excludeTools"),
+    true,
+  );
+});
+
 test("排除字段拒绝会命中协议工具名的通配条目", () => {
   const snapshot = discoverUserTemplates(new Map([
     ["star.md", "---\ndescription: 全通配\nexcludeTools: ['*']\n---\n"],

@@ -451,6 +451,10 @@ function parseDeclaredToolNames(
     : { kind: "valid", values: Object.freeze(values) };
 }
 
+function hasSelectionModifier(values: readonly string[] | undefined): boolean {
+  return values?.some((value) => value.startsWith("+") || value.startsWith("-")) === true;
+}
+
 function stringScalarValue(field: ParsedFrontmatterField): string | undefined {
   return isScalar(field.value) && typeof field.value.value === "string"
     ? field.value.value
@@ -595,7 +599,7 @@ function parseCandidate(
     );
   }
   const tools = parsedTools.kind === "absent" ? undefined : parsedTools.values;
-  if (tools?.some((tool) => tool.startsWith("+") || tool.startsWith("-")) === true) {
+  if (hasSelectionModifier(tools)) {
     return invalidCandidate(
       source,
       fileName,
@@ -628,6 +632,14 @@ function parseCandidate(
   const excludeTools = parsedExcludeTools.kind === "valid" && parsedExcludeTools.values.length > 0
     ? parsedExcludeTools.values
     : undefined;
+  if (hasSelectionModifier(excludeTools)) {
+    return invalidCandidate(
+      source,
+      fileName,
+      "tool_modifier_unsupported",
+      fieldDiagnosticDetails("excludeTools", excludeToolsField),
+    );
+  }
 
   const extensionsField = frontmatter.fields.get("extensions");
   const parsedExtensions = parseStringArray(extensionsField);
@@ -880,7 +892,9 @@ function candidateReasonLabel(diagnostic: TemplateCandidateDiagnostic): string {
     case "exclude_tools_invalid":
       return "Invalid excludeTools configuration";
     case "tool_modifier_unsupported":
-      return "Template tools does not support + or - modifiers; their baseline comes from the host's default tool configuration, so the extension cannot guarantee the declaration matches actual capabilities";
+      return diagnostic.field === "excludeTools"
+        ? "Template excludeTools does not support + or - modifiers; the extension rejects them at load time instead of letting them silently do nothing or change meaning"
+        : "Template tools does not support + or - modifiers; their baseline comes from the host's default tool configuration, so the extension cannot guarantee the declaration matches actual capabilities";
     case "reserved_tool":
       return diagnostic.field === "excludeTools"
         ? "excludeTools contains an entry matching a reserved system tool"
