@@ -246,7 +246,8 @@ pi
 | 字段 | 必填 | 默认值 | 说明 |
 | --- | :-: | :-: | --- |
 | `description` | 是 | 无 | 模板的用途 |
-| `tools` | 否 | Pi 默认工具 | 子代理可用的业务工具 |
+| `tools` | 否 | Pi 默认工具 | 子代理可用的业务工具：纯工具名与 `*` 通配 |
+| `excludeTools` | 否 | 无 | 从子代理移除的业务工具；条目支持 `*` 通配，且优先于 `tools` |
 | `extensions` | 否 | Pi 默认扩展发现机制 | 子代理可用的额外扩展来源：本地路径、`npm:`、`git:`、URL 或 `builtin:<name>` |
 | `allowSubagents` | 否 | `true` | 子代理是否可以创建下一级子代理 |
 | `contextFiles` | 否 | `true` | 是否加载 `AGENTS.md`、`CLAUDE.md` 等上下文文件 |
@@ -256,12 +257,14 @@ pi
 
 模板使用严格的 YAML frontmatter，仅支持上表所列字段。正文即为子代理的角色提示词。
 
-省略 `tools` 或 `extensions` 与传入空数组并不等价：
+省略字段并不总是等价于传入空数组：
 
 | 写法 | 行为 |
 | --- | --- |
-| 省略 `tools` | 采用 Pi 正常的工具选择逻辑 |
-| `tools: []` | 无业务工具，仅保留运行子代理所必需的工具 |
+| 省略 `tools` | 采用 Pi 正常的工具选择逻辑；不改动宿主默认工具集 |
+| `tools: []` | 常规选择中无业务工具，仅保留运行子代理所必需的工具（在 pi 1.1.0 及更高版本上，未列出的 MCP 工具仍会注册 —— 如需移除请使用 `excludeTools`） |
+| 省略 `excludeTools` | 不排除任何工具 |
+| `excludeTools: []` | 与省略它等价 |
 | 省略 `extensions` | 采用 Pi 正常的扩展发现规则 |
 | `extensions: []` | 禁用正常扩展发现，仅加载本插件自身 |
 
@@ -297,6 +300,16 @@ thinking: high
 
 Confirm the existing implementation and constraints first, then make the changes. Keep the change scope focused and run relevant checks before reporting the result.
 ```
+
+### 工具声明与排除
+
+`tools` 采用白名单写法：接受纯工具名与 `*` 通配。`*` 可以出现在条目的任意位置，一个条目中也可以出现多个。`+name` / `-name` 修饰符不受支持 —— 使用修饰符的模板在加载期即被判为无效，诊断会指向该模板与 `tools` 字段。修饰符的基准集来自宿主的默认工具配置，模板无法控制。
+
+`*` 需要 pi 1.1.0 或更高版本。在旧版本上，pi 会把 `*` 当作字面工具名：它匹配不到任何工具，子代理会在没有任何业务工具的情况下启动。
+
+自 pi 1.1.0 起，`tools` 白名单不再排他：未列出的工具（尤其是 MCP 工具）仍会注册，并可经 codemode 一类间接路径调用。要移除不应可达的工具，请使用 `excludeTools`。它接受 YAML 字符串数组，条目遵循与 `tools` 相同的名字形状规则 —— 非空、无内部逗号或空白、无重复项、不接受保留系统工具名 —— 并且同样支持 `*` 通配。排除在工具注册阶段生效，因此被排除的工具即使经上述间接路径也不可达。当 `tools` 与 `excludeTools` 同时覆盖某个工具时，排除优先。
+
+本插件不校验子代理的实际活动工具集是否等于声明。拼错的工具名只会静默地少一个工具，不会阻止启动。
 
 ## ⚙️ 运行时配置
 

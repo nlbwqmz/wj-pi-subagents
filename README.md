@@ -246,7 +246,8 @@ The template directory only reads direct, lowercase `.md` files and does not sca
 | Field | Required | Default | Description |
 | --- | :-: | :-: | --- |
 | `description` | Yes | None | What the template is for |
-| `tools` | No | Pi's default tools | Business tools available to the subagent |
+| `tools` | No | Pi's default tools | Business tools available to the subagent: plain tool names and `*` wildcards |
+| `excludeTools` | No | None | Business tools removed from the subagent; entries accept `*` wildcards, and exclusion wins over `tools` |
 | `extensions` | No | Pi's default extension discovery | Additional extension sources for the subagent: local paths, `npm:`, `git:`, URLs, or `builtin:<name>` |
 | `allowSubagents` | No | `true` | Whether the subagent may create the next level of subagents |
 | `contextFiles` | No | `true` | Whether to load context files such as `AGENTS.md` and `CLAUDE.md` |
@@ -256,12 +257,14 @@ The template directory only reads direct, lowercase `.md` files and does not sca
 
 Templates use strict YAML frontmatter, and only the fields in the table above are supported. The body is the subagent's role prompt.
 
-Omitting `tools` or `extensions` is not the same as passing an empty array:
+Omitting a field is not always the same as passing an empty array:
 
 | Form | Behavior |
 | --- | --- |
-| Omit `tools` | Use Pi's normal tool selection |
-| `tools: []` | No business tools; only the tools required to run a subagent |
+| Omit `tools` | Use Pi's normal tool selection; the host's default tool set is left untouched |
+| `tools: []` | No business tools from Pi's normal selection; only the tools required to run a subagent (on Pi 1.1.0 and later, unlisted MCP tools still stay registered — use `excludeTools` to remove them) |
+| Omit `excludeTools` | Exclude nothing |
+| `excludeTools: []` | Same as omitting it |
 | Omit `extensions` | Use Pi's normal extension discovery rules |
 | `extensions: []` | Disable normal extension discovery; load only this plugin itself |
 
@@ -297,6 +300,16 @@ thinking: high
 
 Confirm the existing implementation and constraints first, then make the changes. Keep the change scope focused and run relevant checks before reporting the result.
 ```
+
+### Tool declaration and exclusion
+
+`tools` is a whitelist: it accepts plain tool names and `*` wildcards. A wildcard may appear anywhere in an entry, and an entry may contain several of them. `+name` and `-name` modifiers are not supported — a template that uses them is invalid at load time, with a diagnostic pointing at the template and the `tools` field. Modifier baselines come from the host's default tool configuration, which a template cannot control.
+
+`*` requires Pi 1.1.0 or later. On older versions Pi treats `*` as a literal tool name: it matches no tool, and the subagent starts with no business tools at all.
+
+Since Pi 1.1.0, a `tools` whitelist is no longer exclusive: tools it does not list — MCP tools in particular — stay registered and remain reachable through indirect paths such as codemode. Use `excludeTools` to remove what must not be reachable. It takes a YAML string array whose entries follow the same name-shape rules as `tools` — non-empty, no internal commas or whitespace, no duplicates, no reserved system tool names — and also accept `*` wildcards. Exclusion happens at tool registration, so excluded tools stay unreachable even through those indirect paths. When `tools` and `excludeTools` both cover a tool, exclusion wins.
+
+The extension does not verify that a subagent's active tool set equals the declaration. A misspelled tool name silently yields one fewer tool instead of failing the launch.
 
 ## ⚙️ Runtime Configuration
 
