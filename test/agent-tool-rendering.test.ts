@@ -876,6 +876,51 @@ test("渲染层仅显示完全规范的启动详情", () => {
   assert.doesNotMatch(rendered, /example\.test/);
 });
 
+test("模板清单展开渲染按 tools、排除项、extensions 顺序显示", () => {
+  const rendered = renderAgentToolResult(
+    "get_agent_templates",
+    {
+      content: [],
+      details: [
+        {
+          template_id: "demo",
+          description: "演示模板",
+          tools: ["read"],
+          exclude_tools: ["mcp_*", "future_business_tool"],
+          extensions: ["builtin:mcp"],
+        },
+      ],
+    },
+    { expanded: true },
+    theme,
+    {},
+  ).render(160).join("\n");
+
+  const lines = rendered.split("\n");
+  const toolsIndex = lines.findIndex((line) => line.startsWith("tools:"));
+  const excludeIndex = lines.findIndex((line) => line.startsWith("exclude_tools:"));
+  const extensionsIndex = lines.findIndex((line) => line.startsWith("extensions:"));
+  assert.equal(toolsIndex >= 0, true);
+  assert.equal(excludeIndex > toolsIndex, true);
+  assert.equal(extensionsIndex > excludeIndex, true);
+  assert.match(rendered, /exclude_tools: mcp_\*, future_business_tool/u);
+});
+
+test("模板清单排除项形态非法时渲染内部错误", () => {
+  const rendered = renderAgentToolResult(
+    "get_agent_templates",
+    {
+      content: [],
+      details: [{ template_id: "demo", description: "演示模板", exclude_tools: [1] }],
+    },
+    { expanded: true },
+    theme,
+    {},
+  ).render(160).join("\n");
+
+  assert.match(rendered, /internal_error/u);
+});
+
 test("状态和树渲染展示快照内的规范启动详情", () => {
   const node = {
     agent_id: "550e8400-e29b-41d4-a716-446655440000",

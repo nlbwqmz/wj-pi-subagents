@@ -47,6 +47,8 @@ export interface TemplateDefinition {
   readonly description: string;
   /** undefined 表示 frontmatter 未声明，[] 表示显式空工具集。 */
   readonly tools: readonly string[] | undefined;
+  /** undefined 表示 frontmatter 未声明；空数组与不写等价（都不产生排除参数）。 */
+  readonly excludeTools?: readonly string[];
   /** undefined 表示 frontmatter 未声明，[] 表示显式未加载扩展。 */
   readonly extensions: readonly TemplateExtension[] | undefined;
   readonly allowSubagents: boolean;
@@ -62,6 +64,7 @@ export interface AgentTemplateListItem {
   readonly template_id: string;
   readonly description: string;
   readonly tools?: readonly string[];
+  readonly exclude_tools?: readonly string[];
   readonly extensions?: readonly string[];
 }
 
@@ -77,6 +80,7 @@ export type TemplateCandidateDiagnosticReason =
   | "description_invalid"
   | "description_too_long"
   | "tools_invalid"
+  | "exclude_tools_invalid"
   | "tool_modifier_unsupported"
   | "reserved_tool"
   | "extensions_invalid"
@@ -178,6 +182,7 @@ const TEMPLATE_FRONTMATTER_FIELDS = new Set<string>([
   "description",
   "extensions",
   "tools",
+  "excludeTools",
   "allowSubagents",
   "contextFiles",
   "systemPromptMode",
@@ -226,6 +231,7 @@ function templateJsonView(template: TemplateDefinition): Record<string, unknown>
     source: template.source,
     description: template.description,
     ...(template.tools === undefined ? {} : { tools: [...template.tools] }),
+    ...(template.excludeTools === undefined ? {} : { excludeTools: [...template.excludeTools] }),
     ...(template.extensions === undefined
       ? {}
       : { extensions: template.extensions.map((extension) => extension.displaySource) }),
@@ -256,6 +262,9 @@ export function listAgentTemplates(
     template_id: template.templateId,
     description: template.description,
     ...(template.tools === undefined ? {} : { tools: Object.freeze([...template.tools]) }),
+    ...(template.excludeTools === undefined
+      ? {}
+      : { exclude_tools: Object.freeze([...template.excludeTools]) }),
     ...(template.extensions === undefined
       ? {}
       : { extensions: Object.freeze(template.extensions.map((extension) => extension.displaySource)) }),
@@ -396,6 +405,31 @@ function parseStringArray(field: ParsedFrontmatterField | undefined): StringArra
   return { kind: "valid", values: Object.freeze(values) };
 }
 
+type DeclaredToolNamesParseResult =
+  | { readonly kind: "absent" }
+  | { readonly kind: "invalid" }
+  | { readonly kind: "reserved" }
+  | { readonly kind: "valid"; readonly values: readonly string[] };
+
+/**
+ * 工具名与排除项共用的解析：名字形状要求非空、不重复、无内部逗号、无内部空白
+ * （内部逗号会被 pi 的逗号分隔参数语法拆成两个名字），并同样拒绝保留系统工具名，
+ * 避免子进程缺少协议工具。
+ */
+function parseDeclaredToolNames(
+  field: ParsedFrontmatterField | undefined,
+): DeclaredToolNamesParseResult {
+  const parsed = parseStringArray(field);
+  if (parsed.kind !== "valid") return parsed;
+  if (parsed.values.some((value) => /[,\s]/.test(value.displayValue))) {
+    return { kind: "invalid" };
+  }
+  const values = parsed.values.map((value) => value.displayValue);
+  return values.some((value) => RESERVED_SYSTEM_TOOL_NAMES.has(value))
+    ? { kind: "reserved" }
+    : { kind: "valid", values: Object.freeze(values) };
+}
+
 function stringScalarValue(field: ParsedFrontmatterField): string | undefined {
   return isScalar(field.value) && typeof field.value.value === "string"
     ? field.value.value
@@ -519,7 +553,7 @@ function parseCandidate(
   }
 
   const toolsField = frontmatter.fields.get("tools");
-  const parsedTools = parseStringArray(toolsField);
+  const parsedTools = parseDeclaredToolNames(toolsField);
   if (parsedTools.kind === "invalid") {
     return invalidCandidate(
       source,
@@ -528,10 +562,7 @@ function parseCandidate(
       fieldDiagnosticDetails("tools", toolsField),
     );
   }
-  const tools = parsedTools.kind === "absent"
-    ? undefined
-    : Object.freeze(parsedTools.values.map((tool) => tool.displayValue));
-  if (tools?.some((tool) => RESERVED_SYSTEM_TOOL_NAMES.has(tool)) === true) {
+  if (parsedTools.kind === "reserved") {
     return invalidCandidate(
       source,
       fileName,
@@ -539,6 +570,7 @@ function parseCandidate(
       fieldDiagnosticDetails("tools", toolsField),
     );
   }
+  const tools = parsedTools.kind === "absent" ? undefined : parsedTools.values;
   if (tools?.some((tool) => tool.startsWith("+") || tool.startsWith("-")) === true) {
     return invalidCandidate(
       source,
@@ -547,6 +579,28 @@ function parseCandidate(
       fieldDiagnosticDetails("tools", toolsField),
     );
   }
+
+  const excludeToolsField = frontmatter.fields.get("excludeTools");
+  const parsedExcludeTools = parseDeclaredToolNames(excludeToolsField);
+  if (parsedExcludeTools.kind === "invalid") {
+    return invalidCandidate(
+      source,
+      fileName,
+      "exclude_tools_invalid",
+      fieldDiagnosticDetails("excludeTools", excludeToolsField),
+    );
+  }
+  if (parsedExcludeTools.kind === "reserved") {
+    return invalidCandidate(
+      source,
+      fileName,
+      "reserved_tool",
+      fieldDiagnosticDetails("excludeTools", excludeToolsField),
+    );
+  }
+  const excludeTools = parsedExcludeTools.kind === "valid" && parsedExcludeTools.values.length > 0
+    ? parsedExcludeTools.values
+    : undefined;
 
   const extensionsField = frontmatter.fields.get("extensions");
   const parsedExtensions = parseStringArray(extensionsField);
@@ -650,6 +704,7 @@ function parseCandidate(
       templateDirectory: directory,
       description,
       tools,
+      ...(excludeTools === undefined ? {} : { excludeTools }),
       extensions,
       allowSubagents,
       contextFiles,
@@ -771,8 +826,8 @@ export function discoverTemplateSnapshot(
   });
 }
 
-function candidateReasonLabel(reason: TemplateCandidateDiagnosticReason): string {
-  switch (reason) {
+function candidateReasonLabel(diagnostic: TemplateCandidateDiagnostic): string {
+  switch (diagnostic.reason) {
     case "file_unreadable":
       return "File is unreadable";
     case "invalid_utf8":
@@ -795,10 +850,14 @@ function candidateReasonLabel(reason: TemplateCandidateDiagnosticReason): string
       return "Description exceeds 512 Unicode code points";
     case "tools_invalid":
       return "Invalid tools configuration";
+    case "exclude_tools_invalid":
+      return "Invalid excludeTools configuration";
     case "tool_modifier_unsupported":
       return "Template tools does not support + or - modifiers; their baseline comes from the host's default tool configuration, so the extension cannot guarantee the declaration matches actual capabilities";
     case "reserved_tool":
-      return "Tools contains a reserved system tool";
+      return diagnostic.field === "excludeTools"
+        ? "excludeTools contains a reserved system tool"
+        : "Tools contains a reserved system tool";
     case "extensions_invalid":
       return "Invalid extensions configuration";
     case "allow_subagents_invalid":
@@ -820,7 +879,7 @@ function candidateReasonLabel(reason: TemplateCandidateDiagnosticReason): string
 export function formatTemplateDiscoveryDiagnostics(snapshot: TemplateDiscoverySnapshot): string {
   const parts = [
     ...snapshot.invalidCandidates.map((diagnostic) => (
-      `${diagnostic.source}:${diagnostic.fileName}: ${candidateReasonLabel(diagnostic.reason)}`
+      `${diagnostic.source}:${diagnostic.fileName}: ${candidateReasonLabel(diagnostic)}`
     )),
     ...snapshot.sourceDiagnostics.map((diagnostic) => (
       `${diagnostic.source} template directory: cannot be listed`

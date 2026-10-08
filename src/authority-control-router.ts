@@ -394,6 +394,9 @@ function templateListToJson(value: readonly AgentTemplateListItem[]): Supervisor
     template_id: item.template_id,
     description: item.description,
     ...(item.tools === undefined ? {} : { tools: Object.freeze([...item.tools]) }),
+    ...(item.exclude_tools === undefined
+      ? {}
+      : { exclude_tools: Object.freeze([...item.exclude_tools]) }),
     ...(item.extensions === undefined ? {} : { extensions: Object.freeze([...item.extensions]) }),
   })));
 }
@@ -412,6 +415,9 @@ function templateToJson(value: TemplateDefinition): SupervisorJsonValue {
     template_directory: value.templateDirectory,
     description: value.description,
     ...(value.tools === undefined ? {} : { tools: Object.freeze([...value.tools]) }),
+    ...(value.excludeTools === undefined
+      ? {}
+      : { exclude_tools: Object.freeze([...value.excludeTools]) }),
     ...(value.extensions === undefined ? {} : {
       extensions: Object.freeze(value.extensions.map((extension) => Object.freeze({
         source: extension.source,
@@ -485,20 +491,23 @@ function parseTemplateList(value: SupervisorJsonValue): readonly AgentTemplateLi
   for (const item of value) {
     if (typeof item !== "object" || item === null || Array.isArray(item)) return undefined;
     const record = item as Record<string, unknown>;
-    const allowed = ["template_id", "description", "tools", "extensions"];
+    const allowed = ["template_id", "description", "tools", "exclude_tools", "extensions"];
     const tools = parseOptionalStringList(record.tools);
+    const excludeTools = parseOptionalStringList(record.exclude_tools);
     const extensions = parseOptionalStringList(record.extensions);
     if (
       Object.keys(record).some((key) => !allowed.includes(key))
       || typeof record.template_id !== "string"
       || typeof record.description !== "string"
       || (record.tools !== undefined && tools === undefined)
+      || (record.exclude_tools !== undefined && excludeTools === undefined)
       || (record.extensions !== undefined && extensions === undefined)
     ) return undefined;
     templates.push(Object.freeze({
       template_id: record.template_id,
       description: record.description,
       ...(tools === undefined ? {} : { tools }),
+      ...(excludeTools === undefined ? {} : { exclude_tools: excludeTools }),
       ...(extensions === undefined ? {} : { extensions }),
     }));
   }
@@ -509,10 +518,11 @@ function parseTemplate(value: unknown): TemplateDefinition | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
   const allowed = [
-    "template_id", "source", "template_directory", "description", "tools", "extensions",
-    "allow_subagents", "context_files", "system_mode", "model", "thinking", "body",
+    "template_id", "source", "template_directory", "description", "tools", "exclude_tools",
+    "extensions", "allow_subagents", "context_files", "system_mode", "model", "thinking", "body",
   ];
   const tools = parseOptionalStringList(record.tools);
+  const excludeTools = parseOptionalStringList(record.exclude_tools);
   const extensions = parseOptionalTemplateExtensions(record.extensions);
   if (
     Object.keys(record).some((key) => !allowed.includes(key))
@@ -521,6 +531,7 @@ function parseTemplate(value: unknown): TemplateDefinition | undefined {
     || typeof record.template_directory !== "string"
     || typeof record.description !== "string"
     || (record.tools !== undefined && tools === undefined)
+    || (record.exclude_tools !== undefined && excludeTools === undefined)
     || (record.extensions !== undefined && extensions === undefined)
     || typeof record.allow_subagents !== "boolean"
     || typeof record.context_files !== "boolean"
@@ -539,6 +550,7 @@ function parseTemplate(value: unknown): TemplateDefinition | undefined {
     templateDirectory: record.template_directory,
     description: record.description,
     tools,
+    ...(excludeTools === undefined ? {} : { excludeTools }),
     extensions,
     allowSubagents: record.allow_subagents,
     contextFiles: record.context_files,

@@ -5,6 +5,7 @@ import test from "node:test";
 import { PI_AGENT_DIR_ENV_KEY } from "../src/pi-agent-dir.ts";
 import {
   discoverTemplateSnapshot,
+  formatTemplateDiscoveryDiagnostics,
   listAgentTemplates,
   MAX_TEMPLATE_BODY_BYTES,
   TemplateSnapshotController,
@@ -302,6 +303,101 @@ test("tools 接受 * 出现在任意位置或多次出现的通配条目", () =>
     ],
   );
   assert.deepEqual(snapshot.invalidCandidates, []);
+});
+
+test("排除字段接受 YAML 字符串数组并保留条目顺序", () => {
+  const snapshot = discoverUserTemplates(new Map([
+    ["researcher.md", [
+      "---",
+      "description: 排除工具",
+      "excludeTools:",
+      "  - mcp_*",
+      "  - future_business_tool",
+      "---",
+      "",
+    ].join("\n")],
+  ]));
+
+  assert.deepEqual(snapshot.templates[0]?.excludeTools, ["mcp_*", "future_business_tool"]);
+  assert.deepEqual(listAgentTemplates(snapshot), [{
+    template_id: "researcher",
+    description: "排除工具",
+    exclude_tools: ["mcp_*", "future_business_tool"],
+  }]);
+});
+
+test("排除字段为空数组时与不写该字段等价", () => {
+  const snapshot = discoverUserTemplates(new Map([
+    ["empty.md", "---\ndescription: 空排除\nexcludeTools: []\n---\n"],
+    ["omitted.md", "---\ndescription: 缺省排除\n---\n"],
+  ]));
+
+  assert.deepEqual(snapshot.templates.map((template) => template.templateId), ["empty", "omitted"]);
+  assert.equal(snapshot.templates[0]?.excludeTools, undefined);
+  assert.equal(snapshot.templates[1]?.excludeTools, undefined);
+  assert.equal(Object.hasOwn(snapshot.templates[0] ?? {}, "excludeTools"), false);
+  assert.deepEqual(listAgentTemplates(snapshot), [
+    { template_id: "empty", description: "空排除" },
+    { template_id: "omitted", description: "缺省排除" },
+  ]);
+});
+
+test("排除字段与 tools 共用名字形状规则并拒绝非法条目", () => {
+  const snapshot = discoverUserTemplates(new Map([
+    ["comma.md", "---\ndescription: 逗号\nexcludeTools: ['a,b']\n---\n"],
+    ["whitespace.md", "---\ndescription: 内部空白\nexcludeTools: ['a b']\n---\n"],
+    ["empty.md", "---\ndescription: 空串\nexcludeTools: ['  ']\n---\n"],
+    ["duplicate.md", "---\ndescription: 重复\nexcludeTools: [a, ' a ']\n---\n"],
+    ["scalar.md", "---\ndescription: 标量\nexcludeTools: a\n---\n"],
+    ["value.md", "---\ndescription: 非字符串\nexcludeTools: [1]\n---\n"],
+    ["tools-comma.md", "---\ndescription: 工具名逗号\ntools: ['a,b']\n---\n"],
+    ["tools-whitespace.md", "---\ndescription: 工具名空白\ntools: ['a b']\n---\n"],
+  ]));
+
+  assert.deepEqual(snapshot.templates, []);
+  assert.deepEqual(diagnosticReasons(snapshot), {
+    "comma.md": "exclude_tools_invalid",
+    "duplicate.md": "exclude_tools_invalid",
+    "empty.md": "exclude_tools_invalid",
+    "scalar.md": "exclude_tools_invalid",
+    "tools-comma.md": "tools_invalid",
+    "tools-whitespace.md": "tools_invalid",
+    "value.md": "exclude_tools_invalid",
+    "whitespace.md": "exclude_tools_invalid",
+  });
+  assert.equal(
+    snapshot.invalidCandidates
+      .filter((diagnostic) => diagnostic.fileName.startsWith("tools-"))
+      .every((diagnostic) => diagnostic.field === "tools"),
+    true,
+  );
+  assert.equal(
+    snapshot.invalidCandidates
+      .filter((diagnostic) => !diagnostic.fileName.startsWith("tools-"))
+      .every((diagnostic) => diagnostic.field === "excludeTools"),
+    true,
+  );
+});
+
+test("排除字段拒绝保留系统工具名并定位到 excludeTools 字段", () => {
+  const snapshot = discoverUserTemplates(new Map([
+    ["reserved.md", "---\ndescription: 保留工具\nexcludeTools: [spawn_agent, mcp_*]\n---\n"],
+  ]));
+
+  assert.deepEqual(snapshot.templates, []);
+  assert.deepEqual(diagnosticReasons(snapshot), { "reserved.md": "reserved_tool" });
+  assert.equal(snapshot.invalidCandidates[0]?.field, "excludeTools");
+});
+
+test("排除字段保留名诊断文案指向 excludeTools 字段", () => {
+  const snapshot = discoverUserTemplates(new Map([
+    ["exclude-reserved.md", "---\ndescription: 排除保留\nexcludeTools: [spawn_agent]\n---\n"],
+    ["tools-reserved.md", "---\ndescription: 工具保留\ntools: [spawn_agent]\n---\n"],
+  ]));
+
+  const message = formatTemplateDiscoveryDiagnostics(snapshot);
+  assert.match(message, /exclude-reserved\.md: excludeTools contains a reserved system tool/u);
+  assert.match(message, /tools-reserved\.md: Tools contains a reserved system tool/u);
 });
 
 test("description 必填，按 trim 后 Unicode code point 数校验", () => {

@@ -449,6 +449,12 @@ function renderTemplateResult(
         : `tools: ${template.tools.length === 0 ? "None" : template.tools.join(", ")}`,
       color: "dim",
     });
+    if (template.excludeTools !== undefined) {
+      lines.push({
+        text: `exclude_tools: ${template.excludeTools.length === 0 ? "None" : template.excludeTools.join(", ")}`,
+        color: "dim",
+      });
+    }
     if (template.extensions !== undefined) {
       lines.push({
         text: `extensions: ${template.extensions.length === 0 ? "None" : template.extensions.join(", ")}`,
@@ -829,10 +835,15 @@ function formatTokens(count: number): string {
   return `${Math.round(count / 1_000_000)}M`;
 }
 
+function isStringArray(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
 function readTemplates(value: unknown): readonly {
   readonly templateId: string;
   readonly description: string;
   readonly tools?: readonly string[];
+  readonly excludeTools?: readonly string[];
   readonly extensions?: readonly string[];
 }[] | undefined {
   if (!Array.isArray(value)) return undefined;
@@ -840,6 +851,7 @@ function readTemplates(value: unknown): readonly {
     readonly templateId: string;
     readonly description: string;
     readonly tools?: readonly string[];
+    readonly excludeTools?: readonly string[];
     readonly extensions?: readonly string[];
   }> = [];
   for (const item of value) {
@@ -847,19 +859,21 @@ function readTemplates(value: unknown): readonly {
     const templateId = readOptionalString(record, "template_id");
     const description = readOptionalString(record, "description");
     const tools = readProperty(record, "tools");
+    const excludeTools = readProperty(record, "exclude_tools");
     const extensions = readProperty(record, "extensions");
     if (
       templateId === undefined
       || description === undefined
-      || (tools !== undefined && (!Array.isArray(tools) || !tools.every((tool) => typeof tool === "string")))
-      || (extensions !== undefined
-        && (!Array.isArray(extensions) || !extensions.every((extension) => typeof extension === "string")))
+      || (tools !== undefined && !isStringArray(tools))
+      || (excludeTools !== undefined && !isStringArray(excludeTools))
+      || (extensions !== undefined && !isStringArray(extensions))
     ) return undefined;
     templates.push({
       templateId,
       description,
-      ...(tools === undefined ? {} : { tools: tools as readonly string[] }),
-      ...(extensions === undefined ? {} : { extensions: extensions as readonly string[] }),
+      ...(tools === undefined ? {} : { tools }),
+      ...(excludeTools === undefined ? {} : { excludeTools }),
+      ...(extensions === undefined ? {} : { extensions }),
     });
   }
   return templates;

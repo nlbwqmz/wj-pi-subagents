@@ -79,3 +79,41 @@ test("npm:、git:、URL 与 git@ 扩展来源原样传递", () => {
     ...sources.flatMap((source) => ["-e", source]),
   ]);
 });
+
+test("排除字段按声明顺序作为排除参数传给子 Pi", () => {
+  const options = buildManagedRpcOptions(createTemplate({
+    excludeTools: ["mcp_*", "future_business_tool"],
+  }));
+
+  assert.deepEqual(options.args, [
+    "--no-session",
+    "--exclude-tools",
+    "mcp_*,future_business_tool",
+  ]);
+});
+
+test("排除字段缺省或为空数组时不产生排除参数，tools 缺省仍不产生白名单参数", () => {
+  assert.deepEqual(buildManagedRpcOptions(createTemplate()).args, ["--no-session"]);
+  assert.deepEqual(
+    buildManagedRpcOptions(createTemplate({ excludeTools: [] })).args,
+    ["--no-session"],
+  );
+});
+
+test("白名单与排除参数同时出现时各自保留声明顺序", () => {
+  const options = buildManagedRpcOptions(createTemplate({
+    tools: ["read", "grep"],
+    excludeTools: ["mcp_*"],
+  }), {
+    childReplyTools: ["normal_reply"],
+    managementTools: ["spawn_agent"],
+  });
+
+  assert.deepEqual(options.args, [
+    "--no-session",
+    "--tools",
+    "read,grep,normal_reply,spawn_agent",
+    "--exclude-tools",
+    "mcp_*",
+  ]);
+});

@@ -259,6 +259,10 @@ export function buildManagedRpcOptions(
     ])];
     args.push("--tools", tools.join(","));
   }
+  // 空数组与未声明等价；排除参数在最低支持的 pi 版本上已存在，无需版本分支。
+  if (template.excludeTools !== undefined && template.excludeTools.length > 0) {
+    args.push("--exclude-tools", template.excludeTools.join(","));
+  }
   const selectedModel = template.model ?? resolveCurrent(options.currentModel);
   const [provider, model] = splitModel(selectedModel);
   return Object.freeze({

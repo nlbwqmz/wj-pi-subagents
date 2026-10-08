@@ -254,6 +254,9 @@ function cloneTemplate(template: TemplateDefinition): TemplateDefinition {
     templateDirectory: template.templateDirectory,
     description: template.description,
     tools: template.tools === undefined ? undefined : Object.freeze([...template.tools]),
+    ...(template.excludeTools === undefined
+      ? {}
+      : { excludeTools: Object.freeze([...template.excludeTools]) }),
     extensions: template.extensions === undefined
       ? undefined
       : Object.freeze(template.extensions.map((extension) => Object.freeze({
