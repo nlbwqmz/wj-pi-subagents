@@ -4,10 +4,16 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 import { PI_AGENT_DIR_ENV_KEY } from "../src/pi-agent-dir.ts";
 import {
+  AGENT_TOOL_NAMES,
+  CHILD_FINAL_REPORT_TOOL_NAME,
+  CHILD_REPLY_TOOL_NAME,
+} from "../src/agent-tools.ts";
+import {
   discoverTemplateSnapshot,
   formatTemplateDiscoveryDiagnostics,
   listAgentTemplates,
   MAX_TEMPLATE_BODY_BYTES,
+  RESERVED_SYSTEM_TOOL_NAMES,
   TemplateSnapshotController,
   type TemplateDirectoryEntry,
   type TemplateDiscoveryFileSystem,
@@ -184,7 +190,20 @@ test("可选 tools 和 extensions 保留 undefined，显式空数组保留在模
   ]);
 });
 
-test("未注册业务工具可用，九个系统保留工具均被拒绝", () => {
+test("保留系统工具名集合覆盖全部协议工具名", () => {
+  const protocolToolNames = [
+    ...AGENT_TOOL_NAMES,
+    CHILD_REPLY_TOOL_NAME,
+    CHILD_FINAL_REPORT_TOOL_NAME,
+  ];
+
+  assert.deepEqual(
+    protocolToolNames.filter((name) => !RESERVED_SYSTEM_TOOL_NAMES.has(name)),
+    [],
+  );
+});
+
+test("未注册业务工具可用，十个系统保留工具均被拒绝", () => {
   const reservedTools = [
     "get_agent_templates",
     "spawn_agent",
@@ -195,6 +214,7 @@ test("未注册业务工具可用，九个系统保留工具均被拒绝", () =>
     "get_agent_status",
     "get_agent_tree",
     "normal_reply",
+    "final_report",
   ];
   const snapshot = discoverUserTemplates(new Map([
     ["business.md", "---\ndescription: 业务工具\ntools: [future_business_tool]\n---\n"],
@@ -389,6 +409,50 @@ test("排除字段拒绝保留系统工具名并定位到 excludeTools 字段", 
   assert.equal(snapshot.invalidCandidates[0]?.field, "excludeTools");
 });
 
+test("排除字段拒绝 final_report 等协议工具字面名", () => {
+  const snapshot = discoverUserTemplates(new Map([
+    ["final-report.md", "---\ndescription: 最终报告\nexcludeTools: [final_report]\n---\n"],
+  ]));
+
+  assert.deepEqual(snapshot.templates, []);
+  assert.deepEqual(diagnosticReasons(snapshot), { "final-report.md": "reserved_tool" });
+  assert.equal(snapshot.invalidCandidates[0]?.field, "excludeTools");
+});
+
+test("排除字段拒绝会命中协议工具名的通配条目", () => {
+  const snapshot = discoverUserTemplates(new Map([
+    ["star.md", "---\ndescription: 全通配\nexcludeTools: ['*']\n---\n"],
+    ["report.md", "---\ndescription: 报告通配\nexcludeTools: ['*report*']\n---\n"],
+    ["normal.md", "---\ndescription: 回复通配\nexcludeTools: ['normal_*']\n---\n"],
+    ["prefix.md", "---\ndescription: 前缀通配\nexcludeTools: ['spawn*']\n---\n"],
+  ]));
+
+  assert.deepEqual(snapshot.templates, []);
+  assert.deepEqual(diagnosticReasons(snapshot), {
+    "normal.md": "reserved_tool",
+    "prefix.md": "reserved_tool",
+    "report.md": "reserved_tool",
+    "star.md": "reserved_tool",
+  });
+  assert.equal(
+    snapshot.invalidCandidates.every((diagnostic) => diagnostic.field === "excludeTools"),
+    true,
+  );
+});
+
+test("排除字段接受不会命中协议工具名的通配与普通条目", () => {
+  const snapshot = discoverUserTemplates(new Map([
+    ["safe.md", "---\ndescription: 安全排除\nexcludeTools: [mcp_*, read, 'future_*']\n---\n"],
+    ["literal.md", "---\ndescription: 字面点号\nexcludeTools: ['normal.reply']\n---\n"],
+  ]));
+
+  assert.deepEqual(snapshot.templates.map((template) => [template.templateId, template.excludeTools]), [
+    ["literal", ["normal.reply"]],
+    ["safe", ["mcp_*", "read", "future_*"]],
+  ]);
+  assert.deepEqual(snapshot.invalidCandidates, []);
+});
+
 test("排除字段保留名诊断文案指向 excludeTools 字段", () => {
   const snapshot = discoverUserTemplates(new Map([
     ["exclude-reserved.md", "---\ndescription: 排除保留\nexcludeTools: [spawn_agent]\n---\n"],
@@ -396,7 +460,7 @@ test("排除字段保留名诊断文案指向 excludeTools 字段", () => {
   ]));
 
   const message = formatTemplateDiscoveryDiagnostics(snapshot);
-  assert.match(message, /exclude-reserved\.md: excludeTools contains a reserved system tool/u);
+  assert.match(message, /exclude-reserved\.md: excludeTools contains an entry matching a reserved system tool/u);
   assert.match(message, /tools-reserved\.md: Tools contains a reserved system tool/u);
 });
 

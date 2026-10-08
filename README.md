@@ -247,7 +247,7 @@ The template directory only reads direct, lowercase `.md` files and does not sca
 | --- | :-: | :-: | --- |
 | `description` | Yes | None | What the template is for |
 | `tools` | No | Pi's default tools | Business tools available to the subagent: plain tool names and `*` wildcards |
-| `excludeTools` | No | None | Business tools removed from the subagent; entries accept `*` wildcards, and exclusion wins over `tools` |
+| `excludeTools` | No | None | Business tools removed from the subagent; entries accept `*` wildcards, must not match protocol tools, and exclusion wins over `tools` |
 | `extensions` | No | Pi's default extension discovery | Additional extension sources for the subagent: local paths, `npm:`, `git:`, URLs, or `builtin:<name>` |
 | `allowSubagents` | No | `true` | Whether the subagent may create the next level of subagents |
 | `contextFiles` | No | `true` | Whether to load context files such as `AGENTS.md` and `CLAUDE.md` |
@@ -307,7 +307,9 @@ Confirm the existing implementation and constraints first, then make the changes
 
 `*` requires Pi 1.1.0 or later. On older versions Pi treats `*` as a literal tool name: it matches no tool, and the subagent starts with no business tools at all.
 
-Since Pi 1.1.0, a `tools` whitelist is no longer exclusive: tools it does not list — MCP tools in particular — stay registered and remain reachable through indirect paths such as codemode. Use `excludeTools` to remove what must not be reachable. It takes a YAML string array whose entries follow the same name-shape rules as `tools` — non-empty, no internal commas or whitespace, no duplicates, no reserved system tool names — and also accept `*` wildcards. Exclusion happens at tool registration, so excluded tools stay unreachable even through those indirect paths. When `tools` and `excludeTools` both cover a tool, exclusion wins.
+Since Pi 1.1.0, a `tools` whitelist is no longer exclusive: tools it does not list — MCP tools in particular — stay registered and remain reachable through indirect paths such as codemode. Use `excludeTools` to remove what must not be reachable. It takes a YAML string array whose entries follow the same name-shape rules as `tools` — non-empty, no internal commas or whitespace, no duplicates — and also accept `*` wildcards. Exclusion happens at tool registration, so excluded tools stay unreachable even through those indirect paths. When `tools` and `excludeTools` both cover a tool, exclusion wins.
+
+Exclusions must not hit the subagent's protocol tools — the eight management tools plus `normal_reply` and `final_report` — because every protocol tool must stay available. A literal protocol tool name and any `*` pattern that can match one (for example `*`, `*report*`, or `normal_*`) make the template invalid at load time, with a diagnostic pointing at the template and the `excludeTools` field. Patterns that cannot match a protocol tool (for example `mcp_*` or `read`) stay valid. For the same reason, `tools` rejects the literal names of protocol tools; a `tools` wildcard may still cover them, since a whitelist cannot remove tools.
 
 The extension does not verify that a subagent's active tool set equals the declaration. A misspelled tool name silently yields one fewer tool instead of failing the launch.
 

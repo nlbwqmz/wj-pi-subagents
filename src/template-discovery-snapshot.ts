@@ -190,7 +190,7 @@ const TEMPLATE_FRONTMATTER_FIELDS = new Set<string>([
   "thinking",
 ]);
 
-const RESERVED_SYSTEM_TOOL_NAMES = new Set<string>([
+export const RESERVED_SYSTEM_TOOL_NAMES: ReadonlySet<string> = new Set<string>([
   "get_agent_templates",
   "spawn_agent",
   "send_message",
@@ -200,7 +200,27 @@ const RESERVED_SYSTEM_TOOL_NAMES = new Set<string>([
   "get_agent_status",
   "get_agent_tree",
   "normal_reply",
+  "final_report",
 ]);
+
+const REGEXP_METACHARACTERS = /[.*+?^${}()|[\]\\]/g;
+
+/**
+ * 排除项不得命中协议工具名：协议工具必须全部保留，否则子进程启动时以能力不匹配失败。
+ * 命中判断只对保留名集合做保守匹配（`*` 为任意序列、其余字符字面、全名匹配），
+ * 不重建 pi 的完整选择语义。
+ */
+function matchesReservedSystemToolName(pattern: string): boolean {
+  const source = pattern
+    .split("*")
+    .map((segment) => segment.replace(REGEXP_METACHARACTERS, "\\$&"))
+    .join(".*");
+  const matcher = new RegExp(`^${source}$`, "u");
+  for (const name of RESERVED_SYSTEM_TOOL_NAMES) {
+    if (matcher.test(name)) return true;
+  }
+  return false;
+}
 
 const nativeFileSystem: TemplateDiscoveryFileSystem = {
   readDirectory(path): readonly TemplateDirectoryEntry[] {
@@ -413,11 +433,12 @@ type DeclaredToolNamesParseResult =
 
 /**
  * 工具名与排除项共用的解析：名字形状要求非空、不重复、无内部逗号、无内部空白
- * （内部逗号会被 pi 的逗号分隔参数语法拆成两个名字），并同样拒绝保留系统工具名，
- * 避免子进程缺少协议工具。
+ * （内部逗号会被 pi 的逗号分隔参数语法拆成两个名字），并通过调用方给出的
+ * 保留名判断拒绝会命中协议工具的条目，避免子进程缺少协议工具。
  */
 function parseDeclaredToolNames(
   field: ParsedFrontmatterField | undefined,
+  matchesReserved: (value: string) => boolean,
 ): DeclaredToolNamesParseResult {
   const parsed = parseStringArray(field);
   if (parsed.kind !== "valid") return parsed;
@@ -425,7 +446,7 @@ function parseDeclaredToolNames(
     return { kind: "invalid" };
   }
   const values = parsed.values.map((value) => value.displayValue);
-  return values.some((value) => RESERVED_SYSTEM_TOOL_NAMES.has(value))
+  return values.some(matchesReserved)
     ? { kind: "reserved" }
     : { kind: "valid", values: Object.freeze(values) };
 }
@@ -553,7 +574,10 @@ function parseCandidate(
   }
 
   const toolsField = frontmatter.fields.get("tools");
-  const parsedTools = parseDeclaredToolNames(toolsField);
+  const parsedTools = parseDeclaredToolNames(
+    toolsField,
+    (value) => RESERVED_SYSTEM_TOOL_NAMES.has(value),
+  );
   if (parsedTools.kind === "invalid") {
     return invalidCandidate(
       source,
@@ -581,7 +605,10 @@ function parseCandidate(
   }
 
   const excludeToolsField = frontmatter.fields.get("excludeTools");
-  const parsedExcludeTools = parseDeclaredToolNames(excludeToolsField);
+  const parsedExcludeTools = parseDeclaredToolNames(
+    excludeToolsField,
+    matchesReservedSystemToolName,
+  );
   if (parsedExcludeTools.kind === "invalid") {
     return invalidCandidate(
       source,
@@ -856,7 +883,7 @@ function candidateReasonLabel(diagnostic: TemplateCandidateDiagnostic): string {
       return "Template tools does not support + or - modifiers; their baseline comes from the host's default tool configuration, so the extension cannot guarantee the declaration matches actual capabilities";
     case "reserved_tool":
       return diagnostic.field === "excludeTools"
-        ? "excludeTools contains a reserved system tool"
+        ? "excludeTools contains an entry matching a reserved system tool"
         : "Tools contains a reserved system tool";
     case "extensions_invalid":
       return "Invalid extensions configuration";
