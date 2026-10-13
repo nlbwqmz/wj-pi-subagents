@@ -57,7 +57,10 @@ test("package manifest、lock 和 CI 固定 Pi 1.2.0 clean-break 基线", () => 
   const workflow = parseYaml(readFileSync(join(repositoryRoot, ".github", "workflows", "ci.yml"), "utf8")) as {
     on?: { schedule?: readonly { readonly cron?: unknown }[] };
     jobs?: {
-      test?: { steps?: readonly { readonly name?: unknown; readonly run?: unknown }[] };
+      test?: {
+        if?: unknown;
+        steps?: readonly { readonly name?: unknown; readonly run?: unknown }[];
+      };
       latest?: {
         if?: unknown;
         "continue-on-error"?: unknown;
@@ -75,6 +78,7 @@ test("package manifest、lock 和 CI 固定 Pi 1.2.0 clean-break 基线", () => 
     workflow.on?.schedule?.some((entry) => typeof entry.cron === "string"),
     "CI 需要 schedule 触发 latest 兼容任务",
   );
+  assert.equal(workflow.jobs?.test?.if, "github.event_name != 'schedule'");
   assert.equal(workflow.jobs?.latest?.if, "github.event_name == 'schedule'");
   assert.equal(workflow.jobs?.latest?.["continue-on-error"], true);
   const installLatest = workflow.jobs?.latest?.steps?.find(
