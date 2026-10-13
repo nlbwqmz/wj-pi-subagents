@@ -880,7 +880,8 @@ test("耗时格式覆盖秒、分钟与小时三个分支", () => {
   assert.equal(lineFor(59_940), `${agentId} · depth 1 · 59.9s`);
   assert.equal(lineFor(60_000), `${agentId} · depth 1 · 1m 0s`);
   assert.equal(lineFor(195_000), `${agentId} · depth 1 · 3m 15s`);
-  assert.equal(lineFor(3_930_000), `${agentId} · depth 1 · 1h 05m 30s`);
+  assert.equal(lineFor(3_600_000), `${agentId} · depth 1 · 1h 0m 0s`);
+  assert.equal(lineFor(3_930_000), `${agentId} · depth 1 · 1h 5m 30s`);
 });
 
 test("10 个工具的成功与失败结果末行都追加 dim 耗时段", () => {

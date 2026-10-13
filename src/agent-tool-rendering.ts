@@ -370,10 +370,7 @@ function readDurationMs(context: AgentToolRenderContext): number | undefined {
     : undefined;
 }
 
-/**
- * 与 pi 1.2.0 formatToolDuration 相同的三个分支；小时分支按验收样例补零。
- * 秒分支保留一位小数，分钟分支不补零，小时分支的分钟与秒补足两位。
- */
+/** 移植 pi 1.2.0 formatToolDuration：4.2s / 3m 15s / 1h 5m 30s，各分支均不补零。 */
 function formatToolDuration(durationMs: number): string {
   const seconds = durationMs / 1000;
   if (seconds < 60) return `${seconds.toFixed(1)}s`;
@@ -381,7 +378,7 @@ function formatToolDuration(durationMs: number): string {
   const minutes = Math.floor(totalSeconds / 60);
   const remainder = totalSeconds % 60;
   if (minutes < 60) return `${minutes}m ${remainder}s`;
-  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m ${String(remainder).padStart(2, "0")}s`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m ${remainder}s`;
 }
 
 /** 按注册工具名称提供语义化调用行。 */
