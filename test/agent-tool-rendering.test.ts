@@ -15,6 +15,7 @@ import {
 import { createAgentFault } from "../src/agent-snapshot-codec.ts";
 import {
   registerAgentTools,
+  registerNormalReplyTool,
   SEND_MESSAGE_HANDOFF_NOTICE,
   WAIT_PARENT_INPUT_WOKEN_NOTICE,
 } from "../src/agent-tools.ts";
@@ -41,6 +42,8 @@ const theme = {
 interface RegisteredAgentTool {
   readonly name: string;
   readonly parameters?: unknown;
+  readonly annotations?: unknown;
+  readonly namespace?: unknown;
   readonly prepareArguments?: (args: unknown) => unknown;
   readonly renderCall?: (
     params: unknown,
@@ -156,6 +159,70 @@ function renderUnexpectedError(
     context,
   ).render(1000).join("\n");
 }
+
+const EXPECTED_TOOL_ANNOTATIONS: Readonly<Record<string, {
+  readonly readOnlyHint: boolean;
+  readonly destructiveHint: boolean;
+  readonly idempotentHint: boolean;
+  readonly openWorldHint: boolean;
+}>> = {
+  spawn_agent: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  send_message: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  wait_agent: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  interrupt_agent: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  terminate_agent: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+  get_agent_status: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  get_agent_tree: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  get_agent_templates: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  normal_reply: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  final_report: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+};
+
+test("10 个子代理工具显式声明四字段 annotations 并归入同一 namespace", () => {
+  const registered: RegisteredAgentTool[] = [];
+  registerAgentTools({
+    registerTool: (tool) => registered.push(tool as RegisteredAgentTool),
+  }, () => makeEmptyController());
+  registerNormalReplyTool({
+    registerTool: (tool) => registered.push(tool as RegisteredAgentTool),
+  }, () => undefined);
+
+  // 工具名保持不变：namespace 只影响 codemode/tool_search 分组，不参与模型看到的名称。
+  assert.deepEqual(
+    registered.map((tool) => tool.name).sort(),
+    Object.keys(EXPECTED_TOOL_ANNOTATIONS).sort(),
+  );
+
+  const namespaces: string[] = [];
+  for (const tool of registered) {
+    assert.deepEqual(
+      tool.annotations,
+      EXPECTED_TOOL_ANNOTATIONS[tool.name],
+      `${tool.name} 的 annotations 与 spec 表不一致`,
+    );
+    // 四个字段全部显式声明，避免 MCP 惯例默认值（destructive/openWorld 为 true）误导消费方。
+    assert.deepEqual(
+      Object.keys(tool.annotations as object).sort(),
+      ["destructiveHint", "idempotentHint", "openWorldHint", "readOnlyHint"],
+      `${tool.name} 的 annotations 必须显式声明全部四个字段`,
+    );
+
+    const namespace = tool.namespace as {
+      readonly name?: unknown;
+      readonly aliases?: readonly unknown[];
+      readonly description?: unknown;
+      readonly instructions?: unknown;
+    } | undefined;
+    assert.ok(namespace, `${tool.name} 缺少 namespace`);
+    assert.equal(namespace.name, "subagent", `${tool.name} 的 namespace.name`);
+    assert.ok(namespace.aliases?.includes("wj-pi-subagents"), `${tool.name} 的 namespace.aliases 未覆盖包名`);
+    assert.ok(namespace.aliases?.includes("subagents"), `${tool.name} 的 namespace.aliases 缺少短别名`);
+    assert.equal(typeof namespace.description, "string", `${tool.name} 的 namespace.description`);
+    assert.equal(typeof namespace.instructions, "string", `${tool.name} 的 namespace.instructions`);
+    namespaces.push(JSON.stringify(namespace));
+  }
+  assert.equal(new Set(namespaces).size, 1, "10 个工具必须共享同一 namespace");
+});
 
 test("wait_agent 注册 schema 与运行时参数边界一致", () => {
   const tool = registeredTool(makeEmptyController(), "wait_agent");
