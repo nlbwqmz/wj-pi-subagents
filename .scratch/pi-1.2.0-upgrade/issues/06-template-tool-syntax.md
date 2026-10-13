@@ -4,10 +4,10 @@
 
 **Blocked by:** 01（版本语义前提：文档不再需要标注 1.1.0 条件）
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] README 与 README.zh-CN 去掉 `*` 的"需 pi 1.1.0"条件说明，补 `mcp__radius__*` / `mcp__*` 示例
-- [ ] 文档补充"扩展不暴露 `--no-mcp`；排除全部 MCP 使用 `excludeTools: ["mcp__*"]`"
-- [ ] `+name`/`-name` 的拒绝行为与现有文档说明保持不变（不改校验、不动 ADR 0002）
-- [ ] 补测试：tools 含通配符时 `--tools` 参数直连断言；`mcp__radius__*` 形态的接受用例
-- [ ] 现有测试全绿
+- [x] README 与 README.zh-CN 去掉 `*` 的"需 pi 1.1.0"条件说明，补 `mcp__radius__*` / `mcp__*` 示例
+- [x] 文档补充"扩展不暴露 `--no-mcp`；排除全部 MCP 使用 `excludeTools: ["mcp__*"]`"
+- [x] `+name`/`-name` 的拒绝行为与现有文档说明保持不变（不改校验、不动 ADR 0002）
+- [x] 补测试：tools 含通配符时 `--tools` 参数直连断言；`mcp__radius__*` 形态的接受用例
+- [x] 现有测试全绿

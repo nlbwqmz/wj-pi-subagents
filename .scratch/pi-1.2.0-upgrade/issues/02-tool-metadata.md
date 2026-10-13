@@ -4,9 +4,9 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] 10 个工具均显式声明四个 annotations 字段，取值与 spec 表一致（wait_agent 不标只读；terminate_agent 标 destructive + idempotent；interrupt_agent 不标 idempotent；spawn_agent 标 openWorld）
-- [ ] 10 个工具携带同一 namespace（name/aliases/description/instructions 齐备），且不改变对模型暴露的工具名
-- [ ] 新增测试断言全部工具的 annotations 与 namespace，未来新增工具漏标会被测试捕获
-- [ ] 现有测试全绿
+- [x] 10 个工具均显式声明四个 annotations 字段，取值与 spec 表一致（wait_agent 不标只读；terminate_agent 标 destructive + idempotent；interrupt_agent 不标 idempotent；spawn_agent 标 openWorld）
+- [x] 10 个工具携带同一 namespace（name/aliases/description/instructions 齐备），且不改变对模型暴露的工具名
+- [x] 新增测试断言全部工具的 annotations 与 namespace，未来新增工具漏标会被测试捕获
+- [x] 现有测试全绿

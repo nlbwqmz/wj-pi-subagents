@@ -4,9 +4,9 @@
 
 **Blocked by:** 04（同一测试文件，串行避免冲突）
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] 事件归一化保留 agent_settled.aborted；未知字段继续被剥离；该事件补齐专门单测
-- [ ] 子代理状态模型记录"最近 settle 是否 aborted"，不修改生命周期取值闭集
-- [ ] wait_agent 与 get_agent_status 结果暴露 aborted；wait_agent 取消时文本仍为 `Operation aborted`
-- [ ] 测试覆盖：事件归一化单测 + 工具结果断言；现有测试全绿
+- [x] 事件归一化保留 agent_settled.aborted；未知字段继续被剥离；该事件补齐专门单测
+- [x] 子代理状态模型记录"最近 settle 是否 aborted"，不修改生命周期取值闭集
+- [x] wait_agent 与 get_agent_status 结果暴露 aborted；wait_agent 取消时文本仍为 `Operation aborted`
+- [x] 测试覆盖：事件归一化单测 + 工具结果断言；现有测试全绿

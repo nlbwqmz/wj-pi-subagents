@@ -4,10 +4,10 @@
 
 **Blocked by:** 01、02、03、04、05、06
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] README 与 README.zh-CN：版本要求、迁移说明、模板语法、内置扩展隔离说明全部更新
-- [ ] CONTEXT 版本表述同步为 1.2.0 基线
-- [ ] release notes（0.7.0）列出最低版本、错误路径改为 isError（模型可见文本不变）、新增能力、无工具名变化
-- [ ] before_agent_start 处注释说明"有意不检查 messageType"（custom run 同样需要准则）
-- [ ] 文档审阅通过，无遗留旧版本表述
+- [x] README 与 README.zh-CN：版本要求、迁移说明、模板语法、内置扩展隔离说明全部更新
+- [x] CONTEXT 版本表述同步为 1.2.0 基线
+- [x] release notes（0.7.0）列出最低版本、错误路径改为 isError（模型可见文本不变）、新增能力、无工具名变化
+- [x] before_agent_start 处注释说明"有意不检查 messageType"（custom run 同样需要准则）
+- [x] 文档审阅通过，无遗留旧版本表述
