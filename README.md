@@ -10,7 +10,7 @@ No built-in templates · No preset workflows · Everything is yours to shape
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D%2022.19.0-5FA04E?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
-[![Pi](https://img.shields.io/badge/Pi-%3E%3D%200.85.1-2563EB)](https://github.com/earendil-works/pi-mono)
+[![Pi](https://img.shields.io/badge/Pi-%3E%3D%201.2.0-2563EB)](https://github.com/earendil-works/pi-mono)
 
 </div>
 
@@ -34,14 +34,23 @@ No built-in templates · No preset workflows · Everything is yours to shape
 | 🎛️ | **Controlled management** | A parent agent can only manage its direct children, supporting wait, status query, interrupt, reuse, and termination |
 | 👁️ | **Visible status** | The TUI shows the status of direct subagents; `/agents` shows the full agent tree within the current session scope |
 | 🔭 | **Live activity viewer** | Press `Enter` on any agent in the tree to watch it work in real time |
-| 🗜️ | **Native context compaction** | Relies on the post-tool compaction flow of Pi `>= 0.85.1`; each root session and subagent manages its own context through its independent Pi session |
+| 🗜️ | **Native context compaction** | Relies on the post-tool compaction flow of Pi `>= 1.2.0`; each root session and subagent manages its own context through its independent Pi session |
 
 ## 📦 Requirements
 
 | Item | Requirement |
 | --- | --- |
 | Node.js | `>= 22.19.0` |
-| Pi | `>= 0.85.1` |
+| Pi | `>= 1.2.0` |
+
+### Migrating from 0.6.x to 0.7.0
+
+0.7.0 raises the minimum Pi version to 1.2.0 and builds on capabilities added in recent Pi releases. Tool names are unchanged, so existing prompts, templates, and scripts keep working.
+
+1. Upgrade Pi to `>= 1.2.0`, then update the plugin.
+2. Templates need no changes: tool names and template fields stay the same.
+3. Error handling can adopt structured fields at your own pace: tool failures now come back as `isError` results with a `{ ok: false, error }` object in `details` / `structuredContent`. The error text the model sees is unchanged.
+4. Tool results now end with a dim duration segment (for example ` · 4.2s`), on success and failure alike.
 
 ## 🚀 Installation
 
@@ -262,13 +271,13 @@ Omitting a field is not always the same as passing an empty array:
 | Form | Behavior |
 | --- | --- |
 | Omit `tools` | Use Pi's normal tool selection; the host's default tool set is left untouched |
-| `tools: []` | No business tools from Pi's normal selection; only the tools required to run a subagent (on Pi 1.1.0 and later, unlisted MCP tools still stay registered — use `excludeTools` to remove them) |
+| `tools: []` | No business tools from Pi's normal selection; only the tools required to run a subagent (unlisted MCP tools still stay registered — use `excludeTools` to remove them) |
 | Omit `excludeTools` | Exclude nothing |
 | `excludeTools: []` | Same as omitting it |
 | Omit `extensions` | Use Pi's normal extension discovery rules |
 | `extensions: []` | Disable normal extension discovery; load only this plugin itself |
 
-`extensions` accepts local paths, `npm:`, `git:`, URLs, and `builtin:<name>`. `builtin:<name>` references a Pi built-in extension (for example `builtin:mcp`) and requires Pi 0.99.0 or later. When `extensions` is declared, this plugin passes `--no-extensions`, so built-in extensions that are not listed (such as `builtin:llama.cpp`, `builtin:codemode`, and `builtin:tool-search`) are also disabled; only the listed entries load through `-e`.
+`extensions` accepts local paths, `npm:`, `git:`, URLs, and `builtin:<name>`. `builtin:<name>` references a Pi built-in extension (for example `builtin:mcp`). When `extensions` is declared, this plugin passes `--no-extensions`, so built-in extensions that are not listed (such as `builtin:llama.cpp`, `builtin:codemode`, and `builtin:tool-search`) are also disabled; only the listed entries load through `-e`. A built-in extension's tools still have to be listed in `tools` before the subagent can call them — for example, list `builtin:codemode` in `extensions` and `codemode` in `tools`.
 
 Example that loads only the built-in MCP extension:
 
@@ -354,7 +363,7 @@ To pin the runtime explicitly, set the `WJ_PI_SUBAGENTS_BRIDGE_RUNTIME` environm
 
 ## 🗜️ Context Compaction
 
-Pi `>= 0.85.1` decides on and runs context compaction through the native post-tool flow after each tool execution. The root session and every subagent are independent Pi sessions; each compacts and continues based on its actual context state, with no extra plugin or coordination protocol required.
+Pi `>= 1.2.0` decides on and runs context compaction through the native post-tool flow after each tool execution. The root session and every subagent are independent Pi sessions; each compacts and continues based on its actual context state, with no extra plugin or coordination protocol required.
 
 This plugin observes Pi's native compaction lifecycle events and `get_state.isCompacting` to calibrate agent status and TUI activity hints. Messages from the parent to a child Pi are still adjudicated by Pi command responses; if Pi rejects a message because it is compacting, the caller receives a retryable `compaction_active`. Pi has no `abort_compaction` RPC, so an interrupt during compaction returns `compaction_active` based on the current native compaction observation instead of calling the plain `abort`, which cannot cancel compaction. Child replies use Pi's fire-and-forget extension message API; a successful result only means the parent extension runtime has accepted the submission.
 

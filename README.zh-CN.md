@@ -10,7 +10,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D%2022.19.0-5FA04E?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
-[![Pi](https://img.shields.io/badge/Pi-%3E%3D%200.85.1-2563EB)](https://github.com/earendil-works/pi-mono)
+[![Pi](https://img.shields.io/badge/Pi-%3E%3D%201.2.0-2563EB)](https://github.com/earendil-works/pi-mono)
 
 </div>
 
@@ -34,14 +34,23 @@
 | 🎛️ | **受控管理** | 父代理只能管理其直接子级，支持等待、状态查询、中断、复用与终止 |
 | 👁️ | **状态可见** | TUI 展示直接子代理的状态；`/agents` 展示当前会话范围内的完整代理树 |
 | 🔭 | **实时动态查看器** | 在树中的任意代理上按 `Enter`，即可实时观看它的工作过程 |
-| 🗜️ | **原生上下文压缩** | 依赖 Pi `>= 0.85.1` 的工具执行后压缩流程；每个根会话和子代理都通过自己独立的 Pi 会话管理上下文 |
+| 🗜️ | **原生上下文压缩** | 依赖 Pi `>= 1.2.0` 的工具执行后压缩流程；每个根会话和子代理都通过自己独立的 Pi 会话管理上下文 |
 
 ## 📦 环境要求
 
 | 项目 | 要求 |
 | --- | --- |
 | Node.js | `>= 22.19.0` |
-| Pi | `>= 0.85.1` |
+| Pi | `>= 1.2.0` |
+
+### 从 0.6.x 迁移到 0.7.0
+
+0.7.0 将最低 Pi 版本提升至 1.2.0，并利用 Pi 近期版本新增的能力。工具名没有变化，既有的提示词、模板与脚本可以继续使用。
+
+1. 将 Pi 升级到 `>= 1.2.0`，再更新插件。
+2. 模板无需改动：工具名与模板字段都保持不变。
+3. 错误处理可按需采用结构化字段：工具失败现在以 `isError` 结果返回，并在 `details` / `structuredContent` 中携带 `{ ok: false, error }` 结构化对象。模型看到的错误文本不变，你可以自行决定何时改用结构化字段。
+4. 工具结果行尾现在会显示 dim 耗时段（例如 ` · 4.2s`），成功与失败结果都会显示。
 
 ## 🚀 安装
 
@@ -262,13 +271,13 @@ pi
 | 写法 | 行为 |
 | --- | --- |
 | 省略 `tools` | 采用 Pi 正常的工具选择逻辑；不改动宿主默认工具集 |
-| `tools: []` | 常规选择中无业务工具，仅保留运行子代理所必需的工具（在 pi 1.1.0 及更高版本上，未列出的 MCP 工具仍会注册 —— 如需移除请使用 `excludeTools`） |
+| `tools: []` | 常规选择中无业务工具，仅保留运行子代理所必需的工具（未列出的 MCP 工具仍会注册 —— 如需移除请使用 `excludeTools`） |
 | 省略 `excludeTools` | 不排除任何工具 |
 | `excludeTools: []` | 与省略它等价 |
 | 省略 `extensions` | 采用 Pi 正常的扩展发现规则 |
 | `extensions: []` | 禁用正常扩展发现，仅加载本插件自身 |
 
-`extensions` 支持本地路径、`npm:`、`git:`、URL 与 `builtin:<name>`。`builtin:<name>` 引用 pi 内置扩展（如 `builtin:mcp`），需要 pi 0.99.0 或更高版本。声明 `extensions` 时本插件会传入 `--no-extensions`，因此未显式列出的内置扩展（如 `builtin:llama.cpp`、`builtin:codemode`、`builtin:tool-search`）也会被屏蔽，只有列出的项通过 `-e` 加载。
+`extensions` 支持本地路径、`npm:`、`git:`、URL 与 `builtin:<name>`。`builtin:<name>` 引用 pi 内置扩展（如 `builtin:mcp`）。声明 `extensions` 时本插件会传入 `--no-extensions`，因此未显式列出的内置扩展（如 `builtin:llama.cpp`、`builtin:codemode`、`builtin:tool-search`）也会被屏蔽，只有列出的项通过 `-e` 加载。内置扩展提供的工具同样需要列入 `tools` 才能被子代理调用 —— 例如在 `extensions` 中列出 `builtin:codemode`，并在 `tools` 中列出 `codemode`。
 
 仅加载内置 MCP 扩展的示例：
 
@@ -354,7 +363,7 @@ Confirm the existing implementation and constraints first, then make the changes
 
 ## 🗜️ 上下文压缩
 
-Pi `>= 0.85.1` 在每次工具执行后，通过原生的 post-tool 流程决定并执行上下文压缩。根会话与每个子代理都是独立的 Pi 会话，各自根据实际上下文状态完成压缩并继续工作，无需任何额外的插件或协调协议。
+Pi `>= 1.2.0` 在每次工具执行后，通过原生的 post-tool 流程决定并执行上下文压缩。根会话与每个子代理都是独立的 Pi 会话，各自根据实际上下文状态完成压缩并继续工作，无需任何额外的插件或协调协议。
 
 本插件通过监听 Pi 原生压缩生命周期事件和 `get_state.isCompacting` 来校准代理状态与 TUI 动态提示。父代理发给子 Pi 的消息仍由 Pi 命令响应裁定；若 Pi 因正在压缩而拒绝消息，调用方会收到可重试的 `compaction_active`。Pi 没有 `abort_compaction` RPC，因此在压缩期间发起中断时，插件不会调用无法取消压缩的普通 `abort`，而是基于当前对原生压缩的观察返回 `compaction_active`。子级回复使用 Pi 的 fire-and-forget 扩展消息 API；调用成功仅表示父扩展运行时已接受该提交。
 
