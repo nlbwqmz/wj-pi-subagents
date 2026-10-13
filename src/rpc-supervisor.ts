@@ -1433,6 +1433,8 @@ export class RpcSupervisor {
     const activeRun = observed.isStreaming || pendingMessageCount > 0;
     if (activeRun) {
       if (this.lifecycleState === "idle") {
+        // 探针发现新 run 与 agent_start 事件同义：上一轮 settle 的中断事实不再适用。
+        this.lastSettleAborted = undefined;
         try {
           this.applyLifecycle({ type: "agent_start" });
         } catch {
