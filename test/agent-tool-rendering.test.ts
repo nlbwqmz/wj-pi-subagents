@@ -1366,3 +1366,44 @@ test("工具提供者不可用时返回 isError:true 的 agent_unavailable", asy
   assert.deepEqual(result.details, envelope);
   assert.deepEqual(result.structuredContent, envelope);
 });
+
+test("child reply 工具成功与失败都输出结构化结果", async () => {
+  const registered: RegisteredAgentTool[] = [];
+  registerNormalReplyTool({
+    registerTool: (tool) => registered.push(tool as RegisteredAgentTool),
+  }, () => ({
+    normalReply: async () => ({ ok: true, data: { accepted: true } }),
+    finalReport: async () => controlFailure("reply_too_large"),
+  }) as never);
+  const execute = async (name: string): Promise<RegisteredToolResult> => {
+    const tool = registered.find((candidate) => candidate.name === name);
+    assert.ok(tool?.execute);
+    return await tool.execute(
+      `${name}-structured-call`,
+      { message: "正文" },
+      undefined,
+      undefined,
+      {},
+    ) as RegisteredToolResult;
+  };
+
+  const success = await execute("normal_reply");
+  assert.equal(success.isError, undefined);
+  assert.deepEqual(success.details, { accepted: true });
+  assert.deepEqual(success.structuredContent, { accepted: true });
+  assert.deepEqual(JSON.parse(success.content[0]!.text!), {
+    ok: true,
+    data: { accepted: true },
+  });
+
+  const failure = await execute("final_report");
+  assert.equal(failure.isError, true);
+  const envelope = JSON.parse(failure.content[0]!.text!) as {
+    readonly ok: boolean;
+    readonly error: { readonly code: string };
+  };
+  assert.equal(envelope.ok, false);
+  assert.equal(envelope.error.code, "reply_too_large");
+  assert.deepEqual(failure.details, envelope);
+  assert.deepEqual(failure.structuredContent, envelope);
+});
