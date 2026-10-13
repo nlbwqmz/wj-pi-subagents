@@ -1,9 +1,6 @@
 name: Cross-platform tests
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
   workflow_dispatch:
   schedule:

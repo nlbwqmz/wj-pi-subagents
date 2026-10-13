@@ -55,7 +55,7 @@ test("package manifest、lock 和 CI 固定 Pi 1.2.0 clean-break 基线", () => 
   assert.equal(lock.packages?.["node_modules/@earendil-works/pi-tui"]?.version, "1.2.0");
 
   const workflow = parseYaml(readFileSync(join(repositoryRoot, ".github", "workflows", "ci.yml"), "utf8")) as {
-    on?: { schedule?: readonly { readonly cron?: unknown }[] };
+    on?: { push?: unknown; schedule?: readonly { readonly cron?: unknown }[] };
     jobs?: {
       test?: {
         if?: unknown;
@@ -74,6 +74,11 @@ test("package manifest、lock 和 CI 固定 Pi 1.2.0 clean-break 基线", () => 
     "npm install -g --ignore-scripts @earendil-works/pi-coding-agent@1.2.0",
   );
 
+  assert.equal(
+    workflow.on?.push,
+    undefined,
+    "push 到 main 不应触发跨平台测试矩阵（仅 PR / 手动 / 定时）",
+  );
   assert.ok(
     workflow.on?.schedule?.some((entry) => typeof entry.cron === "string"),
     "CI 需要 schedule 触发 latest 兼容任务",
