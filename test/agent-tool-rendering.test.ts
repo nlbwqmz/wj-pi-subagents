@@ -1427,6 +1427,62 @@ test("wait_agent 仅在 woken 结果附加顶层提示，其它结果不附加",
   assert.equal(idleData.state, "idle");
 });
 
+test("wait_agent 与 get_agent_status 结果暴露最近一次 settle 的 aborted 事实", async () => {
+  const fake = new HandoffSupervisor();
+  const controller = makeHandoffController(fake);
+  const spawned = await controller.spawnAgent({ template_id: "demo", name: "中断事实测试" });
+  assert.equal(spawned.ok, true, JSON.stringify(spawned));
+  const tree = fake.tree;
+  assert.ok(tree);
+
+  const startGeneration = tree.getLifecycleGeneration(HANDOFF_AGENT_ID);
+  assert.equal(startGeneration.ok, true);
+  if (startGeneration.ok) {
+    tree.applyLifecycleEvent(HANDOFF_AGENT_ID, {
+      type: "agent_start",
+      expected_generation: startGeneration.data,
+    });
+  }
+  const settleGeneration = tree.getLifecycleGeneration(HANDOFF_AGENT_ID);
+  assert.equal(settleGeneration.ok, true);
+  if (settleGeneration.ok) {
+    tree.applyLifecycleEvent(HANDOFF_AGENT_ID, {
+      type: "agent_settled",
+      expected_generation: settleGeneration.data,
+      aborted: true,
+    });
+  }
+
+  const wait = registeredTool(controller, "wait_agent");
+  assert.ok(wait.execute);
+  const waitResult = await wait.execute(
+    "aborted-fact-wait-call",
+    { agent_ids: [HANDOFF_AGENT_ID], timeout_ms: 30_000 },
+    undefined,
+    undefined,
+    {},
+  ) as RegisteredToolResult;
+  const waitDetails = waitResult.details as Record<string, unknown>;
+  assert.equal(waitDetails.outcome, "idle");
+  assert.equal(waitDetails.state, "idle");
+  assert.equal(waitDetails.aborted, true);
+  assert.deepEqual(waitResult.structuredContent, waitResult.details);
+
+  const status = registeredTool(controller, "get_agent_status");
+  assert.ok(status.execute);
+  const statusResult = await status.execute(
+    "aborted-fact-status-call",
+    { agent_id: HANDOFF_AGENT_ID },
+    undefined,
+    undefined,
+    {},
+  ) as RegisteredToolResult;
+  const statusDetails = statusResult.details as Record<string, unknown>;
+  assert.equal(statusDetails.state, "idle");
+  assert.equal(statusDetails.aborted, true);
+  assert.deepEqual(statusResult.structuredContent, statusResult.details);
+});
+
 test("10 个子代理工具声明 outputSchema，成功结果的 structuredContent 与 details 一致", async () => {
   const registered: RegisteredAgentTool[] = [];
   registerAgentTools({

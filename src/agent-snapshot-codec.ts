@@ -73,6 +73,11 @@ export interface AgentSnapshot {
   readonly activity?: AgentActivitySummary;
   readonly error?: AgentFault;
   readonly termination_result?: AgentTerminationResult;
+  /**
+   * 最近一次 settle 是否由中断触发（独立事实字段，不参与生命周期闭集）。
+   * 尚未观察到 settle，或产生端未提供该事实时缺省。
+   */
+  readonly aborted?: boolean;
 }
 
 export const AGENT_FAULT_METADATA: Readonly<Record<AgentFaultCode, Readonly<{
@@ -99,7 +104,7 @@ export interface AgentSnapshotCodecOptions {
 const SNAPSHOT_KEYS = new Set([
   "agent_id", "parent_agent_id", "template_id", "name", "depth", "state", "revision",
   "created_at", "working_elapsed_ms", "context_window_tokens", "context_usage_percent",
-  "activity", "error", "termination_result",
+  "activity", "error", "termination_result", "aborted",
 ]);
 const ACTIVITY_KEYS = new Set(["phase"]);
 const FAULT_KEYS = new Set(["code", "message", "retryable", "details"]);
@@ -147,6 +152,7 @@ export function parseAgentSnapshot(
     if (record.error !== undefined && fault === undefined) return undefined;
     const termination = record.termination_result;
     if (termination !== undefined && !(AGENT_TERMINATION_RESULTS as readonly unknown[]).includes(termination)) return undefined;
+    if (record.aborted !== undefined && typeof record.aborted !== "boolean") return undefined;
     if (state === "failed" && fault === undefined) return undefined;
     if (state !== "failed" && fault !== undefined) return undefined;
     if (state === "terminated" && termination === undefined) return undefined;
@@ -169,6 +175,7 @@ export function parseAgentSnapshot(
       ...(activity === undefined ? {} : { activity }),
       ...(fault === undefined ? {} : { error: fault }),
       ...(termination === undefined ? {} : { termination_result: termination as AgentTerminationResult }),
+      ...(record.aborted === undefined ? {} : { aborted: record.aborted as boolean }),
     });
   } catch {
     return undefined;

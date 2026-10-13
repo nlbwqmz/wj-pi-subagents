@@ -286,6 +286,7 @@ const agentSnapshotSchema: JsonSchema = Object.freeze({
     }),
     error: agentFaultSchema,
     termination_result: Object.freeze({ type: "string" }),
+    aborted: Object.freeze({ type: "boolean" }),
   }),
   required: Object.freeze([
     "agent_id",
@@ -350,6 +351,7 @@ const outputSchemas: Readonly<Record<ProtocolToolName, JsonSchema>> = Object.fre
           outcome: Object.freeze({ enum: Object.freeze(["reply", "final_report", "idle", "terminal"]) }),
           state: Object.freeze({ type: "string" }),
           revision: Object.freeze({ type: "integer" }),
+          aborted: Object.freeze({ type: "boolean" }),
           error: agentFaultSchema,
         }),
         required: Object.freeze(["agent_id", "outcome", "state", "revision"]),

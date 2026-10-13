@@ -474,6 +474,62 @@ test("监督 wire 仅传输规范且独立复制的启动失败详情", () => {
   } as unknown as Parameters<typeof child.publishEvent>[0]));
 });
 
+test("监督 wire 传输 agent_settled 的中断事实并拒绝非法值", () => {
+  const requestIdRegistry = new SupervisorRequestIdRegistry();
+  const parent = new SupervisorChannel({
+    role: "parent",
+    rootId: ROOT_ID,
+    localAgentId: null,
+    peerAgentId: CHILD_ID,
+    parentAgentId: null,
+    depth: 1,
+    credential: CREDENTIAL,
+    requestIdRegistry,
+  });
+  const child = new SupervisorChannel({
+    role: "child",
+    rootId: ROOT_ID,
+    localAgentId: CHILD_ID,
+    peerAgentId: "",
+    parentAgentId: null,
+    depth: 1,
+    credential: CREDENTIAL,
+    requestIdRegistry,
+  });
+  const helloResult = parent.receive(child.startHandshake());
+  assert.equal(helloResult.kind, "accepted");
+  if (helloResult.kind !== "accepted") return;
+  for (const outbound of helloResult.outbound) child.receive(outbound);
+  assert.equal(parent.receive(child.publishSnapshot([snapshot()], 1)).kind, "accepted");
+
+  const accepted = parent.receive(child.publishEvent({
+    type: "agent_settled",
+    expected_generation: 1,
+    aborted: true,
+  }));
+  assert.equal(accepted.kind, "accepted");
+  if (accepted.kind !== "accepted") return;
+  assert.deepEqual(accepted.event, {
+    root_id: ROOT_ID,
+    agent_id: CHILD_ID,
+    type: "agent_settled",
+    expected_generation: 1,
+    aborted: true,
+  });
+
+  // 只有 agent_settled 可以携带 aborted，且值必须是布尔。
+  assert.throws(() => child.publishEvent({
+    type: "agent_start",
+    expected_generation: 1,
+    aborted: true,
+  } as unknown as Parameters<typeof child.publishEvent>[0]));
+  assert.throws(() => child.publishEvent({
+    type: "agent_settled",
+    expected_generation: 1,
+    aborted: "true",
+  } as unknown as Parameters<typeof child.publishEvent>[0]));
+});
+
 test("Pi threshold 压缩续跑时不把后继 agent_start 前的间隙结算为 idle", async () => {
   const channels = pair(() => true, 200, "idle");
   const rpc = new FakeRpcClient({

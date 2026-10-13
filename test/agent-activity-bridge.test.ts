@@ -334,4 +334,45 @@ test("真实桥接进程拒绝超过 64 KiB 的 prompt/steer 命令正文", asyn
   }
 });
 
+test("真实桥接进程原样透传 agent_settled 的 aborted 事实", async () => {
+  const session = startBridge([
+    { type: "agent_settled", aborted: true },
+    { type: "agent_settled", aborted: false },
+  ]);
+  const faults: unknown[] = [];
+  const unsubscribeFault = session.client.onTransportFault((fault) => faults.push(fault));
+  try {
+    const received: unknown[] = [];
+    const unsubscribe = session.client.onEvent((event) => received.push(event));
+    await session.client.start(AbortSignal.timeout(2_000));
+    await new Promise<void>((resolve) => setTimeout(resolve, 200));
+    unsubscribe();
+
+    assert.deepEqual(received, [
+      { type: "agent_settled", aborted: true },
+      { type: "agent_settled", aborted: false },
+    ]);
+    assert.deepEqual(faults, []);
+  } finally {
+    unsubscribeFault();
+    await session.close();
+  }
+});
+
+test("真实桥接进程对非法 agent_settled.aborted 关闭传输", async () => {
+  const session = startBridge([
+    { type: "agent_settled", aborted: "true" },
+  ]);
+  const faults: unknown[] = [];
+  const unsubscribeFault = session.client.onTransportFault((fault) => faults.push(fault));
+  try {
+    await session.client.start(AbortSignal.timeout(2_000)).catch(() => {});
+    await new Promise<void>((resolve) => setTimeout(resolve, 200));
+    assert.deepEqual(faults, ["protocol_fault"]);
+  } finally {
+    unsubscribeFault();
+    await session.close();
+  }
+});
+
 void AGENT_ID;

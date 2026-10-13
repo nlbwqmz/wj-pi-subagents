@@ -566,6 +566,8 @@ export class RpcSupervisor {
   private hostPendingInputCount = 0;
   private lifecycleObservationVersion = 0;
   private latestAgentStartVersion = 0;
+  /** 最近一次 agent_settled 观察到的中断事实；未观察到时保持未知。 */
+  private lastSettleAborted: boolean | undefined;
   private compactionObservationVersion = 0;
   /** compaction_end 后，同代际 stale true 不能重新激活；稳定 false 会清除该 fence。 */
   private compactionEndFenceVersion: number | undefined;
@@ -1037,9 +1039,14 @@ export class RpcSupervisor {
         this.emitActivity(this.runtimeCompactionActive ? "compacting" : "processing");
         return;
       case "agent_settled": {
+        if (event.aborted !== undefined && typeof event.aborted !== "boolean") {
+          this.failRuntime("invalid_rpc_event");
+          return;
+        }
         // RPC 事件与 compaction_end 同属 Pi 有序流；若 willRetry 后直接 settled，
         // 说明后继回合未能产生 agent_start，续跑保护必须在这里收束。
         this.nativeCompactionWillRetry = false;
+        this.lastSettleAborted = typeof event.aborted === "boolean" ? event.aborted : undefined;
         const settlementVersion = this.markLifecycleObservation();
         void this.enqueueStateReconciliation(settlementVersion).catch(() => {
           // 状态探针失败不能伪造 idle；后续状态查询或消息发送仍可重试校准。
@@ -1175,12 +1182,14 @@ export class RpcSupervisor {
       const lifecycleEvent = Object.freeze({
         type: event.type,
         expected_generation: expectedGeneration,
+        ...(event.aborted === undefined ? {} : { aborted: event.aborted }),
         ...(event.error_code === undefined ? {} : { error_code: event.error_code }),
         ...(details === undefined || !hasStartupDiagnosticDetails(details)
           ? {}
           : { error_details: details }),
       }) as AgentLifecycleEvent;
       if (event.agent_id === this.agentId && lifecycleEvent.type === "agent_settled") {
+        if (typeof event.aborted === "boolean") this.lastSettleAborted = event.aborted;
         const settlementVersion = this.markLifecycleObservation();
         void this.enqueueStateReconciliation(settlementVersion).catch(() => {
           // 状态探针失败不能伪造 idle；后续状态查询或消息发送仍可重试校准。
@@ -1447,7 +1456,10 @@ export class RpcSupervisor {
     }
     if (this.lifecycleState === "working" || this.lifecycleState === "interrupting") {
       try {
-        this.applyLifecycle({ type: "agent_settled" });
+        this.applyLifecycle({
+          type: "agent_settled",
+          ...(this.lastSettleAborted === undefined ? {} : { aborted: this.lastSettleAborted }),
+        });
       } catch {
         return false;
       }
@@ -1759,6 +1771,7 @@ export class RpcSupervisor {
     const normalized = Object.freeze({
       type: event.type,
       expected_generation: this.lifecycleGeneration,
+      ...(event.type === "agent_settled" && event.aborted !== undefined ? { aborted: event.aborted } : {}),
       ...(errorCode === undefined ? {} : { error_code: errorCode }),
       ...(details === undefined || !hasStartupDiagnosticDetails(details)
         ? {}

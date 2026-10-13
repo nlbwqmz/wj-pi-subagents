@@ -301,7 +301,9 @@ export type AgentLifecycleEventType = (typeof AGENT_LIFECYCLE_EVENT_TYPES)[numbe
 type FailureLifecycleEventType = "startup_failed" | "runtime_failed";
 
 type LifecycleEventShape<Type extends AgentLifecycleEventType> =
-  Type extends FailureLifecycleEventType ? FailureEvent : EventGeneration;
+  Type extends FailureLifecycleEventType ? FailureEvent
+    : Type extends "agent_settled" ? EventGeneration & { readonly aborted?: boolean }
+      : EventGeneration;
 
 export type AgentLifecycleEvent = {
   readonly [Type in AgentLifecycleEventType]: LifecycleEventShape<Type> & { readonly type: Type };
@@ -350,6 +352,8 @@ interface AgentRecord {
   activity: AgentActivitySummary | undefined;
   error: AgentFault | undefined;
   terminationResult: AgentTerminationResult | undefined;
+  /** 最近一次 agent_settled 是否由中断触发；未观察到时保持未知。 */
+  lastSettleAborted: boolean | undefined;
   terminationHadFailure: boolean;
   terminationHadIncompleteCleanup: boolean;
   readonly scopeActorOnly: boolean;
@@ -381,6 +385,8 @@ interface PublicMutation {
   readonly contextWindowTokens?: number | null;
   /** undefined 表示保持，null 表示清除。 */
   readonly contextUsagePercent?: number | null;
+  /** 最近一次 settle 的中断事实；undefined 表示保持。 */
+  readonly lastSettleAborted?: boolean;
 }
 
 function isAgentContextUsageInput(value: unknown): value is AgentContextUsageInput {
@@ -434,6 +440,7 @@ function isLifecycleEvent(value: unknown): value is AgentLifecycleEvent {
       "type",
       "expected_generation",
       ...(failureEvent ? ["error_code", "error_details"] : []),
+      ...(type === "agent_settled" ? ["aborted"] : []),
     ];
     if (Object.keys(candidate).some((key) => !allowedKeys.includes(key))) return false;
     if (
@@ -441,6 +448,7 @@ function isLifecycleEvent(value: unknown): value is AgentLifecycleEvent {
       || !Number.isSafeInteger(candidate.expected_generation)
       || (candidate.expected_generation as number) < 0
     ) return false;
+    if (candidate.aborted !== undefined && typeof candidate.aborted !== "boolean") return false;
     if (!failureEvent) return true;
     if (
       Object.hasOwn(candidate, "error_code")
@@ -536,6 +544,7 @@ function sameSnapshotExceptContext(
     && JSON.stringify(record.activity) === JSON.stringify(node.activity)
     && JSON.stringify(currentFault) === JSON.stringify(nextFault)
     && record.terminationResult === node.termination_result
+    && record.lastSettleAborted === node.aborted
   );
 }
 
@@ -659,6 +668,7 @@ export class TreeController {
         activity: undefined,
         error: undefined,
         terminationResult: undefined,
+        lastSettleAborted: undefined,
         terminationHadFailure: false,
         terminationHadIncompleteCleanup: false,
         scopeActorOnly: true,
@@ -834,6 +844,7 @@ export class TreeController {
       activity: undefined,
       error: undefined,
       terminationResult: undefined,
+      lastSettleAborted: undefined,
       terminationHadFailure: false,
       terminationHadIncompleteCleanup: false,
       scopeActorOnly: false,
@@ -902,6 +913,7 @@ export class TreeController {
       activity: undefined,
       error: undefined,
       terminationResult: undefined,
+      lastSettleAborted: undefined,
       terminationHadFailure: false,
       terminationHadIncompleteCleanup: false,
       scopeActorOnly: false,
@@ -943,7 +955,10 @@ export class TreeController {
         break;
       case "agent_settled":
         if (record.state === "working" || record.state === "interrupting") {
-          applied = this.mutate(record, { state: "idle" });
+          applied = this.mutate(record, {
+            state: "idle",
+            ...(event.aborted === undefined ? {} : { lastSettleAborted: event.aborted }),
+          });
         }
         break;
       case "interrupt_accepted":
@@ -1278,6 +1293,7 @@ export class TreeController {
           activity: activityForState(node.state, node.activity),
           error: cloneAgentFault(node.error),
           terminationResult: node.termination_result,
+          lastSettleAborted: node.aborted,
           terminationHadFailure: snapshotHadTerminationFailure(node),
           terminationHadIncompleteCleanup: snapshotHadIncompleteCleanup(node),
           scopeActorOnly: false,
@@ -1417,6 +1433,7 @@ export class TreeController {
     record.createdAt = node.created_at;
     record.activity = activityForState(node.state, node.activity);
     record.error = cloneAgentFault(node.error);
+    record.lastSettleAborted = node.aborted;
     record.terminationHadFailure ||= snapshotHadTerminationFailure(node);
     record.terminationHadIncompleteCleanup ||= snapshotHadIncompleteCleanup(node);
     record.terminationResult = node.state === "terminated"
@@ -1721,11 +1738,17 @@ export class TreeController {
     const wasWorking = isWorkingTimeState(record.state);
     const willBeWorking = isWorkingTimeState(nextState);
     const nextActivity = activityForState(nextState, requestedActivity);
+    const nextLastSettleAborted = mutation.lastSettleAborted === undefined
+      ? record.lastSettleAborted
+      : mutation.lastSettleAborted;
     const contextChanged = nextContextWindowTokens !== record.contextWindowTokens
       || nextContextUsagePercent !== record.contextUsagePercent;
     const errorChanged = JSON.stringify(nextError) !== JSON.stringify(record.error);
     const activityChanged = JSON.stringify(nextActivity) !== JSON.stringify(record.activity);
-    if (!stateChanged && !contextChanged && !errorChanged && !activityChanged) return false;
+    const settleAbortedChanged = nextLastSettleAborted !== record.lastSettleAborted;
+    if (
+      !stateChanged && !contextChanged && !errorChanged && !activityChanged && !settleAbortedChanged
+    ) return false;
 
     const workingElapsedAtMutation = this.workingElapsedValue(record, monotonicAt);
     record.state = nextState;
@@ -1733,6 +1756,7 @@ export class TreeController {
     record.contextUsagePercent = nextContextUsagePercent;
     record.activity = nextActivity;
     record.error = nextError;
+    record.lastSettleAborted = nextLastSettleAborted;
     if (wasWorking && !willBeWorking) {
       record.accumulatedWorkingElapsedMs = workingElapsedAtMutation;
       record.workingStartedAt = undefined;
@@ -1785,10 +1809,12 @@ export class TreeController {
     const details = errorDetails === undefined
       ? undefined
       : normalizeStartupDiagnosticDetails(errorCode, errorDetails);
+    const aborted = event.type === "agent_settled" ? event.aborted : undefined;
     const fact = Object.freeze({
       agent_id: agentId,
       type: event.type,
       expected_generation: event.expected_generation,
+      ...(aborted === undefined ? {} : { aborted }),
       ...(errorCode === undefined ? {} : { error_code: errorCode }),
       ...(details === undefined || !hasStartupDiagnosticDetails(details)
         ? {}
@@ -1870,8 +1896,11 @@ export class TreeController {
     const withTerminationResult = record.terminationResult === undefined
       ? withActivity
       : { ...withActivity, termination_result: record.terminationResult };
-    if (record.error === undefined) return Object.freeze(withTerminationResult);
-    return Object.freeze({ ...withTerminationResult, error: cloneAgentFault(record.error)! });
+    const withSettleAborted = record.lastSettleAborted === undefined
+      ? withTerminationResult
+      : { ...withTerminationResult, aborted: record.lastSettleAborted };
+    if (record.error === undefined) return Object.freeze(withSettleAborted);
+    return Object.freeze({ ...withSettleAborted, error: cloneAgentFault(record.error)! });
   }
 
   private outcome(

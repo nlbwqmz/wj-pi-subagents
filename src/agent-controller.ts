@@ -197,6 +197,8 @@ export interface WaitAgentData {
   readonly outcome: WaitAgentEventOutcome;
   readonly state: AgentSnapshot["state"];
   readonly revision: number;
+  /** 目标最近一次 settle 是否由中断触发；事实不可得时缺省。 */
+  readonly aborted?: boolean;
   readonly error?: AgentSnapshot["error"];
 }
 
@@ -1872,6 +1874,7 @@ function makeWaitData(status: AgentSnapshot, outcome: WaitAgentEventOutcome): Wa
     outcome,
     state: status.state,
     revision: status.revision,
+    ...(status.aborted === undefined ? {} : { aborted: status.aborted }),
     ...(status.error === undefined ? {} : { error: status.error }),
   });
 }

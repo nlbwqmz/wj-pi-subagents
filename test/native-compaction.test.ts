@@ -248,3 +248,31 @@ test("compaction_end fence 忽略 stale true，并允许稳定 false 收敛", as
   assert.equal(stateOf(tree), "idle");
   assert.equal(events.some((event) => event.kind === "fault"), false);
 });
+
+test("agent_settled 的 aborted 事实进入节点快照，并被下一次 settle 覆盖", async () => {
+  const { rpc, supervisor, tree } = await startHarness();
+
+  rpc.setState({ isStreaming: true, isCompacting: false, pendingMessageCount: 0 });
+  assert.equal(await supervisor.synchronizeState(), true);
+  assert.equal(stateOf(tree), "working");
+
+  rpc.setState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+  emitPiEvent(rpc, { type: "agent_settled", aborted: true });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(await supervisor.synchronizeState(), true);
+  assert.equal(stateOf(tree), "idle");
+  const interrupted = tree.getStatus(CHILD_ID);
+  assert.equal(interrupted.ok, true);
+  if (interrupted.ok) assert.equal(interrupted.data.aborted, true);
+
+  // 新 run 正常完成时，最近一次 settle 事实被覆盖。
+  rpc.setState({ isStreaming: true, isCompacting: false, pendingMessageCount: 0 });
+  assert.equal(await supervisor.synchronizeState(), true);
+  rpc.setState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+  emitPiEvent(rpc, { type: "agent_settled", aborted: false });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(await supervisor.synchronizeState(), true);
+  const settled = tree.getStatus(CHILD_ID);
+  assert.equal(settled.ok, true);
+  if (settled.ok) assert.equal(settled.data.aborted, false);
+});
