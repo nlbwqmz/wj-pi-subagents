@@ -43,15 +43,6 @@ No built-in templates · No preset workflows · Everything is yours to shape
 | Node.js | `>= 22.19.0` |
 | Pi | `>= 1.2.0` |
 
-### Migrating from 0.6.x to 0.7.0
-
-0.7.0 raises the minimum Pi version to 1.2.0 and builds on capabilities added in recent Pi releases. Tool names are unchanged, so existing prompts, templates, and scripts keep working.
-
-1. Upgrade Pi to `>= 1.2.0`, then update the plugin.
-2. Templates need no changes: tool names and template fields stay the same.
-3. Error handling can adopt structured fields at your own pace: tool failures now come back as `isError` results with a `{ ok: false, error }` object in `details` / `structuredContent`. The error text the model sees is unchanged.
-4. Tool results now end with a dim duration segment (for example ` · 4.2s`), on success and failure alike.
-
 ## 🚀 Installation
 
 ### User-level installation
