@@ -673,7 +673,7 @@ export class RpcSupervisor {
       return Object.freeze({ ok: false, code: "agent_unavailable" });
     }
     const working = this.lifecycleState === "working";
-    // Pi 0.85.1 RPC 没有 abort_compaction。普通 abort 在压缩期间会成功返回，
+    // Pi 1.2.0 RPC 没有 abort_compaction。普通 abort 在压缩期间会成功返回，
     // 但不会停止压缩，因此只能依据当前原生压缩观察拒绝本次中断。
     if (this.runtimeCompactionActive) {
       return Object.freeze({

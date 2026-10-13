@@ -32,7 +32,7 @@ export const WJ_PI_SUBAGENTS_FINAL_TYPE = "wj-pi-subagents-final-report" as cons
 export const WJ_PI_SUBAGENTS_TERMINAL_TYPE = "wj-pi-subagents-terminal" as const;
 
 export interface ParentConversationApi {
-  /** Mirrors Pi 0.85.1 ExtensionAPI.sendMessage, which is fire-and-forget. */
+  /** Mirrors Pi 1.2.0 ExtensionAPI.sendMessage, which is fire-and-forget. */
   sendMessage(message: unknown, options?: unknown): void;
 }
 
