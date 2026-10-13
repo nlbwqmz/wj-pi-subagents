@@ -36,7 +36,7 @@ test("npm test 先干净重建 bridge，避免源码协议与旧 dist 进程不�
   assert.equal(existsSync(join(repositoryRoot, "scripts", "build-bridge.mjs")), true);
 });
 
-test("package manifest、lock 和 CI 固定 Pi 0.85.1 clean-break 基线", () => {
+test("package manifest、lock 和 CI 固定 Pi 1.2.0 clean-break 基线", () => {
   const manifest = JSON.parse(readFileSync(join(repositoryRoot, "package.json"), "utf8")) as {
     peerDependencies?: Record<string, unknown>;
     devDependencies?: Record<string, unknown>;
@@ -46,21 +46,43 @@ test("package manifest、lock 和 CI 固定 Pi 0.85.1 clean-break 基线", () =>
     packages?: Record<string, Record<string, unknown>>;
   };
 
-  assert.equal(manifest.wjPiSubagents?.requiresPi, ">=0.85.1");
-  assert.equal(manifest.peerDependencies?.["@earendil-works/pi-coding-agent"], ">=0.85.1");
-  assert.equal(manifest.peerDependencies?.["@earendil-works/pi-tui"], ">=0.85.1");
-  assert.equal(manifest.devDependencies?.["@earendil-works/pi-coding-agent"], "0.85.1");
-  assert.equal(manifest.devDependencies?.["@earendil-works/pi-tui"], "0.85.1");
-  assert.equal(lock.packages?.["node_modules/@earendil-works/pi-coding-agent"]?.version, "0.85.1");
-  assert.equal(lock.packages?.["node_modules/@earendil-works/pi-tui"]?.version, "0.85.1");
+  assert.equal(manifest.wjPiSubagents?.requiresPi, ">=1.2.0");
+  assert.equal(manifest.peerDependencies?.["@earendil-works/pi-coding-agent"], "*");
+  assert.equal(manifest.peerDependencies?.["@earendil-works/pi-tui"], "*");
+  assert.equal(manifest.devDependencies?.["@earendil-works/pi-coding-agent"], "1.2.0");
+  assert.equal(manifest.devDependencies?.["@earendil-works/pi-tui"], "1.2.0");
+  assert.equal(lock.packages?.["node_modules/@earendil-works/pi-coding-agent"]?.version, "1.2.0");
+  assert.equal(lock.packages?.["node_modules/@earendil-works/pi-tui"]?.version, "1.2.0");
 
   const workflow = parseYaml(readFileSync(join(repositoryRoot, ".github", "workflows", "ci.yml"), "utf8")) as {
-    jobs?: { test?: { steps?: readonly { readonly name?: unknown; readonly run?: unknown }[] } };
+    on?: { schedule?: readonly { readonly cron?: unknown }[] };
+    jobs?: {
+      test?: { steps?: readonly { readonly name?: unknown; readonly run?: unknown }[] };
+      latest?: {
+        if?: unknown;
+        "continue-on-error"?: unknown;
+        steps?: readonly { readonly name?: unknown; readonly run?: unknown }[];
+      };
+    };
   };
   const installPi = workflow.jobs?.test?.steps?.find((step) => step.name === "Install Pi");
   assert.equal(
     installPi?.run,
-    "npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.85.1",
+    "npm install -g --ignore-scripts @earendil-works/pi-coding-agent@1.2.0",
+  );
+
+  assert.ok(
+    workflow.on?.schedule?.some((entry) => typeof entry.cron === "string"),
+    "CI 需要 schedule 触发 latest 兼容任务",
+  );
+  assert.equal(workflow.jobs?.latest?.if, "github.event_name == 'schedule'");
+  assert.equal(workflow.jobs?.latest?.["continue-on-error"], true);
+  const installLatest = workflow.jobs?.latest?.steps?.find(
+    (step) => step.name === "Install latest Pi",
+  );
+  assert.equal(
+    installLatest?.run,
+    "npm install -g --ignore-scripts @earendil-works/pi-coding-agent@latest",
   );
 });
 

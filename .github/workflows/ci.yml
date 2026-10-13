@@ -1,7 +1,13 @@
 name: Cross-platform tests
 
 on:
+  push:
+    branches:
+      - main
+  pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
 
 permissions:
   contents: read
@@ -40,7 +46,33 @@ jobs:
         run: npm run pack:smoke
 
       - name: Install Pi
-        run: npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.85.1
+        run: npm install -g --ignore-scripts @earendil-works/pi-coding-agent@1.2.0
+
+      - name: Run Pi compatibility smoke test
+        run: npm run compat:pi
+
+  latest:
+    name: Latest Pi compatibility
+    if: github.event_name == 'schedule'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.21.1"
+          cache: npm
+
+      - name: Install project dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Install latest Pi
+        run: npm install -g --ignore-scripts @earendil-works/pi-coding-agent@latest
 
       - name: Run Pi compatibility smoke test
         run: npm run compat:pi
