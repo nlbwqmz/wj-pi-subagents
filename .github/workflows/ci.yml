@@ -15,6 +15,7 @@ permissions:
 jobs:
   test:
     name: Test - ${{ matrix.os }}
+    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
 
