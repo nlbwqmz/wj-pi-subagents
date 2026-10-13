@@ -1191,7 +1191,8 @@ export class RpcSupervisor {
           : { error_details: details }),
       }) as AgentLifecycleEvent;
       if (event.agent_id === this.agentId && lifecycleEvent.type === "agent_settled") {
-        if (typeof event.aborted === "boolean") this.lastSettleAborted = event.aborted;
+        // 缺省 aborted 清除既有事实，与 Pi RPC 路径保持同一语义。
+        this.lastSettleAborted = typeof event.aborted === "boolean" ? event.aborted : undefined;
         const settlementVersion = this.markLifecycleObservation();
         void this.enqueueStateReconciliation(settlementVersion).catch(() => {
           // 状态探针失败不能伪造 idle；后续状态查询或消息发送仍可重试校准。

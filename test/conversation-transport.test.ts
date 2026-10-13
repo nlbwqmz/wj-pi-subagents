@@ -648,6 +648,86 @@ test("手动压缩在 settled 探针前开始仍能结算 idle", async () => {
   }
 });
 
+test("监督通道 agent_settled 缺省 aborted 时清除既有中断事实", async () => {
+  const channels = pair(() => true, 200, "idle");
+  const rpc = new FakeRpcClient({
+    state: { isStreaming: false, isCompacting: false, pendingMessageCount: 0 },
+  });
+  const node = new TestManagedRpcNode(rpc);
+  const tree = new TreeController({
+    config: {
+      maxDepth: 2,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 8,
+      waitTimeoutMs: 1_000,
+    },
+    idFactory: () => CHILD_ID,
+  });
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "流式子代理" },
+    managedNode: node,
+    channel: channels.parent,
+    startupTimeoutMs: 1_000,
+    gracefulShutdownMs: 1_000,
+  });
+  const signal = new AbortController().signal;
+  const events: RpcSupervisorEvent[] = [];
+  const unsubscribe = supervisor.onEvent((event) => events.push(event));
+  try {
+    const startup = supervisor.start();
+    await channels.child.bind(signal);
+    assert.equal((await startup).ok, true);
+    await channels.child.waitForReady(signal);
+
+    const generation = tree.getLifecycleGeneration(CHILD_ID);
+    assert.equal(generation.ok, true);
+    if (!generation.ok) return;
+
+    await channels.child.publishEvent({
+      type: "agent_start",
+      expected_generation: generation.data,
+    });
+
+    // 第一次 settle 的探针停在 idle 事实读取前；第二次 settle 在探针放行前
+    // 缺省 aborted，必须清除第一次写入的中断事实。
+    const settledProbe = rpc.deferNext("get_state");
+    await channels.child.publishEvent({
+      type: "agent_settled",
+      expected_generation: generation.data + 1,
+      aborted: true,
+    });
+    await settledProbe.started;
+    await channels.child.publishEvent({
+      type: "agent_settled",
+      expected_generation: generation.data + 1,
+    });
+    settledProbe.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const status = tree.getStatus(CHILD_ID);
+    assert.equal(status.ok, true);
+    if (status.ok) {
+      assert.equal(status.data.state, "idle");
+      assert.equal("aborted" in status.data, false);
+    }
+    const synthesized = events.filter(
+      (event): event is Extract<RpcSupervisorEvent, { kind: "lifecycle" }> =>
+        event.kind === "lifecycle" && event.event.type === "agent_settled",
+    );
+    assert.equal(synthesized.length, 1);
+    const [settled] = synthesized;
+    assert.notEqual(settled, undefined);
+    if (settled !== undefined) assert.equal("aborted" in settled.event, false);
+  } finally {
+    unsubscribe();
+    await channels.parent.release();
+    await channels.child.release();
+  }
+});
+
 test("监督通道路径 agent_start 清除上一轮 settle 的中断事实", async () => {
   const channels = pair(() => true, 200, "idle");
   const rpc = new FakeRpcClient({
