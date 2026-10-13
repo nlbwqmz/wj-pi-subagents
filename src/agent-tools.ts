@@ -32,6 +32,28 @@ export interface AgentToolRegistrationApi {
   registerTool: (tool: unknown) => void;
 }
 
+/**
+ * Pi 1.2.0 的工具语义标注结构面。四个字段全部显式声明，避免 MCP 惯例默认值
+ * （destructiveHint / openWorldHint 为 true）误导权限类消费方。
+ */
+export interface AgentToolAnnotations {
+  readonly readOnlyHint: boolean;
+  readonly destructiveHint: boolean;
+  readonly idempotentHint: boolean;
+  readonly openWorldHint: boolean;
+}
+
+/**
+ * Pi 1.2.0 的工具 namespace 结构面。只用于 codemode 分组与 tool_search 文档，
+ * 不改变模型看到的工具名（ToolDefinition.name）。
+ */
+export interface AgentToolNamespace {
+  readonly name: string;
+  readonly aliases?: readonly string[];
+  readonly description?: string;
+  readonly instructions?: string;
+}
+
 export type AgentToolControllerProvider = (
   context: unknown,
 ) => AgentController | Promise<AgentController>;
@@ -208,6 +230,41 @@ const descriptions: Readonly<Record<AgentToolName, string>> = Object.freeze({
   terminate_agent: "Permanently terminate a direct child subagent and its registered subtree, then confirm resource reclamation. Use only when you are sure the branch will not be reused.",
   get_agent_status: "Read the most recently confirmed safe status snapshot for a direct child subagent.",
   get_agent_tree: "Read the read-only agent tree visible to the current caller.",
+});
+
+/** 全部 10 个协议工具：8 个管理工具 + normal_reply / final_report。 */
+type ProtocolToolName =
+  | AgentToolName
+  | typeof CHILD_REPLY_TOOL_NAME
+  | typeof CHILD_FINAL_REPORT_TOOL_NAME;
+
+/**
+ * 10 个工具共享的 namespace；name 取得简短以免 codemode 分组标题过长，
+ * aliases 覆盖包名与常见短名，instructions 简述工具选择顺序。
+ */
+const SUBAGENT_TOOL_NAMESPACE: AgentToolNamespace = Object.freeze({
+  name: "subagent",
+  aliases: Object.freeze(["wj-pi-subagents", "subagents"]),
+  description: "Multi-level subagent orchestration: spawn direct child subagents, hand off tasks, observe their reports, and inspect or stop them.",
+  instructions: "Call get_agent_templates before spawn_agent and copy the returned template_id exactly. After a successful spawn, hand off the task with send_message, then observe it with wait_agent. Use get_agent_status for one agent's latest snapshot and get_agent_tree for the whole visible tree. interrupt_agent stops the active turn without discarding the subagent; terminate_agent releases a subtree that will not be reused.",
+});
+
+/**
+ * 按 spec 表逐工具声明语义标注：wait_agent 不标只读（成功等待会消费/释放批次）；
+ * terminate_agent 幂等（终态不可再变），interrupt_agent 不幂等（可能打断之后的新活动）；
+ * spawn_agent 开放世界（模板发现与启动握手依赖外部环境）。
+ */
+const toolAnnotations: Readonly<Record<ProtocolToolName, AgentToolAnnotations>> = Object.freeze({
+  spawn_agent: Object.freeze({ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }),
+  send_message: Object.freeze({ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }),
+  wait_agent: Object.freeze({ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }),
+  interrupt_agent: Object.freeze({ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }),
+  terminate_agent: Object.freeze({ readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false }),
+  get_agent_status: Object.freeze({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }),
+  get_agent_tree: Object.freeze({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }),
+  get_agent_templates: Object.freeze({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }),
+  normal_reply: Object.freeze({ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }),
+  final_report: Object.freeze({ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }),
 });
 
 export const PARENT_COORDINATION_SYSTEM_PROMPT = [
@@ -415,6 +472,8 @@ function executeTool(
     label: name,
     description: descriptions[name],
     parameters: schemas[name],
+    annotations: toolAnnotations[name],
+    namespace: SUBAGENT_TOOL_NAMESPACE,
     ...(prepareArguments === undefined ? {} : { prepareArguments }),
     executionMode: name === "wait_agent" ? "parallel" : "sequential",
     renderCall: (
@@ -514,6 +573,8 @@ export function registerNormalReplyTool(
     label: CHILD_REPLY_TOOL_NAME,
     description: childReplyDescription,
     parameters: childReplySchema,
+    annotations: toolAnnotations[CHILD_REPLY_TOOL_NAME],
+    namespace: SUBAGENT_TOOL_NAMESPACE,
     executionMode: "sequential",
     renderCall: (
       params: unknown,
@@ -545,6 +606,8 @@ export function registerNormalReplyTool(
     label: CHILD_FINAL_REPORT_TOOL_NAME,
     description: childFinalReportDescription,
     parameters: childFinalReportSchema,
+    annotations: toolAnnotations[CHILD_FINAL_REPORT_TOOL_NAME],
+    namespace: SUBAGENT_TOOL_NAMESPACE,
     executionMode: "sequential",
     renderCall: (
       params: unknown,
