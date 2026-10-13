@@ -158,6 +158,38 @@ test("Pi 低于最低版本时拒绝激活", async () => {
   if (!result.ok) assert.equal(result.diagnostic.reason, "pi_version_unsupported");
 });
 
+test("Pi 版本过低时诊断提示包含实际版本、最低版本与升级指引", async () => {
+  const handlers: Array<(event: unknown, context: unknown) => void> = [];
+  const notifications: Array<{ message: string; type: string }> = [];
+  const api: ExtensionApiSurface = {
+    ...readyApi(),
+    on: ((_event: string, handler: (event: unknown, context: unknown) => void) => {
+      handlers.push(handler);
+    }) as NonNullable<ExtensionApiSurface["on"]>,
+  };
+  const extension = createWjPiSubagentsExtension({
+    probe: readyOverrides({
+      loadPiModule: async () => ({ VERSION: "1.1.0", RpcClient: ReadyRpcClient }),
+    }),
+  });
+
+  await extension(api);
+  assert.equal(handlers.length, 1);
+  handlers[0]?.(
+    { type: "session_start", reason: "startup" },
+    { hasUI: true, ui: { notify: (message: string, type: string) => notifications.push({ message, type }) } },
+  );
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0]?.type, "warning");
+  const message = notifications[0]?.message ?? "";
+  assert.match(message, /pi_version_unsupported/);
+  assert.match(message, /1\.1\.0/);
+  assert.match(message, new RegExp(MIN_PI_VERSION.replaceAll(".", "\\.")));
+  assert.match(message, /npm install/);
+  assert.doesNotMatch(message, new RegExp(MIN_NODE_VERSION.replaceAll(".", "\\.")));
+});
+
 test("Pi 版本不可解析时拒绝激活", async () => {
   const result = await checkHostCapabilities({
     extensionApi: readyApi(),

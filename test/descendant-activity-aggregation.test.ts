@@ -180,7 +180,7 @@ test("子模式扩展把本进程完整活动规范化上行且不在本层缓�
     await activator(api as unknown as ExtensionApiSurface, {
       ok: true,
       nodeVersion: process.versions.node,
-      piVersion: "0.85.1",
+      piVersion: "1.2.0",
       platform: process.platform,
       processTreeAdapter: {} as never,
     } as AvailableHostCapabilities);
@@ -310,7 +310,7 @@ test("模型调用失败沿桥接归一化、监督通道、活动缓存贯通�
     await activator(api as unknown as ExtensionApiSurface, {
       ok: true,
       nodeVersion: process.versions.node,
-      piVersion: "0.85.1",
+      piVersion: "1.2.0",
       platform: process.platform,
       processTreeAdapter: {} as never,
     } as AvailableHostCapabilities);
@@ -540,7 +540,7 @@ test("压缩自身失败沿产生端订阅登记为无身份失败条目，压�
     await activator(api as unknown as ExtensionApiSurface, {
       ok: true,
       nodeVersion: process.versions.node,
-      piVersion: "0.85.1",
+      piVersion: "1.2.0",
       platform: process.platform,
       processTreeAdapter: {} as never,
     } as AvailableHostCapabilities);
@@ -663,7 +663,7 @@ test("子模式扩展跨实例 reload 后恢复 display source generation 并轮
   const hostCapabilities = {
     ok: true,
     nodeVersion: process.versions.node,
-    piVersion: "0.85.1",
+    piVersion: "1.2.0",
     platform: process.platform,
     processTreeAdapter: {} as never,
   } as AvailableHostCapabilities;
@@ -809,7 +809,7 @@ test("子运行时 input handler 只在 rpc steer 上唤醒且绝不抛错", asy
   const hostCapabilities = {
     ok: true,
     nodeVersion: process.versions.node,
-    piVersion: "0.85.1",
+    piVersion: "1.2.0",
     platform: process.platform,
     processTreeAdapter: {} as never,
   } as AvailableHostCapabilities;
@@ -901,7 +901,7 @@ test("根运行时 input handler 不因 rpc steer 唤醒父消息 waiter", async
   const hostCapabilities = {
     ok: true,
     nodeVersion: process.versions.node,
-    piVersion: "0.85.1",
+    piVersion: "1.2.0",
     platform: process.platform,
     processTreeAdapter: {} as never,
   } as AvailableHostCapabilities;
@@ -957,7 +957,7 @@ test("handoff pending 期间 rpc steer 输入不唤醒 waiter", async () => {
   const hostCapabilities = {
     ok: true,
     nodeVersion: process.versions.node,
-    piVersion: "0.85.1",
+    piVersion: "1.2.0",
     platform: process.platform,
     processTreeAdapter: {} as never,
   } as AvailableHostCapabilities;
@@ -1039,7 +1039,7 @@ test("子运行时协议版本与代码常量不一致时 session_start 被拒",
   const hostCapabilities = {
     ok: true,
     nodeVersion: process.versions.node,
-    piVersion: "0.85.1",
+    piVersion: "1.2.0",
     platform: process.platform,
     processTreeAdapter: {} as never,
   } as AvailableHostCapabilities;

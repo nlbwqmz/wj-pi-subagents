@@ -79,6 +79,8 @@ export interface HostCapabilityDiagnostic {
   code: typeof HOST_CAPABILITY_DIAGNOSTIC_CODE;
   reason: HostCapabilityFailureReason;
   missingApi?: string[];
+  /** 仅在 pi_version_unsupported 分支填充，且该值已通过 semver.valid 校验。 */
+  currentVersion?: string;
 }
 
 export type HostCapabilityResult =
@@ -125,13 +127,18 @@ interface SemverApi {
   satisfies(version: string, range: string): boolean;
 }
 
-function unavailable(reason: HostCapabilityFailureReason, missingApi?: string[]): HostCapabilityResult {
+function unavailable(
+  reason: HostCapabilityFailureReason,
+  missingApi?: string[],
+  currentVersion?: string,
+): HostCapabilityResult {
   return {
     ok: false,
     diagnostic: {
       code: HOST_CAPABILITY_DIAGNOSTIC_CODE,
       reason,
       ...(missingApi === undefined ? {} : { missingApi }),
+      ...(currentVersion === undefined ? {} : { currentVersion }),
     },
   };
 }
@@ -230,6 +237,10 @@ async function loadDefaultProcessTreeAdapter(platform: NodeJS.Platform): Promise
 }
 
 function formatHostCapabilityDiagnostic(diagnostic: HostCapabilityDiagnostic): string {
+  if (diagnostic.reason === "pi_version_unsupported") {
+    const currentVersion = diagnostic.currentVersion ?? "unknown";
+    return `${diagnostic.code}: Pi subagent extension was not activated (pi_version_unsupported: current Pi ${currentVersion} < required ${MIN_PI_VERSION}); upgrade with: npm install -g --ignore-scripts @earendil-works/pi-coding-agent`;
+  }
   const missingApi = diagnostic.missingApi?.join(",");
   const detail = missingApi === undefined ? diagnostic.reason : `${diagnostic.reason}:${missingApi}`;
   return `${diagnostic.code}: Pi subagent extension was not activated (${detail})`;
@@ -311,7 +322,7 @@ export async function checkHostCapabilities(input: HostProbeInput): Promise<Host
       return unavailable("pi_version_unparseable");
     }
     if (!semver.satisfies(piVersion, PI_VERSION_RANGE)) {
-      return unavailable("pi_version_unsupported");
+      return unavailable("pi_version_unsupported", undefined, piVersion);
     }
   } catch {
     return unavailable("runtime_dependency_unavailable");
