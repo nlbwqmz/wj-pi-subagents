@@ -13,6 +13,9 @@ _Avoid_: 消息状态
 
 **Pi 回合收束**：Pi 发出的真实 `agent_settled` 事实，表示当前回合已静止；只有 Pi 状态探测同时确认没有流式执行、原生压缩和待处理输入，且控制收尾允许时，才可据此登记 `idle`。它不自动生成报告或结果。
 
+**settle 中断事实**：记录最近一次 `agent_settled` 是否由中断触发的运行事实（对应代码 `lastSettleAborted`）；被取消（`aborted=true`）与正常完成（`aborted=false`）由此区分。未观察到时保持未知；新 run 开始（`agent_start`）时清除。它只描述 settle 归因，不改变生命周期状态。
+_Avoid_: settle 状态、中断状态
+
 **Pi 原生压缩观察**：Pi 的 `compaction_start`、`compaction_end` 和 `get_state.isCompacting` 共同提供压缩运行事实。插件用这些事实校准生命周期和活动提示，不建立父子压缩事务，也不把本地观察状态作为消息发送的预拒绝依据。Pi 1.2.0 RPC 没有 `abort_compaction`，因此中断操作在观察到压缩活动时直接返回可重试的 `compaction_active`，不会把普通 `abort` 误当成压缩取消。
 
 **消息发送**：父代理与子代理之间传递一次提示、控制内容或回复内容的操作。其成功含义由接收接口决定：Pi RPC 命令会返回明确接纳结果；Pi 扩展消息 API 只确认同步提交，不代表异步处理完成。
