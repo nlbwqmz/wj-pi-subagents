@@ -566,6 +566,8 @@ export class RpcSupervisor {
   private hostPendingInputCount = 0;
   private lifecycleObservationVersion = 0;
   private latestAgentStartVersion = 0;
+  /** 最近一次 agent_settled 观察到的中断事实；未观察到时保持未知。 */
+  private lastSettleAborted: boolean | undefined;
   private compactionObservationVersion = 0;
   /** compaction_end 后，同代际 stale true 不能重新激活；稳定 false 会清除该 fence。 */
   private compactionEndFenceVersion: number | undefined;
@@ -671,7 +673,7 @@ export class RpcSupervisor {
       return Object.freeze({ ok: false, code: "agent_unavailable" });
     }
     const working = this.lifecycleState === "working";
-    // Pi 0.85.1 RPC 没有 abort_compaction。普通 abort 在压缩期间会成功返回，
+    // Pi 1.2.0 RPC 没有 abort_compaction。普通 abort 在压缩期间会成功返回，
     // 但不会停止压缩，因此只能依据当前原生压缩观察拒绝本次中断。
     if (this.runtimeCompactionActive) {
       return Object.freeze({
@@ -1026,6 +1028,8 @@ export class RpcSupervisor {
       case "agent_start":
         this.hostPendingInputCount = 0;
         this.nativeCompactionWillRetry = false;
+        // 新 run 开始后上一轮 settle 的中断事实不再适用。
+        this.lastSettleAborted = undefined;
         this.markLifecycleObservation("agent_start");
         this.resetToolActivity();
         if (this.lifecycleState === "idle") this.applyLifecycle({ type: "agent_start" });
@@ -1037,9 +1041,14 @@ export class RpcSupervisor {
         this.emitActivity(this.runtimeCompactionActive ? "compacting" : "processing");
         return;
       case "agent_settled": {
+        if (event.aborted !== undefined && typeof event.aborted !== "boolean") {
+          this.failRuntime("invalid_rpc_event");
+          return;
+        }
         // RPC 事件与 compaction_end 同属 Pi 有序流；若 willRetry 后直接 settled，
         // 说明后继回合未能产生 agent_start，续跑保护必须在这里收束。
         this.nativeCompactionWillRetry = false;
+        this.lastSettleAborted = typeof event.aborted === "boolean" ? event.aborted : undefined;
         const settlementVersion = this.markLifecycleObservation();
         void this.enqueueStateReconciliation(settlementVersion).catch(() => {
           // 状态探针失败不能伪造 idle；后续状态查询或消息发送仍可重试校准。
@@ -1175,12 +1184,15 @@ export class RpcSupervisor {
       const lifecycleEvent = Object.freeze({
         type: event.type,
         expected_generation: expectedGeneration,
+        ...(event.aborted === undefined ? {} : { aborted: event.aborted }),
         ...(event.error_code === undefined ? {} : { error_code: event.error_code }),
         ...(details === undefined || !hasStartupDiagnosticDetails(details)
           ? {}
           : { error_details: details }),
       }) as AgentLifecycleEvent;
       if (event.agent_id === this.agentId && lifecycleEvent.type === "agent_settled") {
+        // 缺省 aborted 清除既有事实，与 Pi RPC 路径保持同一语义。
+        this.lastSettleAborted = typeof event.aborted === "boolean" ? event.aborted : undefined;
         const settlementVersion = this.markLifecycleObservation();
         void this.enqueueStateReconciliation(settlementVersion).catch(() => {
           // 状态探针失败不能伪造 idle；后续状态查询或消息发送仍可重试校准。
@@ -1197,8 +1209,11 @@ export class RpcSupervisor {
       if (event.agent_id === this.agentId) {
         this.lifecycleGeneration = outcome.data.lifecycle_generation;
         this.lifecycleState = outcome.data.node.state;
-        if (lifecycleEvent.type === "agent_start") this.markLifecycleObservation("agent_start");
-        else if (lifecycleEvent.type === "agent_settled") this.markLifecycleObservation();
+        if (lifecycleEvent.type === "agent_start") {
+          // 新 run 开始后上一轮 settle 的中断事实不再适用。
+          this.lastSettleAborted = undefined;
+          this.markLifecycleObservation("agent_start");
+        } else if (lifecycleEvent.type === "agent_settled") this.markLifecycleObservation();
         if (lifecycleEvent.type === "runtime_failed" && outcome.data.node.state === "failed") {
           if (this.phase === "starting") {
             this.recordStartupFault("protocol_fault");
@@ -1418,6 +1433,8 @@ export class RpcSupervisor {
     const activeRun = observed.isStreaming || pendingMessageCount > 0;
     if (activeRun) {
       if (this.lifecycleState === "idle") {
+        // 探针发现新 run 与 agent_start 事件同义：上一轮 settle 的中断事实不再适用。
+        this.lastSettleAborted = undefined;
         try {
           this.applyLifecycle({ type: "agent_start" });
         } catch {
@@ -1447,7 +1464,10 @@ export class RpcSupervisor {
     }
     if (this.lifecycleState === "working" || this.lifecycleState === "interrupting") {
       try {
-        this.applyLifecycle({ type: "agent_settled" });
+        this.applyLifecycle({
+          type: "agent_settled",
+          ...(this.lastSettleAborted === undefined ? {} : { aborted: this.lastSettleAborted }),
+        });
       } catch {
         return false;
       }
@@ -1759,6 +1779,7 @@ export class RpcSupervisor {
     const normalized = Object.freeze({
       type: event.type,
       expected_generation: this.lifecycleGeneration,
+      ...(event.type === "agent_settled" && event.aborted !== undefined ? { aborted: event.aborted } : {}),
       ...(errorCode === undefined ? {} : { error_code: errorCode }),
       ...(details === undefined || !hasStartupDiagnosticDetails(details)
         ? {}

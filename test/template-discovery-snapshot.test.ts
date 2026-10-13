@@ -310,6 +310,7 @@ test("tools 接受 * 出现在任意位置或多次出现的通配条目", () =>
     ["trailing.md", "---\ndescription: 后缀通配\ntools: ['mcp_*']\n---\n"],
     ["multiple.md", "---\ndescription: 多次通配\ntools: ['*a*', 'b*c*d']\n---\n"],
     ["mixed.md", "---\ndescription: 与普通名混用\ntools: [read, '*']\n---\n"],
+    ["server.md", "---\ndescription: MCP 服务器通配\ntools: ['mcp__radius__*']\n---\n"],
   ]));
 
   assert.deepEqual(
@@ -319,6 +320,7 @@ test("tools 接受 * 出现在任意位置或多次出现的通配条目", () =>
       ["middle", ["mcp*server"]],
       ["mixed", ["read", "*"]],
       ["multiple", ["*a*", "b*c*d"]],
+      ["server", ["mcp__radius__*"]],
       ["trailing", ["mcp_*"]],
     ],
   );
@@ -479,13 +481,13 @@ test("排除字段拒绝会命中协议工具名的通配条目", () => {
 
 test("排除字段接受不会命中协议工具名的通配与普通条目", () => {
   const snapshot = discoverUserTemplates(new Map([
-    ["safe.md", "---\ndescription: 安全排除\nexcludeTools: [mcp_*, read, 'future_*']\n---\n"],
+    ["safe.md", "---\ndescription: 安全排除\nexcludeTools: [mcp_*, mcp__*, read, 'future_*']\n---\n"],
     ["literal.md", "---\ndescription: 字面点号\nexcludeTools: ['normal.reply']\n---\n"],
   ]));
 
   assert.deepEqual(snapshot.templates.map((template) => [template.templateId, template.excludeTools]), [
     ["literal", ["normal.reply"]],
-    ["safe", ["mcp_*", "read", "future_*"]],
+    ["safe", ["mcp_*", "mcp__*", "read", "future_*"]],
   ]);
   assert.deepEqual(snapshot.invalidCandidates, []);
 });

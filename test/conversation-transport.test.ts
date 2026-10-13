@@ -335,7 +335,7 @@ test("控制响应在监督 wire 上保留规范启动错误 details", () => {
 });
 
 test("旧协议、已删除压缩帧和旧任务字段稳定拒绝为 protocol_mismatch", () => {
-  assert.equal(SUPERVISOR_PROTOCOL_VERSION, "wj-pi-subagents/31");
+  assert.equal(SUPERVISOR_PROTOCOL_VERSION, "wj-pi-subagents/32");
   assert.equal((SUPERVISOR_FRAME_KINDS as readonly string[]).includes("compaction_prepare"), false);
   assert.equal((SUPERVISOR_FRAME_KINDS as readonly string[]).includes("compaction_prepared"), false);
   assert.equal((SUPERVISOR_FRAME_KINDS as readonly string[]).includes("compaction_complete"), false);
@@ -474,6 +474,62 @@ test("监督 wire 仅传输规范且独立复制的启动失败详情", () => {
   } as unknown as Parameters<typeof child.publishEvent>[0]));
 });
 
+test("监督 wire 传输 agent_settled 的中断事实并拒绝非法值", () => {
+  const requestIdRegistry = new SupervisorRequestIdRegistry();
+  const parent = new SupervisorChannel({
+    role: "parent",
+    rootId: ROOT_ID,
+    localAgentId: null,
+    peerAgentId: CHILD_ID,
+    parentAgentId: null,
+    depth: 1,
+    credential: CREDENTIAL,
+    requestIdRegistry,
+  });
+  const child = new SupervisorChannel({
+    role: "child",
+    rootId: ROOT_ID,
+    localAgentId: CHILD_ID,
+    peerAgentId: "",
+    parentAgentId: null,
+    depth: 1,
+    credential: CREDENTIAL,
+    requestIdRegistry,
+  });
+  const helloResult = parent.receive(child.startHandshake());
+  assert.equal(helloResult.kind, "accepted");
+  if (helloResult.kind !== "accepted") return;
+  for (const outbound of helloResult.outbound) child.receive(outbound);
+  assert.equal(parent.receive(child.publishSnapshot([snapshot()], 1)).kind, "accepted");
+
+  const accepted = parent.receive(child.publishEvent({
+    type: "agent_settled",
+    expected_generation: 1,
+    aborted: true,
+  }));
+  assert.equal(accepted.kind, "accepted");
+  if (accepted.kind !== "accepted") return;
+  assert.deepEqual(accepted.event, {
+    root_id: ROOT_ID,
+    agent_id: CHILD_ID,
+    type: "agent_settled",
+    expected_generation: 1,
+    aborted: true,
+  });
+
+  // 只有 agent_settled 可以携带 aborted，且值必须是布尔。
+  assert.throws(() => child.publishEvent({
+    type: "agent_start",
+    expected_generation: 1,
+    aborted: true,
+  } as unknown as Parameters<typeof child.publishEvent>[0]));
+  assert.throws(() => child.publishEvent({
+    type: "agent_settled",
+    expected_generation: 1,
+    aborted: "true",
+  } as unknown as Parameters<typeof child.publishEvent>[0]));
+});
+
 test("Pi threshold 压缩续跑时不把后继 agent_start 前的间隙结算为 idle", async () => {
   const channels = pair(() => true, 200, "idle");
   const rpc = new FakeRpcClient({
@@ -586,6 +642,163 @@ test("手动压缩在 settled 探针前开始仍能结算 idle", async () => {
     const status = tree.getStatus(CHILD_ID);
     assert.equal(status.ok, true);
     if (status.ok) assert.equal(status.data.state, "idle");
+  } finally {
+    await channels.parent.release();
+    await channels.child.release();
+  }
+});
+
+test("监督通道 agent_settled 缺省 aborted 时清除既有中断事实", async () => {
+  const channels = pair(() => true, 200, "idle");
+  const rpc = new FakeRpcClient({
+    state: { isStreaming: false, isCompacting: false, pendingMessageCount: 0 },
+  });
+  const node = new TestManagedRpcNode(rpc);
+  const tree = new TreeController({
+    config: {
+      maxDepth: 2,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 8,
+      waitTimeoutMs: 1_000,
+    },
+    idFactory: () => CHILD_ID,
+  });
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "流式子代理" },
+    managedNode: node,
+    channel: channels.parent,
+    startupTimeoutMs: 1_000,
+    gracefulShutdownMs: 1_000,
+  });
+  const signal = new AbortController().signal;
+  const events: RpcSupervisorEvent[] = [];
+  const unsubscribe = supervisor.onEvent((event) => events.push(event));
+  try {
+    const startup = supervisor.start();
+    await channels.child.bind(signal);
+    assert.equal((await startup).ok, true);
+    await channels.child.waitForReady(signal);
+
+    const generation = tree.getLifecycleGeneration(CHILD_ID);
+    assert.equal(generation.ok, true);
+    if (!generation.ok) return;
+
+    await channels.child.publishEvent({
+      type: "agent_start",
+      expected_generation: generation.data,
+    });
+
+    // 第一次 settle 的探针停在 idle 事实读取前；第二次 settle 在探针放行前
+    // 缺省 aborted，必须清除第一次写入的中断事实。
+    const settledProbe = rpc.deferNext("get_state");
+    await channels.child.publishEvent({
+      type: "agent_settled",
+      expected_generation: generation.data + 1,
+      aborted: true,
+    });
+    await settledProbe.started;
+    await channels.child.publishEvent({
+      type: "agent_settled",
+      expected_generation: generation.data + 1,
+    });
+    settledProbe.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const status = tree.getStatus(CHILD_ID);
+    assert.equal(status.ok, true);
+    if (status.ok) {
+      assert.equal(status.data.state, "idle");
+      assert.equal("aborted" in status.data, false);
+    }
+    const synthesized = events.filter(
+      (event): event is Extract<RpcSupervisorEvent, { kind: "lifecycle" }> =>
+        event.kind === "lifecycle" && event.event.type === "agent_settled",
+    );
+    assert.equal(synthesized.length, 1);
+    const [settled] = synthesized;
+    assert.notEqual(settled, undefined);
+    if (settled !== undefined) assert.equal("aborted" in settled.event, false);
+  } finally {
+    unsubscribe();
+    await channels.parent.release();
+    await channels.child.release();
+  }
+});
+
+test("监督通道路径 agent_start 清除上一轮 settle 的中断事实", async () => {
+  const channels = pair(() => true, 200, "idle");
+  const rpc = new FakeRpcClient({
+    state: { isStreaming: false, isCompacting: false, pendingMessageCount: 0 },
+  });
+  const node = new TestManagedRpcNode(rpc);
+  const tree = new TreeController({
+    config: {
+      maxDepth: 2,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 8,
+      waitTimeoutMs: 1_000,
+    },
+    idFactory: () => CHILD_ID,
+  });
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "流式子代理" },
+    managedNode: node,
+    channel: channels.parent,
+    startupTimeoutMs: 1_000,
+    gracefulShutdownMs: 1_000,
+  });
+  const signal = new AbortController().signal;
+  try {
+    const startup = supervisor.start();
+    await channels.child.bind(signal);
+    assert.equal((await startup).ok, true);
+    await channels.child.waitForReady(signal);
+
+    const firstGeneration = tree.getLifecycleGeneration(CHILD_ID);
+    assert.equal(firstGeneration.ok, true);
+    if (!firstGeneration.ok) return;
+
+    await channels.child.publishEvent({
+      type: "agent_start",
+      expected_generation: firstGeneration.data,
+    });
+    await channels.child.publishEvent({
+      type: "agent_settled",
+      expected_generation: firstGeneration.data + 1,
+      aborted: true,
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const interrupted = tree.getStatus(CHILD_ID);
+    assert.equal(interrupted.ok, true);
+    if (interrupted.ok) assert.equal(interrupted.data.aborted, true);
+
+    const nextGeneration = tree.getLifecycleGeneration(CHILD_ID);
+    assert.equal(nextGeneration.ok, true);
+    if (!nextGeneration.ok) return;
+    await channels.child.publishEvent({
+      type: "agent_start",
+      expected_generation: nextGeneration.data,
+    });
+    const restarted = tree.getStatus(CHILD_ID);
+    assert.equal(restarted.ok, true);
+    if (restarted.ok) {
+      assert.equal(restarted.data.state, "working");
+      assert.equal("aborted" in restarted.data, false);
+    }
+
+    // 新 run 若没有 settle 事件、只由状态探针结算，也不得再带出上一轮的中断事实。
+    assert.equal(await supervisor.synchronizeState(), true);
+    const settled = tree.getStatus(CHILD_ID);
+    assert.equal(settled.ok, true);
+    if (settled.ok) {
+      assert.equal(settled.data.state, "idle");
+      assert.equal("aborted" in settled.data, false);
+    }
   } finally {
     await channels.parent.release();
     await channels.child.release();

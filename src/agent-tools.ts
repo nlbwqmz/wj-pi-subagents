@@ -23,6 +23,7 @@ import {
 import {
   PUBLIC_ERROR_CODES,
   controlFailure,
+  type ControlFailure,
   type ControlResult,
   type PublicErrorCode,
 } from "./tree-controller.ts";
@@ -30,6 +31,28 @@ import {
 /** Pi 扩展 API 的最小结构面；生产类型由宿主包提供，核心包不复制其定义。 */
 export interface AgentToolRegistrationApi {
   registerTool: (tool: unknown) => void;
+}
+
+/**
+ * Pi 1.2.0 的工具语义标注结构面。四个字段全部显式声明，避免 MCP 惯例默认值
+ * （destructiveHint / openWorldHint 为 true）误导权限类消费方。
+ */
+export interface AgentToolAnnotations {
+  readonly readOnlyHint: boolean;
+  readonly destructiveHint: boolean;
+  readonly idempotentHint: boolean;
+  readonly openWorldHint: boolean;
+}
+
+/**
+ * Pi 1.2.0 的工具 namespace 结构面。只用于 codemode 分组与 tool_search 文档，
+ * 不改变模型看到的工具名（ToolDefinition.name）。
+ */
+export interface AgentToolNamespace {
+  readonly name: string;
+  readonly aliases?: readonly string[];
+  readonly description?: string;
+  readonly instructions?: string;
 }
 
 export type AgentToolControllerProvider = (
@@ -73,37 +96,8 @@ export const WAIT_PARENT_INPUT_WOKEN_NOTICE =
 
 export type AgentToolName = (typeof AGENT_TOOL_NAMES)[number];
 
-/** 公开工具错误使用稳定 JSON 外壳，不把异常、路径或句柄带回模型。 */
-export class SubagentToolError extends Error {
-  readonly code: string;
-  readonly retryable: boolean;
-
-  constructor(error: {
-    readonly code: string;
-    readonly message: string;
-    readonly retryable: boolean;
-    readonly details?: unknown;
-  }) {
-    // 工具边界只信任 code 与对应白名单 details；其余字段始终重新生成。
-    const code = (PUBLIC_ERROR_CODES as readonly string[]).includes(error.code)
-      ? error.code
-      : "internal_error";
-    const canonical = controlFailure(
-      code as PublicErrorCode,
-      error.details,
-    ).error;
-    super(JSON.stringify({
-      ok: false,
-      error: canonical,
-    }));
-    this.name = "SubagentToolError";
-    this.code = canonical.code;
-    this.retryable = canonical.retryable;
-  }
-}
-
 interface JsonSchema {
-  readonly type: string;
+  readonly type?: string | readonly string[];
   readonly description?: string;
   readonly properties?: Readonly<Record<string, JsonSchema>>;
   readonly required?: readonly string[];
@@ -117,6 +111,7 @@ interface JsonSchema {
   readonly minimum?: number;
   readonly maximum?: number;
   readonly pattern?: string;
+  readonly anyOf?: readonly JsonSchema[];
 }
 
 const uuidSchema: JsonSchema = Object.freeze({
@@ -208,6 +203,238 @@ const descriptions: Readonly<Record<AgentToolName, string>> = Object.freeze({
   terminate_agent: "Permanently terminate a direct child subagent and its registered subtree, then confirm resource reclamation. Use only when you are sure the branch will not be reused.",
   get_agent_status: "Read the most recently confirmed safe status snapshot for a direct child subagent.",
   get_agent_tree: "Read the read-only agent tree visible to the current caller.",
+});
+
+/** 全部 10 个协议工具：8 个管理工具 + normal_reply / final_report。 */
+type ProtocolToolName =
+  | AgentToolName
+  | typeof CHILD_REPLY_TOOL_NAME
+  | typeof CHILD_FINAL_REPORT_TOOL_NAME;
+
+/**
+ * 10 个工具共享的 namespace；name 取得简短以免 codemode 分组标题过长，
+ * aliases 覆盖包名与常见短名，instructions 简述工具选择顺序。
+ */
+const SUBAGENT_TOOL_NAMESPACE: AgentToolNamespace = Object.freeze({
+  name: "subagent",
+  aliases: Object.freeze(["wj-pi-subagents", "subagents"]),
+  description: "Multi-level subagent orchestration: spawn direct child subagents, hand off tasks, observe their reports, and inspect or stop them.",
+  instructions: "Call get_agent_templates before spawn_agent and copy the returned template_id exactly. After a successful spawn, hand off the task with send_message, then observe it with wait_agent. Use get_agent_status for one agent's latest snapshot and get_agent_tree for the whole visible tree. interrupt_agent stops the active turn without discarding the subagent; terminate_agent releases a subtree that will not be reused.",
+});
+
+/**
+ * 按 spec 表逐工具声明语义标注：wait_agent 不标只读（成功等待会消费/释放批次）；
+ * terminate_agent 幂等（终态不可再变），interrupt_agent 不幂等（可能打断之后的新活动）；
+ * spawn_agent 开放世界（模板发现与启动握手依赖外部环境）。
+ */
+const toolAnnotations: Readonly<Record<ProtocolToolName, AgentToolAnnotations>> = Object.freeze({
+  spawn_agent: Object.freeze({ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }),
+  send_message: Object.freeze({ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }),
+  wait_agent: Object.freeze({ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }),
+  interrupt_agent: Object.freeze({ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }),
+  terminate_agent: Object.freeze({ readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false }),
+  get_agent_status: Object.freeze({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }),
+  get_agent_tree: Object.freeze({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }),
+  get_agent_templates: Object.freeze({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }),
+  normal_reply: Object.freeze({ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }),
+  final_report: Object.freeze({ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }),
+});
+
+/**
+ * 工具失败时附带的规范故障对象；只暴露白名单错误码与稳定元数据。
+ */
+const agentFaultSchema: JsonSchema = Object.freeze({
+  type: "object",
+  properties: Object.freeze({
+    code: Object.freeze({ type: "string" }),
+    message: Object.freeze({ type: "string" }),
+    retryable: Object.freeze({ type: "boolean" }),
+    details: Object.freeze({
+      type: "object",
+      properties: Object.freeze({
+        provider: Object.freeze({ type: "string" }),
+        model: Object.freeze({ type: "string" }),
+        extension: Object.freeze({ type: "string" }),
+      }),
+      additionalProperties: false,
+    }),
+  }),
+  required: Object.freeze(["code", "message", "retryable"]),
+  additionalProperties: false,
+});
+
+/** 单个子代理的公开快照；字段与 AgentSnapshot 一致。 */
+const agentSnapshotSchema: JsonSchema = Object.freeze({
+  type: "object",
+  properties: Object.freeze({
+    agent_id: Object.freeze({ type: "string" }),
+    parent_agent_id: Object.freeze({ type: ["string", "null"] }),
+    template_id: Object.freeze({ type: "string" }),
+    name: Object.freeze({ type: "string" }),
+    depth: Object.freeze({ type: "integer" }),
+    state: Object.freeze({ type: "string" }),
+    revision: Object.freeze({ type: "integer" }),
+    created_at: Object.freeze({ type: "string" }),
+    working_elapsed_ms: Object.freeze({ type: "number" }),
+    context_window_tokens: Object.freeze({ type: "number" }),
+    context_usage_percent: Object.freeze({ type: "number" }),
+    activity: Object.freeze({
+      type: "object",
+      properties: Object.freeze({ phase: Object.freeze({ type: "string" }) }),
+      required: Object.freeze(["phase"]),
+      additionalProperties: false,
+    }),
+    error: agentFaultSchema,
+    termination_result: Object.freeze({ type: "string" }),
+    aborted: Object.freeze({ type: "boolean" }),
+  }),
+  required: Object.freeze([
+    "agent_id",
+    "parent_agent_id",
+    "template_id",
+    "name",
+    "depth",
+    "state",
+    "revision",
+  ]),
+  additionalProperties: false,
+});
+
+/** 消息类工具的固定确认结果。 */
+const acceptedSchema: JsonSchema = Object.freeze({
+  type: "object",
+  properties: Object.freeze({ accepted: Object.freeze({ type: "boolean" }) }),
+  required: Object.freeze(["accepted"]),
+  additionalProperties: false,
+});
+
+/**
+ * 10 个工具成功结果的 structuredContent 形状；与现有 details 结构逐字段一致，
+ * 不新增数据结构。失败结果的 {ok:false,error} 外壳由工具边界统一生成，不属于
+ * outputSchema 描述的成功范围。
+ */
+const outputSchemas: Readonly<Record<ProtocolToolName, JsonSchema>> = Object.freeze({
+  get_agent_templates: Object.freeze({
+    type: "array",
+    items: Object.freeze({
+      type: "object",
+      properties: Object.freeze({
+        template_id: Object.freeze({ type: "string" }),
+        description: Object.freeze({ type: "string" }),
+        tools: Object.freeze({ type: "array", items: Object.freeze({ type: "string" }) }),
+        exclude_tools: Object.freeze({ type: "array", items: Object.freeze({ type: "string" }) }),
+        extensions: Object.freeze({ type: "array", items: Object.freeze({ type: "string" }) }),
+      }),
+      required: Object.freeze(["template_id", "description"]),
+      additionalProperties: false,
+    }),
+  }),
+  spawn_agent: Object.freeze({
+    type: "object",
+    properties: Object.freeze({
+      agent_id: Object.freeze({ type: "string" }),
+      name: Object.freeze({ type: "string" }),
+      template_id: Object.freeze({ type: "string" }),
+      depth: Object.freeze({ type: "integer" }),
+      state: Object.freeze({ enum: Object.freeze(["idle"]) }),
+    }),
+    required: Object.freeze(["agent_id", "name", "template_id", "depth", "state"]),
+    additionalProperties: false,
+  }),
+  send_message: acceptedSchema,
+  wait_agent: Object.freeze({
+    anyOf: Object.freeze([
+      Object.freeze({
+        type: "object",
+        properties: Object.freeze({
+          agent_id: Object.freeze({ type: "string" }),
+          outcome: Object.freeze({ enum: Object.freeze(["reply", "final_report", "idle", "terminal"]) }),
+          state: Object.freeze({ type: "string" }),
+          revision: Object.freeze({ type: "integer" }),
+          aborted: Object.freeze({ type: "boolean" }),
+          error: agentFaultSchema,
+        }),
+        required: Object.freeze(["agent_id", "outcome", "state", "revision"]),
+        additionalProperties: false,
+      }),
+      Object.freeze({
+        type: "object",
+        properties: Object.freeze({
+          agent_ids: Object.freeze({ type: "array", items: Object.freeze({ type: "string" }) }),
+          outcome: Object.freeze({ enum: Object.freeze(["timeout"]) }),
+        }),
+        required: Object.freeze(["agent_ids", "outcome"]),
+        additionalProperties: false,
+      }),
+      Object.freeze({
+        type: "object",
+        properties: Object.freeze({
+          agent_ids: Object.freeze({ type: "array", items: Object.freeze({ type: "string" }) }),
+          outcome: Object.freeze({ enum: Object.freeze(["woken"]) }),
+          wake_reason: Object.freeze({ enum: Object.freeze(["parent_input"]) }),
+        }),
+        required: Object.freeze(["agent_ids", "outcome", "wake_reason"]),
+        additionalProperties: false,
+      }),
+      Object.freeze({
+        type: "object",
+        properties: Object.freeze({
+          agent_ids: Object.freeze({ type: "array", items: Object.freeze({ type: "string" }) }),
+          outcome: Object.freeze({ enum: Object.freeze(["batch_released"]) }),
+          released_by_agent_id: Object.freeze({ type: "string" }),
+          released_by_outcome: Object.freeze({ enum: Object.freeze(["reply", "final_report", "idle", "terminal"]) }),
+        }),
+        required: Object.freeze(["agent_ids", "outcome", "released_by_agent_id", "released_by_outcome"]),
+        additionalProperties: false,
+      }),
+    ]),
+  }),
+  interrupt_agent: Object.freeze({
+    type: "object",
+    properties: Object.freeze({
+      agent_id: Object.freeze({ type: "string" }),
+      accepted: Object.freeze({ type: "boolean" }),
+      changed: Object.freeze({ type: "boolean" }),
+      state: Object.freeze({ type: "string" }),
+      blocked_reason: Object.freeze({ enum: Object.freeze(["compaction_active"]) }),
+      error: agentFaultSchema,
+    }),
+    required: Object.freeze(["agent_id", "accepted", "changed", "state"]),
+    additionalProperties: false,
+  }),
+  terminate_agent: Object.freeze({
+    type: "object",
+    properties: Object.freeze({
+      agent_id: Object.freeze({ type: "string" }),
+      state: Object.freeze({ enum: Object.freeze(["terminated"]) }),
+      changed: Object.freeze({ type: "boolean" }),
+      forced: Object.freeze({ type: "boolean" }),
+      terminated_count: Object.freeze({ type: "integer" }),
+    }),
+    required: Object.freeze(["agent_id", "state", "changed", "forced", "terminated_count"]),
+    additionalProperties: false,
+  }),
+  get_agent_status: agentSnapshotSchema,
+  get_agent_tree: Object.freeze({
+    type: "object",
+    properties: Object.freeze({
+      tree_revision: Object.freeze({ type: "integer" }),
+      scope: Object.freeze({
+        type: "object",
+        properties: Object.freeze({
+          kind: Object.freeze({ enum: Object.freeze(["root", "subtree"]) }),
+          agent_id: Object.freeze({ type: "string" }),
+        }),
+        required: Object.freeze(["kind"]),
+        additionalProperties: false,
+      }),
+      nodes: Object.freeze({ type: "array", items: agentSnapshotSchema }),
+    }),
+    required: Object.freeze(["tree_revision", "scope", "nodes"]),
+    additionalProperties: false,
+  }),
+  normal_reply: acceptedSchema,
+  final_report: acceptedSchema,
 });
 
 export const PARENT_COORDINATION_SYSTEM_PROMPT = [
@@ -351,16 +578,46 @@ const childReplyDescription =
 const childFinalReportDescription =
   "Send an explicit report to the direct parent. A successful call only means the parent extension runtime accepted the message submission; it does not mean Pi completed asynchronous delivery, and it does not end the current turn or session. It may be called multiple times.";
 
-/** 返回给 Pi 的固定工具结果；details 只包含控制器安全数据。 */
+/**
+ * 工具边界只信任 code 与对应白名单 details；其余字段（伪造 message、敏感附加
+ * 字段）始终重新生成。所有失败都经此归一化后再进入结果外壳。
+ */
+function canonicalToolFailure(error: {
+  readonly code: string;
+  readonly details?: unknown;
+}): ControlFailure {
+  const code = (PUBLIC_ERROR_CODES as readonly string[]).includes(error.code)
+    ? error.code as PublicErrorCode
+    : "internal_error";
+  return controlFailure(code, error.details);
+}
+
+/** 模型可见的错误文本；与改造前 SubagentToolError.message 逐字一致。 */
+function toolFailureText(failure: ControlFailure): string {
+  return JSON.stringify({ ok: false, error: failure.error });
+}
+
+/**
+ * 返回给 Pi 的固定工具结果：details 只包含控制器安全数据；成功时
+ * structuredContent 与 details 一致；失败时返回 isError:true 与
+ * {ok:false,error} 结构化外壳，不再抛 SubagentToolError。
+ */
 function toolResult<T>(result: ControlResult<T>, dataOnly = false, notice?: string): unknown {
-  if (!result.ok) throw new SubagentToolError(result.error);
+  if (!result.ok) {
+    const failure = canonicalToolFailure(result.error);
+    return {
+      content: [{ type: "text", text: toolFailureText(failure) }],
+      details: failure,
+      structuredContent: failure,
+      isError: true,
+    };
+  }
   const payload = dataOnly ? result.data : result;
+  const text = notice === undefined ? payload : { ...payload, notice };
   return {
-    content: [{
-      type: "text",
-      text: JSON.stringify(notice === undefined ? payload : { ...payload, notice }),
-    }],
+    content: [{ type: "text", text: JSON.stringify(text) }],
     details: result.data,
+    structuredContent: result.data,
   };
 }
 
@@ -372,7 +629,7 @@ function resolveSuccessNotice(
   result: ControlResult<unknown>,
 ): string | undefined {
   if (typeof notice !== "function") return notice;
-  // 失败结果在 toolResult 内转换成 SubagentToolError，永远不携带 notice。
+  // 失败结果在 toolResult 内转换成 isError 外壳，永远不携带 notice。
   return result.ok ? notice(result.data) : undefined;
 }
 
@@ -385,12 +642,12 @@ function isWokenWaitData(data: unknown): boolean {
 async function controllerFor(
   provider: AgentToolControllerProvider,
   context: unknown,
-): Promise<AgentController> {
+): Promise<ControlResult<AgentController>> {
   const controller = await provider(context);
   if (controller === undefined || controller === null) {
-    throw new SubagentToolError(controlFailure("agent_unavailable").error);
+    return controlFailure("agent_unavailable");
   }
-  return controller;
+  return Object.freeze({ ok: true as const, data: controller });
 }
 
 function executeTool(
@@ -415,6 +672,9 @@ function executeTool(
     label: name,
     description: descriptions[name],
     parameters: schemas[name],
+    outputSchema: outputSchemas[name],
+    annotations: toolAnnotations[name],
+    namespace: SUBAGENT_TOOL_NAMESPACE,
     ...(prepareArguments === undefined ? {} : { prepareArguments }),
     executionMode: name === "wait_agent" ? "parallel" : "sequential",
     renderCall: (
@@ -435,7 +695,9 @@ function executeTool(
       _onUpdate: unknown,
       context: unknown,
     ) => {
-      const result = await execute(await controllerFor(provider, context), params, {
+      const controller = await controllerFor(provider, context);
+      if (!controller.ok) return toolResult(controller, dataOnly);
+      const result = await execute(controller.data, params, {
         toolCallId,
         signal,
         context,
@@ -453,7 +715,8 @@ function executeTool(
 function prepareWaitAgentArguments(value: unknown): unknown {
   const parsed = parseWaitAgentToolInput(value);
   if (parsed.ok) return parsed.value;
-  throw new SubagentToolError(controlFailure("invalid_argument", parsed.issue).error);
+  // prepareArguments 由 Pi 在 execute 之前调用；错误消息保持稳定 JSON 外壳。
+  throw new Error(toolFailureText(controlFailure("invalid_argument", parsed.issue)));
 }
 
 export interface AgentToolRegistrationOptions extends AgentToolRenderLookups {
@@ -514,6 +777,9 @@ export function registerNormalReplyTool(
     label: CHILD_REPLY_TOOL_NAME,
     description: childReplyDescription,
     parameters: childReplySchema,
+    outputSchema: outputSchemas[CHILD_REPLY_TOOL_NAME],
+    annotations: toolAnnotations[CHILD_REPLY_TOOL_NAME],
+    namespace: SUBAGENT_TOOL_NAMESPACE,
     executionMode: "sequential",
     renderCall: (
       params: unknown,
@@ -535,7 +801,7 @@ export function registerNormalReplyTool(
     ) => {
       const coordinator = await provider(context);
       if (coordinator === undefined) {
-        throw new SubagentToolError(controlFailure("agent_unavailable").error);
+        return toolResult(controlFailure("agent_unavailable"));
       }
       return toolResult(await coordinator.normalReply(params, signal));
     },
@@ -545,6 +811,9 @@ export function registerNormalReplyTool(
     label: CHILD_FINAL_REPORT_TOOL_NAME,
     description: childFinalReportDescription,
     parameters: childFinalReportSchema,
+    outputSchema: outputSchemas[CHILD_FINAL_REPORT_TOOL_NAME],
+    annotations: toolAnnotations[CHILD_FINAL_REPORT_TOOL_NAME],
+    namespace: SUBAGENT_TOOL_NAMESPACE,
     executionMode: "sequential",
     renderCall: (
       params: unknown,
@@ -565,7 +834,7 @@ export function registerNormalReplyTool(
       context: unknown,
     ) => {
       const coordinator = await provider(context);
-      if (coordinator === undefined) throw new SubagentToolError(controlFailure("agent_unavailable").error);
+      if (coordinator === undefined) return toolResult(controlFailure("agent_unavailable"));
       return toolResult(await coordinator.finalReport(params, signal));
     },
   });

@@ -40,7 +40,7 @@ import {
 } from "./tree-controller.ts";
 
 /** 父子监督通道与 Pi 任务 RPC 完全隔离的固定协议版本。 */
-export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/31";
+export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/32";
 
 export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "hello",
@@ -223,6 +223,8 @@ export interface SupervisorEvent {
   readonly agent_id: string;
   readonly type: AgentLifecycleEventType;
   readonly expected_generation?: number;
+  /** agent_settled 的最近一次中断事实；仅该事件类型可携带。 */
+  readonly aborted?: boolean;
   readonly error_code?: AgentFault["code"];
   /** 失败生命周期事件的严格、可复制诊断闭集。 */
   readonly error_details?: StartupDiagnosticDetails;
@@ -1420,6 +1422,7 @@ export class SupervisorChannel {
       agent_id: agentId,
       type: candidate.type,
       ...(candidate.expected_generation === undefined ? {} : { expected_generation: candidate.expected_generation }),
+      ...(candidate.aborted === undefined ? {} : { aborted: candidate.aborted }),
       ...(candidate.error_code === undefined ? {} : { error_code: candidate.error_code }),
       ...(candidate.error_details === undefined ? {} : { error_details: candidate.error_details }),
     };
@@ -1958,8 +1961,10 @@ export class SupervisorChannel {
       "type",
       "expected_generation",
       ...(failureEvent ? ["error_code", "error_details"] : []),
+      ...(type === "agent_settled" ? ["aborted"] : []),
     ];
     if (Object.keys(payload).some((key) => !allowedKeys.includes(key))) frameError("invalid_frame");
+    if (hasOwn(payload, "aborted") && typeof payload.aborted !== "boolean") frameError("invalid_frame");
     if (
       hasOwn(payload, "error_code")
       && (payload.error_code === undefined || !(AGENT_FAULT_CODES as readonly string[]).includes(payload.error_code as string))
@@ -1981,6 +1986,7 @@ export class SupervisorChannel {
       agent_id: payload.agent_id as string,
       type,
       expected_generation: payload.expected_generation as number,
+      ...(payload.aborted === undefined ? {} : { aborted: payload.aborted as boolean }),
       ...(payload.error_code === undefined
         ? {}
         : { error_code: payload.error_code as AgentFault["code"] }),

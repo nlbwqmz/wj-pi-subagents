@@ -1134,8 +1134,10 @@ function isSafeBridgeEvent(value: unknown): boolean {
   if (!isRecord(value) || typeof value.type !== "string") return false;
   switch (value.type) {
     case "agent_start":
-    case "agent_settled":
       return Object.keys(value).length === 1;
+    case "agent_settled":
+      return (value.aborted === undefined || typeof value.aborted === "boolean")
+        && Object.keys(value).every((key) => key === "type" || key === "aborted");
     case "compaction_start":
       return (value.reason === "manual" || value.reason === "threshold" || value.reason === "overflow")
         && Object.keys(value).every((key) => key === "type" || key === "reason");

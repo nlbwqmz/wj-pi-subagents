@@ -1,6 +1,6 @@
 {
   "name": "wj-pi-subagents",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "author": "WJ",
   "description": "Multi-level subagent orchestration plugin for Pi — no built-in templates, no preset workflows, everything is yours to shape",
   "homepage": "https://github.com/nlbwqmz/wj-pi-subagents#readme",
@@ -35,16 +35,16 @@
     "node": ">=22.19.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.85.1",
-    "@earendil-works/pi-tui": ">=0.85.1"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "dependencies": {
     "semver": "7.8.0",
     "yaml": "2.9.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.85.1",
-    "@earendil-works/pi-tui": "0.85.1",
+    "@earendil-works/pi-coding-agent": "1.2.0",
+    "@earendil-works/pi-tui": "1.2.0",
     "@types/node": "24.12.4",
     "@types/semver": "7.7.1",
     "typescript": "5.9.3"
@@ -67,6 +67,6 @@
     ]
   },
   "wjPiSubagents": {
-    "requiresPi": ">=0.85.1"
+    "requiresPi": ">=1.2.0"
   }
 }

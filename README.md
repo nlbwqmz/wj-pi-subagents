@@ -10,7 +10,7 @@ No built-in templates · No preset workflows · Everything is yours to shape
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D%2022.19.0-5FA04E?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
-[![Pi](https://img.shields.io/badge/Pi-%3E%3D%200.85.1-2563EB)](https://github.com/earendil-works/pi-mono)
+[![Pi](https://img.shields.io/badge/Pi-%3E%3D%201.2.0-2563EB)](https://github.com/earendil-works/pi-mono)
 
 </div>
 
@@ -34,14 +34,14 @@ No built-in templates · No preset workflows · Everything is yours to shape
 | 🎛️ | **Controlled management** | A parent agent can only manage its direct children, supporting wait, status query, interrupt, reuse, and termination |
 | 👁️ | **Visible status** | The TUI shows the status of direct subagents; `/agents` shows the full agent tree within the current session scope |
 | 🔭 | **Live activity viewer** | Press `Enter` on any agent in the tree to watch it work in real time |
-| 🗜️ | **Native context compaction** | Relies on the post-tool compaction flow of Pi `>= 0.85.1`; each root session and subagent manages its own context through its independent Pi session |
+| 🗜️ | **Native context compaction** | Relies on the post-tool compaction flow of Pi `>= 1.2.0`; each root session and subagent manages its own context through its independent Pi session |
 
 ## 📦 Requirements
 
 | Item | Requirement |
 | --- | --- |
 | Node.js | `>= 22.19.0` |
-| Pi | `>= 0.85.1` |
+| Pi | `>= 1.2.0` |
 
 ## 🚀 Installation
 
@@ -262,13 +262,13 @@ Omitting a field is not always the same as passing an empty array:
 | Form | Behavior |
 | --- | --- |
 | Omit `tools` | Use Pi's normal tool selection; the host's default tool set is left untouched |
-| `tools: []` | No business tools from Pi's normal selection; only the tools required to run a subagent (on Pi 1.1.0 and later, unlisted MCP tools still stay registered — use `excludeTools` to remove them) |
+| `tools: []` | No business tools from Pi's normal selection; only the tools required to run a subagent (unlisted MCP tools still stay registered — use `excludeTools` to remove them) |
 | Omit `excludeTools` | Exclude nothing |
 | `excludeTools: []` | Same as omitting it |
 | Omit `extensions` | Use Pi's normal extension discovery rules |
 | `extensions: []` | Disable normal extension discovery; load only this plugin itself |
 
-`extensions` accepts local paths, `npm:`, `git:`, URLs, and `builtin:<name>`. `builtin:<name>` references a Pi built-in extension (for example `builtin:mcp`) and requires Pi 0.99.0 or later. When `extensions` is declared, this plugin passes `--no-extensions`, so built-in extensions that are not listed (such as `builtin:llama.cpp`, `builtin:codemode`, and `builtin:tool-search`) are also disabled; only the listed entries load through `-e`.
+`extensions` accepts local paths, `npm:`, `git:`, URLs, and `builtin:<name>`. `builtin:<name>` references a Pi built-in extension (for example `builtin:mcp`). When `extensions` is declared, this plugin passes `--no-extensions`, so built-in extensions that are not listed (such as `builtin:llama.cpp`, `builtin:codemode`, and `builtin:tool-search`) are also disabled; only the listed entries load through `-e`. A built-in extension's tools still have to be listed in `tools` before the subagent can call them — for example, list `builtin:codemode` in `extensions` and `codemode` in `tools`.
 
 Example that loads only the built-in MCP extension:
 
@@ -305,11 +305,13 @@ Confirm the existing implementation and constraints first, then make the changes
 
 `tools` is a whitelist: it accepts plain tool names and `*` wildcards. A wildcard may appear anywhere in an entry, and an entry may contain several of them. `+name` and `-name` modifiers are not supported — a template that uses them is invalid at load time, with a diagnostic pointing at the template and the `tools` field. Modifier baselines come from the host's default tool configuration, which a template cannot control.
 
-`*` requires Pi 1.1.0 or later. On older versions Pi treats `*` as a literal tool name: it matches no tool, and the subagent starts with no business tools at all.
+Wildcards also cover MCP tools: `mcp__radius__*` selects every tool from the `radius` MCP server, and `mcp__*` selects every MCP tool.
 
-Since Pi 1.1.0, a `tools` whitelist is no longer exclusive: tools it does not list — MCP tools in particular — stay registered and remain reachable through indirect paths such as codemode. Use `excludeTools` to remove what must not be reachable. It takes a YAML string array whose entries follow the same name-shape rules as `tools` — non-empty, no internal commas or whitespace, no duplicates — and also accept `*` wildcards. Like `tools`, `excludeTools` rejects `+name` / `-name` modifiers at load time, with a diagnostic pointing at the template and the `excludeTools` field. Exclusion happens at tool registration, so excluded tools stay unreachable even through those indirect paths. When `tools` and `excludeTools` both cover a tool, exclusion wins. On Pi versions before 1.1.0, the exclusion argument matches literal tool names only: `*` and any entry containing a wildcard are treated as literal names, match no tool, and the exclusion silently has no effect — the tools they were meant to remove stay reachable.
+A `tools` whitelist is not exclusive: tools it does not list — MCP tools in particular — stay registered and remain reachable through indirect paths such as codemode. Use `excludeTools` to remove what must not be reachable. It takes a YAML string array whose entries follow the same name-shape rules as `tools` — non-empty, no internal commas or whitespace, no duplicates — and also accept `*` wildcards. Like `tools`, `excludeTools` rejects `+name` / `-name` modifiers at load time, with a diagnostic pointing at the template and the `excludeTools` field. Exclusion happens at tool registration, so excluded tools stay unreachable even through those indirect paths. When `tools` and `excludeTools` both cover a tool, exclusion wins.
 
 Exclusions must not hit the subagent's protocol tools — the eight management tools plus `normal_reply` and `final_report` — because every protocol tool must stay available. A literal protocol tool name and any `*` pattern that can match one (for example `*`, `*report*`, or `normal_*`) make the template invalid at load time, with a diagnostic pointing at the template and the `excludeTools` field. Patterns that cannot match a protocol tool (for example `mcp_*` or `read`) stay valid. For the same reason, `tools` rejects the literal names of protocol tools; a `tools` wildcard may still cover them, since a whitelist cannot remove tools.
+
+The extension does not expose a `--no-mcp` switch: excluding MCP tools is the template's job. To exclude every MCP tool, declare `excludeTools: ["mcp__*"]`.
 
 The extension does not verify that a subagent's active tool set equals the declaration. A misspelled tool name silently yields one fewer tool instead of failing the launch.
 
@@ -352,7 +354,7 @@ To pin the runtime explicitly, set the `WJ_PI_SUBAGENTS_BRIDGE_RUNTIME` environm
 
 ## 🗜️ Context Compaction
 
-Pi `>= 0.85.1` decides on and runs context compaction through the native post-tool flow after each tool execution. The root session and every subagent are independent Pi sessions; each compacts and continues based on its actual context state, with no extra plugin or coordination protocol required.
+Pi `>= 1.2.0` decides on and runs context compaction through the native post-tool flow after each tool execution. The root session and every subagent are independent Pi sessions; each compacts and continues based on its actual context state, with no extra plugin or coordination protocol required.
 
 This plugin observes Pi's native compaction lifecycle events and `get_state.isCompacting` to calibrate agent status and TUI activity hints. Messages from the parent to a child Pi are still adjudicated by Pi command responses; if Pi rejects a message because it is compacting, the caller receives a retryable `compaction_active`. Pi has no `abort_compaction` RPC, so an interrupt during compaction returns `compaction_active` based on the current native compaction observation instead of calling the plain `abort`, which cannot cancel compaction. Child replies use Pi's fire-and-forget extension message API; a successful result only means the parent extension runtime has accepted the submission.
 

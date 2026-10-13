@@ -42,7 +42,8 @@ import {
   extensionDiagnosticLabelFromSource,
 } from "../src/startup-diagnostic.ts";
 import { parseAgentSnapshot } from "../src/agent-snapshot-codec.ts";
-import { SubagentToolError } from "../src/agent-tools.ts";
+import { registerAgentTools } from "../src/agent-tools.ts";
+import type { AgentController } from "../src/agent-controller.ts";
 
 const BRIDGE_CREDENTIAL = "startup-diagnostic-test-credential-0001";
 const SUPERVISOR_CREDENTIAL = "startup-supervisor-test-credential-0001";
@@ -512,16 +513,48 @@ test("provider、model 与 thinking 不匹配时启动仍然拒绝", async () =>
   }
 });
 
-test("工具错误保留规范启动 details，忽略伪造消息和敏感附加字段", () => {
+test("工具错误保留规范启动 details，忽略伪造消息和敏感附加字段", async () => {
   const failure = controlFailure("provider_unavailable", {
     provider: "wj-provider",
     path: "C:\\Users\\robot\\private\\provider.ts",
   });
-  const error = new SubagentToolError({
-    ...failure.error,
-    message: "TOP_SECRET_FORGED_MESSAGE",
-  });
-  const parsed = JSON.parse(error.message) as {
+  // 伪造 message 和敏感附加字段：工具边界必须重新生成规范外壳。
+  const forgedFailure = {
+    ...failure,
+    error: {
+      ...failure.error,
+      message: "TOP_SECRET_FORGED_MESSAGE",
+      details: {
+        ...failure.error.details,
+        path: "C:\\Users\\robot\\private\\provider.ts",
+      },
+    },
+  };
+  const registered: Array<Record<string, unknown>> = [];
+  registerAgentTools(
+    { registerTool: (tool) => registered.push(tool as Record<string, unknown>) },
+    () => ({ spawnAgent: () => forgedFailure }) as unknown as AgentController,
+  );
+  const tool = registered.find((candidate) => candidate.name === "spawn_agent");
+  assert.ok(tool);
+  const execute = tool.execute as (
+    toolCallId: string,
+    params: unknown,
+    signal: undefined,
+    onUpdate: undefined,
+    context: unknown,
+  ) => Promise<Record<string, unknown>>;
+  const result = await execute(
+    "startup-error-call",
+    { template_id: "demo", name: "测试" },
+    undefined,
+    undefined,
+    {},
+  );
+
+  assert.equal(result.isError, true);
+  const content = result.content as readonly { readonly type: string; readonly text: string }[];
+  const parsed = JSON.parse(content[0]!.text) as {
     readonly error: {
       readonly code: string;
       readonly message: string;
@@ -539,8 +572,10 @@ test("工具错误保留规范启动 details，忽略伪造消息和敏感附加
       details: { provider: "wj-provider" },
     },
   });
-  assert.equal(error.message.includes("TOP_SECRET"), false);
-  assert.equal(error.message.includes("Users"), false);
+  assert.deepEqual(result.details, parsed);
+  assert.deepEqual(result.structuredContent, parsed);
+  assert.equal(JSON.stringify(result).includes("TOP_SECRET"), false);
+  assert.equal(JSON.stringify(result).includes("Users"), false);
 });
 
 test("未分类的启动异常保持 spawn_failed", async () => {

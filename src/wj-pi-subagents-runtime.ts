@@ -1203,6 +1203,8 @@ export function createWjPiSubagentsRuntimeActivator(
       },
     });
 
+    // 有意不检查 event.messageType：所有 run 都注入准则，包括 sendMessage(triggerTurn: true)
+    // 触发的 custom run——被唤醒处理子代理回复的父代理同样需要父准则与模板目录。
     api.on("before_agent_start", async (event) => {
       const current = active;
       if (current === undefined || current.handoffPending === true) return;

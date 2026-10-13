@@ -10,7 +10,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D%2022.19.0-5FA04E?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
-[![Pi](https://img.shields.io/badge/Pi-%3E%3D%200.85.1-2563EB)](https://github.com/earendil-works/pi-mono)
+[![Pi](https://img.shields.io/badge/Pi-%3E%3D%201.2.0-2563EB)](https://github.com/earendil-works/pi-mono)
 
 </div>
 
@@ -34,14 +34,14 @@
 | 🎛️ | **受控管理** | 父代理只能管理其直接子级，支持等待、状态查询、中断、复用与终止 |
 | 👁️ | **状态可见** | TUI 展示直接子代理的状态；`/agents` 展示当前会话范围内的完整代理树 |
 | 🔭 | **实时动态查看器** | 在树中的任意代理上按 `Enter`，即可实时观看它的工作过程 |
-| 🗜️ | **原生上下文压缩** | 依赖 Pi `>= 0.85.1` 的工具执行后压缩流程；每个根会话和子代理都通过自己独立的 Pi 会话管理上下文 |
+| 🗜️ | **原生上下文压缩** | 依赖 Pi `>= 1.2.0` 的工具执行后压缩流程；每个根会话和子代理都通过自己独立的 Pi 会话管理上下文 |
 
 ## 📦 环境要求
 
 | 项目 | 要求 |
 | --- | --- |
 | Node.js | `>= 22.19.0` |
-| Pi | `>= 0.85.1` |
+| Pi | `>= 1.2.0` |
 
 ## 🚀 安装
 
@@ -262,13 +262,13 @@ pi
 | 写法 | 行为 |
 | --- | --- |
 | 省略 `tools` | 采用 Pi 正常的工具选择逻辑；不改动宿主默认工具集 |
-| `tools: []` | 常规选择中无业务工具，仅保留运行子代理所必需的工具（在 pi 1.1.0 及更高版本上，未列出的 MCP 工具仍会注册 —— 如需移除请使用 `excludeTools`） |
+| `tools: []` | 常规选择中无业务工具，仅保留运行子代理所必需的工具（未列出的 MCP 工具仍会注册 —— 如需移除请使用 `excludeTools`） |
 | 省略 `excludeTools` | 不排除任何工具 |
 | `excludeTools: []` | 与省略它等价 |
 | 省略 `extensions` | 采用 Pi 正常的扩展发现规则 |
 | `extensions: []` | 禁用正常扩展发现，仅加载本插件自身 |
 
-`extensions` 支持本地路径、`npm:`、`git:`、URL 与 `builtin:<name>`。`builtin:<name>` 引用 pi 内置扩展（如 `builtin:mcp`），需要 pi 0.99.0 或更高版本。声明 `extensions` 时本插件会传入 `--no-extensions`，因此未显式列出的内置扩展（如 `builtin:llama.cpp`、`builtin:codemode`、`builtin:tool-search`）也会被屏蔽，只有列出的项通过 `-e` 加载。
+`extensions` 支持本地路径、`npm:`、`git:`、URL 与 `builtin:<name>`。`builtin:<name>` 引用 pi 内置扩展（如 `builtin:mcp`）。声明 `extensions` 时本插件会传入 `--no-extensions`，因此未显式列出的内置扩展（如 `builtin:llama.cpp`、`builtin:codemode`、`builtin:tool-search`）也会被屏蔽，只有列出的项通过 `-e` 加载。内置扩展提供的工具同样需要列入 `tools` 才能被子代理调用 —— 例如在 `extensions` 中列出 `builtin:codemode`，并在 `tools` 中列出 `codemode`。
 
 仅加载内置 MCP 扩展的示例：
 
@@ -305,11 +305,13 @@ Confirm the existing implementation and constraints first, then make the changes
 
 `tools` 采用白名单写法：接受纯工具名与 `*` 通配。`*` 可以出现在条目的任意位置，一个条目中也可以出现多个。`+name` / `-name` 修饰符不受支持 —— 使用修饰符的模板在加载期即被判为无效，诊断会指向该模板与 `tools` 字段。修饰符的基准集来自宿主的默认工具配置，模板无法控制。
 
-`*` 需要 pi 1.1.0 或更高版本。在旧版本上，pi 会把 `*` 当作字面工具名：它匹配不到任何工具，子代理会在没有任何业务工具的情况下启动。
+通配同样覆盖 MCP 工具：`mcp__radius__*` 选中 `radius` MCP 服务器的全部工具，`mcp__*` 选中全部 MCP 工具。
 
-自 pi 1.1.0 起，`tools` 白名单不再排他：未列出的工具（尤其是 MCP 工具）仍会注册，并可经 codemode 一类间接路径调用。要移除不应可达的工具，请使用 `excludeTools`。它接受 YAML 字符串数组，条目遵循与 `tools` 相同的名字形状规则 —— 非空、无内部逗号或空白、无重复项 —— 并且同样支持 `*` 通配。与 `tools` 一样，`excludeTools` 会在加载期拒绝 `+name` / `-name` 修饰符，诊断指向该模板与 `excludeTools` 字段。排除在工具注册阶段生效，因此被排除的工具即使经上述间接路径也不可达。当 `tools` 与 `excludeTools` 同时覆盖某个工具时，排除优先。在 pi 1.1.0 之前的版本上，排除参数只做字面工具名匹配：`*` 与含通配的条目会被当作字面工具名，匹配不到任何工具，排除静默不生效 —— 本应被移除的工具仍然可达。
+`tools` 白名单并不排他：未列出的工具（尤其是 MCP 工具）仍会注册，并可经 codemode 一类间接路径调用。要移除不应可达的工具，请使用 `excludeTools`。它接受 YAML 字符串数组，条目遵循与 `tools` 相同的名字形状规则 —— 非空、无内部逗号或空白、无重复项 —— 并且同样支持 `*` 通配。与 `tools` 一样，`excludeTools` 会在加载期拒绝 `+name` / `-name` 修饰符，诊断指向该模板与 `excludeTools` 字段。排除在工具注册阶段生效，因此被排除的工具即使经上述间接路径也不可达。当 `tools` 与 `excludeTools` 同时覆盖某个工具时，排除优先。
 
 排除项不得命中子代理的协议工具 —— 八个管理工具加 `normal_reply`、`final_report` —— 协议工具必须全部保留。协议工具的字面名，以及任何可能匹配到协议工具名的 `*` 模式（如 `*`、`*report*`、`normal_*`），都会让模板在加载期被判为无效，诊断指向该模板与 `excludeTools` 字段。不会命中协议工具的模式（如 `mcp_*`、`read`）照常有效。同理，`tools` 会拒绝协议工具的字面名；`tools` 中的 `*` 通配仍可覆盖它们，因为白名单无法移除工具。
+
+本插件不暴露 `--no-mcp`：排除 MCP 工具由模板的 `excludeTools` 承担。要排除全部 MCP 工具，请声明 `excludeTools: ["mcp__*"]`。
 
 本插件不校验子代理的实际活动工具集是否等于声明。拼错的工具名只会静默地少一个工具，不会阻止启动。
 
@@ -352,7 +354,7 @@ Confirm the existing implementation and constraints first, then make the changes
 
 ## 🗜️ 上下文压缩
 
-Pi `>= 0.85.1` 在每次工具执行后，通过原生的 post-tool 流程决定并执行上下文压缩。根会话与每个子代理都是独立的 Pi 会话，各自根据实际上下文状态完成压缩并继续工作，无需任何额外的插件或协调协议。
+Pi `>= 1.2.0` 在每次工具执行后，通过原生的 post-tool 流程决定并执行上下文压缩。根会话与每个子代理都是独立的 Pi 会话，各自根据实际上下文状态完成压缩并继续工作，无需任何额外的插件或协调协议。
 
 本插件通过监听 Pi 原生压缩生命周期事件和 `get_state.isCompacting` 来校准代理状态与 TUI 动态提示。父代理发给子 Pi 的消息仍由 Pi 命令响应裁定；若 Pi 因正在压缩而拒绝消息，调用方会收到可重试的 `compaction_active`。Pi 没有 `abort_compaction` RPC，因此在压缩期间发起中断时，插件不会调用无法取消压缩的普通 `abort`，而是基于当前对原生压缩的观察返回 `compaction_active`。子级回复使用 Pi 的 fire-and-forget 扩展消息 API；调用成功仅表示父扩展运行时已接受该提交。
 

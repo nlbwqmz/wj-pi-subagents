@@ -117,3 +117,21 @@ test("白名单与排除参数同时出现时各自保留声明顺序", () => {
     "mcp_*",
   ]);
 });
+
+test("tools 中的通配条目原样传给子 Pi 的 --tools 参数", () => {
+  const merged = buildManagedRpcOptions(createTemplate({
+    tools: ["read", "mcp__radius__*"],
+  }), {
+    childReplyTools: ["normal_reply"],
+    managementTools: ["spawn_agent"],
+  });
+
+  assert.deepEqual(merged.args, [
+    "--no-session",
+    "--tools",
+    "read,mcp__radius__*,normal_reply,spawn_agent",
+  ]);
+
+  const star = buildManagedRpcOptions(createTemplate({ tools: ["*"] }));
+  assert.deepEqual(star.args, ["--no-session", "--tools", "*"]);
+});

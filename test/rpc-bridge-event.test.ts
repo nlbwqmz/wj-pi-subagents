@@ -58,6 +58,33 @@ test("任务桥接公开无载荷 agent_start 事实并剥离其余字段", () =
   });
 });
 
+test("任务桥接保留 agent_settled.aborted 事实并剥离其余字段", () => {
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "agent_settled",
+    aborted: true,
+    result: { secret: true },
+  }), {
+    kind: "event",
+    event: { type: "agent_settled", aborted: true },
+  });
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "agent_settled",
+    aborted: false,
+  }), {
+    kind: "event",
+    event: { type: "agent_settled", aborted: false },
+  });
+  // 产生端未提供该事实时保持旧形状；显式非法值拒绝。
+  assert.deepEqual(normalizeRpcBridgeEvent({ type: "agent_settled" }), {
+    kind: "event",
+    event: { type: "agent_settled" },
+  });
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "agent_settled",
+    aborted: "true",
+  }), { kind: "invalid" });
+});
+
 test("桥接严格规范化 Pi 的完整压缩原因闭集，非法原因拒绝", () => {
   for (const reason of ["manual", "threshold", "overflow"] as const) {
     assert.deepEqual(normalizeRpcBridgeEvent({

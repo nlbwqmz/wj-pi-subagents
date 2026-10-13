@@ -731,7 +731,8 @@ export type AgentActivityEventNormalization =
 
 /** 桥接进程允许跨进程公开的 Pi 事件闭集。 */
 export type SafeRpcBridgeEvent =
-  | { readonly type: "agent_start" | "agent_settled" }
+  | { readonly type: "agent_start" }
+  | { readonly type: "agent_settled"; readonly aborted?: boolean }
   | {
       readonly type: "compaction_start";
       readonly reason: "manual" | "threshold" | "overflow";
@@ -806,8 +807,16 @@ export function normalizeRpcBridgeEvent(event: unknown): RpcBridgeEventNormaliza
   if (!isRecord(event) || typeof event.type !== "string") return INVALID_EVENT;
   switch (event.type) {
     case "agent_start":
-    case "agent_settled":
-      return safeEvent(Object.freeze({ type: event.type }));
+      return safeEvent(Object.freeze({ type: "agent_start" }));
+    case "agent_settled": {
+      // RPC agent_settled 透传本次 settle 是否由中断触发；字段缺失时
+      // 保持旧形状，未知字段仍被剥离。
+      if (event.aborted !== undefined && typeof event.aborted !== "boolean") return INVALID_EVENT;
+      return safeEvent(Object.freeze({
+        type: "agent_settled",
+        ...(event.aborted === undefined ? {} : { aborted: event.aborted }),
+      }));
+    }
     case "compaction_start":
       if (event.reason !== "manual" && event.reason !== "threshold" && event.reason !== "overflow") {
         return INVALID_EVENT;
@@ -2324,8 +2333,8 @@ function extractErrorText(result: unknown): string | undefined {
 }
 
 /**
- * 插件工具失败事实的规范稳定错误码：SubagentToolError 把稳定 JSON 外壳放
- * 在 content 的 text 块中，这里只取白名单内的 error.code；其余结构、底层
+ * 插件工具失败事实的规范稳定错误码：工具边界把稳定 JSON 外壳放在
+ * content 的 text 块中，这里只取白名单内的 error.code；其余结构、底层
  * 异常正文与白名单外错误码一律省略。
  */
 function extractPluginErrorCode(result: unknown): string | undefined {

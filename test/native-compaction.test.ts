@@ -248,3 +248,101 @@ test("compaction_end fence 忽略 stale true，并允许稳定 false 收敛", as
   assert.equal(stateOf(tree), "idle");
   assert.equal(events.some((event) => event.kind === "fault"), false);
 });
+
+test("agent_settled 的 aborted 事实进入节点快照，并被下一次 settle 覆盖", async () => {
+  const { rpc, supervisor, tree } = await startHarness();
+
+  rpc.setState({ isStreaming: true, isCompacting: false, pendingMessageCount: 0 });
+  assert.equal(await supervisor.synchronizeState(), true);
+  assert.equal(stateOf(tree), "working");
+
+  rpc.setState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+  emitPiEvent(rpc, { type: "agent_settled", aborted: true });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(await supervisor.synchronizeState(), true);
+  assert.equal(stateOf(tree), "idle");
+  const interrupted = tree.getStatus(CHILD_ID);
+  assert.equal(interrupted.ok, true);
+  if (interrupted.ok) assert.equal(interrupted.data.aborted, true);
+
+  // 新 run 正常完成时，最近一次 settle 事实被覆盖。
+  rpc.setState({ isStreaming: true, isCompacting: false, pendingMessageCount: 0 });
+  assert.equal(await supervisor.synchronizeState(), true);
+  rpc.setState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+  emitPiEvent(rpc, { type: "agent_settled", aborted: false });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(await supervisor.synchronizeState(), true);
+  const settled = tree.getStatus(CHILD_ID);
+  assert.equal(settled.ok, true);
+  if (settled.ok) assert.equal(settled.data.aborted, false);
+});
+
+test("取消后新 run 的 agent_start 清除上一轮 settle 的中断事实", async () => {
+  const { rpc, supervisor, tree } = await startHarness();
+
+  rpc.setState({ isStreaming: true, isCompacting: false, pendingMessageCount: 0 });
+  assert.equal(await supervisor.synchronizeState(), true);
+  assert.equal(stateOf(tree), "working");
+
+  rpc.setState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+  emitPiEvent(rpc, { type: "agent_settled", aborted: true });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(await supervisor.synchronizeState(), true);
+  const interrupted = tree.getStatus(CHILD_ID);
+  assert.equal(interrupted.ok, true);
+  if (interrupted.ok) assert.equal(interrupted.data.aborted, true);
+
+  // 新 run 开始：上一轮被取消的中断事实不得继续暴露。
+  rpc.setState({ isStreaming: true, isCompacting: false, pendingMessageCount: 0 });
+  emitPiEvent(rpc, { type: "agent_start" });
+  const restarted = tree.getStatus(CHILD_ID);
+  assert.equal(restarted.ok, true);
+  if (restarted.ok) {
+    assert.equal(restarted.data.state, "working");
+    assert.equal("aborted" in restarted.data, false);
+  }
+
+  // 新 run 若没有 settle 事件、只由状态探针结算，也不得再带出上一轮的中断事实。
+  rpc.setState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+  assert.equal(await supervisor.synchronizeState(), true);
+  const probeSettled = tree.getStatus(CHILD_ID);
+  assert.equal(probeSettled.ok, true);
+  if (probeSettled.ok) {
+    assert.equal(probeSettled.data.state, "idle");
+    assert.equal("aborted" in probeSettled.data, false);
+  }
+});
+
+test("探针合成 agent_start 时清除上一轮 settle 的中断事实", async () => {
+  const { rpc, supervisor, tree } = await startHarness();
+
+  rpc.setState({ isStreaming: true, isCompacting: false, pendingMessageCount: 0 });
+  assert.equal(await supervisor.synchronizeState(), true);
+  assert.equal(stateOf(tree), "working");
+
+  rpc.setState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+  emitPiEvent(rpc, { type: "agent_settled", aborted: true });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(await supervisor.synchronizeState(), true);
+  const interrupted = tree.getStatus(CHILD_ID);
+  assert.equal(interrupted.ok, true);
+  if (interrupted.ok) assert.equal(interrupted.data.aborted, true);
+
+  // 新 run 只由状态探针发现：没有 agent_start 事件，中断事实也必须失效。
+  rpc.setState({ isStreaming: true, isCompacting: false, pendingMessageCount: 0 });
+  assert.equal(await supervisor.synchronizeState(), true);
+  assert.equal(stateOf(tree), "working");
+  const restarted = tree.getStatus(CHILD_ID);
+  assert.equal(restarted.ok, true);
+  if (restarted.ok) assert.equal("aborted" in restarted.data, false);
+
+  // 新 run 结束时同样没有 settle 事件，探针合成 settle 不得带出上一轮事实。
+  rpc.setState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+  assert.equal(await supervisor.synchronizeState(), true);
+  const settled = tree.getStatus(CHILD_ID);
+  assert.equal(settled.ok, true);
+  if (settled.ok) {
+    assert.equal(settled.data.state, "idle");
+    assert.equal("aborted" in settled.data, false);
+  }
+});

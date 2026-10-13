@@ -190,6 +190,16 @@ function apply(tree: TreeController, agentId: string, type: AgentLifecycleEventT
   if (result.ok) assert.equal(result.data.applied, true, JSON.stringify(result));
 }
 
+function applySettledAborted(tree: TreeController, agentId: string, aborted: boolean): void {
+  const result = tree.applyLifecycleEvent(agentId, {
+    type: "agent_settled",
+    expected_generation: generation(tree, agentId),
+    aborted,
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  if (result.ok) assert.equal(result.data.applied, true, JSON.stringify(result));
+}
+
 interface Signal {
   readonly promise: Promise<void>;
   readonly resolve: () => void;
@@ -927,6 +937,95 @@ test("嵌套子生命周期快速收敛时直接父保持健康并合并完整�
         assert.equal(status.data.state, "terminated");
         assert.equal(status.data.termination_result, "completed");
       }
+    }
+  } finally {
+    await publisher?.close().catch(() => {});
+    await channels.child.release().catch(() => {});
+    await channels.parent.release().catch(() => {});
+  }
+});
+
+test("嵌套 settle 的 aborted 事实经监督事实与快照投影到根", async () => {
+  const allocated = [DIRECT_CHILD_ID, NESTED_ONE_ID];
+  let allocation = 0;
+  const rootTree = makeTree(() => allocated[allocation++] ?? NESTED_ONE_ID);
+  const childTree = makeTree(
+    () => NESTED_ONE_ID,
+    {
+      agentId: DIRECT_CHILD_ID,
+      parentAgentId: null,
+      depth: 1,
+      managementEnabled: true,
+      templateId: "direct",
+      name: "直接父",
+    },
+  );
+  const directChildActor = actor(DIRECT_CHILD_ID);
+  const initial = childTree.getSupervisionSubtreeSnapshot(directChildActor);
+  assert.equal(initial.ok, true, JSON.stringify(initial));
+  if (!initial.ok) return;
+
+  const channels = channelPair(initial.data.nodes);
+  const supervisor = new RpcSupervisor({
+    controller: rootTree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "direct", name: "直接父" },
+    managedNode: new ManagedFakeNode(),
+    channel: channels.parent,
+    startupTimeoutMs: 1_000,
+    gracefulShutdownMs: 1_000,
+  });
+  const abort = new AbortController();
+  let publisher: SubtreePublisher<unknown, AppliedLifecycleFact> | undefined;
+  try {
+    const startup = supervisor.start();
+    await channels.child.bind(abort.signal);
+    assert.deepEqual(await startup, {
+      ok: true,
+      agent_id: DIRECT_CHILD_ID,
+      state: "idle",
+    });
+    await channels.child.waitForReady(abort.signal);
+
+    const nested = rootTree.reserveStartingChild(directChildActor, {
+      templateId: "nested",
+      name: "嵌套中断",
+    });
+    assert.equal(nested.ok, true, JSON.stringify(nested));
+    if (!nested.ok) return;
+    const adopted = childTree.adoptSpawnGrant(directChildActor, {
+      node: nested.data.node,
+      lifecycle_generation: nested.data.lifecycle_generation,
+      management_enabled: true,
+    });
+    assert.equal(adopted.ok, true, JSON.stringify(adopted));
+
+    publisher = new SubtreePublisher<unknown, AppliedLifecycleFact>({
+      read: () => {
+        const snapshot = childTree.getSupervisionSubtreeSnapshot(directChildActor);
+        if (!snapshot.ok) throw new Error("子树读取失败");
+        return {
+          nodes: snapshot.data.nodes,
+          subtreeRevision: snapshot.data.tree_revision + 1,
+        };
+      },
+      onChange: (listener) => childTree.onChange(listener),
+      onLifecycleEvent: (listener) => childTree.onLifecycleEvent(listener),
+    }, channels.child);
+    await publisher.start();
+    await settle();
+
+    apply(childTree, NESTED_ONE_ID, "startup_ready");
+    apply(childTree, NESTED_ONE_ID, "agent_start");
+    applySettledAborted(childTree, NESTED_ONE_ID, true);
+    await publisher.flush();
+    await settle();
+
+    const status = rootTree.getStatus(NESTED_ONE_ID);
+    assert.equal(status.ok, true, JSON.stringify(status));
+    if (status.ok) {
+      assert.equal(status.data.state, "idle");
+      assert.equal(status.data.aborted, true);
     }
   } finally {
     await publisher?.close().catch(() => {});

@@ -1996,13 +1996,14 @@ function pluginEnd(toolName: string, result: unknown, isError = false): unknown 
   };
 }
 
-/** SubagentToolError 的稳定 JSON 外壳：content text 块中的完整 JSON 字符串。 */
+/** 插件工具失败的稳定结果形状：content 文本外壳 + isError 事实 + 结构化 details。 */
 function pluginErrorShell(code: string, message = "boom"): unknown {
+  const envelope = { ok: false, error: { code, message, retryable: false, details: {} } };
   return {
-    content: [{
-      type: "text",
-      text: JSON.stringify({ ok: false, error: { code, message, retryable: false, details: {} } }),
-    }],
+    content: [{ type: "text", text: JSON.stringify(envelope) }],
+    details: envelope,
+    structuredContent: envelope,
+    isError: true,
   };
 }
 
@@ -2180,6 +2181,7 @@ test("插件工具结束事实区分成功与失败摘要并只携带白名单�
     agent_id: PLUGIN_CHILD_ID,
     message: "投递正文",
   });
+  assert.equal(failedSend.event.isError, true);
   assert.equal(failedSend.event.errorCode, "agent_unavailable");
   // 插件失败不携带错误正文。
   assert.equal(failedSend.event.errorText, undefined);
@@ -2192,6 +2194,7 @@ test("插件工具结束事实区分成功与失败摘要并只携带白名单�
   assert.equal(failedReply.kind, "event");
   if (failedReply.kind !== "event" || failedReply.event.type !== "tool_execution_end") return;
   assert.deepEqual(summaryOf(failedReply.event), { tool: "normal_reply", message: "过长回复" });
+  assert.equal(failedReply.event.isError, true);
   assert.equal(failedReply.event.errorCode, "reply_too_large");
 
   // final_report 成功保留完整正文，不携带错误码。
