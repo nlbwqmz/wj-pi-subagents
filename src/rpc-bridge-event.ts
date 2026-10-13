@@ -2324,8 +2324,8 @@ function extractErrorText(result: unknown): string | undefined {
 }
 
 /**
- * 插件工具失败事实的规范稳定错误码：SubagentToolError 把稳定 JSON 外壳放
- * 在 content 的 text 块中，这里只取白名单内的 error.code；其余结构、底层
+ * 插件工具失败事实的规范稳定错误码：工具边界把稳定 JSON 外壳放在
+ * content 的 text 块中，这里只取白名单内的 error.code；其余结构、底层
  * 异常正文与白名单外错误码一律省略。
  */
 function extractPluginErrorCode(result: unknown): string | undefined {

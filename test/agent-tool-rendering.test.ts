@@ -44,6 +44,7 @@ interface RegisteredAgentTool {
   readonly parameters?: unknown;
   readonly annotations?: unknown;
   readonly namespace?: unknown;
+  readonly outputSchema?: unknown;
   readonly prepareArguments?: (args: unknown) => unknown;
   readonly renderCall?: (
     params: unknown,
@@ -82,17 +83,38 @@ function registeredTool(
   return tool;
 }
 
+interface RegisteredToolResult {
+  readonly content: readonly { readonly type: string; readonly text?: string }[];
+  readonly details?: unknown;
+  readonly structuredContent?: unknown;
+  readonly isError?: boolean;
+}
+
+async function executeRegisteredToolResult(
+  tool: RegisteredAgentTool,
+  params: unknown,
+): Promise<RegisteredToolResult> {
+  assert.ok(tool.execute);
+  const result = await tool.execute(
+    "render-test-call",
+    params,
+    undefined,
+    undefined,
+    {},
+  ) as RegisteredToolResult;
+  // 全部调用点都是失败路径：工具边界必须返回 isError 结果而不是抛错。
+  assert.equal(result.isError, true, "expected registered tool to return an error result");
+  return result;
+}
+
 async function executeRegisteredTool(
   tool: RegisteredAgentTool,
   params: unknown,
 ): Promise<string> {
-  assert.ok(tool.execute);
-  try {
-    await tool.execute("render-test-call", params, undefined, undefined, {});
-  } catch (error) {
-    return error instanceof Error ? error.message : String(error);
-  }
-  throw new Error("expected registered tool to fail");
+  const result = await executeRegisteredToolResult(tool, params);
+  const text = result.content[0]?.text;
+  assert.equal(typeof text, "string");
+  return text as string;
 }
 
 function makeEmptyController(): AgentController {
@@ -1112,17 +1134,15 @@ test("send_message 成功返回在 JSON 顶层附带移交提示，details 保�
     undefined,
     undefined,
     {},
-  ) as {
-    content: readonly { readonly type: string; readonly text: string }[];
-    details: unknown;
-  };
+  ) as RegisteredToolResult;
 
-  assert.deepEqual(JSON.parse(result.content[0]!.text), {
+  assert.deepEqual(JSON.parse(result.content[0]!.text!), {
     ok: true,
     data: { accepted: true },
     notice: SEND_MESSAGE_HANDOFF_NOTICE,
   });
   assert.deepEqual(result.details, { accepted: true });
+  assert.deepEqual(result.structuredContent, { accepted: true });
 });
 
 test("其余工具成功返回的 JSON 形态不变，不附带 notice 字段", async () => {
@@ -1136,12 +1156,9 @@ test("其余工具成功返回的 JSON 形态不变，不附带 notice 字段", 
     undefined,
     undefined,
     {},
-  ) as {
-    content: readonly { readonly type: string; readonly text: string }[];
-    details: unknown;
-  };
+  ) as RegisteredToolResult;
 
-  const parsed = JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+  const parsed = JSON.parse(result.content[0]!.text!) as Record<string, unknown>;
   assert.equal("notice" in parsed, false);
   assert.deepEqual(parsed, {
     ok: true,
@@ -1160,6 +1177,7 @@ test("其余工具成功返回的 JSON 形态不变，不附带 notice 字段", 
     depth: 1,
     state: "idle",
   });
+  assert.deepEqual(result.structuredContent, result.details);
 });
 
 test("wait_agent 仅在 woken 结果附加顶层提示，其它结果不附加", async () => {
@@ -1189,22 +1207,20 @@ test("wait_agent 仅在 woken 结果附加顶层提示，其它结果不附加",
   );
   await new Promise<void>((resolve) => setImmediate(resolve));
   controller.wakeWaitersForParentInput();
-  const result = await pending as {
-    content: readonly { readonly type: string; readonly text: string }[];
-    details: unknown;
-  };
+  const result = await pending as RegisteredToolResult;
 
   const wokenData = {
     agent_ids: [HANDOFF_AGENT_ID],
     outcome: "woken",
     wake_reason: "parent_input",
   };
-  assert.deepEqual(JSON.parse(result.content[0]!.text), {
+  assert.deepEqual(JSON.parse(result.content[0]!.text!), {
     ok: true,
     data: wokenData,
     notice: WAIT_PARENT_INPUT_WOKEN_NOTICE,
   });
   assert.deepEqual(result.details, wokenData);
+  assert.deepEqual(result.structuredContent, wokenData);
 
   // 真实事件结果（idle）不携带该提示。
   const nextLifecycle = tree.getLifecycleGeneration(HANDOFF_AGENT_ID);
@@ -1221,13 +1237,132 @@ test("wait_agent 仅在 woken 结果附加顶层提示，其它结果不附加",
     undefined,
     undefined,
     {},
-  ) as {
-    content: readonly { readonly type: string; readonly text: string }[];
-  };
-  const idleParsed = JSON.parse(idle.content[0]!.text) as Record<string, unknown>;
+  ) as RegisteredToolResult;
+  const idleParsed = JSON.parse(idle.content[0]!.text!) as Record<string, unknown>;
   assert.equal("notice" in idleParsed, false);
   const idleData = idleParsed.data as Record<string, unknown>;
   assert.equal(idleData.agent_id, HANDOFF_AGENT_ID);
   assert.equal(idleData.outcome, "idle");
   assert.equal(idleData.state, "idle");
+});
+
+test("10 个子代理工具声明 outputSchema，成功结果的 structuredContent 与 details 一致", async () => {
+  const registered: RegisteredAgentTool[] = [];
+  registerAgentTools({
+    registerTool: (tool) => registered.push(tool as RegisteredAgentTool),
+  }, () => makeEmptyController());
+  registerNormalReplyTool({
+    registerTool: (tool) => registered.push(tool as RegisteredAgentTool),
+  }, () => undefined);
+
+  assert.equal(registered.length, 10);
+  for (const tool of registered) {
+    const outputSchema = tool.outputSchema as {
+      readonly type?: unknown;
+      readonly anyOf?: unknown;
+    } | undefined;
+    assert.ok(outputSchema, `${tool.name} 缺少 outputSchema`);
+    assert.ok(
+      outputSchema.type === "object"
+        || outputSchema.type === "array"
+        || Array.isArray(outputSchema.anyOf),
+      `${tool.name} 的 outputSchema 形状异常`,
+    );
+  }
+
+  // get_agent_templates 成功路径：details 是模板数组，content 直接是该数组。
+  const templates = registered.find((tool) => tool.name === "get_agent_templates");
+  assert.ok(templates?.execute);
+  const templatesResult = await templates.execute(
+    "structured-templates-call",
+    {},
+    undefined,
+    undefined,
+    {},
+  ) as RegisteredToolResult;
+  assert.equal(templatesResult.isError, undefined);
+  assert.deepEqual(templatesResult.details, []);
+  assert.deepEqual(templatesResult.structuredContent, []);
+  assert.equal(templatesResult.content[0]?.text, "[]");
+
+  // spawn_agent 成功路径：content 是完整 ControlResult，structuredContent 等于 details。
+  const fake = new HandoffSupervisor();
+  const controller = makeHandoffController(fake);
+  const spawn = registeredTool(controller, "spawn_agent");
+  assert.ok(spawn.execute);
+  const spawnResult = await spawn.execute(
+    "structured-spawn-call",
+    { template_id: "demo", name: "结构化输出测试" },
+    undefined,
+    undefined,
+    {},
+  ) as RegisteredToolResult;
+  assert.equal(spawnResult.isError, undefined);
+  assert.deepEqual(spawnResult.structuredContent, spawnResult.details);
+  assert.equal(
+    (spawnResult.details as Record<string, unknown>).agent_id,
+    HANDOFF_AGENT_ID,
+  );
+});
+
+test("工具失败路径返回 isError:true 与结构化错误，不再抛错", async () => {
+  const missingAgentId = "0c490542-8355-4df3-922d-994800000000";
+  const controller = makeEmptyController();
+  const tool = registeredTool(controller, "wait_agent");
+  assert.ok(tool.execute);
+  const result = await tool.execute(
+    "structured-failure-call",
+    { agent_ids: [missingAgentId] },
+    undefined,
+    undefined,
+    {},
+  ) as RegisteredToolResult;
+
+  assert.equal(result.isError, true);
+  const envelope = JSON.parse(result.content[0]?.text ?? "") as {
+    readonly ok: boolean;
+    readonly error: {
+      readonly code: string;
+      readonly message: string;
+      readonly retryable: boolean;
+      readonly details: Readonly<Record<string, unknown>>;
+    };
+  };
+  assert.deepEqual(envelope, {
+    ok: false,
+    error: {
+      code: "agent_not_found",
+      message: "Subagent ID is not registered",
+      retryable: false,
+      details: {},
+    },
+  });
+  assert.deepEqual(result.details, envelope);
+  assert.deepEqual(result.structuredContent, envelope);
+});
+
+test("工具提供者不可用时返回 isError:true 的 agent_unavailable", async () => {
+  const registered: RegisteredAgentTool[] = [];
+  registerAgentTools({
+    registerTool: (tool) => registered.push(tool as RegisteredAgentTool),
+  }, () => undefined as never);
+  const tool = registered.find((candidate) => candidate.name === "get_agent_tree");
+  assert.ok(tool?.execute);
+  const result = await tool.execute(
+    "structured-unavailable-call",
+    {},
+    undefined,
+    undefined,
+    {},
+  ) as RegisteredToolResult;
+
+  assert.equal(result.isError, true);
+  const envelope = JSON.parse(result.content[0]?.text ?? "") as {
+    readonly ok: boolean;
+    readonly error: { readonly code: string };
+  };
+  assert.equal(envelope.ok, false);
+  assert.equal(envelope.error.code, "agent_unavailable");
+  assert.deepEqual(result.details, envelope);
+  assert.deepEqual(result.structuredContent, envelope);
 });
