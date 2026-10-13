@@ -66,6 +66,8 @@ export interface AgentToolRenderContext {
   readonly expanded?: boolean;
   readonly isError?: boolean;
   readonly lastComponent?: unknown;
+  /** pi 1.2.0 渲染上下文：最终结果的单调耗时；partial 或未执行时为 undefined。 */
+  readonly durationMs?: number;
 }
 
 export interface AgentToolResultView {
@@ -96,6 +98,8 @@ export interface SafeRenderLine {
   readonly maxLines?: number;
   readonly overflowText?: string;
   readonly overflowHint?: (hiddenLines: number) => readonly SafeRenderSegment[];
+  /** 追加在该行末尾的只读段（如 dim 耗时段）；随整行一起接受宽度约束。 */
+  readonly suffix?: readonly SafeRenderSegment[];
 }
 
 export interface SafeTextComponentOptions {
@@ -178,13 +182,46 @@ export class SafeTextComponent implements AgentToolRenderComponent {
         segment.color,
         segment.bold === true ? this.theme.bold(text) : text,
       );
+    /** 逐段着色并整体约束到 contentWidth；用于行尾附加段与分段折叠提示。 */
+    const renderSegmentLine = (segments: readonly SafeRenderSegment[]): string => {
+      let used = 0;
+      const kept: SafeRenderSegment[] = [];
+      for (const segment of segments) {
+        if (used >= contentWidth) break;
+        const width = displayWidth(segment.text);
+        if (used + width <= contentWidth) {
+          kept.push(segment);
+          used += width;
+          continue;
+        }
+        kept.push({ ...segment, text: truncateToDisplayWidth(segment.text, contentWidth - used) });
+        used = contentWidth;
+        break;
+      }
+      const plainWidth = kept.reduce((total, segment) => total + displayWidth(segment.text), 0);
+      const styledText = kept.map((segment) => styleSegmentText(segment, segment.text)).join("");
+      const leftPad = " ".repeat(outputPad + horizontalPadding);
+      if (background === undefined) return `${leftPad}${styledText}`;
+      const rightPad = " ".repeat(Math.max(
+        0,
+        availableWidth - outputPad - horizontalPadding - plainWidth,
+      ));
+      return background(`${leftPad}${styledText}${rightPad}`);
+    };
 
     for (const line of this.lines) {
       const prefix = sanitizeInline(line.prefix ?? "");
+      const lineColorSegment = (text: string): SafeRenderSegment => ({
+        text,
+        color: line.color,
+        ...(line.bold === true ? { bold: true } : {}),
+      });
       const lineWidth = Math.max(1, contentWidth - displayWidth(prefix));
       const safeText = line.multiline === true
         ? sanitizeMultiline(line.text)
         : sanitizeInline(line.text);
+      const suffix = sanitizeRenderSegments(line.suffix);
+      const suffixWidth = suffix.reduce((total, segment) => total + displayWidth(segment.text), 0);
       let wrapped = safeText
         .split("\n")
         .flatMap((part) => wrapToDisplayWidth(part, lineWidth));
@@ -214,21 +251,42 @@ export class SafeTextComponent implements AgentToolRenderComponent {
           ];
         }
       }
-      for (const part of wrapped) {
+      for (let index = 0; index < wrapped.length; index += 1) {
+        const part = wrapped[index]!;
+        if (index === wrapped.length - 1 && suffix.length > 0 && overflowHintSegments === undefined) {
+          const main = truncateToDisplayWidth(
+            part,
+            Math.max(0, contentWidth - displayWidth(prefix) - suffixWidth),
+          );
+          rendered.push(renderSegmentLine([
+            ...(prefix.length === 0 ? [] : [lineColorSegment(prefix)]),
+            ...(main.length === 0 ? [] : [lineColorSegment(main)]),
+            ...suffix,
+          ]));
+          continue;
+        }
         const text = truncateToDisplayWidth(`${prefix}${part}`, contentWidth);
         rendered.push(renderLine(line, text));
       }
       if (overflowHintSegments !== undefined) {
-        const plainHint = `${prefix}${overflowHintSegments.map((segment) => segment.text).join("")}`;
-        const styledHint = displayWidth(plainHint) > contentWidth
-          ? styleSegmentText(
-            overflowHintSegments[0]!,
-            truncateToDisplayWidth(plainHint, contentWidth),
-          )
-          : `${prefix}${overflowHintSegments
-            .map((segment) => styleSegmentText(segment, segment.text))
-            .join("")}`;
-        rendered.push(renderLine(line, styledHint, true));
+        if (suffix.length === 0) {
+          const plainHint = `${prefix}${overflowHintSegments.map((segment) => segment.text).join("")}`;
+          const styledHint = displayWidth(plainHint) > contentWidth
+            ? styleSegmentText(
+              overflowHintSegments[0]!,
+              truncateToDisplayWidth(plainHint, contentWidth),
+            )
+            : `${prefix}${overflowHintSegments
+              .map((segment) => styleSegmentText(segment, segment.text))
+              .join("")}`;
+          rendered.push(renderLine(line, styledHint, true));
+        } else {
+          rendered.push(renderSegmentLine([
+            ...(prefix.length === 0 ? [] : [lineColorSegment(prefix)]),
+            ...overflowHintSegments,
+            ...suffix,
+          ]));
+        }
       }
     }
 
@@ -270,6 +328,60 @@ export function createSafeTextComponent(
     return context.lastComponent;
   }
   return new SafeTextComponent(lines, theme, options);
+}
+
+/**
+ * 结果渲染专用组件：在最后一行尾部追加 dim 耗时段。
+ * partial 结果由 renderAgentToolResult 提前返回 Processing，不经过这里。
+ */
+function createResultComponent(
+  lines: readonly SafeRenderLine[],
+  theme: AgentToolRenderTheme,
+  context: AgentToolRenderContext,
+): AgentToolRenderComponent {
+  const durationMs = readDurationMs(context);
+  return createSafeTextComponent(
+    durationMs === undefined ? lines : appendDurationSuffix(lines, durationMs),
+    theme,
+    context,
+  );
+}
+
+function appendDurationSuffix(
+  lines: readonly SafeRenderLine[],
+  durationMs: number,
+): readonly SafeRenderLine[] {
+  if (lines.length === 0) return lines;
+  const suffix: SafeRenderSegment = {
+    text: ` · ${formatToolDuration(durationMs)}`,
+    color: "dim",
+  };
+  const last = lines[lines.length - 1]!;
+  return [
+    ...lines.slice(0, -1),
+    { ...last, suffix: [...(last.suffix ?? []), suffix] },
+  ];
+}
+
+function readDurationMs(context: AgentToolRenderContext): number | undefined {
+  const value = readProperty(context, "durationMs");
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+/**
+ * 与 pi 1.2.0 formatToolDuration 相同的三个分支；小时分支按验收样例补零。
+ * 秒分支保留一位小数，分钟分支不补零，小时分支的分钟与秒补足两位。
+ */
+function formatToolDuration(durationMs: number): string {
+  const seconds = durationMs / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const totalSeconds = Math.floor(seconds);
+  const minutes = Math.floor(totalSeconds / 60);
+  const remainder = totalSeconds % 60;
+  if (minutes < 60) return `${minutes}m ${remainder}s`;
+  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m ${String(remainder).padStart(2, "0")}s`;
 }
 
 /** 按注册工具名称提供语义化调用行。 */
@@ -376,7 +488,7 @@ export function renderAgentToolResult(
     && error === undefined
     && unexpectedErrorReason === OPERATION_ABORTED_REASON
   ) {
-    return createSafeTextComponent([{
+    return createResultComponent([{
       text: OPERATION_ABORTED_REASON,
       color: "error",
     }], theme, context);
@@ -386,7 +498,7 @@ export function renderAgentToolResult(
       code: "internal_error",
       reason: unexpectedErrorReason ?? INTERNAL_ERROR_REASON,
     };
-    return createSafeTextComponent([{
+    return createResultComponent([{
       text: `${failure.code}: ${failure.reason}${formatStableErrorDetails(error?.details)}`,
       color: "error",
     }], theme, context);
@@ -403,7 +515,7 @@ export function renderAgentToolResult(
   if (name === "normal_reply" || name === "final_report") {
     const details = readRecord(readProperty(result, "details"));
     return readProperty(details, "accepted") === true
-      ? createSafeTextComponent([{
+      ? createResultComponent([{
         text: name === "final_report" ? "Report received by parent session" : "Received by parent session",
         color: "success",
       }], theme, context)
@@ -416,7 +528,7 @@ function invalidResult(
   theme: AgentToolRenderTheme,
   context: AgentToolRenderContext,
 ): AgentToolRenderComponent {
-  return createSafeTextComponent([{
+  return createResultComponent([{
     text: `internal_error: ${INTERNAL_ERROR_REASON}`,
     color: "error",
   }], theme, context);
@@ -431,10 +543,10 @@ function renderTemplateResult(
   const templates = readTemplates(readProperty(result, "details"));
   if (templates === undefined) return invalidResult(theme, context);
   if (templates.length === 0) {
-    return createSafeTextComponent([{ text: "No available templates", color: "muted" }], theme, context);
+    return createResultComponent([{ text: "No available templates", color: "muted" }], theme, context);
   }
   if (options.expanded !== true) {
-    return createSafeTextComponent([{
+    return createResultComponent([{
       text: `Available templates: ${templates.length} · ${templates.map((item) => item.templateId).join(" · ")}`,
       color: "success",
     }], theme, context);
@@ -462,7 +574,7 @@ function renderTemplateResult(
       });
     }
   }
-  return createSafeTextComponent(lines, theme, context);
+  return createResultComponent(lines, theme, context);
 }
 
 function renderSpawnResult(
@@ -474,7 +586,7 @@ function renderSpawnResult(
   const agentId = readOptionalString(details, "agent_id");
   const depth = readOptionalSafeInteger(details, "depth");
   if (agentId === undefined || depth === undefined) return invalidResult(theme, context);
-  return createSafeTextComponent([{
+  return createResultComponent([{
     text: `${agentId} · depth ${depth}`,
     color: "success",
   }], theme, context);
@@ -492,7 +604,7 @@ function renderSendResult(
   }
   const agentId = readAgentId(context.args);
   const name = agentId === undefined ? undefined : resolveName(agentId, lookups);
-  return createSafeTextComponent([{
+  return createResultComponent([{
     text: name === undefined ? "Sent" : `Sent to ${name}`,
     color: "success",
   }], theme, context);
@@ -509,7 +621,7 @@ function renderWaitResult(
   if (outcome === "timeout") {
     const agentIds = readStringArray(details, "agent_ids");
     if (agentIds === undefined || agentIds.length === 0) return invalidResult(theme, context);
-    return createSafeTextComponent([{
+    return createResultComponent([{
       text: `${agentIds.length} agents · timeout`,
       color: "warning",
     }], theme, context);
@@ -519,7 +631,7 @@ function renderWaitResult(
     // wake_reason 是固定值（parent_input），不参与展示判定。
     const agentIds = readStringArray(details, "agent_ids");
     if (agentIds === undefined || agentIds.length === 0) return invalidResult(theme, context);
-    return createSafeTextComponent([{
+    return createResultComponent([{
       text: `${agentIds.length} agents · woken · parent_input`,
       color: "warning",
     }], theme, context);
@@ -541,7 +653,7 @@ function renderWaitResult(
       ].includes(releasedByOutcome)
     ) return invalidResult(theme, context);
     const releasedBy = resolveName(releasedByAgentId, lookups) ?? releasedByAgentId;
-    return createSafeTextComponent([{
+    return createResultComponent([{
       text: `batch_released · ${releasedBy} · ${releasedByOutcome}`,
       color: "success",
     }], theme, context);
@@ -567,7 +679,7 @@ function renderWaitResult(
   const warning = errorCode !== undefined
     || outcome === "idle";
   const name = resolveName(agentId, lookups) ?? agentId;
-  return createSafeTextComponent([{
+  return createResultComponent([{
     text: `${name} · ${outcome}${errorCode === undefined ? "" : ` · ${errorCode}`}`,
     color: warning ? "warning" : "success",
   }], theme, context);
@@ -596,12 +708,12 @@ function renderInterruptResult(
   ) return invalidResult(theme, context);
   const name = resolveName(agentId, lookups) ?? agentId;
   if (blockedReason === "compaction_active") {
-    return createSafeTextComponent([{
+    return createResultComponent([{
       text: `${name} · unchanged · ${state} · Compaction active; retry after it finishes`,
       color: "warning",
     }], theme, context);
   }
-  return createSafeTextComponent([{
+  return createResultComponent([{
     text: `${name} · ${changed ? "changed" : "unchanged"} · ${state}`,
     color: "success",
   }], theme, context);
@@ -629,12 +741,12 @@ function renderTerminateResult(
   ) return invalidResult(theme, context);
   const name = resolveName(agentId, lookups) ?? agentId;
   if (!changed && count === 0) {
-    return createSafeTextComponent([{
+    return createResultComponent([{
       text: `${name} · Idempotent; no additional nodes reclaimed`,
       color: "muted",
     }], theme, context);
   }
-  return createSafeTextComponent([{
+  return createResultComponent([{
     text: `${name} · Reclaimed ${count} new node${count === 1 ? "" : "s"}${forced ? " · forced" : ""}`,
     color: forced ? "warning" : "success",
   }], theme, context);
@@ -651,7 +763,7 @@ function renderStatusResult(
   const lines = options.expanded === true
     ? expandedStatusLines(snapshot)
     : collapsedStatusLines(snapshot);
-  return createSafeTextComponent(lines, theme, context);
+  return createResultComponent(lines, theme, context);
 }
 
 function collapsedStatusLines(snapshot: AgentSnapshot): readonly SafeRenderLine[] {
@@ -732,7 +844,7 @@ function renderTreeResult(
   if (tree === undefined) return invalidResult(theme, context);
   const summary = treeSummary(tree);
   if (options.expanded !== true) {
-    return createSafeTextComponent([{ text: summary, color: "success" }], theme, context);
+    return createResultComponent([{ text: summary, color: "success" }], theme, context);
   }
   const lines: SafeRenderLine[] = [
     { text: `scope: ${formatScope(tree)}`, color: "muted" },
@@ -773,7 +885,7 @@ function renderTreeResult(
     }
   }
   if (lines.length === 2) lines.push({ text: "No nodes", color: "dim" });
-  return createSafeTextComponent(lines, theme, context);
+  return createResultComponent(lines, theme, context);
 }
 
 function readTreeSnapshot(value: unknown): ScopedAgentTreeSnapshot | undefined {
@@ -1176,6 +1288,17 @@ export function sanitizeMultiline(value: string): string {
 
 function sanitizeInline(value: string): string {
   return sanitizeMultiline(value).replace(/\n/g, " ");
+}
+
+function sanitizeRenderSegments(
+  segments: readonly SafeRenderSegment[] | undefined,
+): readonly SafeRenderSegment[] {
+  if (!Array.isArray(segments) || segments.length === 0) return [];
+  return segments.map((segment) => ({
+    text: sanitizeInline(segment.text),
+    color: segment.color,
+    ...(segment.bold === undefined ? {} : { bold: segment.bold }),
+  }));
 }
 
 function validWidth(width: number): number {
