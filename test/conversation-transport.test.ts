@@ -647,3 +647,80 @@ test("手动压缩在 settled 探针前开始仍能结算 idle", async () => {
     await channels.child.release();
   }
 });
+
+test("监督通道路径 agent_start 清除上一轮 settle 的中断事实", async () => {
+  const channels = pair(() => true, 200, "idle");
+  const rpc = new FakeRpcClient({
+    state: { isStreaming: false, isCompacting: false, pendingMessageCount: 0 },
+  });
+  const node = new TestManagedRpcNode(rpc);
+  const tree = new TreeController({
+    config: {
+      maxDepth: 2,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 8,
+      waitTimeoutMs: 1_000,
+    },
+    idFactory: () => CHILD_ID,
+  });
+  const supervisor = new RpcSupervisor({
+    controller: tree,
+    actor: ROOT_TREE_ACTOR,
+    reservation: { templateId: "researcher", name: "流式子代理" },
+    managedNode: node,
+    channel: channels.parent,
+    startupTimeoutMs: 1_000,
+    gracefulShutdownMs: 1_000,
+  });
+  const signal = new AbortController().signal;
+  try {
+    const startup = supervisor.start();
+    await channels.child.bind(signal);
+    assert.equal((await startup).ok, true);
+    await channels.child.waitForReady(signal);
+
+    const firstGeneration = tree.getLifecycleGeneration(CHILD_ID);
+    assert.equal(firstGeneration.ok, true);
+    if (!firstGeneration.ok) return;
+
+    await channels.child.publishEvent({
+      type: "agent_start",
+      expected_generation: firstGeneration.data,
+    });
+    await channels.child.publishEvent({
+      type: "agent_settled",
+      expected_generation: firstGeneration.data + 1,
+      aborted: true,
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const interrupted = tree.getStatus(CHILD_ID);
+    assert.equal(interrupted.ok, true);
+    if (interrupted.ok) assert.equal(interrupted.data.aborted, true);
+
+    const nextGeneration = tree.getLifecycleGeneration(CHILD_ID);
+    assert.equal(nextGeneration.ok, true);
+    if (!nextGeneration.ok) return;
+    await channels.child.publishEvent({
+      type: "agent_start",
+      expected_generation: nextGeneration.data,
+    });
+    const restarted = tree.getStatus(CHILD_ID);
+    assert.equal(restarted.ok, true);
+    if (restarted.ok) {
+      assert.equal(restarted.data.state, "working");
+      assert.equal("aborted" in restarted.data, false);
+    }
+
+    // 新 run 若没有 settle 事件、只由状态探针结算，也不得再带出上一轮的中断事实。
+    assert.equal(await supervisor.synchronizeState(), true);
+    const settled = tree.getStatus(CHILD_ID);
+    assert.equal(settled.ok, true);
+    if (settled.ok) {
+      assert.equal(settled.data.state, "idle");
+      assert.equal("aborted" in settled.data, false);
+    }
+  } finally {
+    await channels.parent.release();
+    await channels.child.release();
+  }
+});

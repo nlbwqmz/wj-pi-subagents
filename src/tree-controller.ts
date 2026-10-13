@@ -385,8 +385,8 @@ interface PublicMutation {
   readonly contextWindowTokens?: number | null;
   /** undefined 表示保持，null 表示清除。 */
   readonly contextUsagePercent?: number | null;
-  /** 最近一次 settle 的中断事实；undefined 表示保持。 */
-  readonly lastSettleAborted?: boolean;
+  /** 最近一次 settle 的中断事实；undefined 表示保持，null 表示清除。 */
+  readonly lastSettleAborted?: boolean | null;
 }
 
 function isAgentContextUsageInput(value: unknown): value is AgentContextUsageInput {
@@ -950,7 +950,8 @@ export class TreeController {
         break;
       case "agent_start":
         if (record.state === "idle") {
-          applied = this.mutate(record, { state: "working" });
+          // 新 run 开始后上一轮 settle 的中断事实不再适用。
+          applied = this.mutate(record, { state: "working", lastSettleAborted: null });
         }
         break;
       case "agent_settled":
@@ -1740,7 +1741,7 @@ export class TreeController {
     const nextActivity = activityForState(nextState, requestedActivity);
     const nextLastSettleAborted = mutation.lastSettleAborted === undefined
       ? record.lastSettleAborted
-      : mutation.lastSettleAborted;
+      : mutation.lastSettleAborted === null ? undefined : mutation.lastSettleAborted;
     const contextChanged = nextContextWindowTokens !== record.contextWindowTokens
       || nextContextUsagePercent !== record.contextUsagePercent;
     const errorChanged = JSON.stringify(nextError) !== JSON.stringify(record.error);

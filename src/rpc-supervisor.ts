@@ -1028,6 +1028,8 @@ export class RpcSupervisor {
       case "agent_start":
         this.hostPendingInputCount = 0;
         this.nativeCompactionWillRetry = false;
+        // 新 run 开始后上一轮 settle 的中断事实不再适用。
+        this.lastSettleAborted = undefined;
         this.markLifecycleObservation("agent_start");
         this.resetToolActivity();
         if (this.lifecycleState === "idle") this.applyLifecycle({ type: "agent_start" });
@@ -1206,8 +1208,11 @@ export class RpcSupervisor {
       if (event.agent_id === this.agentId) {
         this.lifecycleGeneration = outcome.data.lifecycle_generation;
         this.lifecycleState = outcome.data.node.state;
-        if (lifecycleEvent.type === "agent_start") this.markLifecycleObservation("agent_start");
-        else if (lifecycleEvent.type === "agent_settled") this.markLifecycleObservation();
+        if (lifecycleEvent.type === "agent_start") {
+          // 新 run 开始后上一轮 settle 的中断事实不再适用。
+          this.lastSettleAborted = undefined;
+          this.markLifecycleObservation("agent_start");
+        } else if (lifecycleEvent.type === "agent_settled") this.markLifecycleObservation();
         if (lifecycleEvent.type === "runtime_failed" && outcome.data.node.state === "failed") {
           if (this.phase === "starting") {
             this.recordStartupFault("protocol_fault");

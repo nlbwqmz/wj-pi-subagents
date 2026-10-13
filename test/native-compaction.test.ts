@@ -276,3 +276,39 @@ test("agent_settled 的 aborted 事实进入节点快照，并被下一次 settl
   assert.equal(settled.ok, true);
   if (settled.ok) assert.equal(settled.data.aborted, false);
 });
+
+test("取消后新 run 的 agent_start 清除上一轮 settle 的中断事实", async () => {
+  const { rpc, supervisor, tree } = await startHarness();
+
+  rpc.setState({ isStreaming: true, isCompacting: false, pendingMessageCount: 0 });
+  assert.equal(await supervisor.synchronizeState(), true);
+  assert.equal(stateOf(tree), "working");
+
+  rpc.setState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+  emitPiEvent(rpc, { type: "agent_settled", aborted: true });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(await supervisor.synchronizeState(), true);
+  const interrupted = tree.getStatus(CHILD_ID);
+  assert.equal(interrupted.ok, true);
+  if (interrupted.ok) assert.equal(interrupted.data.aborted, true);
+
+  // 新 run 开始：上一轮被取消的中断事实不得继续暴露。
+  rpc.setState({ isStreaming: true, isCompacting: false, pendingMessageCount: 0 });
+  emitPiEvent(rpc, { type: "agent_start" });
+  const restarted = tree.getStatus(CHILD_ID);
+  assert.equal(restarted.ok, true);
+  if (restarted.ok) {
+    assert.equal(restarted.data.state, "working");
+    assert.equal("aborted" in restarted.data, false);
+  }
+
+  // 新 run 若没有 settle 事件、只由状态探针结算，也不得再带出上一轮的中断事实。
+  rpc.setState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+  assert.equal(await supervisor.synchronizeState(), true);
+  const probeSettled = tree.getStatus(CHILD_ID);
+  assert.equal(probeSettled.ok, true);
+  if (probeSettled.ok) {
+    assert.equal(probeSettled.data.state, "idle");
+    assert.equal("aborted" in probeSettled.data, false);
+  }
+});
