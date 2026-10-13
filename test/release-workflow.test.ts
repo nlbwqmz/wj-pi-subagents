@@ -103,3 +103,19 @@ test("release workflow 只监听版本形状 tag，npm 成功后才创建 GitHub
   assert.ok(createRun.includes("--notes-file \"release-notes/${GITHUB_REF_NAME}.md\""));
   assert.equal(createRun.includes("--generate-notes"), false);
 });
+
+test("release workflow 发布前先通过三平台测试矩阵", () => {
+  const workflow = asRecord(parse(readFileSync(workflowPath, "utf8")));
+  const jobs = asRecord(workflow.jobs);
+  const testJob = asRecord(jobs.test);
+  assert.equal(testJob.if, "github.event.deleted == false");
+  const matrix = asRecord(asRecord(testJob.strategy).matrix);
+  assert.deepEqual(matrix.os, ["windows-latest", "ubuntu-latest", "macos-latest"]);
+  const testRuns = asArray(testJob.steps)
+    .map(asRecord)
+    .map((step) => step.run)
+    .filter((run): run is string => typeof run === "string");
+  assert.ok(testRuns.some((run) => run.includes("npm run check")));
+  assert.ok(testRuns.some((run) => run.includes("npm run compat:pi")));
+  assert.equal(asRecord(jobs.publish_npm).needs, "test");
+});
