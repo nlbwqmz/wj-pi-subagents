@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
   createManagedRpcNode,
@@ -99,6 +102,34 @@ test("Windows Job Object 启动失败时完成 helper 回滚", nativeTestOptions
     adapter.launch({ command: `C:\\wj-pi-subagents-missing-${randomUUID()}.exe` }),
     /Windows Job Object helper 未就绪/,
   );
+});
+
+test("Windows Job Object helper 未就绪时重新启动一次", nativeTestOptions, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "wj-job-retry-"));
+  const attemptsPath = join(directory, "attempts.txt");
+  const helperPath = join(directory, "helper.ps1");
+  // 假的 native helper：每次启动只留一行痕迹就退出，永远到不了 ready。
+  const literalPath = attemptsPath.replace(/'/g, "''");
+  writeFileSync(
+    helperPath,
+    `Add-Content -LiteralPath '${literalPath}' -Value 'attempt'\nexit 1\n`,
+    "utf8",
+  );
+
+  try {
+    const adapter = new WindowsJobObjectAdapter({ helperScriptPath: helperPath });
+    await assert.rejects(
+      adapter.launch(nodeLaunch("process.exit(0)")),
+      /Windows Job Object helper 未就绪/,
+    );
+
+    const attempts = readFileSync(attemptsPath, "utf8")
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0);
+    assert.equal(attempts.length, 2, "helper 未就绪时必须重新启动一次，只重试一次");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("Windows Job Object 保留孙进程存在事实，并能一次强制回收整棵树", nativeTestOptions, async () => {

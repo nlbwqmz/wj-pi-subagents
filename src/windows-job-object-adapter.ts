@@ -13,7 +13,11 @@ import type {
 
 // helper 内部的 named pipe 连接最多等待 10 秒；启动门限必须更长，避免
 // GitHub Windows runner 在首次启动 PowerShell/C# helper 时被过早判定为失败。
-const DEFAULT_READY_TIMEOUT_MS = 15_000;
+// helper 先跑 Add-Type 编译内联 C#、再建 Job Object，最后才发 ready；runner
+// 冷启动时这整段可能飙到 5 倍开销（实测同 commit 正常 3 秒、抖动时超 15 秒）。
+const DEFAULT_READY_TIMEOUT_MS = 45_000;
+/** 启动门限仍然超时时，整轮重启 helper 的次数：只重试一次，最坏耗时有界。 */
+const DEFAULT_LAUNCH_ATTEMPTS = 2;
 const DEFAULT_COMMAND_TIMEOUT_MS = 5_000;
 function defaultWindowsJobHelperPath(): string {
   const colocated = fileURLToPath(new URL("./windows-job-object-helper.ps1", import.meta.url));
@@ -178,6 +182,11 @@ function isResourceState(value: string | undefined): value is ResourceObservatio
   return value === "released" || value === "present" || value === "unknown";
 }
 
+/** 单次启动尝试的结局；只有“未就绪”属于可重试的冷启动抖动。 */
+type LaunchAttempt =
+  | { readonly ok: true; readonly launch: WindowsJobObjectLaunch }
+  | { readonly ok: false; readonly error: Error };
+
 /**
  * Windows 的真实进程树适配器。
  *
@@ -205,8 +214,24 @@ export class WindowsJobObjectAdapter implements ProcessTreeAdapter {
   /**
    * 以启动前说明创建进程树，并返回与 Pi RPC 可直接连接的标准流。
    * 这是满足 Job Object 绑定时序的唯一公开启动路径。
+   *
+   * helper 未就绪属于冷启动抖动（编译内联 C#、runner 争抢 CPU），与启动说明本身
+   * 无关：因此失败时整轮重启一次，但不无限重试，保证错误环境的耗时有界。
    */
   async launch(options: WindowsJobObjectLaunchOptions): Promise<WindowsJobObjectLaunch> {
+    let lastFailure: Error | undefined;
+    for (let attempt = 0; attempt < DEFAULT_LAUNCH_ATTEMPTS; attempt += 1) {
+      const result = await this.launchOnce(options);
+      if (result.ok) return result.launch;
+      lastFailure = result.error;
+    }
+    throw lastFailure ?? safeError("Windows Job Object helper 未就绪");
+  }
+
+  /** 单次启动尝试；只有“helper 未就绪”可重试，其余错误直接上抛。 */
+  private async launchOnce(
+    options: WindowsJobObjectLaunchOptions,
+  ): Promise<LaunchAttempt> {
     if (process.platform !== "win32") {
       throw safeError("Windows Job Object 仅可在 Windows 宿主启动");
     }
@@ -309,17 +334,20 @@ export class WindowsJobObjectAdapter implements ProcessTreeAdapter {
       const exitDetail = state.helperExitCode === undefined
         ? ""
         : `，helper exit=${state.helperExitCode ?? "null"}${state.helperExitSignal === null ? "" : ` signal=${state.helperExitSignal}`}`;
-      throw safeError(`Windows Job Object helper 未就绪：${detail}${exitDetail}`);
+      return { ok: false, error: safeError(`Windows Job Object helper 未就绪：${detail}${exitDetail}`) };
     }
 
-    return Object.freeze({
-      tree: token,
-      transport: Object.freeze({
-        stdin: helper.stdin,
-        stdout: helper.stdout,
-        stderr: helper.stderr,
+    return {
+      ok: true,
+      launch: Object.freeze({
+        tree: token,
+        transport: Object.freeze({
+          stdin: helper.stdin,
+          stdout: helper.stdout,
+          stderr: helper.stderr,
+        }),
       }),
-    });
+    };
   }
 
   async requestGracefulClose(tree: ProcessTreeHandle, signal: AbortSignal): Promise<void> {
@@ -524,6 +552,8 @@ export class WindowsJobObjectAdapter implements ProcessTreeAdapter {
     }
     state.resources = "unknown";
     this.closePipeServers(state);
+    // 失败的启动尝试不会把 handle 交给调用方，回收登记表以免重试路径累积。
+    this.states.delete(state.token);
   }
 
   private closePipeServers(state: TreeState): void {
