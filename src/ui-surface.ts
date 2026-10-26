@@ -3,6 +3,16 @@ const COMBINING_MARK_PATTERN = /^\p{Mark}$/u;
 const EXTENDED_PICTOGRAPHIC_PATTERN = /\p{Extended_Pictographic}/u;
 const REGIONAL_INDICATOR_PATTERN = /\p{Regional_Indicator}/u;
 const TERMINAL_CONTROL_PATTERN = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]+/gu;
+const DISPLAY_WIDTH_CACHE_LIMIT = 512;
+const CODE_POINT_WIDTH_CACHE_LIMIT = 4_096;
+
+/**
+ * 宿主每帧都会重新渲染整棵组件树，同一批整行会被反复求宽；有界 LRU 缓存
+ * 把重复测量压成一次查表，超出上限时逐个淘汰最久未使用的项。
+ */
+const displayWidthCache = new Map<string, number>();
+/** 码点宽度只依赖码点本身；中文正文几十万次调用通常只有几千个不同码点。 */
+const codePointWidthCache = new Map<number, number>();
 
 export type UiPanelLineStyle = "header" | "body" | "terminal" | "error" | "footer" | "accent" | "warning";
 
@@ -14,9 +24,28 @@ interface UiPanelTheme {
 
 /** 计算无 ANSI 文本的终端列宽，避免按 UTF-16 单元切断 Unicode 字符。 */
 export function displayWidth(value: string): number {
+  const cached = displayWidthCache.get(value);
+  if (cached !== undefined) {
+    // 命中即刷新顺序，保证容量满时淘汰的是最久未使用的键。
+    displayWidthCache.delete(value);
+    displayWidthCache.set(value, cached);
+    return cached;
+  }
   let width = 0;
   for (const { segment } of SEGMENTER.segment(value)) width += graphemeWidth(segment);
+  rememberDisplayWidth(value, width);
   return width;
+}
+
+function rememberDisplayWidth(value: string, width: number): void {
+  evictOldestEntry(displayWidthCache, DISPLAY_WIDTH_CACHE_LIMIT);
+  displayWidthCache.set(value, width);
+}
+
+function evictOldestEntry<K, V>(cache: Map<K, V>, limit: number): void {
+  if (cache.size < limit) return;
+  const oldest = cache.keys().next();
+  if (oldest.done !== true) cache.delete(oldest.value);
 }
 
 /** 超宽时保留一个省略号，并始终在字素簇边界截断。 */
@@ -189,6 +218,15 @@ export function graphemeWidth(grapheme: string): number {
 
 function codePointWidth(character: string): number {
   const codePoint = character.codePointAt(0) ?? 0;
+  const cached = codePointWidthCache.get(codePoint);
+  if (cached !== undefined) return cached;
+  const width = measureCodePointWidth(codePoint, character);
+  evictOldestEntry(codePointWidthCache, CODE_POINT_WIDTH_CACHE_LIMIT);
+  codePointWidthCache.set(codePoint, width);
+  return width;
+}
+
+function measureCodePointWidth(codePoint: number, character: string): number {
   if (
     codePoint === 0
     || codePoint < 32

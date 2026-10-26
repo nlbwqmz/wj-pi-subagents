@@ -5,6 +5,7 @@ import {
   type StartupDiagnosticDetails,
 } from "./startup-diagnostic.ts";
 import { displayWidth, truncateToDisplayWidth } from "./agent-tree-ui.ts";
+import { graphemeWidth } from "./ui-surface.ts";
 import {
   WAIT_AGENT_DEFAULT_TIMEOUT_MS,
   coerceWaitAgentTimeoutValue,
@@ -119,18 +120,21 @@ export interface SafeTextComponentOptions {
  * 因而不信任的正文不能注入终端控制序列，也不会绕过宿主的宽度约束。
  */
 export class SafeTextComponent implements AgentToolRenderComponent {
-  private lines: readonly SafeRenderLine[];
   private theme: AgentToolRenderTheme;
   private options: SafeTextComponentOptions;
+  /** 内容整体替换一次就重建一次；渲染结果只对该内容快照和宽度有效。 */
+  private prepared: readonly PreparedSafeLine[];
+  private cachedWidth = -1;
+  private cachedLines: string[] | undefined;
 
   constructor(
     lines: readonly SafeRenderLine[],
     theme: AgentToolRenderTheme,
     options: SafeTextComponentOptions = {},
   ) {
-    this.lines = lines;
     this.theme = theme;
     this.options = options;
+    this.prepared = prepareSafeLines(lines);
   }
 
   update(
@@ -138,13 +142,18 @@ export class SafeTextComponent implements AgentToolRenderComponent {
     theme: AgentToolRenderTheme,
     options: SafeTextComponentOptions = {},
   ): void {
-    this.lines = lines;
     this.theme = theme;
     this.options = options;
+    this.prepared = prepareSafeLines(lines);
+    this.cachedWidth = -1;
+    this.cachedLines = undefined;
   }
 
   render(width: number): string[] {
     const availableWidth = validWidth(width);
+    if (this.cachedLines !== undefined && this.cachedWidth === availableWidth) {
+      return this.cachedLines;
+    }
     const background = this.options.background;
     const outputPad = validPadding(this.options.outputPad, availableWidth);
     const horizontalPadding = background === undefined
@@ -209,19 +218,18 @@ export class SafeTextComponent implements AgentToolRenderComponent {
       return background(`${leftPad}${styledText}${rightPad}`);
     };
 
-    for (const line of this.lines) {
-      const prefix = sanitizeInline(line.prefix ?? "");
+    for (const prepared of this.prepared) {
+      const line = prepared.line;
+      const prefix = prepared.prefix;
       const lineColorSegment = (text: string): SafeRenderSegment => ({
         text,
         color: line.color,
         ...(line.bold === true ? { bold: true } : {}),
       });
-      const lineWidth = Math.max(1, contentWidth - displayWidth(prefix));
-      const safeText = line.multiline === true
-        ? sanitizeMultiline(line.text)
-        : sanitizeInline(line.text);
-      const suffix = sanitizeRenderSegments(line.suffix);
-      const suffixWidth = suffix.reduce((total, segment) => total + displayWidth(segment.text), 0);
+      const lineWidth = Math.max(1, contentWidth - prepared.prefixWidth);
+      const safeText = prepared.text;
+      const suffix = prepared.suffix;
+      const suffixWidth = prepared.suffixWidth;
       let wrapped = safeText
         .split("\n")
         .flatMap((part) => wrapToDisplayWidth(part, lineWidth));
@@ -256,7 +264,7 @@ export class SafeTextComponent implements AgentToolRenderComponent {
         if (index === wrapped.length - 1 && suffix.length > 0 && overflowHintSegments === undefined) {
           const main = truncateToDisplayWidth(
             part,
-            Math.max(0, contentWidth - displayWidth(prefix) - suffixWidth),
+            Math.max(0, contentWidth - prepared.prefixWidth - suffixWidth),
           );
           rendered.push(renderSegmentLine([
             ...(prefix.length === 0 ? [] : [lineColorSegment(prefix)]),
@@ -302,19 +310,25 @@ export class SafeTextComponent implements AgentToolRenderComponent {
       );
     }
 
+    let output = rendered;
     if (background !== undefined) {
       const paddingY = validVerticalPadding(this.options.paddingY);
       const blank = background(" ".repeat(availableWidth));
-      return [
+      output = [
         ...Array.from({ length: paddingY }, () => blank),
         ...rendered,
         ...Array.from({ length: paddingY }, () => blank),
       ];
     }
-    return rendered;
+    this.cachedWidth = availableWidth;
+    this.cachedLines = output;
+    return output;
   }
 
-  invalidate(): void {}
+  invalidate(): void {
+    this.cachedWidth = -1;
+    this.cachedLines = undefined;
+  }
 }
 
 export function createSafeTextComponent(
@@ -1298,6 +1312,33 @@ function sanitizeRenderSegments(
   }));
 }
 
+interface PreparedSafeLine {
+  readonly line: SafeRenderLine;
+  readonly prefix: string;
+  readonly prefixWidth: number;
+  readonly text: string;
+  readonly suffix: readonly SafeRenderSegment[];
+  readonly suffixWidth: number;
+}
+
+/**
+ * 净化与前后缀宽度只依赖行内容，随内容更新做一次；渲染时只做着色与拼接。
+ */
+function prepareSafeLines(lines: readonly SafeRenderLine[]): readonly PreparedSafeLine[] {
+  return lines.map((line) => {
+    const prefix = sanitizeInline(line.prefix ?? "");
+    const suffix = sanitizeRenderSegments(line.suffix);
+    return {
+      line,
+      prefix,
+      prefixWidth: displayWidth(prefix),
+      text: line.multiline === true ? sanitizeMultiline(line.text) : sanitizeInline(line.text),
+      suffix,
+      suffixWidth: suffix.reduce((total, segment) => total + displayWidth(segment.text), 0),
+    };
+  });
+}
+
 function validWidth(width: number): number {
   return Number.isSafeInteger(width) && width > 0 ? width : 1;
 }
@@ -1318,7 +1359,7 @@ function wrapToDisplayWidth(value: string, width: number): string[] {
   let line = "";
   let lineWidth = 0;
   for (const { segment } of SEGMENTER.segment(value)) {
-    const segmentWidth = displayWidth(segment);
+    const segmentWidth = graphemeWidth(segment);
     if (segmentWidth > width) {
       if (line.length > 0) lines.push(line);
       lines.push(truncateToDisplayWidth(segment, width));

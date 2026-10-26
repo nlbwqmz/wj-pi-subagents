@@ -1,13 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  createSafeTextComponent,
   renderAgentToolCall,
   renderAgentToolResult,
   type AgentToolRenderComponent,
   type AgentToolRenderContext,
   type AgentToolResultRenderOptions,
   type AgentToolResultView,
+  type SafeRenderLine,
+  type SafeTextComponentOptions,
 } from "../src/agent-tool-rendering.ts";
+import { displayWidth } from "../src/ui-surface.ts";
 import {
   AgentController,
   type AgentSupervisor,
@@ -1643,4 +1647,230 @@ test("child reply 工具成功与失败都输出结构化结果", async () => {
   assert.equal(envelope.error.code, "reply_too_large");
   assert.deepEqual(failure.details, envelope);
   assert.deepEqual(failure.structuredContent, envelope);
+});
+
+// ---------------------------------------------------------------------------
+// 工具文本组件的帧间复用
+//
+// 宿主每帧都会对整棵组件树重新调用 render()：工具调用与结果组件在"内容没变"
+// 的帧上必须复用上一次的结果，否则每个字素都要重新付一次 Unicode 字素切分。
+// 以下用例钉住三件事：复用、失效（内容 / 宽度 / 宿主 invalidate），以及渲染
+// 结果与优化前逐字节一致。
+// ---------------------------------------------------------------------------
+
+interface BaselineInput {
+  readonly lines: readonly SafeRenderLine[];
+  readonly width: number;
+  readonly options?: SafeTextComponentOptions;
+}
+
+const RENDER_BASELINE_INPUTS: Readonly<Record<string, BaselineInput>> = {
+  "cjk": {
+    lines: [{ text: "这是一段很长的中文正文，用来验证折行在宽字符上的边界行为是否正确。", color: "dim" }],
+    width: 20,
+  },
+  "mixed-ascii-cjk": {
+    lines: [{ text: "spawn_agent(A) → 子代理 A 已启动；pid=8123", color: "success" }],
+    width: 16,
+  },
+  "emoji-zwj": {
+    lines: [{ text: "👨‍👩‍👧‍👦 家族 🇨🇳 国旗 👍🏽 肤色 e\u0301 组合", color: "dim" }],
+    width: 9,
+  },
+  "long-ascii": {
+    lines: [{ text: "abcdefghijklmnopqrstuvwxyz0123456789", color: "dim" }],
+    width: 7,
+  },
+  "injection": {
+    lines: [{ text: "a\u001b[31mb\u200bc\td\r\ne\u0007f", color: "dim", multiline: true }],
+    width: 5,
+  },
+  "prefix-suffix": {
+    lines: [{
+      text: "正文内容正文内容",
+      color: "dim",
+      prefix: "│ ",
+      suffix: [{ text: " · 4.2s", color: "dim" }],
+    }],
+    width: 12,
+  },
+  "overflow": {
+    lines: [{ text: "1\n2\n3\n4\n5\n6", color: "dim", multiline: true }],
+    width: 20,
+    options: { maxLines: 3, overflowText: "… (more)" },
+  },
+  "empty": {
+    lines: [{ text: "", color: "dim" }],
+    width: 20,
+  },
+  "combining-marks": {
+    lines: [{
+      text: "\u0915\u094d\u200d\u0915\u094d\u200dx\u0915\u094d\u200d",
+      color: "dim",
+    }],
+    width: 2,
+  },
+  "thai-am": {
+    lines: [{ text: "กำลังทำ", color: "dim" }],
+    width: 2,
+  },
+  "oversize-grapheme": {
+    lines: [{ text: "👍", color: "dim" }],
+    width: 1,
+  },
+};
+
+// 由优化前的实现生成：行首 / 行尾空格用 \u0020 转义，避免肉眼不可见的尾随空白。
+const RENDER_BASELINE = JSON.parse(String.raw`{
+  "cjk": ["这是一段很长的中文正", "文，用来验证折行在宽", "字符上的边界行为是否", "正确。"],
+  "mixed-ascii-cjk": ["spawn_agent(A) →", "\u0020子代理 A 已启动", "；pid=8123"],
+  "emoji-zwj": ["👨\u0020👩\u0020👧\u0020", "👦\u0020家族\u0020", "🇨🇳\u0020国旗\u0020", "👍🏽\u0020肤色 e\u0301", "\u0020组合"],
+  "long-ascii": ["abcdefg", "hijklmn", "opqrstu", "vwxyz01", "2345678", "9"],
+  "injection": ["a [31", "mb c\u0020", "\u0020d", "e f"],
+  "prefix-suffix": ["│ 正文内容正", "│ 文… · 4.2s"],
+  "overflow": ["1", "2", "… (more)"],
+  "empty": [""],
+  "combining-marks": ["क्\u0020", "क्\u0020", "xक्", "\u0020"],
+  "thai-am": ["กำ", "ลัง", "ทำ"],
+  "oversize-grapheme": ["…"]
+}`) as Readonly<Record<string, readonly string[]>>;
+
+test("工具文本组件的渲染结果与优化前逐字节一致", () => {
+  for (const [name, input] of Object.entries(RENDER_BASELINE_INPUTS)) {
+    const expected = RENDER_BASELINE[name];
+    assert.ok(expected, `缺少基线快照：${name}`);
+    const rendered = createSafeTextComponent(input.lines, theme, {}, input.options ?? {})
+      .render(input.width);
+    assert.deepEqual(rendered, [...expected], name);
+  }
+});
+
+test("折行保持字素边界并始终满足可用宽度", () => {
+  const cases: readonly {
+    readonly text: string;
+    readonly width: number;
+    readonly expected: readonly string[];
+  }[] = [
+    { text: "a中b", width: 3, expected: ["a中", "b"] },
+    { text: "中文", width: 3, expected: ["中", "文"] },
+    { text: "中a", width: 2, expected: ["中", "a"] },
+    { text: "👍👍", width: 3, expected: ["👍", "👍"] },
+    { text: "👍", width: 1, expected: ["…"] },
+    { text: "e\u0301x", width: 1, expected: ["e\u0301", "x"] },
+  ];
+  for (const { text, width, expected } of cases) {
+    const rendered = createSafeTextComponent([{ text, color: "dim" }], theme, {}).render(width);
+    assert.deepEqual(rendered, [...expected], `${text} @ ${width}`);
+    for (const line of rendered) {
+      assert.ok(displayWidth(line) <= width, `${line} 超出可用宽度 ${width}`);
+    }
+  }
+});
+
+test("工具文本组件在同一宽度与内容上复用上一次的渲染结果", () => {
+  const component = createSafeTextComponent([{ text: "alpha", color: "dim" }], theme, {});
+  const first = component.render(40);
+  const second = component.render(40);
+  assert.equal(second, first, "同宽度重复渲染必须复用上一次的结果");
+  assert.deepEqual(second, ["alpha"]);
+});
+
+test("内容变化后立即渲染新内容，不返回旧结果", () => {
+  const context: { lastComponent?: unknown } = {};
+  const before = createSafeTextComponent([{ text: "旧内容", color: "dim" }], theme, context);
+  assert.deepEqual(before.render(40), ["旧内容"]);
+
+  // pi 把上一次的组件挂在渲染上下文上；扩展复用它并整体替换内容。
+  context.lastComponent = before;
+  const after = createSafeTextComponent([{ text: "新内容", color: "dim" }], theme, context);
+  assert.equal(after, before, "同一渲染上下文必须复用组件实例");
+  assert.deepEqual(after.render(40), ["新内容"]);
+});
+
+test("宽度变化后重新折行，切回原宽度复用该宽度的结果", () => {
+  const component = createSafeTextComponent([{ text: "中文中文中文", color: "dim" }], theme, {});
+  const wide = component.render(40);
+  assert.deepEqual(wide, ["中文中文中文"]);
+
+  const freshNarrow = createSafeTextComponent([{ text: "中文中文中文", color: "dim" }], theme, {})
+    .render(4);
+  const narrow = component.render(4);
+  assert.deepEqual(narrow, freshNarrow, "切换宽度后必须与无缓存基线一致");
+  assert.deepEqual(narrow, ["中文", "中文", "中文"]);
+
+  assert.deepEqual(component.render(40), wide);
+});
+
+test("工具调用渲染走生产路径时复用同一个组件实例及其渲染结果", () => {
+  const context: { lastComponent?: unknown } = {};
+  const first = renderAgentToolCall(
+    "send_message",
+    { agent_id: "agent-1", message: "第一段正文" },
+    theme,
+    context,
+  );
+  const lines = first.render(60);
+  assert.equal(first.render(60), lines, "同帧重复渲染必须复用结果");
+
+  // pi 把上一次的组件挂在渲染上下文上；扩展复用它并整体替换内容。
+  context.lastComponent = first;
+  const second = renderAgentToolCall(
+    "send_message",
+    { agent_id: "agent-1", message: "第二段正文" },
+    theme,
+    context,
+  );
+  assert.equal(second, first, "生产路径必须复用同一个组件实例");
+
+  const fresh = renderAgentToolCall(
+    "send_message",
+    { agent_id: "agent-1", message: "第二段正文" },
+    theme,
+    {},
+  );
+  assert.deepEqual(second.render(60), fresh.render(60), "内容更新后必须与无缓存基线一致");
+  assert.equal(second.render(60), second.render(60));
+});
+
+test("宿主 invalidate 之后使用当前主题重新渲染", () => {
+  let prefix = "A";
+  const dynamicTheme = {
+    fg: (_color: string, text: string): string => `${prefix}${text}`,
+    bold: (text: string): string => text,
+  };
+  const component = createSafeTextComponent([{ text: "x", color: "dim" }], dynamicTheme, {});
+  assert.deepEqual(component.render(20), ["Ax"]);
+
+  prefix = "B";
+  assert.deepEqual(component.render(20), ["Ax"], "未收到 invalidate 时沿用已渲染结果");
+
+  component.invalidate();
+  assert.deepEqual(component.render(20), ["Bx"]);
+});
+
+test("带背景与留白的工具文本组件在缓存命中时仍填满可用宽度", () => {
+  const component = createSafeTextComponent(
+    [{ text: "状态 ready", color: "success" }],
+    theme,
+    {},
+    { background: (text: string): string => text, paddingX: 1, paddingY: 1 },
+  );
+  const first = component.render(14);
+  const second = component.render(14);
+  assert.equal(second, first);
+  assert.equal(first.length, 3);
+  for (const line of first) assert.equal(displayWidth(line), 14);
+  assert.equal(first[1]!.trim(), "状态 ready");
+});
+
+test("折叠上限与溢出提示在复用路径上保持不变", () => {
+  const component = createSafeTextComponent(
+    [{ text: "1\n2\n3\n4\n5\n6", color: "dim", multiline: true }],
+    theme,
+    {},
+    { maxLines: 3, overflowText: "… (more)" },
+  );
+  const first = component.render(20);
+  assert.deepEqual(first, ["1", "2", "… (more)"]);
+  assert.equal(component.render(20), first);
 });
