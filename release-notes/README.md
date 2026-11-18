@@ -15,6 +15,17 @@
 3. 创建并推送 `vX.X.X` 形状的 tag。
 4. 工作流先校验 tag、包版本与发布说明文件，通过后再发布 npm 包，最后用该 Markdown 文件创建 GitHub Release。
 
+## 包内 `CHANGELOG.md` 的生成源
+
+这些发布说明文件同时是 npm 包根目录 `CHANGELOG.md` 的唯一生成源。发布构建的 `prepack` 钩子会自动执行 `npm run changelog:generate`，把本目录下的说明按版本降序拼成包根 `CHANGELOG.md`（派生文件，已 gitignore），并随包发布；`release-notes/vX.Y.Z.md` 始终是唯一人工维护的源文件，也继续作为 GitHub Release 正文。
+
+Pi 从 `1.5.0` 起会读取包内该文件，在交互模式启动时以 `Extension Updates` 通知块展示版本增量，因此本目录文件的格式不能随意变动：
+
+- 首行必须是 `# vX.Y.Z`。
+- 分类使用 `## 分类`；生成时会把这些标题降一级，段内原有层级随之整体下移。
+- 除顶级版本标题与 `## 分类` 外，不要写其它结构。
+- 本目录中最大的版本号必须等于 `package.json` 的 `version`，否则构建失败。
+
 ## 注意事项
 
 - tag 与 `package.json` 版本不一致时工作流直接失败。

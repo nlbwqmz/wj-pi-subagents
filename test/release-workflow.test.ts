@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -8,6 +9,8 @@ import { parse } from "yaml";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const validatorPath = join(repositoryRoot, "scripts", "validate-release-tag.mjs");
+const generatorPath = join(repositoryRoot, "scripts", "generate-changelog.mjs");
+const manifestPath = join(repositoryRoot, "package.json");
 const workflowPath = join(repositoryRoot, ".github", "workflows", "release.yml");
 
 function runValidator(tag: string) {
@@ -16,6 +19,162 @@ function runValidator(tag: string) {
     encoding: "utf8",
   });
 }
+
+function readPackageVersion(): string {
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { version: string };
+  return manifest.version;
+}
+
+function nextPatchVersion(version: string): string {
+  const [major = 0, minor = 0, patch = 0] = version.split(".").map(Number);
+  return `${major}.${minor}.${patch + 1}`;
+}
+
+function compareSemver(left: string, right: string): number {
+  const leftParts = left.split(".").map(Number);
+  const rightParts = right.split(".").map(Number);
+  for (let index = 0; index < 3; index += 1) {
+    const difference = (leftParts[index] ?? 0) - (rightParts[index] ?? 0);
+    if (difference !== 0) return difference;
+  }
+  return 0;
+}
+
+interface NotesFixture {
+  readonly root: string;
+  readonly notesDir: string;
+  readonly outPath: string;
+}
+
+function createNotesFixture(files: readonly (readonly [string, string])[]): NotesFixture {
+  const root = mkdtempSync(join(tmpdir(), "wj-changelog-"));
+  const notesDir = join(root, "notes");
+  mkdirSync(notesDir, { recursive: true });
+  for (const [name, content] of files) writeFileSync(join(notesDir, name), content, "utf8");
+  return { root, notesDir, outPath: join(root, "out", "CHANGELOG.md") };
+}
+
+function runGenerator(fixture: NotesFixture) {
+  return spawnSync(
+    process.execPath,
+    [generatorPath, "--notes-dir", fixture.notesDir, "--out", fixture.outPath],
+    { cwd: repositoryRoot, encoding: "utf8" },
+  );
+}
+
+function releaseNote(version: string, body: readonly string[]): string {
+  return ["# v" + version, "", ...body].join("\n");
+}
+
+test("CHANGELOG 生成器把发布说明按 semver 降序拼成包内 CHANGELOG.md", () => {
+  const manifestVersion = readPackageVersion();
+  const versions = [...new Set(["0.1.0", "0.2.0", manifestVersion])];
+  const richBody = [
+    "## 新增",
+    "",
+    "- 支持 `--notes-dir` 与 `--out` 选项，行内代码 `## 保持原样`。",
+    "",
+    "### 细节",
+    "",
+    "#### 更深的标题",
+    "",
+    "```text",
+    "## 围栏里的标题不降级",
+    "### 围栏里的子标题也不降级",
+    "```",
+    "",
+    "~~~markdown",
+    "## 波浪号围栏里的标题也不降级",
+    "~~~",
+    "",
+    "- 列表与空行保持原样。",
+  ];
+  const fixture = createNotesFixture(
+    versions.map((version): readonly [string, string] => [
+      `v${version}.md`,
+      releaseNote(version, version === "0.2.0" ? richBody : ["## 优化", "", `- ${version} 的变更。`]),
+    ]),
+  );
+
+  try {
+    const result = runGenerator(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(existsSync(fixture.outPath), true);
+
+    const changelog = readFileSync(fixture.outPath, "utf8");
+    const headers = [...changelog.matchAll(/^## \[(\d+\.\d+\.\d+)\]$/gm)].map(
+      (match) => match[1] ?? "",
+    );
+    assert.deepEqual(headers, [...versions].sort(compareSemver).reverse());
+    assert.ok(headers.includes("0.2.0"), "段头必须形如 ## [0.2.0]");
+    assert.equal(headers[0], manifestVersion);
+
+    assert.match(changelog, /^### 新增$/m, "正文标题必须降一级");
+    assert.match(changelog, /^#### 细节$/m, "正文标题必须逐级下降");
+    assert.match(changelog, /^##### 更深的标题$/m);
+    assert.equal(/^## 新增$/m.test(changelog), false);
+    assert.equal(/^### 细节$/m.test(changelog), false);
+    assert.match(changelog, /^## 围栏里的标题不降级$/m, "代码围栏内的标题不降级");
+    assert.match(changelog, /^### 围栏里的子标题也不降级$/m);
+    assert.match(changelog, /^## 波浪号围栏里的标题也不降级$/m);
+    assert.match(changelog, /^- 支持 `--notes-dir` 与 `--out` 选项，行内代码 `## 保持原样`。$/m);
+
+    assert.equal(changelog.includes("\n\n\n"), false, "段与段之间恰好一个空行");
+    assert.match(changelog, /\n$/, "文件末尾必须换行");
+    assert.equal(/\n\n$/.test(changelog), false, "文件末尾只能有单个换行");
+    assert.equal(/^# /m.test(changelog), false, "输出不得包含顶级标题");
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+function expectGeneratorFailure(
+  files: readonly (readonly [string, string])[],
+  expectedMessage: RegExp,
+): void {
+  const fixture = createNotesFixture(files);
+  try {
+    const result = runGenerator(fixture);
+    assert.notEqual(result.status, 0, `应生成失败：${expectedMessage.source}`);
+    assert.match(result.stderr, expectedMessage);
+    assert.equal(existsSync(fixture.outPath), false, "校验失败时不得写出目标文件");
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}
+
+test("CHANGELOG 生成器校验失败即退出且不写盘", () => {
+  const manifestVersion = readPackageVersion();
+  const body = ["## 优化", "", "- 变更。"];
+
+  expectGeneratorFailure(
+    [
+      ["v0.2.0.md", releaseNote("0.2.0", body)],
+      ["0.2.0.md", releaseNote("0.2.0", body)],
+    ],
+    /版本 0\.2\.0 重复/,
+  );
+
+  expectGeneratorFailure(
+    [["v0.2.0.md", releaseNote("0.2.1", body)]],
+    /标题版本 0\.2\.1 与文件名版本 0\.2\.0 不一致/,
+  );
+
+  expectGeneratorFailure([["v0.2.0.md", releaseNote("0.2.0", ["", "  "])]], /正文为空/);
+
+  expectGeneratorFailure([["README.md", "# 发布说明目录\n"]], /没有可用的 vX\.Y\.Z\.md/);
+
+  const newerVersion = nextPatchVersion(manifestVersion);
+  expectGeneratorFailure(
+    [
+      ["v0.2.0.md", releaseNote("0.2.0", body)],
+      [`v${newerVersion}.md`, releaseNote(newerVersion, body)],
+    ],
+    new RegExp(
+      `发布说明最大版本 ${newerVersion.replaceAll(".", "\\.")} 与 package\\.json 版本 ${manifestVersion.replaceAll(".", "\\.")} 不一致`,
+    ),
+  );
+});
 
 function asRecord(value: unknown): Record<string, unknown> {
   assert.equal(typeof value, "object");

@@ -36,6 +36,29 @@ test("npm test 先干净重建 bridge，避免源码协议与旧 dist 进程不�
   assert.equal(existsSync(join(repositoryRoot, "scripts", "build-bridge.mjs")), true);
 });
 
+test("package manifest 在 prepack 阶段生成并随包发布 CHANGELOG.md", () => {
+  const manifest = JSON.parse(readFileSync(join(repositoryRoot, "package.json"), "utf8")) as {
+    files?: unknown;
+    scripts?: Record<string, unknown>;
+  };
+  const gitignore = readFileSync(join(repositoryRoot, ".gitignore"), "utf8");
+
+  assert.ok(Array.isArray(manifest.files));
+  for (const entry of ["LICENSE", "CHANGELOG.md", "dist", "index.ts", "src"]) {
+    assert.ok(manifest.files.includes(entry), `files 缺少 ${entry}`);
+  }
+
+  assert.equal(manifest.scripts?.["changelog:generate"], "node scripts/generate-changelog.mjs");
+  assert.equal(manifest.scripts?.prepack, "npm run build:bridge && npm run changelog:generate");
+  const prepack = String(manifest.scripts?.prepack);
+  assert.ok(
+    prepack.indexOf("npm run build:bridge") < prepack.indexOf("npm run changelog:generate"),
+    "prepack 必须先 build:bridge 再 changelog:generate",
+  );
+  assert.equal(existsSync(join(repositoryRoot, "scripts", "generate-changelog.mjs")), true);
+  assert.match(gitignore, /^\/CHANGELOG\.md$/m, "CHANGELOG.md 是派生产物，必须被 gitignore");
+});
+
 test("package manifest、lock 和 CI 固定 Pi 1.2.0 clean-break 基线", () => {
   const manifest = JSON.parse(readFileSync(join(repositoryRoot, "package.json"), "utf8")) as {
     peerDependencies?: Record<string, unknown>;

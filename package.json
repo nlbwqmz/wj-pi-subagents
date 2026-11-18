@@ -23,6 +23,7 @@
   ],
   "files": [
     "LICENSE",
+    "CHANGELOG.md",
     "dist",
     "index.ts",
     "src"
@@ -51,10 +52,11 @@
   },
   "scripts": {
     "build:bridge": "node scripts/build-bridge.mjs",
+    "changelog:generate": "node scripts/generate-changelog.mjs",
     "pack:smoke": "node scripts/package-smoke.mjs",
     "release:validate": "node scripts/validate-release-tag.mjs",
     "prepublishOnly": "npm run check",
-    "prepack": "npm run build:bridge",
+    "prepack": "npm run build:bridge && npm run changelog:generate",
     "typecheck": "tsc --noEmit",
     "pretest": "npm run build:bridge",
     "test": "node --experimental-strip-types --test test/*.test.ts",

@@ -65,7 +65,7 @@ try {
   if (installedManifest.pi?.extensions?.[0] !== "./index.ts") {
     throw new Error("Smoke 测试包未声明 ./index.ts 扩展入口");
   }
-  for (const file of ["index.ts", "LICENSE"]) {
+  for (const file of ["index.ts", "LICENSE", "CHANGELOG.md"]) {
     if (!existsSync(join(installedPackagePath, file))) {
       throw new Error(`Smoke 测试包缺少 ${file}`);
     }
