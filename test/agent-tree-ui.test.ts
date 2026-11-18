@@ -109,6 +109,66 @@ test("错误态与无选中行的回车被忽略", () => {
   assert.equal(empty.handleInput("\x1b"), "close");
 });
 
+test("回车兼容 Kitty CSI-u 编码", () => {
+  const panel = new AgentTreePanelModel(treeSnapshot(), { viewport_height: 8 });
+  assert.equal(panel.handleInput("\x1b[13u"), "enter");
+  assert.equal(panel.getPublicState().selected_key, PARENT_ID);
+
+  assert.equal(panel.handleInput("\x1b[B"), "changed");
+  assert.equal(panel.handleInput("\x1b[13u"), "enter");
+  assert.equal(panel.getPublicState().selected_key, WORKING_CHILD_ID);
+
+  // 必须有选中行的前置条件不变：空树与错误态仍忽略回车。
+  const empty = new AgentTreePanelModel(Object.freeze({
+    tree_revision: 1,
+    scope: Object.freeze({ kind: "root" as const }),
+    nodes: Object.freeze([]),
+  }), { viewport_height: 8 });
+  assert.equal(empty.handleInput("\x1b[13u"), "ignored");
+
+  const errored = new AgentTreePanelModel(treeSnapshot(), { viewport_height: 8 });
+  errored.markError();
+  assert.equal(errored.handleInput("\x1b[13u"), "ignored");
+});
+
+test("Esc 兼容 Kitty CSI-u 与 modifyOtherKeys 编码", () => {
+  const panel = new AgentTreePanelModel(treeSnapshot(), { viewport_height: 8 });
+  assert.equal(panel.handleInput("\x1b[27u"), "close");
+
+  const otherKeys = new AgentTreePanelModel(treeSnapshot(), { viewport_height: 8 });
+  assert.equal(otherKeys.handleInput("\x1b[27;1;27~"), "close");
+
+  // Esc 的短路先于错误态，保持原有优先级。
+  const errored = new AgentTreePanelModel(treeSnapshot(), { viewport_height: 8 });
+  errored.markError();
+  assert.equal(errored.handleInput("\x1b[27u"), "close");
+});
+
+test("方向键兼容 SS3 与 Kitty CSI 编码", () => {
+  const panel = new AgentTreePanelModel(treeSnapshot(), { viewport_height: 8 });
+  // SS3：↓ 下移、↑ 回退。
+  assert.equal(panel.handleInput("\x1bOB"), "changed");
+  assert.equal(panel.getPublicState().selected_key, WORKING_CHILD_ID);
+  assert.equal(panel.handleInput("\x1bOA"), "changed");
+  assert.equal(panel.getPublicState().selected_key, PARENT_ID);
+
+  // SS3：← 折叠选中分支，→ 重新展开。
+  assert.equal(panel.handleInput("\x1bOD"), "changed");
+  assert.equal(panel.getPublicState().expanded_agent_ids.includes(PARENT_ID), false);
+  assert.equal(panel.handleInput("\x1bOC"), "changed");
+  assert.equal(panel.getPublicState().expanded_agent_ids.includes(PARENT_ID), true);
+
+  // Kitty CSI（带 modifier 参数）：↑↓ 移动，←→ 折叠展开。
+  assert.equal(panel.handleInput("\x1b[1;1B"), "changed");
+  assert.equal(panel.getPublicState().selected_key, WORKING_CHILD_ID);
+  assert.equal(panel.handleInput("\x1b[1;1A"), "changed");
+  assert.equal(panel.getPublicState().selected_key, PARENT_ID);
+  assert.equal(panel.handleInput("\x1b[1;1D"), "changed");
+  assert.equal(panel.getPublicState().expanded_agent_ids.includes(PARENT_ID), false);
+  assert.equal(panel.handleInput("\x1b[1;1C"), "changed");
+  assert.equal(panel.getPublicState().expanded_agent_ids.includes(PARENT_ID), true);
+});
+
 test("面板将终态节点保留在对应父代理的树分支中", () => {
   const panel = new AgentTreePanelModel(treeSnapshot(), { viewport_height: 12 });
   const lines = panel.render(240);

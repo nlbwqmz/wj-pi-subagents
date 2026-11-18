@@ -834,12 +834,16 @@ export class AgentActivityViewerModel {
     ]);
   }
   handleInput(data: string): AgentActivityViewerInputOutcome {
-    if (data === "\x1b") return "close";
-    if (data === "\t") return this.moveSelection(1);
-    if (data === "\x1b[Z") return this.moveSelection(-1);
-    if (data === "\r" || data === "\n" || data === " ") return this.toggleSelectedKey();
-    if (data === "\x1b[C") return this.setSelectedExpansion(true);
-    if (data === "\x1b[D") return this.setSelectedExpansion(false);
+    if (matchesKey(data, Key.escape)) return "close";
+    // Shift+Tab 先于 Tab 判定：反向选择必须优先，避免任何编码族被正向分支吞掉。
+    if (matchesKey(data, Key.shift(Key.tab))) return this.moveSelection(-1);
+    if (matchesKey(data, Key.tab)) return this.moveSelection(1);
+    // 保留 legacy 的 `\n`（Kitty 协议激活时 matchesKey 不把它当 enter）。
+    if (matchesKey(data, Key.enter) || data === "\n" || data === " ") {
+      return this.toggleSelectedKey();
+    }
+    if (matchesKey(data, Key.right)) return this.setSelectedExpansion(true);
+    if (matchesKey(data, Key.left)) return this.setSelectedExpansion(false);
     if (matchesKey(data, Key.home)) {
       if (this.scrollOffset === 0 && !this.followEnabled) return "ignored";
       // 跳到首部 = 回看历史：暂停自动跟随。
@@ -858,13 +862,13 @@ export class AgentActivityViewerModel {
 
     const maxOffset = this.maxScrollOffset();
     if (this.followEnabled) this.scrollOffset = maxOffset;
-    if (data === "\x1b[A" || data === "k") {
+    if (matchesKey(data, Key.up) || data === "k") {
       if (this.scrollOffset <= 0) return "ignored";
       this.followEnabled = false;
       this.scrollOffset -= 1;
       return "changed";
     }
-    if (data === "\x1b[B" || data === "j") {
+    if (matchesKey(data, Key.down) || data === "j") {
       if (this.scrollOffset >= maxOffset) return "ignored";
       this.scrollOffset += 1;
       if (this.scrollOffset >= maxOffset) this.followEnabled = true;

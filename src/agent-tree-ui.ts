@@ -639,7 +639,7 @@ export function bindAgentTreeUi(
             handleInput: (data) => {
               try {
                 if (panel.model === undefined) {
-                  if (data === "\x1b") finish();
+                  if (matchesKey(data, Key.escape)) finish();
                 } else {
                   const outcome = panel.model.handleInput(data);
                   if (outcome === "close") finish();
@@ -796,7 +796,7 @@ export class AgentTreePanelModel {
   }
 
   handleInput(data: string): AgentTreePanelInputOutcome {
-    if (data === "\x1b") return "close";
+    if (matchesKey(data, Key.escape)) return "close";
     if (this.status === "error") return "ignored";
     const rows = this.buildRows();
     this.clampSelection(rows.length);
@@ -814,13 +814,13 @@ export class AgentTreePanelModel {
       this.clampSelection(rows.length);
       return "changed";
     }
-    if (data === "\x1b[A" || data === "k") {
+    if (matchesKey(data, Key.up) || data === "k") {
       if (this.selectedIndex <= 0) return "ignored";
       this.selectedIndex -= 1;
       this.clampSelection(rows.length);
       return "changed";
     }
-    if (data === "\x1b[B" || data === "j") {
+    if (matchesKey(data, Key.down) || data === "j") {
       if (this.selectedIndex >= rows.length - 1) return "ignored";
       this.selectedIndex += 1;
       this.clampSelection(rows.length);
@@ -828,9 +828,9 @@ export class AgentTreePanelModel {
     }
     const selected = rows[this.selectedIndex];
     if (selected === undefined) return "ignored";
-    if (data === "\r") return "enter";
-    if (data === "\x1b[C" || data === "l") return this.expandSelected(selected.key);
-    if (data === "\x1b[D" || data === "h") return this.collapseSelected(selected.key);
+    if (matchesKey(data, Key.enter)) return "enter";
+    if (matchesKey(data, Key.right) || data === "l") return this.expandSelected(selected.key);
+    if (matchesKey(data, Key.left) || data === "h") return this.collapseSelected(selected.key);
     return "ignored";
   }
 

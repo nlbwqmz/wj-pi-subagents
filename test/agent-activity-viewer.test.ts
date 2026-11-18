@@ -1639,6 +1639,105 @@ test("Esc 关闭查看器，其余未知输入被忽略", () => {
   assert.equal(viewer.handleInput("x"), "ignored");
 });
 
+test("查看器按键识别兼容 Kitty CSI-u / modifyOtherKeys / SS3 编码", () => {
+  // Esc：Kitty CSI-u 与 xterm modifyOtherKeys 编码同样关闭。
+  for (const encoded of ["\x1b[27u", "\x1b[27;1;27~"]) {
+    const viewer = new AgentActivityViewerModel(viewerAgent(), replayFixture());
+    assert.equal(viewer.handleInput(encoded), "close", JSON.stringify(encoded));
+  }
+
+  // Tab / Shift+Tab：各种编码与 legacy 编码选中同一项，且 Shift+Tab 一定反向。
+  const entries = [
+    messageEntry([{ type: "thinking", thinking: "思考一" }]),
+    messageEntry([{ type: "thinking", thinking: "思考二" }]),
+    messageEntry([{ type: "thinking", thinking: "思考三" }]),
+  ];
+  const selectionAfter = (data: string): string | undefined => {
+    const viewer = new AgentActivityViewerModel(viewerAgent(), entries, { viewport_height: 20 });
+    assert.equal(viewer.handleInput(data), "changed", JSON.stringify(data));
+    return viewer.getSelectedKey();
+  };
+  const tabSelection = selectionAfter("\t");
+  const shiftTabSelection = selectionAfter("\x1b[Z");
+  assert.ok(tabSelection !== undefined, "Tab 应建立选择");
+  assert.ok(shiftTabSelection !== undefined, "Shift+Tab 应建立选择");
+  assert.notEqual(shiftTabSelection, tabSelection, "Shift+Tab 必须与 Tab 方向相反");
+  // Tab 的 Kitty CSI-u 编码。
+  assert.equal(selectionAfter("\x1b[9u"), tabSelection);
+  // Shift+Tab 的 Kitty CSI-u 与 xterm modifyOtherKeys 编码都走反向选择。
+  assert.equal(selectionAfter("\x1b[9;2u"), shiftTabSelection);
+  assert.equal(selectionAfter("\x1b[27;2;9~"), shiftTabSelection);
+
+  // Enter：CSI-u 与 modifyOtherKeys 编码同样切换展开；legacy 输入保持可用。
+  const expansionViewer = new AgentActivityViewerModel(viewerAgent(), [
+    messageEntry([{ type: "thinking", thinking: "计划" }]),
+  ], { viewport_height: 20 });
+  assert.equal(expansionViewer.handleInput("\x1b[13u"), "changed");
+  assert.equal(expansionViewer.getExpandedKeys().length, 1);
+  assert.equal(expansionViewer.handleInput("\x1b[13;1u"), "changed");
+  assert.equal(expansionViewer.getExpandedKeys().length, 0);
+  assert.equal(expansionViewer.handleInput("\n"), "changed");
+  assert.equal(expansionViewer.getExpandedKeys().length, 1);
+
+  // 左右方向键：CSI 1;1X 与 SS3 编码展开/折叠，与 legacy CSI 编码等价。
+  const expandWith = (data: string): number => {
+    const viewer = new AgentActivityViewerModel(viewerAgent(), [
+      messageEntry([{ type: "thinking", thinking: "计划" }]),
+    ], { viewport_height: 20 });
+    assert.equal(viewer.handleInput("\t"), "changed");
+    assert.equal(viewer.handleInput(data), "changed", JSON.stringify(data));
+    return viewer.getExpandedKeys().length;
+  };
+  assert.equal(expandWith("\x1b[C"), 1);
+  assert.equal(expandWith("\x1b[1;1C"), 1);
+  assert.equal(expandWith("\x1bOC"), 1);
+
+  const collapseWith = (data: string): number => {
+    const viewer = new AgentActivityViewerModel(viewerAgent(), [
+      messageEntry([{ type: "thinking", thinking: "计划" }]),
+    ], { viewport_height: 20 });
+    assert.equal(viewer.handleInput("\t"), "changed");
+    assert.equal(viewer.handleInput("\x1b[C"), "changed");
+    assert.equal(viewer.handleInput(data), "changed", JSON.stringify(data));
+    return viewer.getExpandedKeys().length;
+  };
+  assert.equal(collapseWith("\x1b[D"), 0);
+  assert.equal(collapseWith("\x1b[1;1D"), 0);
+  assert.equal(collapseWith("\x1bOD"), 0);
+
+  // 上下方向键：CSI 1;1X 与 SS3 编码滚动同样的行数。
+  const scrollUpOffset = (data: string): number => {
+    const viewer = new AgentActivityViewerModel(viewerAgent(), replayFixture(), {
+      viewport_height: VIEWPORT,
+    });
+    const before = viewer.getPublicState().scroll_offset;
+    assert.equal(viewer.handleInput(data), "changed", JSON.stringify(data));
+    const after = viewer.getPublicState().scroll_offset;
+    assert.equal(after, before - 1, JSON.stringify(data));
+    assert.equal(viewer.getPublicState().follow_enabled, false, JSON.stringify(data));
+    return after;
+  };
+  const legacyUp = scrollUpOffset("\x1b[A");
+  assert.equal(scrollUpOffset("\x1b[1;1A"), legacyUp);
+  assert.equal(scrollUpOffset("\x1bOA"), legacyUp);
+
+  const scrollDownOffset = (data: string): number => {
+    const viewer = new AgentActivityViewerModel(viewerAgent(), replayFixture(), {
+      viewport_height: VIEWPORT,
+    });
+    // 用 legacy `k` 离开底部，避免下行分支因已在底部被忽略。
+    assert.equal(viewer.handleInput("k"), "changed");
+    const before = viewer.getPublicState().scroll_offset;
+    assert.equal(viewer.handleInput(data), "changed", JSON.stringify(data));
+    const after = viewer.getPublicState().scroll_offset;
+    assert.equal(after, before + 1, JSON.stringify(data));
+    return after;
+  };
+  const legacyDown = scrollDownOffset("\x1b[B");
+  assert.equal(scrollDownOffset("\x1b[1;1B"), legacyDown);
+  assert.equal(scrollDownOffset("\x1bOB"), legacyDown);
+});
+
 test("标题展示模板、名称与生命周期状态并净化控制字符", () => {
   const viewer = new AgentActivityViewerModel({
     agent_id: AGENT_ID,
