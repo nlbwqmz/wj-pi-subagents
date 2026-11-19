@@ -234,7 +234,7 @@ test("release workflow 只监听版本形状 tag，npm 成功后才创建 GitHub
   const validateIndex = publishRuns.findIndex((run) => run.includes("release:validate"));
   const notesIndex = publishRuns.findIndex((run) => run.includes("release-notes/"));
   const checkIndex = publishRuns.findIndex((run) => run.includes("npm run check"));
-  const buildIndex = publishRuns.findIndex((run) => run.includes("npm run build:bridge"));
+  const buildIndex = publishRuns.findIndex((run) => run.includes("npm run build:package"));
   const publishIndex = publishRuns.findIndex(
     (run) => run.includes("npm publish --ignore-scripts --access public --provenance"),
   );
@@ -243,6 +243,13 @@ test("release workflow 只监听版本形状 tag，npm 成功后才创建 GitHub
   assert.ok(checkIndex > notesIndex);
   assert.ok(buildIndex > checkIndex);
   assert.ok(publishIndex > buildIndex);
+  assert.equal(
+    publishRuns.some(
+      (run) => run.includes("npm run build:bridge") || run.includes("changelog:generate"),
+    ),
+    false,
+    "发布 job 只能调用单一产物入口 build:package，不得内联子步骤（--ignore-scripts 会跳过 prepack）",
+  );
 
   const release = asRecord(jobs.create_github_release);
   assert.equal(release.needs, "publish_npm");

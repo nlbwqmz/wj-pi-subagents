@@ -89,8 +89,8 @@ jobs:
       - name: 运行发布前检查
         run: npm run check
 
-      - name: 构建 RPC bridge
-        run: npm run build:bridge
+      - name: 构建发布产物
+        run: npm run build:package
 
       - name: 发布到 npm
         shell: bash

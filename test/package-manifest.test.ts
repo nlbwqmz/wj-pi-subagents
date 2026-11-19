@@ -49,11 +49,15 @@ test("package manifest 在 prepack 阶段生成并随包发布 CHANGELOG.md", ()
   }
 
   assert.equal(manifest.scripts?.["changelog:generate"], "node scripts/generate-changelog.mjs");
-  assert.equal(manifest.scripts?.prepack, "npm run build:bridge && npm run changelog:generate");
-  const prepack = String(manifest.scripts?.prepack);
+  assert.equal(
+    manifest.scripts?.["build:package"],
+    "npm run build:bridge && npm run changelog:generate",
+  );
+  assert.equal(manifest.scripts?.prepack, "npm run build:package");
+  const buildPackage = String(manifest.scripts?.["build:package"]);
   assert.ok(
-    prepack.indexOf("npm run build:bridge") < prepack.indexOf("npm run changelog:generate"),
-    "prepack 必须先 build:bridge 再 changelog:generate",
+    buildPackage.indexOf("npm run build:bridge") < buildPackage.indexOf("npm run changelog:generate"),
+    "build:package 必须先 build:bridge 再 changelog:generate",
   );
   assert.equal(existsSync(join(repositoryRoot, "scripts", "generate-changelog.mjs")), true);
   assert.match(gitignore, /^\/CHANGELOG\.md$/m, "CHANGELOG.md 是派生产物，必须被 gitignore");

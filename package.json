@@ -52,11 +52,12 @@
   },
   "scripts": {
     "build:bridge": "node scripts/build-bridge.mjs",
+    "build:package": "npm run build:bridge && npm run changelog:generate",
     "changelog:generate": "node scripts/generate-changelog.mjs",
     "pack:smoke": "node scripts/package-smoke.mjs",
     "release:validate": "node scripts/validate-release-tag.mjs",
     "prepublishOnly": "npm run check",
-    "prepack": "npm run build:bridge && npm run changelog:generate",
+    "prepack": "npm run build:package",
     "typecheck": "tsc --noEmit",
     "pretest": "npm run build:bridge",
     "test": "node --experimental-strip-types --test test/*.test.ts",

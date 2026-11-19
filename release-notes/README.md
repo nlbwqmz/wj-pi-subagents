@@ -17,7 +17,7 @@
 
 ## 包内 `CHANGELOG.md` 的生成源
 
-这些发布说明文件同时是 npm 包根目录 `CHANGELOG.md` 的唯一生成源。发布构建的 `prepack` 钩子会自动执行 `npm run changelog:generate`，把本目录下的说明按版本降序拼成包根 `CHANGELOG.md`（派生文件，已 gitignore），并随包发布；`release-notes/vX.Y.Z.md` 始终是唯一人工维护的源文件，也继续作为 GitHub Release 正文。
+这些发布说明文件同时是 npm 包根目录 `CHANGELOG.md` 的唯一生成源。`npm run build:package` 是本仓唯一的发布产物构建入口，它依次执行 bridge 构建与 `npm run changelog:generate`，把本目录下的说明按版本降序拼成包根 `CHANGELOG.md`（派生文件，已 gitignore），并随包发布。CI 发布 job 与本地 `prepack` 都只调用该入口：`npm publish` 使用 `--ignore-scripts`，生命周期钩子不会执行，因此发布 job 必须显式先跑 `build:package`；`release-notes/vX.Y.Z.md` 始终是唯一人工维护的源文件，也继续作为 GitHub Release 正文。
 
 Pi 从 `1.5.0` 起会读取包内该文件，在交互模式启动时以 `Extension Updates` 通知块展示版本增量，因此本目录文件的格式不能随意变动：
 
